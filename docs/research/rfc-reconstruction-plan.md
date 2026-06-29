@@ -67,7 +67,7 @@ historical decisions, or aligned future direction. It does not become current
 law by being checked in; each reconstruction PR must account for the gap between
 the text, the implementation, and the durable direction.
 
-Every RFC rewrite uses the RFC-writing skill's stage-aware loop:
+Every RFC rewrite follows this stage-aware loop:
 
 1. Observe the local RFC process, current stage, related RFCs, implementation,
    tests, docs, Exo state, and durable design evidence.

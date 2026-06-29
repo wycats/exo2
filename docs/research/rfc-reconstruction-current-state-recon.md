@@ -113,8 +113,10 @@ rows have changed since it was written.
 ## Current Reconstruction Queue
 
 This is the first execution queue under the evidence-driven reconstruction
-method. The queue starts with RFC `10200` so Exo can reliably address RFCs by
-ID, then moves to full RFC rewrites and lifecycle cleanup.
+method. The queue starts with RFC `10200` so Exo can reliably address that RFC
+by ID, then moves to full RFC rewrites and lifecycle cleanup. The separate
+`0060` numeric collision remains an ID-addressing exception until row 5 is
+processed.
 
 | Order | Work | Reason | Expected PR Shape |
 | ---: | --- | --- | --- |
