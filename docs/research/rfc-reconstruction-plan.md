@@ -1,5 +1,9 @@
 # RFC Reconstruction Plan
 
+Current status source: [RFC Reconstruction Current-State Recon](./rfc-reconstruction-current-state-recon.md).
+That checkpoint refreshes the public-tree corpus inventory after the clean-root
+cutover and supersedes the next-step recommendations in this older plan.
+
 This plan turns the initial inventory into a safe rewrite sequence. It avoids
 editing RFC files directly until each action can be expressed through the Exo
 RFC command surface (`supersede`, `archive`, `withdraw`, `edit`, `promote`,
@@ -8,14 +12,20 @@ RFC command surface (`supersede`, `archive`, `withdraw`, `edit`, `promote`,
 ## Current Findings
 
 - The corpus has 334 markdown files under `docs/rfcs`.
-- 194 files belong to 96 duplicate-title families.
+- 332 of those files are managed RFC records; `README.md` and
+  `0000-template.md` are support files.
+- 193 managed RFC records belong to 96 duplicate-title families.
+- Duplicate numeric ID collisions have been reduced to one remaining group:
+  `0060`.
 - Stage 3 is mostly closer to the current Rust/SQLite/sidecar implementation
   than Stage 4.
 - Stage 4 mixes canonical current law, duplicate stable records, and historical
   transition plans.
-- The most stale stable record is `0022` (`Unified Project State`), which
-  describes a TypeScript `ContextService` world while the current codebase is
-  SQLite-backed through `tools/exo` and `crates/exosuit-storage`.
+- `0022` (`Unified Project State`) has been archived and superseded by
+  `10176`; it is no longer pending reconstruction work.
+- The most important remaining stale stable record is `10154` (`Context
+  Persistence`), which still describes checking in `docs/agent-context` rather
+  than the current SQLite plus repo/sidecar/shadow projection model.
 - PR [#187](https://github.com/wycats/exo2/pull/187) retired agent-context
   phase archives: `phase finish` no longer copies `docs/agent-context/current`
   to `docs/agent-context/archive`, the committed archive corpus was removed,
@@ -29,6 +39,8 @@ RFC command surface (`supersede`, `archive`, `withdraw`, `edit`, `promote`,
 - The lane-centered workbench direction should influence what we do about
   drift, but this checkpoint does not implement lanes or rewrite RFCs around
   that design package.
+- The clean public-root cutover is complete; RFC reconstruction now proceeds
+  against the public tree and should not rely on private-history-only context.
 
 ## Reconstruction Rules
 
@@ -86,9 +98,9 @@ reference material.
 
 | RFC | Current Issue | Evidence Direction |
 | ---: | --- | --- |
-| 0022 | Describes old TypeScript project-state service. | Replace with SQLite/project-state reality from `10176`, `tools/exo/src/context.rs`, and storage migrations; record this as substantive replacement unless/until Exo supersession metadata is added. |
+| 10154 | Context persistence is no longer simply checked-in `docs/agent-context`. | Rewrite around repo/sidecar/shadow state policies, SQLite as operational source of truth, and portable SQL projections. |
 | 0121 | Core VS Code `AgentRuntime` extraction is implemented, but should not be used as law for MCP proxy or daemon lifecycle. | Keep the shared-agent-runtime record focused on `AgentRuntime`; split MCP proxy and daemon lifecycle surfaces clearly in separate RFCs. |
-| 10154 | Context persistence is no longer simply checked-in `docs/agent-context`. | Rewrite around repo/sidecar/shadow state policies and portable SQL projections. |
+| 10165 | Storage write mediation has landed, but the RFC wording still contradicts itself on shadow-table enforcement. | Correct status language so ordinary Exo write mediation is complete and `xShadowName` enforcement remains the named hardening gap unless code evidence changes. |
 
 ## Demotion Or Withdrawal Status
 
@@ -109,7 +121,7 @@ promotion.
 | RFC | Status | Why |
 | ---: | --- | --- |
 | 10176 | clean | Matches the current SQLite-backed project state model. |
-| 10165 | clean | Matches current storage virtual-table and revision-algebra code. |
+| 10165 | cleanup-first | Ordinary reactive write mediation is current, but the RFC's shadow-boundary status wording needs correction before stabilization. |
 | 0137 | clean-with-caveat | Matches generated exohook GitHub Actions projection; sync-check language still needs care. |
 | 10179 | cleanup-first | Core re-exec support is current, but extension binary-dir behavior still needs wording cleanup. |
 | 0132 | cleanup-first | Command spec/router/parser direction is active, but the full tiny DSL grammar is only partially current. |
@@ -135,13 +147,21 @@ IDs, because ambiguous IDs can make the command surface select no safe target.
 
 ## Next Concrete Step
 
-The duplicate stable records (`0002`, `0004`, `0020`, `0024`, `0106`) have
-already been superseded through Exo sidecar state. Numeric ID collision review,
-clear-survivor cleanup, RFC `0021` withdrawal, the project-state cluster map,
-and the phase-archive/current-file withdrawal pass have landed. The next
-actionable slice is the RFC `0022` disposition framed in
-`docs/research/rfc-project-state-cluster-disposition.md`, followed by `10154`
-context-persistence cleanup.
+The current action sequence is:
+
+1. Account for the RFC `10200` identity repair reminder before the next
+   ID-addressed RFC mutation batch.
+2. Rewrite RFC `10154` as the current Stage 4 persistence policy.
+3. Correct RFC `10165` storage status wording around ordinary write mediation
+   and the remaining shadow-table enforcement gap.
+4. Make stable duplicate supersession readable in markdown/read surfaces for
+   `0002 -> 10153`, `0004 -> 10155`, `0020 -> 10159`, `0024 -> 10162`, and
+   `0106 -> 0108`.
+5. Resolve the remaining numeric collision `0060`.
+
+Use
+`docs/research/rfc-reconstruction-current-state-recon.md` as the current queue
+before opening the next lifecycle or rewrite PR.
 
 ## Session Note
 
