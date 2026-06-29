@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+
+echo "scripts/check is a compatibility shim. Running exo validate dev..."
+exec exo validate dev

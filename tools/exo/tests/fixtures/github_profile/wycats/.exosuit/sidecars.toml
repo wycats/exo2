@@ -1,0 +1,9 @@
+version = 1
+
+[defaults]
+root = "~/.exo/sidecars"
+auto_push = "if_remote"
+
+[projects."github.com/wycats/locald"]
+key = "locald"
+remote = "git@github.com:wycats/locald-exosuit-state.git"

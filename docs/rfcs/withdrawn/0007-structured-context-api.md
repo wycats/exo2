@@ -1,0 +1,38 @@
+<!-- exo:7 ulid:01kg5kp2b712b1t2xr9k6rzng4 -->
+
+# RFC 7: Structured Context API
+
+
+# RFC 0007: Structured Context API
+
+## Summary
+
+Define `exosuit-core` as a library for managing Agent Context as a structured database ("Markdown ORM").
+
+## Motivation
+
+To robustly manipulate the plan and tasks, we need a structured approach that relies on ASTs rather than regex, and stable IDs rather than string matching.
+
+## Detailed Design
+
+### Philosophy
+
+- **Markdown as Database**: The file system is the DB.
+- **AST over Regex**: Use `unified` / `remark`.
+- **Tooling Independence**: Core logic in `exosuit-core`.
+
+### Schema
+
+- **IDs**: Stored in HTML comments `<!-- id: "..." -->`.
+- **Relations**: `<!-- relates-to: "..." -->`.
+
+### API
+
+- `addPlanItem`, `completePlanItem`
+- `addTask`, `completeTask`
+- `getPlan`, `getTasks`
+
+## Testing Strategy
+
+- **Integration-First**: Test full Markdown strings.
+- **No Snapshots**: Explicit expectations.

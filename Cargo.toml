@@ -1,0 +1,89 @@
+[workspace]
+resolver = "3"
+members = [
+  "tools/exo",
+  "tools/exo-workspace",
+  "crates/exo-reexec",
+  "crates/exosuit-process-host",
+  "crates/exohook",
+  "crates/exohistory",
+  "crates/exospec",
+  "crates/exosuit-core",
+  "crates/exosuit-file-refs",
+  "crates/exosuit-reactivity",
+  "crates/exosuit-reactivity-core",
+  "crates/exosuit-storage",
+  "crates/exosuit-ulid",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wycats/exo2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_copy_implementations = "warn"
+# Note: missing_docs is intentionally not set here because it would apply to tests.
+# Each lib.rs should enable it explicitly with #![warn(missing_docs)] if desired.
+dead_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+
+[workspace.lints.clippy]
+# Groups
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Architecture & Safety
+unsafe_derive_deserialize = "warn"
+print_stdout = "allow"
+print_stderr = "allow"
+await_holding_lock = "warn"
+# Assertion-style panics are acceptable in tests. Production crates that should
+# reject them opt back in with crate-level denies.
+unwrap_used = "allow"
+expect_used = "allow"
+
+# Strict Denials
+panic = "allow"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+needless_pass_by_value = "deny"
+trivially_copy_pass_by_ref = "deny"
+
+# Noise Reduction
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+struct_excessive_bools = "allow"
+must_use_candidate = "allow"
+branches_sharing_code = "allow"
+bool_assert_comparison = "allow"
+collapsible_if = "allow"
+default_constructed_unit_structs = "allow"
+disallowed_methods = "warn"
+field_reassign_with_default = "allow"
+if_same_then_else = "allow"
+literal_string_with_formatting_args = "allow"
+manual_contains = "allow"
+map_unwrap_or = "allow"
+needless_borrow = "allow"
+no_effect_underscore_binding = "allow"
+redundant_closure_for_method_calls = "allow"
+similar_names = "allow"
+single_char_add_str = "allow"
+uninlined_format_args = "allow"
+unnecessary_debug_formatting = "allow"
+unnecessary_map_or = "allow"
+unnecessary_sort_by = "allow"

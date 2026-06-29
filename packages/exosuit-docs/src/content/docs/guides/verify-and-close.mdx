@@ -1,0 +1,42 @@
+---
+title: Verify and close
+description: Finish work only after evidence is recorded.
+---
+
+Work closes when the relevant checks are green and the outcome is recorded. Verification is the Review phase of the loop made explicit: you confirm that what you built matches what was intended, capture the evidence, and only then close.
+
+## Green to green
+
+Every change goes from a green test suite to a green test suite. There is no such thing as a "pre-existing failure."
+
+Before starting work, the suite must be green; if it is not, fixing it is the first task. After finishing work, the suite must be green; any test that fails is a regression caused by this session, regardless of when the test was written. A flaky or environment-dependent test gets fixed to be robust, not skipped and waved past.
+
+This removes the ambiguity of partial completion: either the checks pass and the work is closed, or they do not and the work is not done.
+
+## Run the checks
+
+`exo verify` runs the verification checks for the current work. Use it as the gate before closing a task, goal, or phase, not as an afterthought once the summary is already written. If verification surfaces a failure, that failure is the next thing to fix; it is not a footnote on an otherwise-complete report.
+
+For phase work, the loop is:
+
+1. Make the change and keep it scoped.
+2. Run `exo verify` (and any project-specific checks) until green.
+3. Close the unit with a log that records what was done and what proves it.
+
+## The outcome-review gate
+
+Closing a goal or task is a checkpoint, not a formality. When a completion response reports that an outcome review is needed, the agent does not silently mark the work done. It summarizes the proposed outcome and the supporting evidence in plain language and asks the user to confirm.
+
+The user is the arbiter of completion. The completion is recorded only after the user approves it. This keeps the human in the loop at the moment that matters most: the transition from "claimed done" to "recorded as done."
+
+## What a completion summary contains
+
+A completion summary describes:
+
+- **Result** — what changed, in concrete terms.
+- **Evidence** — the checks that passed, the tests that ran, the output that was observed.
+- **Follow-up** — anything deferred, with a pointer to where it is tracked.
+
+It does not hide unresolved work behind a green label. If something is incomplete, the summary says so plainly.
+
+Closing a unit of work this way feeds the next Status read: the recorded outcome becomes the ground truth that the next cycle orients against.

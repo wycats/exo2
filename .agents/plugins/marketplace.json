@@ -1,0 +1,20 @@
+{
+  "name": "exo2",
+  "interface": {
+    "displayName": "Exo2"
+  },
+  "plugins": [
+    {
+      "name": "exo",
+      "source": {
+        "source": "local",
+        "path": "./plugins/exo"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

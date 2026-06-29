@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "sourceMap": true,
+    "types": ["svelte", "node"],
+    "paths": {
+      "@exosuit/core": ["../exosuit-core/src/index.ts"],
+      "@exosuit/core/*": ["../exosuit-core/src/*"]
+    }
+  },
+  "include": ["src/**/*", "tests/**/*"],
+  "exclude": [
+    "node_modules",
+    ".vscode-test",
+    "src/webview/**/*",
+    "src/types/**/*",
+    "playground/**/*"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@exosuit/rtd",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Rich Text Document (RTD) core library for Exosuit",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/exo2.git",
+    "directory": "packages/exosuit-rtd"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:unit": "pnpm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "csstype": "^3.2.3",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.15"
+  }
+}

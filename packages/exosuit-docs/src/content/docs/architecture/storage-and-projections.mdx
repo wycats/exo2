@@ -1,0 +1,70 @@
+---
+title: Storage and projections
+description: Source-of-truth boundaries for Exosuit state.
+---
+
+This page describes the **mechanism** behind Exosuit state: how SQLite stores
+canonical data, how reads and writes are mediated, and how the binary database
+becomes git-friendly text. For the principle behind local-first state, see
+[Local-first state](/concepts/local-first-state/). For concrete paths, see
+[State locations](/reference/state-locations/).
+
+## Canonical store: SQLite
+
+Project steering state (epochs, phases, goals, tasks, ideas, inbox items)
+lives in a SQLite database (RFC 10165, RFC 10176). The data model is
+storage-agnostic and hierarchical: an epoch contains phases, a phase contains
+goals, a goal contains tasks. Children reference parents by foreign key, so
+metadata is never duplicated across rows.
+
+SQL replaces hand-coded lookups. Finding the active phase, joining goals to
+their RFC stage, or computing pending work is a query, not a bespoke traversal.
+Real foreign keys catch broken references at write time instead of surfacing as
+corrupt cross-file state later.
+
+## Virtual tables and shadow tables
+
+Exosuit does not read and write the canonical tables directly. Each logical
+table is a **virtual table** that mediates access, backed by a **shadow table**
+that holds the actual rows (RFC 10165).
+
+- The virtual table is the reactive mediator. Reads pass through it so
+  dependencies can be recorded.
+- The shadow table is the backing store. SQLite defensive mode makes it
+  read-only to ordinary SQL, so every write must go through the virtual table's
+  update path rather than touching `*_data` directly.
+
+Reads are intercepted in two ways, matching the two kinds of observation in the
+reactivity algebra:
+
+- **Membership** — which rows exist in a scan (a `COUNT(*)` observes only this).
+- **Content** — what a specific column value is (a keyed `SELECT col` observes
+  both membership and content).
+
+Recording these observations is what makes the store reactive: a consumer that
+read a value is automatically a dependent of that value. The conceptual basis is
+covered in [Validation-based reactivity](/architecture/validation-based-reactivity/).
+
+## Git-friendly projections: sorted SQL dumps
+
+A SQLite file is binary; it cannot be diffed, reviewed, or merged. To make state
+reviewable in version control, Exosuit projects the canonical tables into
+deterministic **sorted SQL text dumps** (RFC 10178).
+
+- One `INSERT` statement per line, sorted by `text_id` (ULID), so the same
+  database state always produces the same text.
+- Internal rowids are omitted; foreign keys are emitted as the referenced
+  entity's `text_id` and resolved back to rowids on import.
+- A fresh clone can reconstruct the database by importing the dumps in
+  dependency order.
+
+The dumps are a projection, not a second source of truth. They exist for
+git-friendliness (diffing, review, portability), not for human reading or tool
+consumption. Production code never reads project steering state from them; it
+reads from SQLite. The dumps are written by policy: repo policy writes them into
+the workspace, sidecar policy writes them into a private portable sidecar, and
+shadow policy writes none.
+
+These are not TOML projections of state. There are no TOML projections of
+SQLite-canonical state; the former `plan.toml`, `ideas.toml`, and `inbox.toml`
+files were deleted, and the SQL dumps replaced them as the git bridge.

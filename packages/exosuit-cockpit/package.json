@@ -1,0 +1,34 @@
+{
+  "name": "exosuit-cockpit",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/exo2.git",
+    "directory": "packages/exosuit-cockpit"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host 127.0.0.1",
+    "build": "svelte-kit sync && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "svelte-kit sync && vitest run"
+  },
+  "devDependencies": {
+    "@lucide/svelte": "1.18.0",
+    "@sveltejs/adapter-node": "5.5.4",
+    "@sveltejs/kit": "2.65.0",
+    "@sveltejs/vite-plugin-svelte": "6.2.1",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/svelte": "5.2.9",
+    "@tsconfig/svelte": "5.0.8",
+    "happy-dom": "20.0.11",
+    "svelte": "5.45.3",
+    "svelte-check": "4.3.4",
+    "typescript": "5.9.3",
+    "vite": "7.2.6",
+    "vitest": "4.0.15"
+  }
+}

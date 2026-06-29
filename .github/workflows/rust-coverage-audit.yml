@@ -1,0 +1,320 @@
+name: Rust Coverage Audit
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to audit. Leave blank to audit ref/main."
+        required: false
+        type: string
+      ref:
+        description: "Ref to audit when PR number is blank."
+        required: false
+        default: main
+        type: string
+  schedule:
+    - cron: "17 10 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  COVERAGE_AUDIT_BRANCH: ${{ vars.COVERAGE_AUDIT_BRANCH || 'automation/rust-coverage-audit' }}
+  COVERAGE_AUDIT_LABEL: ${{ vars.COVERAGE_AUDIT_LABEL || 'coverage-audit' }}
+  COVERAGE_RUN_LABEL: ${{ vars.COVERAGE_RUN_LABEL || 'run-coverage' }}
+  COVERAGE_STATUS_CONTEXT: Rust Coverage Audit
+  COVERAGE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  pr-coverage:
+    name: Rust Coverage Audit
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != (vars.COVERAGE_AUDIT_BRANCH || 'automation/rust-coverage-audit') &&
+      contains(github.event.pull_request.labels.*.name, vars.COVERAGE_RUN_LABEL || 'run-coverage')
+    permissions:
+      contents: read
+    concurrency:
+      group: rust-coverage-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout tested PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-rust-coverage-audit-pr-${{ github.event.pull_request.number }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-coverage-audit-pr-${{ github.event.pull_request.number }}-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Rust Coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+  pr-coverage-report:
+    name: Report Rust Coverage Audit
+    needs: pr-coverage
+    if: >-
+      always() &&
+      (needs.pr-coverage.result == 'success' || needs.pr-coverage.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    concurrency:
+      group: rust-coverage-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout trusted audit helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Report PR result
+        env:
+          COVERAGE_RESULT: ${{ needs.pr-coverage.result }}
+          COVERAGE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          COVERAGE_TESTED_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/rust-coverage-audit.sh pr-result
+
+  manual-pr-metadata:
+    name: Resolve Manual PR Coverage Metadata
+    if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.metadata.outputs.pr_number }}
+      head_sha: ${{ steps.metadata.outputs.head_sha }}
+    steps:
+      - name: Resolve exact PR head
+        id: metadata
+        env:
+          COVERAGE_PR_NUMBER: ${{ inputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$COVERAGE_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Manual PR coverage requires a numeric PR number."
+            exit 1
+          fi
+
+          metadata="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${COVERAGE_PR_NUMBER}")"
+          head_sha="$(jq -r '.head.sha // empty' <<<"$metadata")"
+          head_repo="$(jq -r '.head.repo.full_name // empty' <<<"$metadata")"
+          base_sha="$(jq -r '.base.sha // empty' <<<"$metadata")"
+          if [[ -z "$head_sha" || -z "$head_repo" || -z "$base_sha" ]]; then
+            echo "::error::PR #${COVERAGE_PR_NUMBER} does not have a resolvable head repository and SHA."
+            exit 1
+          fi
+
+          {
+            printf 'pr_number=%s\n' "$COVERAGE_PR_NUMBER"
+            printf 'head_sha=%s\n' "$head_sha"
+          } >>"$GITHUB_OUTPUT"
+
+  manual-pr-coverage:
+    name: Rust Coverage Audit
+    needs: manual-pr-metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: rust-coverage-pr-${{ needs.manual-pr-metadata.outputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout tested PR head
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.manual-pr-metadata.outputs.pr_number }}/head
+          persist-credentials: false
+
+      - name: Verify exact PR head
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.manual-pr-metadata.outputs.head_sha }}
+        run: |
+          actual_head_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error::Checked out ${actual_head_sha}, expected ${EXPECTED_HEAD_SHA}."
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Rust Coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+  manual-pr-coverage-report:
+    name: Report Manual Rust Coverage Audit
+    needs: [manual-pr-metadata, manual-pr-coverage]
+    if: >-
+      always() &&
+      needs.manual-pr-metadata.result == 'success' &&
+      (needs.manual-pr-coverage.result == 'success' || needs.manual-pr-coverage.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    concurrency:
+      group: rust-coverage-pr-${{ needs.manual-pr-metadata.outputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout trusted audit helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Report PR result
+        env:
+          COVERAGE_RESULT: ${{ needs.manual-pr-coverage.result }}
+          COVERAGE_PR_NUMBER: ${{ needs.manual-pr-metadata.outputs.pr_number }}
+          COVERAGE_TESTED_SHA: ${{ needs.manual-pr-metadata.outputs.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/rust-coverage-audit.sh pr-result
+
+  main-coverage:
+    name: Rust Coverage Main Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr == '' && (inputs.ref == '' || inputs.ref == 'main'))
+    permissions:
+      contents: read
+    outputs:
+      tested_sha: ${{ steps.tested-sha.outputs.sha }}
+    concurrency:
+      group: rust-coverage-main-audit
+      cancel-in-progress: false
+    steps:
+      - name: Checkout tested main SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Record tested main SHA
+        id: tested-sha
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-rust-coverage-audit-main-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-coverage-audit-main-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Rust Coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+  main-coverage-report:
+    name: Report Rust Coverage Main Audit
+    needs: main-coverage
+    if: >-
+      always() &&
+      (needs.main-coverage.result == 'success' || needs.main-coverage.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
+    concurrency:
+      group: rust-coverage-main-audit
+      cancel-in-progress: false
+    steps:
+      - name: Checkout trusted audit helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Configure trusted Git credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+
+      - name: Report main result
+        env:
+          COVERAGE_RESULT: ${{ needs.main-coverage.result }}
+          COVERAGE_MAIN_SHA: ${{ needs.main-coverage.outputs.tested_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/rust-coverage-audit.sh main-result
+
+  manual-ref-coverage:
+    name: Rust Coverage Manual Ref Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.pr == '' && inputs.ref != '' && inputs.ref != 'main'
+    permissions:
+      contents: read
+    concurrency:
+      group: rust-coverage-ref-${{ inputs.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Rust Coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Report requested ref result
+        if: success()
+        run: |
+          echo "Rust coverage audit for '${{ inputs.ref }}' passed."
+          echo "Manual non-main audits are read-only and do not update the main coverage tracker PR."

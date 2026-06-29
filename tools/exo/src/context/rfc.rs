@@ -1,0 +1,35 @@
+use crate::ExoResult;
+use crate::context::SqliteLoader;
+use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct RfcIndexEntry {
+    pub id: String,
+    pub stage: u8,
+    pub title: String,
+}
+
+pub fn index_rfcs(root: &Path) -> ExoResult<HashMap<String, RfcIndexEntry>> {
+    let db_path = crate::context::db_path_resolving_project(root);
+    if !db_path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let loader = SqliteLoader::open(&db_path)?;
+    let rfcs = loader.load_rfcs()?;
+    let mut entries = HashMap::new();
+
+    for rfc in rfcs {
+        entries.insert(
+            format!("{:05}", rfc.rfc_number),
+            RfcIndexEntry {
+                id: format!("{:05}", rfc.rfc_number),
+                stage: rfc.stage,
+                title: rfc.title,
+            },
+        );
+    }
+
+    Ok(entries)
+}

@@ -1,0 +1,77 @@
+---
+title: North Star
+description: The future Exosuit user journey.
+---
+
+This is where Exosuit is headed, not a description of every surface as it
+stands today. The mature experience starts from a workspace. The workspace is
+the collaboration boundary, and the extension follows the project: orientation,
+state, controls, and next actions all show up where the work is happening.
+
+It's worth reading as one picture of how the four pillars (inverted sovereignty,
+high coherence, phased rigor, and evolutionary intelligence) play out once the
+workflow is wired all the way through.
+
+## Genesis
+
+A new project begins by establishing its mission. The user states what the
+project is for, and that intent becomes the anchor every later decision is
+measured against. Exosuit resolves the project from its git repository: the
+canonical project identity is derived from the git common directory, so linked
+worktrees share one project, one state store, and one daemon (RFC 10184).
+
+From the first moment, project state is canonical in the Exosuit state store
+rather than scattered across ad-hoc files. There is one place to read where the
+project stands and one place progress is written (RFC 10180).
+
+## Modes of collaboration
+
+The agent shifts between three modes depending on where the work is in its
+lifecycle (RFC 10155):
+
+- **Thinking Partner** — exploration and design. Surfaces tensions, challenges
+  assumptions, asks "why." Used during planning and design reviews.
+- **Chief of Staff** — organization and cadence. Restores context, tracks
+  obligations, keeps the plan coherent. Used at phase transitions.
+- **Maker** — execution. Follows the plan, works incrementally, keeps scope
+  bounded. Used during implementation.
+
+The same agent moves between modes; the mode is a stance, not a separate
+persona.
+
+## Planning
+
+Work is structured into a hierarchy: **epochs** group **phases**, phases hold
+**goals**, and goals decompose into **tasks**. Planning fills in this structure
+collaboratively, with the user approving the shape before execution begins.
+Each goal is calibrated to a single Prepare → Execute → Review cycle, which
+keeps phases plannable and progress legible (RFC 00230).
+
+## Research
+
+When a technical unknown blocks progress, the work opens as a research track
+rather than a guess. The agent investigates by reading code, fetching
+references, and recording findings, and the conclusion is captured as a
+decision. Durable decisions become RFCs (documents on disk); the structured
+backlog and progress stay canonical state (RFC 10180).
+
+## Deep work
+
+During implementation the user picks the active task and the agent works it
+with full project context in view. Steering keeps the agent aligned: progress
+commands return entity-scoped feedback, so a concern the user raises reaches the
+agent at the moment it can act on it rather than waiting for an explicit status
+check (RFC 10182, RFC 10181).
+
+## Phase transition
+
+A phase closes only on evidence. Verification runs the project's checks, and
+coherence catches drift between what the documents claim and what the code
+does. When everything is green and the outcome is recorded, the phase finishes
+and its learning carries forward into the next one.
+
+## Evolution
+
+The system improves as it is used. Repeated patterns are promoted into axioms,
+decisions accumulate as RFCs, and the workflow itself becomes a thing the
+project can refine.

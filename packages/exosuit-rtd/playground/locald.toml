@@ -1,0 +1,7 @@
+[project]
+name = "playground"
+domain = "playground.localhost"
+
+[services.web]
+type = "exec"
+command = "pnpm dev --port $PORT"

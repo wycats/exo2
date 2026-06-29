@@ -1,0 +1,67 @@
+---
+title: Architecture overview
+description: Exosuit system architecture at a glance.
+---
+
+Exosuit is one semantic core projected through several transports. A Rust
+state-and-command layer owns project state; the CLI, the VS Code extension, and
+LM tools are clients of that core, not separate implementations of it (RFC 0089,
+RFC 0125).
+
+## The layers
+
+Exosuit is built from focused Rust crates and a TypeScript extension:
+
+| Layer           | Where                                                         | Responsibility                                                                               |
+| --------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Command surface | `tools/exo`                                                   | The `exo` CLI: routing, command dispatch, and the daemon.                                    |
+| Domain core     | `crates/exosuit-core`                                         | Project state model, steering, and workflow logic (RFC 10176).                               |
+| Storage         | `crates/exosuit-storage`                                      | SQLite schema, reactive virtual tables, shadow tables, and SQL dumps (RFC 10165, RFC 10178). |
+| Reactivity      | `crates/exosuit-reactivity`, `crates/exosuit-reactivity-core` | Revision algebra and trace recording shared across the storage and runtime layers.           |
+| Hooks           | `crates/exohook`                                              | Validation-lane execution and CI/git-hook projection (RFC 0137).                             |
+| Extension       | `packages/exosuit-vscode`                                     | The VS Code cockpit: sidebar surfaces and webviews (RFC 0110, RFC 10162).                    |
+
+Supporting crates round out the system: `exosuit-ulid` for stable identifiers,
+`exosuit-file-refs` for file reference resolution, `exospec` for spec handling,
+and `exohistory` for history analysis.
+
+## How the pieces connect
+
+State is canonical in one place — the project SQLite database — and every client
+reaches it through the same machine channel (RFC 0125). The daemon is the shared
+boundary: it owns command handling for a project and serves the CLI, the
+extension, and LM tools as equal clients (RFC 0097).
+
+```text
+   CLI            VS Code extension          LM tools
+    │                    │                      │
+    └─────────┬──────────┴───────────┬──────────┘
+              ▼                       ▼
+        Unix domain socket: {state_root}/runtime/daemon.sock
+              │
+              ▼
+        exo daemon  ──  one per project, idle-timed
+              │
+              ▼
+        Project SQLite database: {state_root}/cache/exo.db
+              │
+              ▼
+        Git-friendly SQL dumps (repo or sidecar policy)
+```
+
+Because identity and state are project-scoped (RFC 10184), linked git worktrees
+share one daemon, one database, and one socket while keeping distinct workspace
+roots. A change made through the CLI is immediately visible to the extension,
+because both read the same canonical state through the same channel. There is no
+second copy to keep in sync.
+
+The extension itself observes a strict runtime split (RFC 0110): the Extension
+Host runs framework-agnostic TypeScript and talks to the daemon, while webviews
+render the UI and communicate only by message passing.
+
+## Where to go deeper
+
+- [Storage and projections](/architecture/storage-and-projections/) — the SQLite mechanism and git-friendly dumps.
+- [Validation-based reactivity](/architecture/validation-based-reactivity/) — how reads become dependencies and edits invalidate derived state.
+- [Sidecar architecture](/architecture/sidecars/) — the persistence-policy model for repo, shadow, and sidecar state.
+- [VS Code extension](/reference/vscode-extension/) — the client surface and how it follows the project.

@@ -1,0 +1,63 @@
+---
+title: Local-first state
+description: Workspace sovereignty and inspectable state boundaries.
+---
+
+A project's state lives somewhere you own and can carry. It belongs to the
+project, it travels with the project, and you read and change it through `exo`
+commands. That's the first design axiom (RFC 10153 §1).
+
+"Local" doesn't mean "in the repo." The state can live beside your code, in your
+home directory, or in a private repository that follows you across machines. The
+constant is that it's portable and yours. Where it lives is a policy choice,
+covered in [sidecar architecture](/architecture/sidecars/).
+
+This page covers the _principle_. For concrete on-disk locations see
+[state locations](/reference/state-locations/); for the storage mechanism see
+[storage and projections](/architecture/storage-and-projections/).
+
+## Why state is local-first
+
+An AI agent has a finite context window and no memory between sessions. It needs
+a reliable, structured place to read the current state and write down what it
+did. If a fact isn't recorded where the project can find it, the fact may as
+well not have happened. Keep that record somewhere you own and the project stays
+self-contained: you can pick it up on another machine, in another editor, or
+with a fresh agent and find the same state. The extension follows the project;
+the project doesn't depend on the extension (RFC 10153 §5, inverted source of
+truth).
+
+## The three-category rule
+
+Every persistent surface in the workspace is exactly one of three things
+(RFC 10180):
+
+- **Canonical state** — structured data used for project steering: epochs,
+  phases, goals, tasks, ideas, the inbox, axioms. It has a schema, tools operate
+  on its relationships, and its value is in those relationships rather than in
+  prose. Canonical state lives in SQLite and is reached through operations, not
+  by reading files.
+- **Tool configuration** — data that deterministically configures tool
+  behavior: which commands to run, where binaries are, which hooks to execute.
+  Configuration lives in files such as `exosuit.toml` and `hooks.toml`.
+- **Documents** — primarily unstructured prose whose value is the narrative:
+  RFCs, design notes, research, specs. Documents live as files and are written
+  for people.
+
+The boundary test for a surface that has both structured fields and prose is to
+ask what the primary reason it exists is. An axiom carries markdown, but it
+exists for its structured steering role, so it is canonical state. An RFC
+carries metadata, but it exists for its prose argument, so it is a document.
+
+## The database and the dumps
+
+The live SQLite database is the source of truth, and the `exo` CLI is how you
+read and change it. Every query and every mutation goes through there.
+
+SQL dumps are how that state travels. Under repo policy they're committed to
+git, so state changes show up as reviewable diffs. Under sidecar policy they're
+how your state crosses machines. It's the same format doing the same job:
+carrying the state somewhere you own.
+
+Durable human content (design docs, research, specs, and RFCs) lives as prose
+files, written and read by people.

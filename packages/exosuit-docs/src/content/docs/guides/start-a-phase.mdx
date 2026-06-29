@@ -1,0 +1,47 @@
+---
+title: Start a phase
+description: Move from planning into active work.
+---
+
+A phase is the active unit of work. Starting one moves you out of planning
+and into execution, and it commits the project to a single focus until the
+phase is verified and closed.
+
+## The phase loop
+
+The phase loop has five steps:
+
+1. **Start** — `exo phase start <id>` activates the phase.
+2. **Plan** — populate the phase with tasks via `exo task add`. Stop here for
+   approval before writing code; no code is written until the plan is agreed.
+3. **Implement** — write code and tests, recording work as you go with
+   `exo task` commands (`task start`, `task log`, `task complete`).
+4. **Verify** — run `exo verify`. The phase is not finishable until it passes.
+5. **Finish** — `exo phase finish` commits and closes the phase. The
+   `--message` flag commits and finishes in one step.
+
+Start a phase only when the previous work is cleanly committed and the next
+unit of work has a clear goal. The active phase should immediately expose the
+next task, current status, and verification path.
+
+## A dirty working tree is a signal, not a blocker
+
+If the working tree is dirty when you start or resume, Exosuit steers you
+through a deterministic review loop rather than letting an agent "clean up"
+by deleting files (RFC 0117):
+
+1. **Orient** — run `exo phase status` to see what the active phase implies
+   about the changes.
+2. **Inspect** — read `git status --porcelain` and `git diff`.
+3. **Recommend** — if the changes touch source, context, or RFCs, the
+   recommended path is **commit + PR**. If they look generated-only, confirm
+   intent before acting.
+4. **Wait** — pause for user feedback before any destructive action.
+
+Deletion is exceptional. Files are only removed when they are generated and
+disposable, explicitly deprecated, or the user confirms deletion is desired.
+The usual resolution is to commit the work and open a PR, not to discard it.
+
+Once the tree is clean and the next goal is clear, start the phase and move
+into the [SOAR loop](/guides/run-the-loop/). When the work is done,
+[verify and close](/guides/verify-and-close/).

@@ -1,0 +1,78 @@
+---
+title: Run the loop
+description: Status, orient, act, and review with Exosuit.
+---
+
+Day-to-day work in Exosuit follows SOAR: **Status → Orient → Act → Review**
+(RFC 00224). If you know Boyd's OODA loop, SOAR is the same idea with one change:
+OODA assumes a single actor, and SOAR assumes a human-AI pair where you keep
+decision authority. You run the loop all day, and it keeps the work grounded in
+what's actually there instead of what the agent remembers.
+
+## The four phases
+
+### Status — where am I?
+
+Detect current state and any drift from the planned trajectory. You are not
+sensing a raw environment; you are checking the delta from the plan.
+
+- `exo status` — phase, tasks, and git state at a glance.
+- `exo phase status` — the detailed phase breakdown.
+- `exo task list` — the task-level view.
+
+Outputs: current phase and epoch context, completed versus pending work, git
+dirty state, and any blockers or anomalies.
+
+### Orient — what are my options?
+
+Synthesize context, update the mental model, and generate actionable options.
+
+- `exo map` — active work and suggested next actions.
+- `exo map --next` — a single best next action.
+- `exo context` — a full context dump for recovery.
+- `exo goal list` — goals with their RFC linkage.
+
+Outputs: ranked options with rationale, repair paths when state is
+inconsistent, and any pending intents that need attention.
+
+### Act — execute the chosen action
+
+Perform concrete work: code, tests, documentation. The constraint is the heart
+of SOAR. **The human decides (explicitly or by delegation); the AI acts.**
+
+- `exo task start`, `exo task log`, `exo task complete` — task mutation.
+- `exo goal complete` — close a goal with a log entry.
+- Code edits and test runs in the workspace.
+
+### Review — did it work?
+
+Verify the work meets expectations and capture what was learned. OODA leaves
+verification implicit in the next Observe; SOAR makes it an explicit phase.
+
+- `exo verify` — run verification checks.
+- Human judgment — visual inspection, manual testing.
+- PR review — the code-review process.
+
+Outputs: pass/fail status, learnings to record, and the trigger for the next
+iteration.
+
+## Cadence
+
+You don't run the four phases in a rigid march. Different moments lean on
+different phases.
+
+- **Session start:** `Status → Orient`. Where am I, and what is next?
+- **During work:** `Act → Review → Status` in a tight loop. Execute, verify,
+  re-check state.
+- **At decision points:** `Orient`. What are my options?
+- **Strategic moments:** step out to the Plan tools (`exo rfc`, `exo epoch`,
+  roadmap work). These operate _across_ SOAR cycles and are not part of the
+  tactical loop.
+
+A complete SOAR cycle often culminates in a pull request. The PR is a Review
+artifact that captures what was done and invites verification. Merging closes
+the loop and produces a new Status on the main branch.
+
+SOAR is the all-day tactical loop. To implement a single discrete unit of work
+with more rigor, use the heavier [Prepare → Execute → Review](/guides/plan-execute-review/)
+protocol, which adds explicit approval gates between phases.

@@ -1,0 +1,225 @@
+---
+title: Product patterns
+description: Mockup-derived product UI patterns for documentation examples.
+---
+
+Product examples should feel like cockpit fragments inside the documentation:
+dark panels, visible workflow state, compact rails, and explicit labels. These
+patterns mirror the product sheet in the mockups rather than the earlier light
+card examples.
+
+<section class="exo-fullbleed exo-sheet" aria-label="Exosuit product patterns sheet">
+  <div class="exo-sheet-chrome">
+    <span>Exosuit style guide v1 — product patterns</span>
+    <span class="exo-page-index">04 / 12</span>
+  </div>
+
+<div class="exo-dark-band">
+  <div class="exo-hero-lockup">
+    <div
+      class="exo-logo-mark-large"
+      aria-label="Exosuit bracket caret mark"
+    ></div>
+    <div class="exo-vertical-rule" aria-hidden="true"></div>
+    <div>
+      <p class="exo-kicker">Interface grammar</p>
+      <h2 class="exo-display-title">Product Patterns</h2>
+      <p class="exo-display-subtitle">
+        Phase headers, RFC rails, signal events, status bars, and task lists.
+      </p>
+      <div class="exo-signature-row" aria-label="Product pattern principles">
+        <span class="exo-signature-item">
+          <i class="exo-dot"></i> State before narrative
+        </span>
+        <span class="exo-signature-item">
+          <i class="exo-dot green"></i> Rails before decoration
+        </span>
+        <span class="exo-signature-item">
+          <i class="exo-dot yellow"></i> Attention is explicit
+        </span>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <div class="exo-sheet-body">
+    <div class="exo-product-layout">
+      <aside class="exo-pattern-list" aria-label="Product pattern list">
+        <div class="exo-pattern-row">
+          <div class="exo-icon-tile"><span class="exo-icon crosshair"></span></div>
+          <div>
+            <span class="exo-number">01</span>
+            <h3>Phase header</h3>
+            <p>Current phase, owner, mode, task count, and next action.</p>
+          </div>
+        </div>
+        <div class="exo-pattern-row">
+          <div class="exo-icon-tile"><span class="exo-icon nodes"></span></div>
+          <div>
+            <span class="exo-number green">02</span>
+            <h3>RFC rail</h3>
+            <p>Lifecycle position remains visible while the user reads detail.</p>
+          </div>
+        </div>
+        <div class="exo-pattern-row">
+          <div class="exo-icon-tile"><span class="exo-icon signal"></span></div>
+          <div>
+            <span class="exo-number yellow">03</span>
+            <h3>Signal event</h3>
+            <p>Perception events include source, confidence, and required action.</p>
+          </div>
+        </div>
+        <div class="exo-pattern-row">
+          <div class="exo-icon-tile"><span class="exo-icon list"></span></div>
+          <div>
+            <span class="exo-number red">04</span>
+            <h3>Task table</h3>
+            <p>Dense rows make work status scannable without hiding blockers.</p>
+          </div>
+        </div>
+      </aside>
+
+      <div class="exo-product-stack">
+        <section class="exo-product-card" aria-label="Phase header pattern">
+          <div class="exo-product-head">
+            <div>
+              <span class="exo-dark-label">Phase</span>
+              <strong class="exo-product-title">Steering</strong>
+            </div>
+            <span class="exo-dark-badge green">Active</span>
+          </div>
+          <div class="exo-product-meta" aria-label="Phase metadata">
+            <span>Epoch 07</span>
+            <span>RFC-042</span>
+            <span>Task 03 / 12</span>
+            <span>Owner atlas</span>
+            <span>Next review</span>
+          </div>
+        </section>
+
+        <section class="exo-product-card" aria-label="RFC rail pattern">
+          <div class="exo-rfc-dark">
+            <div class="exo-rfc-dark-head">
+              <div>
+                <span class="exo-dark-label">RFC-042</span>
+                <strong>Add semantic diff for signal graph</strong>
+              </div>
+              <span class="exo-dark-badge">Approved</span>
+            </div>
+            <div class="exo-rail" aria-label="RFC lifecycle rail">
+              <span class="exo-rail-step done"><i class="exo-rail-dot"></i>Draft</span>
+              <span class="exo-rail-step done"><i class="exo-rail-dot"></i>Review</span>
+              <span class="exo-rail-step active"><i class="exo-rail-dot"></i>Approved</span>
+              <span class="exo-rail-step"><i class="exo-rail-dot"></i>Implement</span>
+              <span class="exo-rail-step"><i class="exo-rail-dot"></i>Verify</span>
+              <span class="exo-rail-step"><i class="exo-rail-dot"></i>Closed</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="exo-product-card" aria-label="Signal event pattern">
+          <div class="exo-signal-event-head">
+            <div>
+              <span class="exo-dark-label">Perception event</span>
+              <strong>Signal drift detected in steering model.</strong>
+            </div>
+            <span class="exo-dark-badge muted">Investigate</span>
+          </div>
+          <div class="exo-signal-event-meta">
+            <span>Source atlas</span>
+            <span>Signal drift:steering</span>
+            <span>Confidence 0.78</span>
+            <span>Age 2m</span>
+            <span>Action review</span>
+          </div>
+        </section>
+
+        <section class="exo-product-card" aria-label="Status bar pattern">
+          <div class="exo-statusbar-dark">
+            <div class="exo-status-dark-item">
+              <i class="exo-dot green"></i>
+              <span><strong>Steering</strong><span>Active</span></span>
+            </div>
+            <div class="exo-status-dark-item yellow">
+              <i class="exo-dot yellow"></i>
+              <span><strong>Inbox</strong><span>3 new</span></span>
+            </div>
+            <div class="exo-status-dark-item red">
+              <i class="exo-dot red"></i>
+              <span><strong>Diagnostics</strong><span>2 issues</span></span>
+            </div>
+            <span class="exo-action-button">Review</span>
+          </div>
+        </section>
+
+        <section class="exo-product-card" aria-label="Task table pattern">
+          <table class="exo-task-table-dark">
+            <thead>
+              <tr>
+                <th>Task</th>
+                <th>Owner</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Add semantic diff for signal graph</td>
+                <td>atlas</td>
+                <td><span class="exo-dark-badge">Active</span></td>
+              </tr>
+              <tr>
+                <td>Define steering signal schema</td>
+                <td>rhea</td>
+                <td><span class="exo-dark-badge green">Complete</span></td>
+              </tr>
+              <tr>
+                <td>Investigate perception anomaly</td>
+                <td>atlas</td>
+                <td><span class="exo-dark-badge red">Blocked</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+
+    <div class="exo-rule-grid" aria-label="Product pattern rules">
+      <section class="exo-rule-panel">
+        <span class="exo-check-icon">✓</span>
+        <div>
+          <p class="exo-kicker">Pattern rules</p>
+          <p>
+            Prefer lists, rails, and compact product panels. Show empty,
+            loading, blocked, and ready-for-review states calmly and directly.
+          </p>
+        </div>
+      </section>
+
+      <section class="exo-do-dont">
+        <div>
+          <p class="exo-kicker">Do</p>
+          <ul class="exo-do-list">
+            <li><span class="exo-check-icon">✓</span><span>Show the active workflow position.</span></li>
+            <li><span class="exo-check-icon">✓</span><span>Pair signal color with labels and next action.</span></li>
+            <li><span class="exo-check-icon">✓</span><span>Keep dense state in compact, readable rows.</span></li>
+          </ul>
+        </div>
+        <div class="exo-do-dont-divider" aria-hidden="true"></div>
+        <div>
+          <p class="exo-kicker">Do not</p>
+          <ul class="exo-dont-list">
+            <li><span class="exo-x-icon">×</span><span>Hide blockers behind decorative severity colors.</span></li>
+            <li><span class="exo-x-icon">×</span><span>Turn workflow rails into vague timelines.</span></li>
+            <li><span class="exo-x-icon">×</span><span>Use chatbot personality where status copy is needed.</span></li>
+          </ul>
+        </div>
+      </section>
+    </div>
+
+  </div>
+
+  <div class="exo-sheet-footer">
+    <span>Exosuit product patterns</span>
+    <span>Phase · RFC · Signal · Status · Tasks</span>
+  </div>
+</section>

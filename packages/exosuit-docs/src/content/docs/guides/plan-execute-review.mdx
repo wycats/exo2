@@ -1,0 +1,62 @@
+---
+title: Prepare, execute, review
+description: The PER protocol for implementing a discrete unit of work.
+---
+
+When you sit down to build one real thing (a feature, a migration, a fix) and it
+carries enough complexity or risk that you don't want to wing it, you reach for
+PER: Prepare → Execute → Review. It's heavier than the daily SOAR loop (see
+[Run the loop](/guides/run-the-loop/)), and that weight is the point.
+
+The first phase is **Prepare**, not "Plan." You're not inventing a plan from
+scratch; you're auditing the plan you already have against the actual codebase.
+
+## The three phases
+
+### Prepare — audit
+
+Read the RFC, plan, or task description and verify it against reality. The
+output is a readiness report:
+
+- verified assumptions,
+- corrections the plan needs,
+- blockers that must be resolved before execution,
+- the implementation order.
+
+### Execute — implement
+
+Follow the approved Prepare report exactly. Write the code and the tests. Do not
+add scope the report did not call for. Execution stays in contact with reality:
+make a change, check the response, then commit to the next change.
+
+### Review — verify
+
+Compare the executed work against what Prepare predicted. The output is a review
+report covering what was implemented correctly, what issues were found, and what
+to do next.
+
+## The gates
+
+Each phase ends at a gate the user controls:
+
+| Gate              | Question                         | Who decides                     |
+| ----------------- | -------------------------------- | ------------------------------- |
+| Prepare → Execute | Is the readiness report correct? | User approves or requests fixes |
+| Execute → Review  | Does it compile? Do tests pass?  | Code and tests confirm          |
+| Review → done     | Is the result acceptable?        | User accepts or requests fixes  |
+
+The gates are why PER turns uncertainty into checkpoints instead of drift. No
+expensive execution begins until the Prepare report is approved, and no work is
+declared finished until Review confirms it.
+
+## Goals are PER cycles
+
+A goal should be sized to a single PER cycle (RFC 00230). If Prepare reveals the
+goal needs multiple independent implementation passes, split it. If Prepare and
+Review are pure ceremony, with nothing to audit and nothing to verify, merge it
+into a larger goal. A well-sized goal is one Prepare can audit as a unit, one Execute
+produces as a single reviewable artifact, and one Review can verify in a single
+pass.
+
+This makes goal ordering the execution schedule: work the goals top-to-bottom,
+each as its own PER cycle. See [Phases, goals, tasks](/concepts/phases-goals-tasks/).

@@ -1,0 +1,55 @@
+body {
+  padding: 20px;
+  font-family: var(--vscode-font-family);
+  color: var(--vscode-editor-foreground);
+  background-color: var(--vscode-editor-background);
+}
+
+.line {
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+}
+
+h1,
+h2,
+h3 {
+  margin-top: 16px;
+  margin-bottom: 8px;
+  font-weight: bold;
+}
+
+h1 {
+  font-size: 1.5em;
+}
+h2 {
+  font-size: 1.3em;
+}
+h3 {
+  font-size: 1.1em;
+}
+
+input[type="checkbox"] {
+  margin-right: 8px;
+}
+
+.verify-btn {
+  margin-left: auto;
+  padding: 2px 6px;
+  font-size: 0.8em;
+  background-color: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+  border-radius: 2px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.line:hover .verify-btn {
+  opacity: 1;
+}
+
+.verify-btn:hover {
+  background-color: var(--vscode-button-secondaryHoverBackground);
+}

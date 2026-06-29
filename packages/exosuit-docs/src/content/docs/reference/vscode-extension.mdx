@@ -1,0 +1,78 @@
+---
+title: VS Code extension
+description: Exosuit surfaces inside VS Code.
+---
+
+The VS Code extension is a client of the Exosuit project, not its owner. It presents
+project state inside the editor (phase details, RFC pipeline, epoch context, task
+state, and steering signals) by reading the same canonical state the CLI reads. It
+follows the project; the project does not depend on it.
+
+## Follows the project
+
+The extension does not hold a private copy of project state. It connects to the same
+project daemon the CLI uses and renders what the daemon reports. Opening a workspace
+folder resolves a project (RFC 10184), connects to that project's daemon, and surfaces
+that project's state. When the active phase, goals, or steering change, whether from
+the CLI, an LM tool, or the sidebar itself, the extension reflects the change because
+all clients read one source of truth.
+
+This is the inverted-sovereignty pillar applied to tooling: the workspace defines
+behavior, and the extension executes it. Uninstalling the extension does not break the
+project; the project remains fully operable from the CLI.
+
+## Daemon and machine channel
+
+The extension talks to a per-project daemon over a Unix domain socket
+(RFC 0097). The daemon listens once per project state root at
+`{state_root}/runtime/daemon.sock`, owns machine-channel command handling, and exits
+after an idle timeout. Linked worktrees share one daemon because they share project
+identity.
+
+The protocol on that socket is the machine channel (RFC 0125), a transport-agnostic,
+language-neutral contract for Exosuit semantics. The CLI, the extension, and LM tools
+are equal clients of the same capability surface, so they cannot drift apart in
+behavior. The socket transport is primary; a stdio subprocess transport is the
+fallback when no daemon is available.
+
+## Host and webview separation
+
+The extension keeps two runtimes strictly separate (RFC 0110):
+
+- **Extension Host (Node.js)** holds the logic. It is pure TypeScript, performs file
+  system and VS Code API work, and manages the source of truth. It does not import
+  Svelte components or runes, because the Svelte runtime is not reliable in the
+  Extension Host process.
+- **Webview (renderer)** holds the UI. It may use Svelte and runes, and is responsible
+  only for rendering and interaction.
+
+The two communicate exclusively through JSON-serializable message passing. Shared code
+must be platform-agnostic: interfaces, DTOs, and pure utilities, not environment-bound
+logic.
+
+A second discipline from the same RFC: when a VS Code API accepts either a rich object
+(such as `vscode.WorkspaceFolder`) or a primitive (such as a string path), prefer the
+rich object. Primitives lose hidden context and behave inconsistently across
+development, production, and test environments.
+
+## The mode-aware cockpit
+
+Phase Details is the primary orientation surface, and it adapts to the workflow's
+`ProgressMode` (RFC 00184). The extension reads `progress_mode` from the CLI rather than
+guessing locally, so the sidebar stays aligned with CLI truth instead of drifting on
+heuristics. Each mode (roadmap revision, between epochs, between phases, planning,
+executing, verifying) has its own header, available actions, and content emphasis.
+Between-mode states render a Strategic Overview; in-phase states render Phase Details.
+
+The Phase Details structure is computed once as a derived root (`derived:phase.details`,
+RFC 10173) and consumed by the sidebar, the CLI, and LM tools alike. Computing it in one
+place removes the duplicated parsing logic that previously let the sidebar, the CLI, and
+LM tools disagree about the same phase.
+
+## See also
+
+- [Run the loop](/guides/run-the-loop/) — the SOAR cycle the cockpit surfaces.
+- [Architecture overview](/architecture/) — how the extension fits among the CLI,
+  daemon, and state store.
+- [Steering and perception](/concepts/steering-and-perception/) — the signals the
+  sidebar renders.

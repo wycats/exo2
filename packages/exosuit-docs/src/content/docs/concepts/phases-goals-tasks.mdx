@@ -1,0 +1,42 @@
+---
+title: Phases, goals, tasks
+description: The core execution vocabulary in Exosuit.
+---
+
+Exosuit organizes work as a four-level hierarchy. Each level nests inside the
+one above it:
+
+- **Epoch** is a thematic band of work that groups related phases. Epochs frame
+  _why_ a stretch of work exists.
+- **Phase** is the active unit of work within an epoch. A phase is what you
+  start, work inside, and finish.
+- **Goal** is an outcome being advanced inside a phase.
+- **Task** is a concrete action that can be started, logged, completed, and
+  reviewed.
+
+Phases contain goals, and goals contain tasks (RFC 00228). The point of the
+vocabulary is that you and the agent can always point at the same active item
+and agree on what "done" means for it.
+
+## Goals are PER-sized
+
+A goal is calibrated to one Prepare → Execute → Review cycle (RFC 00230). That
+turns "what is the right size for a goal?" from a vibes question into a testable
+heuristic:
+
+- **Too big.** Split it if Prepare reveals several independent implementation
+  passes, if it spans unrelated subsystems, or if Execute would produce multiple
+  artifacts that could ship separately.
+- **Too small.** Merge it if Prepare and Review are pure ceremony, if it is
+  really a single task inside a larger unit, or if completing it is not
+  meaningful progress the user would notice.
+- **Just right.** Prepare can audit it as one coherent unit, Execute produces
+  one reviewable artifact, Review can verify it in one pass, and completion is a
+  meaningful checkpoint.
+
+Because each goal is a PER cycle, the order of goals in a phase is the execution
+schedule. Work the top incomplete goal, run its PER cycle, mark it complete with
+a log, and move to the next. See [Prepare, execute,
+review](/guides/plan-execute-review/) for the protocol and
+[concepts/steering](/concepts/steering-and-perception/) for how stale goals are
+refreshed before tasking.

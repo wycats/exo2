@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7649f6a1f5e18762888c9e058ab155311f5ed4265952f907991a2d03b21314c9 # shrinks to case = Call(CallCase { path: ["rfc", "show"], args: [ArgValue { name: "id", kind: Positional { value: Int }, value: Int(-1) }] })
+cc e7f373cfaf1d365afc8a481ea165801a02cc218dd043c705cea86fec835ec0ae # shrinks to case = List(ListCase { namespace: ["run"], kind: "tasks", page: Page { cursor: None, limit: 1 } })

@@ -1,0 +1,53 @@
+---
+title: RFCs
+description: How Exosuit uses RFCs as durable decision records.
+---
+
+RFCs are durable design decisions: the laws of the system, recorded as prose
+rather than ephemeral task notes. They live on disk as documents because their
+value is the prose argument rather than a set of structured fields (RFC 10180).
+Exosuit indexes RFC metadata in its state store, but the files themselves remain
+human-authored, human-read documents.
+
+## The staged process
+
+An RFC advances through five stages (RFC 0108). The structure replaces
+unilateral agent decisions with a collaboration between two roles:
+
+- **The Committee (user)** is the arbiter of consensus. Only the user can
+  approve the transitions that gate design and implementation.
+- **The Champion (agent)** does the legwork of drafting, specifying,
+  implementing, and verifying, but needs the Committee's approval to unlock the
+  next stage.
+
+| Stage | Name          | Means                           | Exit criteria                                                               |
+| ----- | ------------- | ------------------------------- | --------------------------------------------------------------------------- |
+| 0     | **Strawman**  | "I have an idea."               | The user agrees the problem is worth solving.                               |
+| 1     | **Proposal**  | "We agree this is worth doing." | The user agrees with the _shape_ of the solution.                           |
+| 2     | **Draft**     | "Here is exactly how it works." | The spec is complete and the plan is sound. No new design after this point. |
+| 3     | **Candidate** | "It is built."                  | The feature is verified to work as designed.                                |
+| 4     | **Stable**    | "It is the law."                | The RFC is history; the spec is the record of reality.                      |
+
+Stage 0 RFCs are identified by a filename handle and carry no global number. At
+the 0 → 1 transition the RFC is assigned the next global ID and moves to
+`docs/rfcs/stage-1/`.
+
+## Transitions are steering events
+
+Each promotion is a deliberate checkpoint where the user provides steering:
+
+- **0 → 1 — Vision steering**: Is this the right problem?
+- **1 → 2 — Architectural steering**: Is this the right solution structure?
+- **2 → 3 — Implementation steering**: Code review, edge cases.
+- **3 → 4 — Governance steering**: Is this ready to be law?
+
+The agent never promotes 0 → 1 or 1 → 2 without explicit approval.
+
+## The lightweight path
+
+Not every decision is architectural. Naming conventions, small features, and
+configuration choices benefit from being recorded but do not need a full spec at
+each stage. A lightweight RFC (marked `lightweight: true`) still passes through
+all five stages, but with minimal artifacts and combinable transitions. For
+example, "is this worth doing?" and "is the shape right?" can be reviewed
+together (RFC 00226).

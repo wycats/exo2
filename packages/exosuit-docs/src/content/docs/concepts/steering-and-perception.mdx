@@ -1,0 +1,60 @@
+---
+title: Steering and perception
+description: How Exosuit keeps agents aligned with live project state.
+---
+
+Two collaborators, human and AI, work on a shared plan but cannot see each
+other's screens. The human sees the sidebar; the agent sees command responses.
+Steering and perception are how each side keeps the other in view.
+
+**Steering** is the guidance an `exo` command returns alongside its result: what
+just happened, what to do next, and who decides. Under the SOAR loop (RFC 00224)
+the human decides and the agent acts, so steering never auto-executes. It
+surfaces ranked options and waits.
+
+**Perception** is how user feedback, system observations, and plan changes reach
+the agent at the moment it can act on them, rather than only when it explicitly
+asks for status.
+
+## Every command is a perception touchpoint
+
+The agent spends most of its time executing, not calling `exo status`. If
+feedback only arrived through `status`, the agent would be blind to it during
+the work where it matters most. RFC 10182 closes that gap: commands that operate
+on an entity return steering scoped to that entity's tree (task, then parent
+goal, then phase).
+
+Consider an agent reporting progress while the user has just pushed back:
+
+```
+exo task log auth-task --log "Implemented OAuth flow"
+
+Task 'auth-task' logged.
+
+⚠ User concern on goal 'auth-system' (12 min ago):
+  "I don't think we need OAuth here — simple tokens might be enough"
+  → exo inbox list --entity-type goal --entity-id auth-system
+
+→ Next: exo task list (check remaining tasks)
+```
+
+The agent did not ask for feedback. It reported progress, and the system told it
+what it needed to know before it kept building the wrong thing.
+
+## The inbox as a steering channel
+
+The inbox is the channel through which perception events flow (RFC 10181). Every
+event carries an **entity scope** (what it is about), a **source**
+(`user-feedback`, `system-observation`, or `plan-mutation`), a **priority**
+(`immediate`, `next-touch`, `when-relevant`), and an **intent** (`claim`,
+`concern`, `inquiry`, or `fyi`).
+
+Steering delivers signals, not payloads. A command response carries a one-line
+summary, such as "2 items on goal 'Widget Refactor'", and the agent pulls the
+full detail when ready. The one exception is **entity closure**: attempting to
+complete a goal or task with unresolved feedback surfaces that feedback in full,
+forcing it to be addressed before the work is marked done.
+
+Plan mutations emit perception events automatically. Adding a goal, resolving an
+inbox item, or promoting an RFC writes the state change and the perception event
+in one operation, so a change made on one side becomes visible on the other.

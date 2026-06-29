@@ -1,0 +1,23 @@
+{
+  "name": "exo",
+  "version": "0.1.0",
+  "description": "Use Exo project state from Codex through the CLI-shaped exo-run MCP tool.",
+  "author": {
+    "name": "Exosuit"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Exo",
+    "shortDescription": "Use the Exo project loop from Codex.",
+    "longDescription": "Registers an MCP server that launches the durable `exo-mcp` proxy and adds guidance for using the single CLI-shaped `exo-run` tool.",
+    "developerName": "Exosuit",
+    "category": "Productivity",
+    "capabilities": [
+      "MCP server",
+      "Project state",
+      "Task workflow"
+    ],
+    "defaultPrompt": "Use Exo to inspect project state and keep the active phase and task plan current."
+  },
+  "mcpServers": "./.mcp.json"
+}

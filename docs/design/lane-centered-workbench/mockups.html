@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lane-Centered Workbench Mockups</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --paper: #fffdf8;
+    --ink: #1f2623;
+    --muted: #68726c;
+    --line: #d9d3c7;
+    --soft: #ebe6db;
+    --dark: #202824;
+    --dark-2: #2d3833;
+    --green: #1f7a4d;
+    --green-bg: #e5f3ea;
+    --yellow: #9a6a05;
+    --yellow-bg: #fbefd0;
+    --red: #a33b35;
+    --red-bg: #f8dedb;
+    --blue: #285d85;
+    --blue-bg: #dcecf5;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.5;
+  }
+  main { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+  header {
+    background: var(--dark);
+    color: #f8f4e8;
+    border-radius: 20px;
+    padding: 34px 38px;
+    margin-bottom: 24px;
+    box-shadow: 0 18px 50px rgba(28, 34, 31, .16);
+  }
+  h1 { font-size: 42px; line-height: 1.05; margin: 0 0 12px; letter-spacing: -.04em; }
+  h2 { font-size: 22px; margin: 0 0 14px; letter-spacing: -.02em; }
+  h3 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  header p { color: #cfd8d1; max-width: 760px; }
+  .kicker { text-transform: uppercase; font-size: 11px; letter-spacing: .14em; font-weight: 700; color: var(--yellow); margin-bottom: 10px; }
+  .note { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 18px 20px; margin-bottom: 24px; }
+  .screen { background: var(--paper); border: 1px solid var(--line); border-radius: 20px; overflow: hidden; margin: 24px 0; box-shadow: 0 10px 32px rgba(31, 38, 35, .06); }
+  .screen-head { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); background: #fbf8f0; padding: 14px 18px; }
+  .screen-title { font-weight: 750; }
+  .screen-meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .screen-body { padding: 18px; }
+  .grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .panel { border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: #fffefa; }
+  .panel.soft { background: #f8f4ea; }
+  .panel.dark { background: var(--dark); color: #f8f4e8; border-color: #3d4741; }
+  .panel.dark p { color: #cbd5cf; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; background: white; font-family: inherit; font-size: 12px; font-weight: 650; line-height: 1.2; cursor: pointer; }
+  button.btn { appearance: none; }
+  .btn.primary { background: var(--dark); color: white; border-color: var(--dark); }
+  .btn.warn { background: var(--yellow-bg); border-color: #dfc677; color: var(--yellow); }
+  .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 8px; font-size: 11px; font-weight: 700; border: 1px solid var(--line); background: white; white-space: nowrap; }
+  .badge.green { background: var(--green-bg); border-color: #b9dec5; color: var(--green); }
+  .badge.yellow { background: var(--yellow-bg); border-color: #ead086; color: var(--yellow); }
+  .badge.red { background: var(--red-bg); border-color: #ebb7b3; color: var(--red); }
+  .badge.blue { background: var(--blue-bg); border-color: #bad5e5; color: var(--blue); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--line); padding: 8px; }
+  td { border-bottom: 1px solid #ece6da; padding: 10px 8px; vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .lane-title { font-weight: 750; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .attention { display: grid; gap: 10px; }
+  .attention-item { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: start; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: #fffefa; }
+  .rank { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: var(--dark); color: white; font-size: 12px; font-weight: 800; }
+  .stack { display: grid; gap: 10px; }
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .step { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: #fffefa; }
+  .step strong { display: block; margin-bottom: 6px; }
+  .rail { display: grid; grid-template-columns: 110px 1fr; gap: 10px; align-items: start; padding: 10px 0; border-bottom: 1px solid #ece6da; }
+  .rail:last-child { border-bottom: 0; }
+  .label { color: var(--muted); font-size: 12px; font-weight: 700; }
+  pre { white-space: pre-wrap; margin: 0; padding: 12px; border-radius: 12px; background: #202824; color: #e7efe9; font-family: var(--mono); font-size: 12px; line-height: 1.45; overflow: auto; }
+  .sidebar { width: 340px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #fbf8f0; }
+  .sidebar-row { padding: 11px 12px; border-bottom: 1px solid var(--line); }
+  .sidebar-row:last-child { border-bottom: 0; }
+  .thin { font-size: 12px; color: var(--muted); }
+  .callout { border-left: 4px solid var(--yellow); padding: 10px 12px; background: var(--yellow-bg); border-radius: 10px; }
+  @media (max-width: 860px) { .grid, .grid-3, .steps { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="kicker">Design artifact · primary UI reference</div>
+    <h1>Lane-Centered Workbench</h1>
+    <p>These mockups capture the desired product hierarchy, density, terminology, and tone. They are intentionally more specific than the prose proposal: attention first, action second, provenance on demand.</p>
+  </header>
+
+  <section class="note">
+    <h2>How to read these mockups</h2>
+    <p>The goal is not a glossy AI dashboard. The goal is a serious operating surface where humans and agents share one project reality. The UI should look ordinary enough to ship: tables, scoped signals, clear next actions, and status explanations that say why the system believes what it believes.</p>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">01</div><div class="screen-title">Project Overview · Lane Axis</div></div>
+      <div class="screen-meta">project: billing-service · 6 lanes</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="stack">
+        <div class="panel soft">
+          <h2>Needs attention</h2>
+          <div class="attention">
+            <div class="attention-item">
+              <div class="rank">1</div>
+              <div><div class="lane-title">OAuth cleanup</div><div class="sub">PR #184 has requested changes. Validation is stale at current head.</div></div>
+              <span class="badge red">repair needed</span>
+            </div>
+            <div class="attention-item">
+              <div class="rank">2</div>
+              <div><div class="lane-title">Token refresh spike</div><div class="sub">Blocked by RFC question. No PR expected for this research lane.</div></div>
+              <span class="badge yellow">decision needed</span>
+            </div>
+            <div class="attention-item">
+              <div class="rank">3</div>
+              <div><div class="lane-title">Invoice total hotfix</div><div class="sub">CI failing on current PR head. Repair goal suggested.</div></div>
+              <span class="badge red">CI failing</span>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Active lanes</h2>
+          <table>
+            <thead><tr><th>Lane</th><th>Status</th><th>Health</th><th>Next action</th><th></th></tr></thead>
+            <tbody>
+              <tr><td><div class="lane-title">OAuth cleanup</div><div class="sub">worktree · wycats/oauth-cleanup</div></td><td><span class="badge blue">repairing</span></td><td><span class="badge red">review</span> <span class="badge yellow">validation stale</span></td><td>Resolve review comments</td><td><button class="btn" type="button">Why?</button></td></tr>
+              <tr><td><div class="lane-title">Token refresh spike</div><div class="sub">research · no PR expected</div></td><td><span class="badge blue">prepared</span></td><td><span class="badge yellow">blocked signal</span></td><td>Answer RFC question</td><td><button class="btn" type="button">Why?</button></td></tr>
+              <tr><td><div class="lane-title">Preview readiness</div><div class="sub">branch attached · main</div></td><td><span class="badge green">ready</span></td><td><span class="badge green">passing</span></td><td>Outcome review</td><td><button class="btn" type="button">Why?</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="panel">
+          <h2>Project signals</h2>
+          <div class="rail"><div class="label">Immediate</div><div>2 lane signals require action before closure.</div></div>
+          <div class="rail"><div class="label">Next touch</div><div>3 review comments are ready to become repair goals.</div></div>
+          <div class="rail"><div class="label">When relevant</div><div>RFC 10188 has implementation evidence waiting.</div></div>
+        </div>
+        <div class="panel">
+          <h2>State sync</h2>
+          <div class="rail"><div class="label">Local</div><div><span class="badge green">durable</span></div></div>
+          <div class="rail"><div class="label">Checkpoint</div><div><span class="badge yellow">5 rows pending</span></div></div>
+          <div class="rail"><div class="label">Remote</div><div><span class="badge yellow">ahead 1</span></div></div>
+          <div class="rail"><div class="label">Writer</div><div><span class="badge green">owned</span></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">02</div><div class="screen-title">Create Lane Flow</div></div>
+      <div class="screen-meta">four ordinary product steps</div>
+    </div>
+    <div class="screen-body">
+      <div class="steps">
+        <div class="step"><strong>1. Source</strong><p>Issue, RFC, idea, user request, incident, or experiment.</p><span class="badge blue">RFC 10188</span></div>
+        <div class="step"><strong>2. Workspace</strong><p>Use current checkout, create linked worktree, attach branch, or research-only.</p><span class="badge yellow">linked worktree</span></div>
+        <div class="step"><strong>3. First goal</strong><p>PER-sized. Specific enough for hypothesis, execution, and review.</p><span class="badge green">prepared</span></div>
+        <div class="step"><strong>4. Review</strong><p>Preview state writes and command effects before creating.</p><span class="badge">Why this status?</span></div>
+      </div>
+      <div style="margin-top:14px" class="panel dark">
+        <h3>Command preview</h3>
+        <pre>exo workbench lane-create "OAuth cleanup" \
+  --source rfc:10188 \
+  --workspace linked-worktree \
+  --branch wycats/oauth-cleanup \
+  --goal "Make public worker import path explicit"</pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">03</div><div class="screen-title">Lane Detail · Current Goal</div></div>
+      <div class="screen-meta">lane: OAuth cleanup</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="stack">
+        <div class="panel">
+          <div class="toolbar"><span class="badge blue">repairing</span><span class="badge red">review changes requested</span><span class="badge yellow">validation stale</span></div>
+          <h2 style="margin-top:12px">Current goal</h2>
+          <div class="rail"><div class="label">Hypothesis</div><div>Review failures are localized to public worker import boundaries; adapter behavior should not need redesign.</div></div>
+          <div class="rail"><div class="label">Evidence</div><div>PR #184 review thread identifies two import path mismatches. Last adapter tests passed at <span class="mono">91ab02f</span>.</div></div>
+          <div class="rail"><div class="label">Divergence</div><div>Workspace head is now <span class="mono">a38c2e1</span>, so validation no longer covers current code.</div></div>
+          <div class="rail"><div class="label">Next move</div><div>Apply requested import fix, rerun adapter + worker tests, then sync PR status.</div></div>
+        </div>
+        <div class="panel">
+          <h2>Signals</h2>
+          <div class="callout"><strong>User concern:</strong> “This may conflict with sidecar onboarding copy.” <span class="thin">scope: RFC 10188 · priority: next touch</span></div>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="panel">
+          <h2>Artifacts</h2>
+          <div class="rail"><div class="label">Branch</div><div class="mono">wycats/oauth-cleanup</div></div>
+          <div class="rail"><div class="label">PR</div><div>#184 · changes requested</div></div>
+          <div class="rail"><div class="label">RFC</div><div>10188 · implementation relationship</div></div>
+          <div class="rail"><div class="label">Workspace</div><div>linked worktree · dirty source changes</div></div>
+        </div>
+        <div class="panel">
+          <h2>Tool runtime</h2>
+          <div class="rail"><div class="label">Daemon</div><div><span class="badge green">healthy</span> daemon_04f9</div></div>
+          <div class="rail"><div class="label">Binary</div><div class="mono">exo@7c7bf4d</div></div>
+          <div class="rail"><div class="label">Database</div><div class="mono">{state_root}/cache/exo.db</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">04</div><div class="screen-title">PR Review and Repair</div></div>
+      <div class="screen-meta">PR #184 · changes requested</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="panel">
+        <h2>Review inputs</h2>
+        <table>
+          <thead><tr><th>Source</th><th>Finding</th><th>Lane action</th></tr></thead>
+          <tbody>
+            <tr><td>review thread</td><td>Public worker import path mismatches adapter contract.</td><td>Create repair goal</td></tr>
+            <tr><td>CI</td><td>Checks are stale for current head.</td><td>Rerun validation</td></tr>
+            <tr><td>user signal</td><td>Possible conflict with sidecar onboarding copy.</td><td>Inspect RFC before closure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel dark">
+        <h2>Suggested bounded goal</h2>
+        <p>Resolve public worker import review comments and refresh validation at current head.</p>
+        <pre>exo goal add "Resolve public worker import review comments" \
+  --lane oauth-cleanup \
+  --source pr-review:184</pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">05</div><div class="screen-title">RFC Decisions and Workspace View</div></div>
+      <div class="screen-meta">RFC 10188 · sidecar onboarding</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="panel">
+        <h2>RFC relationships</h2>
+        <div class="rail"><div class="label">Motivates</div><div>Token refresh spike</div></div>
+        <div class="rail"><div class="label">Implemented by</div><div>OAuth cleanup</div></div>
+        <div class="rail"><div class="label">Proved by</div><div>Preview readiness lane</div></div>
+        <div class="rail"><div class="label">Blocks</div><div>Closing token refresh until copy question is answered</div></div>
+      </div>
+      <div class="panel">
+        <h2>Workspace visibility</h2>
+        <div class="callout"><strong>Visible in current workspace.</strong> Another linked worktree has shared metadata for this RFC but does not currently contain the document file. That is workspace visibility debt, not evidence that shared RFC metadata is stale.</div>
+        <p style="margin-top:12px">Repair hints must remain scoped to documents visible in the current workspace.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">06</div><div class="screen-title">Why this status?</div></div>
+      <div class="screen-meta">trust surface, not debug drawer</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="panel">
+        <h2>Product explanation</h2>
+        <p>Validation is stale because the last successful test run was observed at commit <span class="mono">91ab02f</span>, while the lane workspace is now at <span class="mono">a38c2e1</span>.</p>
+        <div class="rail"><div class="label">Recommended</div><div>Rerun adapter and worker tests, then sync PR checks.</div></div>
+      </div>
+      <div class="panel dark">
+        <h2>Provenance</h2>
+        <pre>Source
+  observation obs_validation_stale_20260614_0946
+  observed by exo.test.adapter_worker
+  observed at 2026-06-14 09:46 PDT
+
+Workspace view
+  branch wycats/oauth-cleanup
+  current head a38c2e1
+  dirty state: source changes present
+
+Tool runtime
+  exo@7c7bf4d
+  daemon daemon_04f9
+  runtime healthy</pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">07</div><div class="screen-title">Outcome Review</div></div>
+      <div class="screen-meta">close lane · semantic confirmation</div>
+    </div>
+    <div class="screen-body grid">
+      <div class="panel">
+        <h2>Proposed outcome</h2>
+        <p>OAuth cleanup is ready to close as merged. PR #184 is approved, validation passed at current head, and implementation evidence is attached to RFC 10188.</p>
+        <div class="toolbar"><button class="btn primary" type="button">Accept outcome</button><button class="btn" type="button">Revise summary</button><button class="btn warn" type="button">Not complete yet</button><button class="btn" type="button">Discuss</button></div>
+      </div>
+      <div class="panel">
+        <h2>Closure checks</h2>
+        <div class="rail"><div class="label">Signals</div><div><span class="badge green">resolved</span></div></div>
+        <div class="rail"><div class="label">Validation</div><div><span class="badge green">current head</span></div></div>
+        <div class="rail"><div class="label">RFC</div><div><span class="badge green">evidence linked</span></div></div>
+        <div class="rail"><div class="label">Follow-ups</div><div>2 ideas created for later lanes</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen">
+    <div class="screen-head">
+      <div><div class="kicker">08</div><div class="screen-title">Compact VS Code Sidebar</div></div>
+      <div class="screen-meta">operational adapter</div>
+    </div>
+    <div class="screen-body">
+      <div class="sidebar">
+        <div class="sidebar-row"><strong>billing-service</strong><div class="thin">3 lanes need attention</div></div>
+        <div class="sidebar-row"><span class="badge red">1</span> <strong>OAuth cleanup</strong><div class="thin">repair needed · PR #184</div></div>
+        <div class="sidebar-row"><span class="badge yellow">2</span> <strong>Token refresh spike</strong><div class="thin">blocked signal · no PR expected</div></div>
+        <div class="sidebar-row"><span class="badge red">3</span> <strong>Invoice hotfix</strong><div class="thin">CI failing · current head</div></div>
+        <div class="sidebar-row"><span class="badge green">✓</span> <strong>Preview readiness</strong><div class="thin">ready for outcome review</div></div>
+        <div class="sidebar-row"><button class="btn" type="button">Create lane</button> <button class="btn" type="button">Why this status?</button></div>
+      </div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

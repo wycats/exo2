@@ -1,0 +1,49 @@
+node_modules
+dist
+out
+.debug/
+.prototools
+*.vsix
+.DS_Store
+.vscode-test
+packages/*/node_modules
+packages/*/dist
+packages/*/out
+packages/*/.astro
+packages/*/*.tsbuildinfo
+logs/
+*.log
+target
+
+# VS Code extension-host test artifacts
+activation-progress.txt
+activation-success.txt
+activation-error.txt
+packages/**/activation-progress.txt
+packages/**/activation-success.txt
+packages/**/activation-error.txt
+
+# TypeScript build artifacts (avoid noisy diffs)
+**/*.tsbuildinfo
+
+
+lcov.info
+
+# Private local files
+.private/
+.context/
+.reference/
+.logs/
+
+# Local XDG (RFC 10177)
+# Project state root (cache/runtime under project identity)
+.exo/
+# Cache (regenerable artifacts)
+.cache/
+# Runtime artifacts (sockets, PIDs)
+.runtime/
+
+# Reference materials - do not track
+.reference/
+.state/exo.db
+.vercel

@@ -1,0 +1,25 @@
+exohook migrate lefthook report
+input:  lefthook.yml
+output: .config/exo/hooks.toml
+wrote hooks.toml: no
+note: output already exists; no files were written (use --force to overwrite)
+
+Lane mapping:
+- pre-commit -> coherence (staged) + dev (uncommitted mirror)
+- pre-push   -> gate (committed_not_pushed) + ci (head mirror)
+
+Assumptions / conservative choices:
+- lefthook `run:` preserved as check.run (executed via bash -lc internally)
+- checks default to input_mode="none" (no file-level guessing)
+- lefthook `parallel: true` is represented as lane.parallel=true
+- stage_fixed -> check.category="mutate" + coherence override restage=auto (containment=fail)
+
+Migrated hooks:
+- pre-commit commands: check, lint, rust-fmt, rust-clippy, verify-toml
+- pre-push commands:   test, rust-coverage
+
+Next steps:
+- exohook config validate
+- exohook validate coherence --dry-run
+- exohook validate gate --dry-run
+- review argv wrappers; replace bash -lc with structured argv where safe

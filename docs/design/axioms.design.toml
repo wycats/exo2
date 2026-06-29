@@ -1,0 +1,14 @@
+# READ-ONLY: Use 'exo' CLI to modify this file.
+# Design Axioms
+
+[[axioms]]
+id = "context-is-king"
+principle = "Context is King"
+rationale = "AI agents have limited memory and context windows. They need a reliable, structured place to read the current state and write their progress."
+implications = ["Every phase must start by reading the context. Every significant action must be recorded in the context."]
+
+[[axioms]]
+id = "phased-execution"
+principle = "Phased Execution"
+rationale = "Large tasks overwhelm AI agents (and humans). Breaking work into phases ensures that we agree on the 'What' before we do the 'How'."
+implications = ["No code is written until the implementation plan is approved. No phase is marked complete until verification passes."]

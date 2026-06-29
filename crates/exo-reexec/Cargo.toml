@@ -1,0 +1,11 @@
+[package]
+name = "exo-reexec"
+version = "0.1.0"
+edition = "2021"
+description = "Workspace-local binary re-exec for exo-family tools"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,73 @@
+---
+title: Validation-based reactivity
+description: Pull-based reactivity for distributed editor state.
+---
+
+Exosuit uses validation-based reactivity: instead of pushing new values to
+clients, the system records that something changed and lets clients check
+whether their cached assumptions still hold. The model is specified formally in
+the reactivity algebra (`docs/specs/algebras/reactivity.md`) and realized in the
+`exosuit-reactivity-core` and `exosuit-storage` crates (RFC 10165).
+
+## The Iron Rule: validation is a metadata operation
+
+The central invariant is that **validation never executes user logic**. Checking
+whether a cached computation is still valid operates only on revision
+identifiers (integers, content hashes, nonces), never on the underlying values.
+The system decides whether to re-run code without running that code. If the
+revisions a computation depended on are unchanged, its output is unchanged by
+definition, so execution is skipped.
+
+This is what separates validation-based reactivity from push-based systems.
+A push system propagates new values eagerly; a validation system propagates only
+the signal that a value _may_ have changed, and recomputes lazily, on demand.
+
+## Revisions, identity, and equivalence
+
+A cell has a stable **identity** (the address by which it is referenced) and an
+**equivalence** determined by comparing revisions. A revision bump moves a cell to
+a new equivalence class at the same identity. This lets the system distinguish
+"the same thing changed" from "a different thing appeared."
+
+Revisions use strict equality, not ordering. Two revisions are interchangeable
+only if they are equal. Memory revisions are epoch-scoped: each process boot
+generates a fresh epoch identifier, so a revision minted before a restart can
+never accidentally match one minted after. `exosuit-reactivity-core` models this
+directly: the `Revision` type carries a persistent counter variant so revision
+identity survives restarts where it must, and the `Trace`/`TraceEntry` types
+record the dependencies a computation observed.
+
+## Two kinds of observation
+
+Not every read is the same. The algebra distinguishes two observation kinds, and
+the reactive SQLite layer (RFC 10165) maps them onto distinct virtual-table
+callbacks:
+
+| Observation    | Question                       | SQLite callback |
+| -------------- | ------------------------------ | --------------- |
+| **Membership** | Which rows exist in this scan? | `xFilter`       |
+| **Content**    | What is the value at this row? | `xColumn`       |
+
+A `COUNT(*)` observes only membership. A `SELECT col WHERE id = ?` observes both.
+Tracking them separately means a content change at a stable identity does not
+invalidate membership-only dependents, and vice versa. Invalidation stays as
+tight as the actual dependency.
+
+## Why it matters here
+
+Validation-based reactivity gives Exosuit three properties that a push model
+would not:
+
+- **Glitch freedom** — clients never observe partially-updated state, because they
+  re-derive from a consistent revision snapshot rather than receiving a stream of
+  intermediate pushes.
+- **Bandwidth efficiency** — change notifications are revision-sized, not
+  value-sized. The CLI, daemon, and extension exchange "this root changed" signals
+  and pull detail only when they need it.
+- **Traceability** — every derived value carries the trace of what it observed, so
+  the system can explain exactly why a recomputation happened.
+
+For where this state physically lives and how it is serialized for git, see
+[Storage and projections](/architecture/storage-and-projections/). For the
+runtime that surfaces these derived roots in the editor, see the
+[VS Code extension reference](/reference/vscode-extension/).

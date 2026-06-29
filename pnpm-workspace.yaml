@@ -1,0 +1,11 @@
+packages:
+  - packages/*
+  - packages/exosuit-rtd/playground
+
+ignoredBuiltDependencies:
+  - keytar
+
+onlyBuiltDependencies:
+  - "@vscode/vsce-sign"
+  - esbuild
+  - lefthook

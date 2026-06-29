@@ -1,0 +1,61 @@
+---
+title: Sidecar architecture
+description: Project-scoped sidecars and local state boundaries.
+---
+
+A sidecar is one of three **persistence policies** Exosuit can apply to a
+project. The policy decides who owns durable state (the repository, the local
+machine, or a private portable sidecar) without changing the project's
+identity. This page covers that model and when each policy applies. For the
+commands that bind and manage a sidecar, see
+[Sidecars](/reference/sidecars/).
+
+## Identity is separate from policy
+
+Every Exosuit project has one identity, derived from the canonical git common
+directory and stable across linked worktrees, branch changes, and remote URL
+changes. Linked worktrees share a project id, state root, database, and daemon
+while keeping distinct workspace roots (RFC 10184).
+
+Persistence policy is a separate axis. `repo`, `shadow`, and `sidecar` policies
+all use the same local project id; the policy decides where the local state root
+lives and where durable SQL projections are imported from and exported to.
+
+## The three policies
+
+| Policy      | Canonical database lives                        | Durable projection                                       | Use when                                                                                                  |
+| ----------- | ----------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **repo**    | `<primary-workspace>/.exo/cache/exo.db`         | Workspace SQL dumps committed to git                     | The team has adopted Exosuit and state should travel with the repository                                  |
+| **shadow**  | `$HOME/.exo/projects/<project-id>/cache/exo.db` | None by default                                          | You want private machine-local state in a repository that must stay clean                                 |
+| **sidecar** | Machine-local materialization root              | Portable SQL dumps in a private sidecar-state repository | You want high-fidelity state that follows you across machines, still without touching the work repository |
+
+Under **repo** policy, repo state lives beside the primary checkout in `.exo`,
+and selected state is projected to workspace SQL dumps so it diffs and merges in
+git. Linked worktrees share that same directory.
+
+Under **shadow** policy, the canonical database and runtime live under the
+user's home directory. Workspace SQL dumps are not read or written by default,
+so the work repository stays free of Exosuit artifacts.
+
+Under **sidecar** policy, the live database and runtime remain machine-local,
+but portable SQL projections are stored separately in a sidecar-state repository
+bound by an explicit `sidecar_key`. The key is the authority for cross-machine
+binding; remote URLs may be recorded as hints but do not define identity.
+
+## Why this split exists
+
+The pressure is concrete: Exosuit must be usable in the other repositories where
+work happens, not only in its own. Three workflows force the policy axis apart
+from identity (RFC 10184):
+
+- **External work repos** need state that is useful locally but must not be
+  committed. Shadow or sidecar policy serves this.
+- **Git worktrees** need to share one project, database, and daemon while each
+  workspace keeps its own active focus. Stable identity across worktrees serves
+  this.
+- **Personal portability** needs a portable home for context outside a work
+  repository the team has not adopted. Sidecar policy serves this.
+
+The old model used a single "root" axis for all of these, which forced the
+checkout, database, daemon socket, and active phase to move together. Splitting
+identity from policy lets them move independently.

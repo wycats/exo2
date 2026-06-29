@@ -1,0 +1,22 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "checkJs": true,
+    "allowJs": true,
+    "types": ["svelte", "vite/client"],
+    "paths": {
+      "@exosuit/core/Logger.ts": ["../exosuit-core/src/Logger.ts"]
+    }
+  },
+  "include": [
+    "src/webview/**/*",
+    "src/types/**/*",
+    "vite.config.mts",
+    "vite.extension.config.mts"
+  ]
+}

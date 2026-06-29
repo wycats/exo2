@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Extension (full)",
+      "type": "shell",
+      "command": "exo run build-ext",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "detail": "Full build: Rust + TS + WASM + VSIX install",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build Extension (dev)",
+      "type": "shell",
+      "command": "export PATH=\"$HOME/.proto/bin:$HOME/.proto/shims:$PATH\" && pnpm -C packages/exosuit-vscode run build:dev-host",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "detail": "Build the extension bundle used by the Extension Development Host",
+      "problemMatcher": []
+    },
+    {
+      "label": "Watch Extension (dev)",
+      "type": "shell",
+      "command": "export PATH=\"$HOME/.proto/bin:$HOME/.proto/shims:$PATH\" && pnpm -C packages/exosuit-vscode exec vite build -c vite.extension.config.mts --watch",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "isBackground": true,
+      "detail": "Vite watch mode for extension bundle — restart host to pick up changes",
+      "problemMatcher": []
+    }
+  ]
+}

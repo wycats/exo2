@@ -1,0 +1,96 @@
+---
+title: State locations
+description: Where Exosuit stores operational state and source content.
+---
+
+This page lists the concrete paths Exosuit uses. For _why_ state is local-first
+and inspectable, see [Local-first state](/concepts/local-first-state/). For _how_
+the database and its git-friendly dumps work, see
+[Storage and projections](/architecture/storage-and-projections/).
+
+## Project, workspace, and state root
+
+A **project** is the shared identity and state boundary. A **workspace** is the
+checkout you are working in. Linked git worktrees are multiple workspaces that
+share one project (RFC 10184).
+
+Project identity is derived from the canonical git common directory:
+
+```text
+ProjectId = hex(blake3(abs_canonical_git_common_dir_bytes)[0..8])
+```
+
+The ID is stable across linked worktrees, branch changes, and remote URL
+changes. It changes only when the repository's canonical git common directory
+moves.
+
+The **state root** holds the project's local database and runtime. Where it
+lives depends on policy:
+
+| Policy    | State root                                                        | Git dumps                                   |
+| --------- | ----------------------------------------------------------------- | ------------------------------------------- |
+| `repo`    | `<primary-workspace>/.exo/`                                       | Written into the workspace and committed    |
+| `shadow`  | `$HOME/.exo/projects/<project-id>/`                               | Not read or written by default              |
+| `sidecar` | machine-local materialization; portable dumps live in the sidecar | Written into the sidecar, not the work repo |
+
+## Canonical database
+
+The canonical runtime store is the resolved project database (RFC 10184,
+RFC 10180):
+
+```text
+{state_root}/cache/exo.db
+```
+
+For a standard repo-policy project this resolves to
+`<primary-workspace>/.exo/cache/exo.db`. For shadow policy it is
+`$HOME/.exo/projects/<project-id>/cache/exo.db`. This database is the source of
+truth for epochs, phases, goals, tasks, ideas, inbox items, axioms, and task
+logs. Production code never reads or writes this state from TOML files
+(RFC 10180).
+
+## Runtime directory
+
+Each project has one runtime directory under the state root, holding the daemon
+socket and PID file. Linked worktrees share the runtime directory, socket, and
+daemon because they share the project id.
+
+## Git-friendly dumps
+
+Under repo policy, canonical state is projected to deterministic sorted SQL text
+dumps so it can be diffed, reviewed, and merged in git (RFC 10178). One file per
+table:
+
+```text
+docs/agent-context/
+├── epochs.sql
+├── phases.sql
+├── goals.sql
+├── tasks.sql
+├── ideas.sql
+├── inbox.sql
+└── ...
+```
+
+These dumps exist for version control, not for reading or tool consumption. They
+are a projection of SQLite state, not a source of truth, and there are no TOML
+projections of canonical state (RFC 10180). To inspect state, use `exo`
+commands, not the `.sql` files.
+
+## Configuration files
+
+Tool configuration is deterministic and lives in files (RFC 10180):
+
+| Surface                                      | Location                             |
+| -------------------------------------------- | ------------------------------------ |
+| Task definitions, binary paths, build config | `exosuit.toml` (workspace root)      |
+| Hook configuration                           | `.config/exo/hooks.toml`             |
+| Per-project state policy (shadow/sidecar)    | `$HOME/.config/exo/projects.toml`    |
+| Rust toolchain, clippy                       | `rust-toolchain.toml`, `clippy.toml` |
+
+## Documents
+
+Human-authored prose lives as files under `docs/`: design notes, research notes,
+specs, and RFCs (organized by stage under `docs/rfcs/stage-*`). RFCs live on disk
+because they are documents, not because they are projections of state
+(RFC 10180).

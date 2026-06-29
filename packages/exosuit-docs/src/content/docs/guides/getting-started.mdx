@@ -1,0 +1,114 @@
+---
+title: Getting started
+description: Open a project with Exosuit and run your first loop.
+---
+
+The fastest way to understand Exosuit is to open a project with it and watch what
+it tells you to do next. You don't need to learn the whole model first. You need
+`exo status`, a safe place for state, and one loop through the work.
+
+This guide gets you from "installed" to "I ran a real cycle." If you want to work
+on Exosuit itself rather than use it, skip to [Contributing to Exosuit](#contributing-to-exosuit)
+at the end.
+
+## Before you start
+
+You need:
+
+- a git repository (Exosuit keys project identity off the git common directory);
+- the `exo` CLI on your `PATH`;
+- optionally, the VS Code extension for the cockpit sidebar.
+
+To check the CLI is available:
+
+```sh
+exo --version
+```
+
+If that resolves, you're ready.
+
+## Choose where state lives
+
+If the repository is new and your team wants Exosuit state to live with the
+project, initialize it directly:
+
+```sh
+exo init
+```
+
+If the repository already has code, or if you do not want to commit Exosuit
+artifacts to it yet, start with a sidecar instead:
+
+```sh
+exo sidecar bootstrap
+```
+
+Both paths resolve the project from the git common directory and give `exo` a
+canonical state store. The difference is where that state travels. Repo policy
+travels with the repository; sidecar policy travels with you. See
+[Use Exosuit in an existing repo](/guides/use-in-existing-repo/) for the adoption
+path and [Sidecar setup](/guides/sidecar-setup/) for the portable-state path.
+
+## Read where you are
+
+The single most useful command is:
+
+```sh
+exo status
+```
+
+It shows the active phase, its goals and tasks, and your git state. When you don't
+know what to do next, this is the answer. The companion command is:
+
+```sh
+exo map
+```
+
+`exo map` is the steering surface. It shows the active phase and suggests the next
+action. `exo map --next` emits a single best next action, and `exo map --why <command>`
+explains what a command does before you run it.
+
+## Run your first loop
+
+Day-to-day work follows the SOAR loop ([Run the loop](/guides/run-the-loop/)):
+**Status → Orient → Act → Review**. Your first pass through it looks like this:
+
+1. **Status.** Run `exo status` to see the active phase and pending work.
+2. **Orient.** Run `exo map` to see suggested next actions.
+3. **Act.** Start a task and do the work:
+
+   ```sh
+   exo task start <task-id>
+   exo task log <task-id> --message "What you did"
+   ```
+
+4. **Review.** Verify and close:
+
+   ```sh
+   exo verify
+   exo task complete <task-id> --log "What the result was"
+   ```
+
+Completing a task or goal pauses for your review of the outcome before it's
+recorded. That gate is the point: you stay the decision-maker, and the agent
+carries the work ([Verify and close](/guides/verify-and-close/)).
+
+## What to look at next
+
+- [Run the loop](/guides/run-the-loop/) — the daily SOAR rhythm in full.
+- [Use Exosuit in an existing repo](/guides/use-in-existing-repo/) — adopt Exosuit
+  without surprising the repository.
+- [Sidecar setup](/guides/sidecar-setup/) — keep Exosuit state portable and out of
+  the work repository.
+- [Daily workflow](/guides/daily-workflow/) — run the normal work loop once the
+  project is set up.
+- [Phases, goals, tasks](/concepts/phases-goals-tasks/) — the vocabulary the
+  commands operate on.
+
+## Contributing to Exosuit
+
+If you want to work on Exosuit itself, clone the repository, build the extension,
+and run the docs site locally. The repository's own `exosuit.toml` defines the
+build and test tasks, which you run with `exo run <task>`. The CLI commands above
+work the same way inside this repository as they do in any other project, because
+Exosuit dogfoods itself.

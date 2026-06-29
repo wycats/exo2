@@ -1,0 +1,32 @@
+[dev]
+binary_dir = "target/debug"
+
+[storage]
+backend = "sqlite"
+
+[tasks]
+test-core = { cmd = "cargo test -p exosuit-core", desc = "Run core tests", cwd = "root" }
+build-ext = { cmd = "cargo dogfood-exo", desc = "Full build + install extension + activation baseline", cwd = "root" }
+dogfood = { cmd = "cargo dogfood-exo", desc = "Build, install, restart, and verify the full Exosuit dogfood lifecycle", cwd = "root" }
+build-ext-dev = { cmd = "pnpm -C packages/exosuit-vscode run build:dev-host", desc = "Build dev-host extension bundle (no VSIX install)", cwd = "root" }
+test-e2e = { cmd = "node scripts/test-e2e.ts", desc = "Run E2E tests", cwd = "root" }
+check = { cmd = "exo validate dev", desc = "Run dev verification workflow", cwd = "root" }
+gen-spec = { cmd = "cargo run -p exo --quiet -- json artifact && node scripts/sync-lm-tools.ts --add", desc = "Regenerate command-spec.json and curate LM tools", cwd = "root" }
+sync-lm-tools = { cmd = "node scripts/sync-lm-tools.ts", desc = "Show curated LM tools status", cwd = "root" }
+sync-lm-tools-add = { cmd = "node scripts/sync-lm-tools.ts --add", desc = "Write curated LM tools to package.json", cwd = "root" }
+
+[tdd]
+[[tdd.runners]]
+glob = "packages/**/*.ts"
+command = "pnpm exec vitest run {relative_file}"
+cwd = "package_root"
+
+[[tdd.runners]]
+glob = "tools/exo/**/*.rs"
+command = "cargo test -p exo --test {stem}"
+cwd = "root"
+
+[[tdd.runners]]
+glob = "**/*.rs"
+command = "cargo test --test {stem}"
+cwd = "root"

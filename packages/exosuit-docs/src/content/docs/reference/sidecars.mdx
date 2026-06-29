@@ -1,0 +1,99 @@
+---
+title: Sidecars
+description: Sidecar projects and workspace-local discovery.
+---
+
+A sidecar gives you high-fidelity Exosuit state for a repository without
+committing any Exosuit artifacts to that repository. The live database and
+runtime stay machine-local; a portable SQL projection follows you across
+machines through a private sidecar-state repository.
+
+This page is the operational how-to: the `exo sidecar` commands and the
+discovery registry. For when state belongs in a sidecar versus the repo or a
+machine-local shadow, and why, see
+[Sidecar architecture](/architecture/sidecars/).
+
+## When to reach for a sidecar
+
+Use a sidecar when you want rich Exosuit context for a work repository but
+cannot or should not ask the team to adopt Exosuit's files. A sidecar binds the
+local project to a user-chosen **sidecar key** (for example `client-api`) and
+stores portable projections outside the work repository. The key, not a remote
+URL, is the authority for cross-machine binding (RFC 10184, RFC 10187).
+
+## Binding a sidecar
+
+Four commands manage the local binding:
+
+| Command              | Effect                                           |
+| -------------------- | ------------------------------------------------ |
+| `exo sidecar init`   | Initialize sidecar state for the current project |
+| `exo sidecar link`   | Bind the local project to a sidecar key          |
+| `exo sidecar status` | Report sidecar binding and setup state           |
+| `exo sidecar unlink` | Remove the local sidecar binding                 |
+
+The sidecar's own git repository is managed separately, so portable state can be
+committed and pushed independently of the work repository:
+
+| Command                   | Effect                                  |
+| ------------------------- | --------------------------------------- |
+| `exo sidecar repo status` | Show the sidecar repository's git state |
+| `exo sidecar repo commit` | Commit the portable SQL projection      |
+| `exo sidecar repo push`   | Push the sidecar-state repository       |
+
+## The discovery registry
+
+So you do not have to remember per-repository remotes, Exosuit reads a
+machine-readable registry published once on your GitHub profile. The registry
+lives at `.exosuit/sidecars.toml` in your profile repository (`wycats/wycats`
+for a user, `my-org/.github` for an organization). It is configuration, not a
+secret store, and is safe to keep public (RFC 10187).
+
+A minimal registry establishes defaults:
+
+```toml
+version = 1
+
+[defaults]
+root = "~/.exo/sidecars"
+remote_template = "git@github.com:{owner}/{repo}-exosuit-state.git"
+auto_push = "if_remote"
+```
+
+Per-project overrides pin a stable key and remote:
+
+```toml
+[projects."github.com/wycats/locald"]
+key = "locald"
+remote = "git@github.com:wycats/locald-exosuit-state.git"
+auto_push = "if_remote"
+```
+
+In any repository with a GitHub remote, discovery derives the recommended
+configuration:
+
+```sh
+exo sidecar discover
+```
+
+Discovery is read-only. It probes the authenticated user's profile registry
+first, then the remote owner's registry, and reports every source it checked,
+the match kind, the proposed key/root/remote, a confidence level, and the next
+actions. It never creates remotes on its own.
+
+## Setup beyond discovery
+
+Discovery tells Exosuit where sidecar state should live when a registry exists.
+When the registry, state repository, or local binding is missing, setup
+proposes the mutations needed to complete portable sidecar state:
+
+```sh
+exo sidecar setup --dry-run
+exo sidecar setup --profile-owner <owner>
+exo sidecar setup --state-repo <repo>
+```
+
+Setup always plans before it acts: it shows the changes, waits for approval, and
+then applies them. Agents may diagnose setup state and propose plans, but they
+must not silently create GitHub resources. They inspect, propose, ask for
+approval, execute, and report the exact mutations (RFC 10188).

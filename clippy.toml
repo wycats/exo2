@@ -1,0 +1,26 @@
+cognitive-complexity-threshold = 25
+
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+
+[[disallowed-methods]]
+path = "std::fs::read_to_string"
+reason = "Use tokio::fs::read_to_string instead"
+
+[[disallowed-methods]]
+path = "std::fs::read"
+reason = "Use tokio::fs::read instead"
+
+[[disallowed-methods]]
+path = "std::fs::write"
+reason = "Use tokio::fs::write instead"
+
+[[disallowed-methods]]
+path = "std::thread::sleep"
+reason = "Use tokio::time::sleep instead"
+
+[[disallowed-methods]]
+path = "std::process::Command::new"
+reason = "Use tokio::process::Command::new instead"

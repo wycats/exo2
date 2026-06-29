@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fcacd4f6d17d104790b60b6703c56bf780b1bb97f485c2bb3447709e1061f83c # shrinks to graph = Graph { nodes: [Input(0), Input(0), Input(0), Input(0), Input(0), Computed { op: Add, dependencies: [0, 3] }] }, mutations = [(2338093975942988105, -226440665), (7244835950219694823, -1921042984)]
+cc d12137836797de2e2e65ed3b9384b6d1caeb7749bee098c8d866ab6075c6a54a # shrinks to graph = Graph { nodes: [InputScalar(0), InputScalar(0), InputScalar(0), InputScalar(0), InputScalar(0), InputScalar(0), InputScalar(0), InputMap({}), InputScalar(0), InputScalar(0), InputScalar(0), Computed { op: MapLen, dependencies: [7] }, InputScalar(0), InputScalar(0)] }, mutations = [MapInsert(8765839611891812834, 0, 0)]

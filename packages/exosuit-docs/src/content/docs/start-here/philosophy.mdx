@@ -1,0 +1,36 @@
+---
+title: Philosophy
+description: The Exosuit product philosophy and core pillars.
+---
+
+When you work with an AI agent on a real project, the hard part isn't getting it to write code. It's keeping it pointed at the right work, with the right context, without you babysitting every step. Most of that context lives in your head or scrolls away in a chat log.
+
+Exosuit moves that context into the workspace, where both you and the agent can read it, change it, and trust it. You stay in command. The agent picks up the work without losing the thread.
+
+The rest of this page is the four design axioms that make that work (RFC 10153). Each one is a constraint the tooling actually enforces, not a slogan.
+
+## Core pillars
+
+### Inverted sovereignty
+
+Most tools put the editor in charge and treat the project as cargo. Exosuit inverts that. The project is the thing that exists; the VS Code extension is a servant that adapts to whatever project you open. Nothing lives in the editor that the project can't see.
+
+This is what makes a project portable. Open the same workspace on another machine, in another editor, or hand it to a fresh agent, and you get the same rules, the same plan, and the same history. The behavior travels with the project, not with the tool.
+
+### High coherence
+
+An agent only knows what its context tells it. It has bounded memory and a limited context window, so it needs a reliable, structured place to read the current state and write down what it did. If that durable context drifts away from reality, the agent drifts right along with it.
+
+So coherence isn't a nice-to-have. Canonical project state lives in the Exosuit state store and is the single source of truth. RFCs and specs stay as the durable, human-readable record of decisions. When the two disagree, that's a bug you fix, not noise you tolerate.
+
+### Phased rigor
+
+Work happens in distinct, sequential phases (prepare, execute, verify) grouped into thematic epochs. Big tasks overwhelm humans and agents alike. Splitting work into phases forces you to agree on the _what_ before the _how_, and to check the _result_ before moving on.
+
+The discipline is concrete. No code gets written until the plan is approved, and no phase is done until verification passes. The system doesn't wing it, and it doesn't run ahead to a phase you haven't started yet.
+
+### Evolutionary intelligence
+
+The system gets smarter the more you use it. Decisions become RFCs. Patterns that keep recurring get promoted into axioms. The context grows up alongside the project. And because agents focus on the _delta_, what changed since last time, they don't have to re-read the entire history on every turn.
+
+That's how a project accumulates judgment. Build on it long enough and the workspace stops feeling like storage and starts feeling like a collaborator that remembers.

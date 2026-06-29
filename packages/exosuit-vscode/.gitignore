@@ -1,0 +1,15 @@
+out
+dist
+node_modules
+.vscode-test
+*.vsix
+logs/
+*.log
+
+# Generated WASM bindings (built locally)
+src/wasm/
+
+*.wasm
+playwright.config.js
+playwright.config.js.map
+test-results/

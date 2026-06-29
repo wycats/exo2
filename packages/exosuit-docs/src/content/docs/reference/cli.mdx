@@ -1,0 +1,84 @@
+---
+title: CLI
+description: The Exosuit command surface.
+---
+
+`exo` is the authoritative interface to Exosuit state. Canonical project state
+lives in SQLite (RFC 10180); the CLI is how you read and mutate it. Files on
+disk are configuration or documents, not a back door into state.
+
+## Discovery ladder
+
+You do not need to memorize the surface. `exo map` is the agent-first entry
+point for "what should I do next?" (RFC 0080):
+
+- `exo map` — show the active phase, its goals and tasks, and suggested actions.
+- `exo map --next` — emit a single best next action, preferring repairs when the
+  repository is unhealthy.
+- `exo map --why <command>` — explain a command's preconditions and effects
+  before you run it.
+
+Commands divide into **steering** commands, which explain what to do next and
+why, and **action** commands, which mutate state.
+
+## Output protocol
+
+Every command supports a shared output protocol:
+
+- `--format human` (default) — agent-first text, including a steering block that
+  reports what happened, what is next, and any perception items
+  ([Steering and perception](/concepts/steering-and-perception/)).
+- `--format json` — machine-readable output with the same steering data as a
+  structured `steering` block, used by the VS Code extension over the machine
+  channel.
+
+## Command groups
+
+The surface is organized into namespaces. The groups below map onto the
+[SOAR loop](/guides/run-the-loop/) and the planning layer.
+
+### Orientation
+
+| Command               | Purpose                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `exo status`          | Snapshot: active phase, goals, tasks, git state.                                                   |
+| `exo map`             | Steering: next actions for the active phase.                                                       |
+| `exo context`         | Full context dump for recovery.                                                                    |
+| `exo project resolve` | Report project identity, workspace root, state root, database path, and runtime paths (RFC 10184). |
+
+### Planning
+
+| Command     | Operations                                                                                     |
+| ----------- | ---------------------------------------------------------------------------------------------- |
+| `exo epoch` | `list`, `status`, `start`, `finish`, `add`, `remove` — the thematic level above phases.        |
+| `exo phase` | `start`, `status`, `finish`, `add`, `remove`, `update`, `history` — the active unit of work.   |
+| `exo goal`  | `add`, `list`, `reorder`, `complete`, `remove` — outcomes inside a phase, sized as PER cycles. |
+| `exo task`  | `add`, `list`, `start`, `log`, `update`, `complete` — concrete actions under a goal.           |
+
+`exo strike start` opens a singleton high-priority goal in the active phase
+(`kind = "strike"`). The legacy `exo impl` namespace was consolidated into
+`goal` and `task` (RFC 00223).
+
+### Decisions and backlog
+
+| Command     | Operations                                                                                   |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `exo rfc`   | `create`, `list`, `show`, `status`, `promote` — the RFC lifecycle ([RFCs](/concepts/rfcs/)). |
+| `exo idea`  | `add`, `show`, `list` — backlog items awaiting triage.                                       |
+| `exo inbox` | `add`, `list`, `resolve` — the steering channel for entity-scoped feedback (RFC 10181).      |
+| `exo axiom` | `add`, `list`, `remove` — codified principles, canonical in SQLite.                          |
+
+### Verification and portability
+
+| Command       | Operations                                                                                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `exo verify`  | Run the project's verification checks ([Verify and close](/guides/verify-and-close/)).                                                                              |
+| `exo sidecar` | `init`, `link`, `status`, `unlink`, plus `repo {status, commit, push}` — bind a repository to portable personal state ([sidecars reference](/reference/sidecars/)). |
+| `exo run`     | Run a task defined in `exosuit.toml`.                                                                                                                               |
+
+## Managed directories
+
+`docs/rfcs/` is a managed directory: RFC files have schemas, IDs, and
+cross-references. Create RFCs and ideas through the CLI (`exo rfc create`,
+`exo idea add`), never by hand-writing files, so that ID generation and
+indexing stay correct.

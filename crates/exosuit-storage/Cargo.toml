@@ -1,0 +1,18 @@
+[package]
+name = "exosuit-storage"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite storage layer for Exosuit"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+exosuit-reactivity-core = { path = "../exosuit-reactivity-core" }
+rusqlite = { version = "0.38", features = ["bundled", "vtab", "functions"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+thiserror = "1.0"
+blake3 = "1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

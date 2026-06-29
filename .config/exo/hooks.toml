@@ -1,0 +1,90 @@
+version = 3
+
+[hooks]
+pre_commit = "coherence"
+pre_push = "gate"
+
+[workflow.dev]
+label = "Dev (uncommitted)"
+scope = "uncommitted"
+checks = [
+  "check",
+  "vscode-typecheck",
+  "lint",
+  "rust-fmt",
+  "rust-clippy",
+  "verify-toml",
+  "verify-exo-links",
+]
+
+[workflow.coherence]
+label = "Pre-Commit"
+scope = "staged"
+checks = [
+  "check",
+  "vscode-typecheck",
+  "lint",
+  "rust-fmt",
+  "rust-clippy",
+  "verify-toml",
+  "verify-exo-links",
+]
+
+[workflow.gate]
+label = "Pre-Push"
+scope = "committed_not_pushed"
+checks = ["test"]
+
+[workflow.ci]
+label = "CI (HEAD)"
+scope = "head"
+checks = ["test", "rust-test"]
+
+[check.check]
+label = "Check"
+command = "pnpm -r run check"
+
+[check."vscode-typecheck"]
+label = "VS Code Typecheck"
+command = "pnpm --filter exosuit-context run typecheck"
+
+[check.lint]
+label = "Lint"
+filters = ["packages/exosuit-vscode/**/*.{ts,tsx,js,jsx,cjs,mjs}"]
+cwd = "packages/exosuit-vscode"
+command = "pnpm exec eslint --max-warnings 0 --no-warn-ignored {{files}}"
+
+[check."rust-fmt"]
+label = "Rust Fmt"
+filters = ["**/*.rs"]
+command = "rustfmt --edition 2024 {{files}}"
+category = "mutate"
+
+[check."rust-clippy"]
+label = "Rust Clippy"
+command = "cargo clippy --workspace -- -D warnings"
+filters = ["**/*.rs"]
+category = "mutate"
+fix_command = "cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings"
+
+[check."verify-toml"]
+label = "Verify Toml"
+filters = ["**/*.toml"]
+command = "cargo verify-toml {{files}}"
+
+[check."verify-exo-links"]
+label = "Verify Exo Links"
+filters = ["**/*.md"]
+tool = "exo.docs.links.check"
+
+[check.test]
+label = "Test"
+command = "node scripts/ci/check-rust-coverage-workflow-security.mjs && pnpm -r run test:unit"
+
+[check."rust-test"]
+label = "Rust Test"
+command = "CARGO_INCREMENTAL=0 RUSTFLAGS='-C debuginfo=0' cargo test --workspace --locked"
+
+[check."rust-coverage"]
+label = "Rust Coverage"
+command = "cargo llvm-cov --workspace --lcov --output-path lcov.info"

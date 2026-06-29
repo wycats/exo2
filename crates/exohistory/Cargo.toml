@@ -1,0 +1,35 @@
+[package]
+name = "exohistory"
+version.workspace = true
+edition.workspace = true
+description = "Index and analyze VSCode Copilot chat history for pattern mining and bug detection"
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "exohistory"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+exo-reexec = { path = "../exo-reexec" }
+chrono = { version = "0.4.42", features = ["serde"] }
+console = "0.15.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.4"
+comfy-table = { version = "7.1", default-features = false }
+regex = "1.12.2"
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2.0"
+predicates = "3.0"
+
+[features]
+default = ["pretty-print"]
+pretty-print = ["comfy-table/tty"]

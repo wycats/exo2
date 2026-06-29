@@ -1,0 +1,3 @@
+# Repo-policy SQL projections are generated files. Sidecar and shadow policy
+# projects do not write operational state into the workspace.
+docs/agent-context/*.sql merge=exo-sql-dump

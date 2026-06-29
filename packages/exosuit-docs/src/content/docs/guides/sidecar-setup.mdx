@@ -1,0 +1,105 @@
+---
+title: Sidecar setup
+description: Keep Exosuit state portable without committing it to the work repo.
+---
+
+A sidecar is for the repo where you want Exosuit's memory, but not Exosuit's
+files. The work repo stays focused on its own code. Your Exosuit state travels
+through a separate sidecar-state repository.
+
+## What the sidecar owns
+
+Sidecar policy keeps the live database and runtime machine-local, then writes
+portable SQL projections into a private sidecar repository. That gives you the
+important part: your Exosuit context follows you across machines without
+touching the work repo.
+
+The binding is keyed by a **sidecar key**. The key, not the remote URL, is the
+identity you use across machines.
+
+## Discover a sidecar configuration
+
+If you publish a profile registry, Exosuit can discover the recommended setup:
+
+```sh
+exo sidecar discover
+```
+
+Discovery is read-only. It checks profile registry sources, reports what it
+found, and proposes a key/root/remote when it can. It does not create a remote or
+mutate GitHub resources.
+
+## Bootstrap local state
+
+To create or reuse sidecar-backed state:
+
+```sh
+exo sidecar bootstrap
+```
+
+With discovery:
+
+```sh
+exo sidecar bootstrap --discover
+```
+
+If the discovered configuration includes a remote from a template or default,
+accept that remote explicitly:
+
+```sh
+exo sidecar bootstrap --discover --accept-discovered-remote
+```
+
+Then inspect the result:
+
+```sh
+exo sidecar status
+exo project resolve
+```
+
+You should see the sidecar key, sidecar root, database path, projection
+directory, and runtime path.
+
+## Create missing GitHub setup
+
+When the registry or sidecar-state repo does not exist yet, start with a dry run:
+
+```sh
+exo sidecar setup --dry-run
+```
+
+If the plan looks right, run setup with the owner and state repo you want:
+
+```sh
+exo sidecar setup --profile-owner <owner> --state-repo <repo>
+```
+
+Setup plans before it acts. Agents can diagnose setup state and propose the
+mutation, but creating GitHub resources should stay an explicit choice.
+
+## Sync portable state
+
+Sidecar state has its own Git lifecycle:
+
+```sh
+exo sidecar repo status
+exo sidecar repo commit --message "Update Exosuit state"
+exo sidecar repo push
+```
+
+Run those commands when you want your Exosuit context to follow you to another
+machine. Commit the work repo separately.
+
+## When to stop and inspect
+
+Stop and inspect before changing a remote, replacing a remote, or running setup
+against a repo you do not own. Sidecars are meant to make Exosuit safer to use in
+other people's repositories. If the setup feels surprising, pause and run:
+
+```sh
+exo sidecar status
+exo sidecar repo status
+exo project resolve
+```
+
+Next: [Daily workflow](/guides/daily-workflow/) once the sidecar is ready.

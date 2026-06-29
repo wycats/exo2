@@ -1,0 +1,10 @@
+[alias]
+exo = "run -p exo --"
+dogfood-exo = "run -p exo-workspace --bin dogfood_exo --"
+build-wasm = "run -p exo-workspace --bin build_wasm --"
+check-artifacts = "run -p exo-workspace --bin check_artifacts --"
+verify-toml = "run -p exo-workspace --bin verify_toml --"
+test-sidecar-windows = "run -p exo-workspace --bin test_sidecar_windows --"
+install-exo = "install --path tools/exo --locked"
+install-exohook = "install --path crates/exohook --locked"
+install-exohistory = "install --path crates/exohistory --locked"

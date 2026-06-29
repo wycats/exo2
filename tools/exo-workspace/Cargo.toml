@@ -1,0 +1,45 @@
+[package]
+name = "exo-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+autobins = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0"
+cargo-config2 = "0.1.44"
+serde_json = "1.0"
+toml = "0.9.8"
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[[bin]]
+name = "dogfood_exo"
+path = "src/bin/dogfood_exo.rs"
+
+[[bin]]
+name = "sync_moon_language_markers"
+path = "src/bin/sync_moon_language_markers.rs"
+
+[[bin]]
+name = "verify_toml"
+path = "src/bin/verify_toml.rs"
+
+[[bin]]
+name = "copy_codicons"
+path = "src/bin/copy_codicons.rs"
+
+[[bin]]
+name = "build_wasm"
+path = "src/bin/build_wasm.rs"
+
+[[bin]]
+name = "check_artifacts"
+path = "src/bin/check_artifacts.rs"
+
+[[bin]]
+name = "test_sidecar_windows"
+path = "src/bin/test_sidecar_windows.rs"

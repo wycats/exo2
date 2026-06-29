@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/exosuit-context"
+      ],
+      "outFiles": ["${workspaceFolder}/extensions/exosuit-context/out/**/*.js"],
+      "preLaunchTask": "pnpm: compile"
+    }
+  ]
+}

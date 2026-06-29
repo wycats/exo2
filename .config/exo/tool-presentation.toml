@@ -1,0 +1,27 @@
+# Exosuit Tool Presentation Configuration
+# This file maps tool names (and their aliases) to user-friendly presentation strings.
+# The {argName} syntax is used to interpolate arguments from the tool call.
+
+[[tools]]
+name = "readFile"
+alias = "read_file"
+presentation = "Reading file: {path}"
+
+[[tools]]
+name = "openFile"
+alias = "open_file"
+presentation = "Opening file: {path}"
+
+[[tools]]
+name = "editFile"
+alias = "edit_file"
+presentation = "Proposing edit for: {path}"
+
+[[tools]]
+name = "listDirectory"
+alias = "list_files"
+presentation = "Listing directory: {path}"
+
+[[tools]]
+name = "sys.help"
+presentation = "Fetching tool documentation..."

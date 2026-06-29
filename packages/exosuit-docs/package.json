@@ -1,0 +1,26 @@
+{
+  "name": "@exosuit/docs",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Astro Starlight documentation site for Exosuit",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/exo2.git",
+    "directory": "packages/exosuit-docs"
+  },
+  "scripts": {
+    "build": "astro build",
+    "dev": "astro dev",
+    "preview": "astro preview",
+    "test": "pnpm run build",
+    "test:unit": "pnpm run build"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.35.2",
+    "astro": "^5.16.4",
+    "sharp": "^0.34.4"
+  },
+  "devDependencies": {}
+}

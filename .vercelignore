@@ -1,0 +1,27 @@
+# Keep CLI deployment payload focused on the docs site and package metadata.
+# Git-connected Vercel builds still clone the repository; this file mainly keeps
+# manual `vercel deploy` uploads below the request-size limit.
+
+.git
+node_modules
+target
+.cache
+.exo
+.runtime
+.context
+.reference
+.logs
+logs
+.private
+.prototools
+.vscode-test
+.debug
+
+packages/*/node_modules
+packages/*/dist
+packages/*/.astro
+packages/*/*.tsbuildinfo
+
+crates
+tools
+scripts/dev

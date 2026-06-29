@@ -1,0 +1,26 @@
+{
+  "name": "exosuit-monorepo",
+  "description": "Workspace-centered collaboration tooling for human and agent work",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/exo2.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "build:ext": "pnpm --filter exosuit-context run build",
+    "test": "pnpm -r run test",
+    "test:e2e": "pnpm --filter exosuit-context run test:e2e",
+    "test:e2e:ui": "pnpm --filter exosuit-context run test:e2e --headed",
+    "compile": "pnpm -r run compile",
+    "verify:toml": "cargo run -p exo-workspace --bin verify_toml --"
+  },
+  "devDependencies": {
+    "@tsconfig/node-lts": "^24.0.0",
+    "@tsconfig/strictest": "^2.0.8",
+    "smol-toml": "^1.5.2",
+    "typescript": "^5.0.0"
+  }
+}

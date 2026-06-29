@@ -1,0 +1,129 @@
+---
+title: Daily workflow
+description: Use Exosuit for a normal day of project work.
+---
+
+A normal Exosuit day starts by asking the project where it is. Do that before
+you ask an agent to write code. The point is to work from the project's current
+state, not from whatever the chat happens to remember.
+
+## Start with status
+
+Run:
+
+```sh
+exo status
+```
+
+This tells you the active phase, goals, tasks, and git state. If you are coming
+back cold, read this before doing anything else.
+
+Then ask for the map:
+
+```sh
+exo map
+```
+
+`exo map` is the practical steering surface. It shows the active work and
+suggests next actions. If you want one answer instead of the whole map:
+
+```sh
+exo map --next
+```
+
+If a suggested command looks surprising, ask why:
+
+```sh
+exo map --why "exo task start <task-id>"
+```
+
+## Pick one unit of work
+
+Use the hierarchy to keep the day small enough to reason about:
+
+```sh
+exo goal list
+exo task list
+```
+
+Pick the task that belongs to the current goal. Start it before making changes:
+
+```sh
+exo task start <task-id>
+```
+
+As you work, log concrete progress:
+
+```sh
+exo task log <task-id> --log "What changed and what you learned"
+```
+
+The log is not a diary. It is the breadcrumb that lets the next session recover
+the thread.
+
+## Use SOAR for the day
+
+The daily loop is [SOAR](/guides/run-the-loop/): **Status → Orient → Act →
+Review**.
+
+- **Status:** `exo status`
+- **Orient:** `exo map`
+- **Act:** edit files, run commands, log progress
+- **Review:** run checks and record the outcome
+
+You do not need to make this ceremonial. Just keep returning to the loop instead
+of letting the chat drift.
+
+## Use PER for a real change
+
+When the task is more than a quick edit, switch to
+[Prepare → Execute → Review](/guides/plan-execute-review/):
+
+1. Prepare: audit the plan against the codebase.
+2. Execute: make the bounded change.
+3. Review: compare the result to what Prepare predicted.
+
+PER is heavier than SOAR. Use it when the work has enough uncertainty that you
+want an explicit gate before execution.
+
+## Verify and close
+
+Before closing a task or goal:
+
+```sh
+exo verify
+```
+
+Then record the result:
+
+```sh
+exo task complete <task-id> --log "What is now true"
+```
+
+For a completed goal:
+
+```sh
+exo goal complete <goal-id> --log "What shipped and how it was verified"
+```
+
+Completion pauses for outcome review. That is where the human decision belongs:
+the agent can claim the work is done, but the user records that it is done.
+
+## Coming back cold
+
+If you come back after a break, do not ask the agent to remember. Ask the project:
+
+```sh
+exo status
+exo map
+git status --short
+```
+
+If the working tree is dirty, inspect before acting:
+
+```sh
+git diff
+```
+
+Then either continue the active task, commit the finished work, or ask Exosuit to
+orient you again. The project should carry the thread, not the previous chat.

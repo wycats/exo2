@@ -1,0 +1,784 @@
+{
+  "name": "exosuit-context",
+  "displayName": "Exosuit Context",
+  "publisher": "exosuit",
+  "description": "Visualizes Exosuit agent context",
+  "version": "0.0.12",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wycats/exo2.git",
+    "directory": "packages/exosuit-vscode"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onNotebook:exosuit-plan",
+    "onTaskType:exosuit"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "type": "module",
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Exosuit",
+      "properties": {
+        "exosuit.exoBinaryDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing exo toolchain binaries (exo, exohistory, exohook). Accepts an absolute path, a path relative to the workspace root (e.g. ./target/debug), or ${workspaceFolder}/target/debug. When empty (default), binaries are resolved via PATH. Changes take effect on the next CLI invocation without restarting VS Code."
+        },
+        "exosuit.experimental": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable experimental features that are still under development."
+        },
+        "exosuit.logLevel": {
+          "type": "object",
+          "default": {
+            "default": "warn"
+          },
+          "properties": {
+            "default": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Fallback log level for components without an explicit override."
+            },
+            "extension": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for extension host code."
+            },
+            "webview": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for webview UI code."
+            },
+            "bridge": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for webview/extension bridge traffic."
+            },
+            "lmtool": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for LM tool integration."
+            },
+            "core": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for core library services."
+            },
+            "rust": {
+              "enum": [
+                "silent",
+                "error",
+                "warn",
+                "info",
+                "debug",
+                "trace"
+              ],
+              "description": "Log level for Rust-backed services."
+            }
+          },
+          "description": "Per-component log level configuration for Exosuit output."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "exosuit",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "Task ID from exosuit.toml [tasks] (runs via: exo run <task>)."
+          }
+        }
+      }
+    ],
+    "languageModelTools": [
+      {
+        "canBeReferencedInPrompt": true,
+        "displayName": "Chat History",
+        "icon": "$(history)",
+        "inputSchema": {
+          "properties": {
+            "before-summary": {
+              "description": "Get turns before the last summarization (context that was just compacted)",
+              "type": "boolean"
+            },
+            "include-thinking": {
+              "description": "Include extended thinking content",
+              "type": "boolean"
+            },
+            "include-tools": {
+              "description": "Include tool invocations",
+              "type": "boolean"
+            },
+            "match-text": {
+              "description": "Text snippet to match in user messages (identifies the correct session)",
+              "type": "string"
+            },
+            "turns": {
+              "description": "Number of recent turns to retrieve (default: 10, max: 50)",
+              "type": "integer"
+            },
+            "workspace-uri": {
+              "description": "Exact workspace URI to match (e.g., file:///path/to/workspace)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "modelDescription": "Reads recent conversation history from the current VS Code chat session.\n\nUse this to recover context that may have been lost during conversation summarization—especially nuanced user feedback, decisions, and steering.\n\n**Use this when**: The conversation summary mentions a previous session or you need to recover lost context.\n\n**Do NOT use when**: You have full context and don't need to recover past messages.\n\n**Always provide `match-text`** with a distinctive phrase from a recent user message to identify the correct session.",
+        "name": "exo-ai-chat-history",
+        "tags": [
+          "exosuit",
+          "context"
+        ],
+        "toolReferenceName": "ai-chat-history",
+        "userDescription": "Read recent conversation history from this chat session."
+      },
+      {
+        "canBeReferencedInPrompt": true,
+        "displayName": "Workspace Diagnostics",
+        "icon": "$(warning)",
+        "inputSchema": {
+          "properties": {
+            "file": {
+              "description": "Filter diagnostics to files matching this substring (e.g., 'extension.ts' or 'src/services')",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Maximum number of diagnostics to return (default: 50, max: 200)",
+              "type": "number"
+            },
+            "severity": {
+              "description": "Filter by severity level",
+              "enum": [
+                "error",
+                "warning",
+                "info",
+                "hint"
+              ],
+              "type": "string"
+            },
+            "source": {
+              "description": "Filter by diagnostic source (e.g., 'ts', 'eslint')",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "modelDescription": "Get detailed workspace diagnostics (errors, warnings) from VS Code.\n\n**Use this when**: Investigating build errors, checking for warnings after code changes, or diagnosing issues flagged by `exo-run(\"status\")`.\n\n**Do NOT use when**: You just need a quick error count; run `status` through exo-run for the project summary first.",
+        "name": "exo-diagnostics",
+        "tags": [
+          "exosuit",
+          "diagnostics",
+          "debug"
+        ],
+        "toolReferenceName": "diagnostics",
+        "userDescription": "Get detailed workspace error and warning diagnostics."
+      },
+      {
+        "canBeReferencedInPrompt": true,
+        "displayName": "Extension Logs",
+        "icon": "$(output)",
+        "inputSchema": {
+          "properties": {
+            "component": {
+              "description": "Filter by component (e.g., 'lmtool', 'extension', 'webview')",
+              "type": "string"
+            },
+            "level": {
+              "description": "Minimum log level to include (default: all levels)",
+              "enum": [
+                "error",
+                "warn",
+                "info",
+                "debug"
+              ],
+              "type": "string"
+            },
+            "lines": {
+              "description": "Number of recent log lines to return (default: 50, max: 500)",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "modelDescription": "Returns recent log entries from the Exosuit output channel.\n\n**Use this when**: Diagnosing errors, understanding extension behavior, or when a previous operation failed unexpectedly.\n\n**Do NOT use when**: Everything is working normally.",
+        "name": "exo-logs",
+        "tags": [
+          "exosuit",
+          "debug"
+        ],
+        "toolReferenceName": "logs",
+        "userDescription": "Read recent Exosuit extension logs for debugging."
+      },
+      {
+        "name": "exo-ping",
+        "displayName": "Exo Ping",
+        "icon": "$(pulse)",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "exo-ping",
+        "userDescription": "Diagnostic: confirms Exosuit LM tool registration is alive.",
+        "modelDescription": "Diagnostic tool. Returns 'pong' plus the extension's build stamp and pid.\n\n**Use this when**: `exo-run` or another Exosuit tool reports 'currently disabled by the user' but the tool picker shows it enabled. Invoke `exo-ping` to distinguish where the problem is:\n\n- If `exo-ping` also fails: the whole extension's tool registrations are corrupted in the chat layer. Reload the window.\n- If `exo-ping` succeeds: the corruption is per-tool. Run the `Exosuit: Reset LM Tools` command, then if the tool is still reported disabled, toggle it off and back on in Configure Tools.\n\nThis exists because of VS Code chat-layer bug #295683 where tool-enablement state can desync from the picker. `exo-ping` has no dependencies beyond the extension process, so it's the cleanest isolation point.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        },
+        "tags": [
+          "exosuit",
+          "diagnostic"
+        ]
+      },
+      {
+        "name": "exo-run",
+        "displayName": "Run Exo Command",
+        "icon": "$(terminal)",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "exo-run",
+        "userDescription": "Run any exo project management command",
+        "modelDescription": "Primary interface to the exo project management system. Use `help` to discover commands, `help <command>` for details.\n\nCompletion review workflow: when a goal or task completion response asks for outcome review, ask the human the approval question and options in plain language. Keep hidden approval data out of human-visible text; do not show raw JSON or internal fields. If the human approves recording the outcome, call the same completion command again with the hidden approval data from the previous tool result.\n\nCommon commands by intent:\n  Orient:  status, phase status, steering, context snapshot\n  Plan:    goal add, task add, rfc create, rfc list\n  Act:     task start, task complete, goal complete --log\n  Review:  plan review, verify, rfc status\n  Manage:  inbox add, idea add, epoch list\n\nExamples:\n  exo-run(\"status\")\n  exo-run(\"task complete my-task --log 'Done'\")\n  exo-run(\"rfc create --title 'My RFC' --body $1\", [\"Multi-line\\nbody text\"])\n  exo-run(\"help task\")",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "The command to run. Use $1, $2, $3 for complex values."
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Values for $1, $2, $3 placeholders (for multi-line or quoted content)."
+            },
+            "workflowConfirmation": {
+              "type": "object",
+              "description": "Hidden completion approval returned by a previous goal or task review prompt. Do not display this object or its fields to the user. Only pass it after the human approved recording the completed outcome for the same completion command.",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "const": "workflow_completion_confirmation",
+                  "description": "Canonical workflow confirmation kind. Always use workflow_completion_confirmation; legacy aliases are normalized before dispatch."
+                },
+                "entityType": {
+                  "type": "string",
+                  "description": "Entity type being confirmed."
+                },
+                "entityId": {
+                  "type": "string",
+                  "description": "Entity ID being confirmed."
+                },
+                "decision": {
+                  "type": "string",
+                  "enum": [
+                    "yes_complete",
+                    "revise_outcome",
+                    "not_complete_yet",
+                    "discuss"
+                  ],
+                  "description": "Approved outcome-review decision."
+                },
+                "outcome": {
+                  "type": "string",
+                  "description": "Confirmed outcome summary."
+                }
+              },
+              "required": [
+                "kind",
+                "entityType",
+                "entityId",
+                "decision",
+                "outcome"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "command"
+          ]
+        },
+        "tags": [
+          "exosuit",
+          "cli"
+        ]
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "exosuit-sidebar",
+          "title": "Exosuit: Run",
+          "icon": "$(hubot)"
+        },
+        {
+          "id": "exosuit-plan",
+          "title": "Exosuit: Plan",
+          "icon": "$(project)"
+        }
+      ]
+    },
+    "views": {
+      "exosuit-sidebar": [
+        {
+          "id": "exosuit.epochContext",
+          "name": "Epoch Context",
+          "icon": "$(package)"
+        },
+        {
+          "id": "exosuit.pipeline",
+          "name": "RFC Pipeline",
+          "icon": "$(git-merge)"
+        },
+        {
+          "id": "exosuit.phaseDetails",
+          "name": "Phase Details",
+          "icon": "$(list-ordered)"
+        },
+        {
+          "id": "exosuit.debugLogs",
+          "name": "Activity Log",
+          "icon": "$(output)",
+          "type": "webview",
+          "when": "config.exosuit.experimental"
+        }
+      ],
+      "exosuit-plan": [
+        {
+          "id": "exosuit.projectPlan",
+          "name": "Project Plan",
+          "icon": "$(project)"
+        },
+        {
+          "id": "exosuit.sidecarStatus",
+          "name": "Sidecar Status",
+          "icon": "$(database)"
+        },
+        {
+          "id": "exosuit.ideasBacklog",
+          "name": "Ideas Backlog",
+          "icon": "$(lightbulb)"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "exosuit.projectPlan",
+        "contents": "No project plan found.\n\nCreate a plan to start organizing your work.\n[Initialize Project](command:exosuit.initProject)\n\nLearn more about [Exosuit workflows](https://github.com/wycats/exo2).",
+        "when": "!exosuit.hasPlan"
+      },
+      {
+        "view": "exosuit.projectPlan",
+        "contents": "No active phase.\n\nStart a phase to begin working.\n[Start Next Phase](command:exosuit.startNextPhase)",
+        "when": "exosuit.hasPlan && !exosuit.hasActivePhase"
+      },
+      {
+        "view": "exosuit.ideasBacklog",
+        "contents": "No ideas captured yet.\n\nCapture ideas as you work to track future improvements.\n\nUse `exo idea add` or the @exosuit-triage participant to add ideas."
+      }
+    ],
+    "commands": [
+      {
+        "command": "exosuit.focusPhase",
+        "title": "Exosuit: Focus Phase",
+        "icon": "$(target)"
+      },
+      {
+        "command": "exosuit.phaseStatus",
+        "title": "Phase Status",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "exosuit.initProject",
+        "title": "Exosuit: Initialize Project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "exosuit.startNextPhase",
+        "title": "Exosuit: Start Next Phase",
+        "icon": "$(play)"
+      },
+      {
+        "command": "exosuit.resetFocus",
+        "title": "Focus Current Phase",
+        "icon": "$(target)"
+      },
+      {
+        "command": "exosuit.collapseToCurrent",
+        "title": "Collapse All",
+        "icon": "$(collapse-all)"
+      },
+      {
+        "command": "exosuit.revealActivePhase",
+        "title": "Reveal Active Phase",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "exosuit.expandAll",
+        "title": "Expand All",
+        "icon": "$(expand-all)"
+      },
+      {
+        "command": "exosuit.openSource",
+        "title": "Open Source",
+        "icon": "$(json)"
+      },
+      {
+        "command": "exosuit.openRfc",
+        "title": "Open RFC",
+        "icon": "$(file-text)"
+      },
+      {
+        "command": "exosuit.debug.dumpState",
+        "title": "Exosuit: Dump State (Debug)",
+        "icon": "$(debug)"
+      },
+      {
+        "command": "exosuit.debug.listExtensions",
+        "title": "Exosuit: Debug List Extensions",
+        "icon": "$(debug)"
+      },
+      {
+        "command": "exosuit.resetLmTools",
+        "title": "Exosuit: Reset LM Tools",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "exosuit.resetSidebarState",
+        "title": "Exosuit: Reset Sidebar + Runtime State",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "exosuit.verifyDogfoodActivation",
+        "title": "Exosuit: Verify Dogfood Activation",
+        "icon": "$(verified)"
+      },
+      {
+        "command": "exosuit.addComment",
+        "title": "Add Comment",
+        "icon": "$(check)"
+      },
+      {
+        "command": "exosuit.captureIntent",
+        "title": "Exosuit: Capture Intent",
+        "icon": "$(inbox)"
+      },
+      {
+        "command": "exosuit.openInboxQuickPick",
+        "title": "Exosuit: Open Inbox",
+        "icon": "$(inbox)"
+      },
+      {
+        "command": "exosuit.addFeedback",
+        "title": "Add Feedback",
+        "icon": "$(note)"
+      },
+      {
+        "command": "exosuit.claimDone",
+        "title": "Mark Outcome Ready",
+        "icon": "$(check)"
+      },
+      {
+        "command": "exosuit.notSure",
+        "title": "Not Sure About This",
+        "icon": "$(question)"
+      },
+      {
+        "command": "exosuit.acknowledgeClaim",
+        "title": "Outcome Looks Right",
+        "icon": "$(thumbsup)"
+      },
+      {
+        "command": "exosuit.reorg.recommendRenameEpoch",
+        "title": "Recommend Rename Epoch",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "exosuit.reorg.recommendRenamePhase",
+        "title": "Recommend Rename Phase",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "exosuit.reorg.recommendMoveEpoch",
+        "title": "Recommend Move Epoch",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "exosuit.reorg.recommendMovePhase",
+        "title": "Recommend Move Phase",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "exosuit.reorg.recommendMoveGoal",
+        "title": "Recommend Move Goal",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "exosuit.inboxPromoteToGoal",
+        "title": "Promote to Goal",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "exosuit.inboxConvertToIdea",
+        "title": "Convert to Idea",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "exosuit.inboxDismiss",
+        "title": "Dismiss",
+        "icon": "$(close)"
+      },
+      {
+        "command": "exosuit.restartMachineChannel",
+        "title": "Exosuit: Restart Machine Channel Server",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "exosuit.sidecar.runAction",
+        "title": "Exosuit: Run Sidecar Action",
+        "icon": "$(terminal)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "exosuit.captureIntent",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "exosuit.openSource",
+          "when": "activeCustomEditorId == 'exosuit.richContextEditor'",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "exosuit.addFeedback",
+          "when": "view == exosuit.phaseDetails && viewItem == phase-task-readonly",
+          "group": "inline@2"
+        },
+        {
+          "command": "exosuit.claimDone",
+          "when": "view == exosuit.phaseDetails && viewItem =~ /^phase-(goal|strike|task-readonly)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "exosuit.acknowledgeClaim",
+          "when": "view == exosuit.phaseDetails && viewItem =~ /^phase-(goal|strike)-review$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "exosuit.notSure",
+          "when": "view == exosuit.phaseDetails && viewItem =~ /^phase-(goal|strike)-completed$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "exosuit.addFeedback",
+          "when": "view == exosuit.phaseDetails && viewItem =~ /^phase-(goal|strike)(-review|-completed)?$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "exosuit.reorg.recommendRenameEpoch",
+          "when": "view == exosuit.projectPlan && viewItem == exosuit-epoch",
+          "group": "navigation@1"
+        },
+        {
+          "command": "exosuit.reorg.recommendMoveEpoch",
+          "when": "view == exosuit.projectPlan && viewItem == exosuit-epoch",
+          "group": "navigation@2"
+        },
+        {
+          "command": "exosuit.reorg.recommendRenamePhase",
+          "when": "(view == exosuit.projectPlan && viewItem == exosuit-phase) || (view == exosuit.epochContext && viewItem == epoch-sibling-phase)",
+          "group": "navigation@1"
+        },
+        {
+          "command": "exosuit.reorg.recommendMovePhase",
+          "when": "(view == exosuit.projectPlan && viewItem == exosuit-phase) || (view == exosuit.epochContext && viewItem == epoch-sibling-phase)",
+          "group": "navigation@2"
+        },
+        {
+          "command": "exosuit.reorg.recommendMoveGoal",
+          "when": "(view == exosuit.projectPlan && viewItem == phase-task) || (view == exosuit.phaseDetails && viewItem =~ /^phase-(goal|strike)(-review|-completed)?$/)",
+          "group": "navigation@3"
+        },
+        {
+          "command": "exosuit.inboxPromoteToGoal",
+          "when": "view == exosuit.phaseDetails && viewItem == inbox-item",
+          "group": "inline@1"
+        },
+        {
+          "command": "exosuit.inboxConvertToIdea",
+          "when": "view == exosuit.phaseDetails && viewItem == inbox-item",
+          "group": "inline@2"
+        },
+        {
+          "command": "exosuit.inboxDismiss",
+          "when": "view == exosuit.phaseDetails && viewItem == inbox-item",
+          "group": "inline@3"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "exosuit.resetFocus",
+          "when": "view == exosuit.phaseDetails && exosuit.hasFocusedPhase",
+          "group": "navigation@0"
+        },
+        {
+          "command": "exosuit.resetFocus",
+          "when": "view == exosuit.projectPlan && exosuit.hasFocusedPhase",
+          "group": "navigation@0"
+        },
+        {
+          "command": "exosuit.resetSidebarState",
+          "when": "view == exosuit.phaseDetails",
+          "group": "navigation@1"
+        },
+        {
+          "command": "exosuit.collapseToCurrent",
+          "when": "view == exosuit.projectPlan",
+          "group": "navigation@1"
+        },
+        {
+          "command": "exosuit.expandAll",
+          "when": "view == exosuit.projectPlan",
+          "group": "navigation@2"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "exosuit.addComment",
+          "group": "inline",
+          "when": "commentControllerId == exo-plan"
+        }
+      ]
+    },
+    "notebooks": [
+      {
+        "type": "exosuit-plan",
+        "displayName": "Exosuit Plan",
+        "selector": [
+          {
+            "filenamePattern": "*.exo"
+          }
+        ],
+        "priority": "exclusive"
+      }
+    ],
+    "configurationDefaults": {}
+  },
+  "scripts": {
+    "bundle": "vite build -c vite.extension.config.mts && node scripts/write-extension-bundle-manifest.mjs",
+    "build": "pnpm run copy-codicons && pnpm run typecheck && pnpm run build:webview && pnpm run bundle",
+    "build:dogfood": "pnpm run copy-codicons && pnpm run typecheck && pnpm run build:webview && pnpm run bundle",
+    "build:dev-host": "pnpm run copy-codicons && pnpm run typecheck && pnpm run build:webview && pnpm run bundle",
+    "copy-codicons": "cargo run -p exo-workspace --bin copy_codicons --",
+    "build:webview": "vite build",
+    "build:test-bundle": "vite build -c vite.test.config.mts",
+    "typecheck": "tsc -b && pnpm run build:test-bundle",
+    "watch": "tsc -b -w",
+    "check": "svelte-check --tsconfig ./src/webview/tsconfig.json",
+    "pretest": "pnpm run typecheck && pnpm run bundle && pnpm run lint",
+    "lint": "eslint src tests/e2e --max-warnings 0",
+    "lint:fix": "eslint src tests/e2e --fix --max-warnings 0",
+    "test": "node scripts/test-unit.js",
+    "test:headed": "node scripts/test-unit.js --headed",
+    "test:unit": "vitest --run",
+    "test:e2e": "node scripts/test-e2e.ts",
+    "test:e2e:headed": "node scripts/test-e2e.ts --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/svelte": "^5.2.9",
+    "@tsconfig/svelte": "^5.0.6",
+    "@types/glob": "^8.1.0",
+    "@types/mdast": "^4.0.4",
+    "@types/node": "20.2.5",
+    "@types/picomatch": "^4.0.2",
+    "@types/vscode": "^1.93.0",
+    "@typescript-eslint/eslint-plugin": "^8.50.0",
+    "@typescript-eslint/parser": "^8.50.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.27.0",
+    "esbuild-svelte": "^0.9.3",
+    "eslint": "^8.57.1",
+    "glob": "^8.1.0",
+    "happy-dom": "^20.0.11",
+    "jsdom": "^27.2.0",
+    "playwright": "^1.57.0",
+    "svelte": "^5.45.3",
+    "svelte-check": "^4.3.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.6",
+    "vitefu": "^1.1.1",
+    "vitest": "^4.0.15"
+  },
+  "dependencies": {
+    "@exosuit/core": "workspace:*",
+    "@exosuit/rtd": "workspace:*",
+    "@vscode/codicons": "^0.0.43",
+    "picomatch": "^4.0.3",
+    "shiki": "^3.19.0",
+    "smol-toml": "^1.5.2",
+    "ulid": "^2.3.0",
+    "zod": "^4.1.13",
+    "zod-to-json-schema": "^3.25.0"
+  }
+}

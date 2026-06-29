@@ -1,0 +1,104 @@
+---
+title: Use Exosuit in an existing repo
+description: Adopt Exosuit in a repository without surprising the project.
+---
+
+Most real work happens in repositories that already exist. They have owners,
+history, CI, and expectations about what belongs in the tree. Exosuit can work
+there, but you should choose the state policy deliberately.
+
+The safe default is sidecar-backed state. You get the full Exosuit workflow, and
+the work repository stays clean until the team decides to adopt Exosuit files.
+
+## Start by looking, not mutating
+
+From the repository root, ask Exosuit what project it sees:
+
+```sh
+exo project resolve
+```
+
+This reports the project id, workspace root, state root, database path, and
+runtime paths. If the project already has a sidecar or repo policy configured,
+you will see it here. If not, choose the policy before adding state.
+
+## Pick the policy
+
+Use **repo policy** when the repository has adopted Exosuit and the state should
+travel with the repo.
+
+Use **sidecar policy** when you want Exosuit context for your work, but you do
+not want to commit Exosuit artifacts to the repository. This is the normal path
+for client repos, upstream projects, and experiments in somebody else's tree.
+
+Use **shadow policy** when the state should stay local to one machine. It is
+useful for private scratch context, but it does not give you the portable state
+that sidecars provide.
+
+## Bootstrap sidecar state
+
+For an existing repo, start here:
+
+```sh
+exo sidecar bootstrap
+```
+
+That creates or reuses sidecar-backed Exosuit state for the repo. If you have a
+profile registry, you can let discovery propose the key, root, and remote:
+
+```sh
+exo sidecar discover
+exo sidecar bootstrap --discover
+```
+
+If discovery proposes a remote from a template or registry default, accepting it
+is an explicit step:
+
+```sh
+exo sidecar bootstrap --discover --accept-discovered-remote
+```
+
+After bootstrap, check the binding:
+
+```sh
+exo sidecar status
+exo project resolve
+```
+
+You should see a sidecar policy, a machine-local database, and a sidecar
+projection directory outside the work repository.
+
+## Keep the two repos separate
+
+The work repository and the sidecar repository have different jobs.
+
+The work repository holds the code you're changing. Commit code there.
+
+The sidecar repository holds portable Exosuit state. Inspect and sync it with:
+
+```sh
+exo sidecar repo status
+exo sidecar repo commit --message "Update Exosuit state"
+exo sidecar repo push
+```
+
+That separation is the point. You can use Exosuit deeply in a repo without
+asking the repo to carry Exosuit's state.
+
+## Run the loop
+
+Once the project resolves cleanly, use the same commands you would anywhere
+else:
+
+```sh
+exo status
+exo map
+exo task list
+```
+
+At that point the repository is just an Exosuit project with a different
+persistence policy. The workflow does not change.
+
+Next: [Sidecar setup](/guides/sidecar-setup/) if you want the full portable
+state path, or [Daily workflow](/guides/daily-workflow/) if the project is ready
+and you want to start working.

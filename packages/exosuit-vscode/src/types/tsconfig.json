@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.webview.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": ".",
+    "outDir": "../../out/types"
+  },
+  "include": ["."]
+}
