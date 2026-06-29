@@ -7642,6 +7642,93 @@ fn sidecar_repo_status_human_reports_live_owner_block() {
 }
 
 #[test]
+fn daemon_sidecar_repo_status_human_reports_live_owner_block() {
+    let fixture = basic_sidecar_fixture();
+    let other_workspace = fixture._temp.path().join("other-workspace");
+    let owner_pid = std::process::id();
+    write_sidecar_write_owner_marker(
+        &fixture.sidecar_root,
+        "external-test",
+        owner_pid,
+        &other_workspace,
+        None,
+        None,
+    );
+    let _guard = DaemonPathGuard::new(&fixture.repo);
+
+    let human_output = exo_cmd(&fixture.repo, &fixture.home, &fixture.config_home)
+        .args(["sidecar", "repo", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human_output).expect("human output is utf-8");
+    assert!(human.contains("Sidecar repo clean"), "{human}");
+    assert!(
+        human.contains("Ownership blocked by active runtime"),
+        "{human}"
+    );
+    assert!(human.contains(&owner_pid.to_string()), "{human}");
+    assert!(
+        human.contains(other_workspace.to_string_lossy().as_ref()),
+        "{human}"
+    );
+}
+
+#[test]
+fn daemon_sidecar_repo_status_human_reports_invalid_owner_marker() {
+    let fixture = basic_sidecar_fixture();
+    let marker_path = sidecar_write_owner_marker_path(&fixture.sidecar_root, "external-test");
+    std::fs::create_dir_all(marker_path.parent().expect("marker parent"))
+        .expect("create marker parent");
+    std::fs::write(&marker_path, "{not valid json").expect("write invalid marker");
+    let _guard = DaemonPathGuard::new(&fixture.repo);
+
+    let human_output = exo_cmd(&fixture.repo, &fixture.home, &fixture.config_home)
+        .args(["sidecar", "repo", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human_output).expect("human output is utf-8");
+    assert!(human.contains("Ownership marker invalid:"), "{human}");
+    assert!(!human.contains("Ownership blocked"), "{human}");
+}
+
+#[test]
+fn daemon_sidecar_repo_status_human_reports_foreign_checkpoint_debt() {
+    let fixture = basic_sidecar_fixture();
+    let foreign_projection = fixture
+        .sidecar_root
+        .join("projects/other-project/agent-context/tasks.sql");
+    std::fs::create_dir_all(
+        foreign_projection
+            .parent()
+            .expect("foreign projection parent"),
+    )
+    .expect("create foreign projection parent");
+    std::fs::write(&foreign_projection, "foreign projection\n").expect("write foreign projection");
+    let _guard = DaemonPathGuard::new(&fixture.repo);
+
+    let human_output = exo_cmd(&fixture.repo, &fixture.home, &fixture.config_home)
+        .args(["sidecar", "repo", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human_output).expect("human output is utf-8");
+    assert!(human.contains("Foreign checkpoint debt:"), "{human}");
+    assert!(human.contains("other-project: 1 file(s)"), "{human}");
+    assert!(
+        human.contains("exo sidecar checkpoint --project other-project"),
+        "{human}"
+    );
+}
+
+#[test]
 fn sidecar_repo_status_human_reports_invalid_owner_marker() {
     let fixture = basic_sidecar_fixture();
     let marker_path = sidecar_write_owner_marker_path(&fixture.sidecar_root, "external-test");
@@ -7675,7 +7762,7 @@ fn auto_persist_blocks_live_incompatible_sidecar_write_owner() {
         "external-test",
         std::process::id(),
         &other_workspace,
-        None,
+        Some("owner-binary-hash".to_string()),
         None,
     );
     let before = git_output(sidecar_root, &["rev-parse", "HEAD"]);
@@ -7701,6 +7788,27 @@ fn auto_persist_blocks_live_incompatible_sidecar_write_owner() {
             .as_str()
             .is_some_and(|message| message.contains("another active runtime")),
         "{error:?}"
+    );
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains(other_workspace.to_string_lossy().as_ref())
+                && message.contains(&std::process::id().to_string())
+                && message.contains("sidecar key: external-test")
+                && message.contains("exo-write-owners/external-test-")
+                && message.contains("owner db:")
+                && message.contains("owner-binary-hash")
+        }),
+        "{error:?}"
+    );
+    let ownership_details = &error["details"]["details"];
+    assert_eq!(ownership_details["kind"], "sidecar.write_ownership");
+    assert_eq!(
+        ownership_details["owner_pid"],
+        u64::from(std::process::id())
+    );
+    assert_eq!(
+        ownership_details["owner_workspace_root"].as_str(),
+        Some(other_workspace.to_string_lossy().as_ref())
     );
 
     let after = git_output(sidecar_root, &["rev-parse", "HEAD"]);

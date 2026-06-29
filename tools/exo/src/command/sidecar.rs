@@ -5269,20 +5269,34 @@ fn ensure_sidecar_write_ownership(
     let current = current_sidecar_write_owner_marker(repo)?;
     let status = read_sidecar_write_ownership_status_with_current(repo, &current)?;
     if !status.ok {
-        return Err(anyhow::Error::new(ExoFailure::new(
-            ErrorCode::PreconditionFailed,
-            status.issue.unwrap_or_else(|| {
-                "sidecar write ownership is held by another active runtime".to_string()
-            }),
-            ExoFailure::orienting_steering(vec![SuggestedAction {
-                label: "Inspect sidecar ownership".to_string(),
-                command: "exo sidecar repo status".to_string(),
-                rationale: "Review which runtime owns sidecar checkpointing before retrying."
-                    .to_string(),
-                intent: WorkIntent::Orient,
-                confidence: Some(1.0),
-            }]),
-        )));
+        let issue = status.issue.clone().unwrap_or_else(|| {
+            "sidecar write ownership is held by another active runtime".to_string()
+        });
+        return Err(anyhow::Error::new(
+            ExoFailure::new(
+                ErrorCode::PreconditionFailed,
+                sidecar_write_ownership_block_message(&status, &issue),
+                ExoFailure::orienting_steering(vec![SuggestedAction {
+                    label: "Inspect sidecar ownership".to_string(),
+                    command: "exo sidecar repo status".to_string(),
+                    rationale: "Review which runtime owns sidecar checkpointing before retrying."
+                        .to_string(),
+                    intent: WorkIntent::Orient,
+                    confidence: Some(1.0),
+                }]),
+            )
+            .with_details(serde_json::json!({
+                "kind": "sidecar.write_ownership",
+                "sidecar_key": status.sidecar_key,
+                "state": status.state,
+                "issue": issue,
+                "marker_path": status.marker_path,
+                "owner_pid": status.owner_pid,
+                "owner_workspace_root": status.owner_workspace_root,
+                "owner_db_path": status.owner_db_path,
+                "owner_binary_blake3": status.owner_binary_blake3,
+            })),
+        ));
     }
 
     write_sidecar_write_owner_marker(repo, &current)?;
@@ -5294,6 +5308,30 @@ fn ensure_sidecar_write_ownership(
         true,
         None,
     ))
+}
+
+fn sidecar_write_ownership_block_message(
+    status: &SidecarWriteOwnershipStatus,
+    issue: &str,
+) -> String {
+    let mut message = issue.to_string();
+    if let Some(sidecar_key) = status.sidecar_key.as_deref() {
+        message.push_str(&format!("; sidecar key: {sidecar_key}"));
+    }
+    message.push_str(&format!("; marker: {}", status.marker_path.display()));
+    if let Some(workspace_root) = status.owner_workspace_root.as_deref() {
+        message.push_str(&format!("; owner workspace: {}", workspace_root.display()));
+    }
+    if let Some(pid) = status.owner_pid {
+        message.push_str(&format!("; owner pid: {pid}"));
+    }
+    if let Some(db_path) = status.owner_db_path.as_deref() {
+        message.push_str(&format!("; owner db: {}", db_path.display()));
+    }
+    if let Some(binary_hash) = status.owner_binary_blake3.as_deref() {
+        message.push_str(&format!("; owner binary: {binary_hash}"));
+    }
+    message
 }
 
 fn read_sidecar_write_ownership_status(

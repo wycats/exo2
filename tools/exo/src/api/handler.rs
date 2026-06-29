@@ -398,6 +398,13 @@ fn generate_mutation_summary(kind: &str, input: &JsonValue, data: &JsonValue) ->
 /// **Important**: Tool output is rendered as plain text, not markdown.
 /// Do not use markdown syntax (`**`, `#`, `|` tables, backticks).
 fn generate_body_from_data(namespace: &str, operation: &str, data: &JsonValue) -> Option<String> {
+    if namespace == "sidecar"
+        && operation == "repo"
+        && value_str(data, &["kind"]) == Some("sidecar.repo.status")
+    {
+        return Some(render_sidecar_repo_status(data));
+    }
+
     // Task list
     if namespace == "task"
         && operation == "list"
@@ -1053,6 +1060,96 @@ fn generate_body_from_data(namespace: &str, operation: &str, data: &JsonValue) -
 fn value_str<'a>(value: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(JsonValue::as_str))
+}
+
+fn render_sidecar_repo_status(data: &JsonValue) -> String {
+    let state = if data
+        .get("repo_clean")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        "clean"
+    } else {
+        "dirty"
+    };
+    let branch = value_str(data, &["branch"]).unwrap_or("<detached>");
+    let sidecar_root = value_str(data, &["sidecar_root", "sidecarRoot"]).unwrap_or("(unknown)");
+    let mut lines = vec![format!(
+        "Sidecar repo {state} on {branch} at {sidecar_root}"
+    )];
+
+    if let Some(ownership) = data.get("ownership")
+        && ownership
+            .get("ok")
+            .and_then(JsonValue::as_bool)
+            .is_some_and(|ok| !ok)
+    {
+        let issue = value_str(ownership, &["issue"])
+            .or_else(|| value_str(ownership, &["state"]))
+            .unwrap_or("blocked");
+        let owner = ownership
+            .get("owner_pid")
+            .and_then(JsonValue::as_u64)
+            .map(|pid| format!(" {pid}"))
+            .unwrap_or_default();
+        let line = if let Some(details) =
+            issue.strip_prefix("sidecar write ownership marker is invalid: ")
+        {
+            format!("Ownership marker invalid: {details}")
+        } else if let Some(details) =
+            issue.strip_prefix("failed to read sidecar write ownership marker: ")
+        {
+            format!("Ownership marker unreadable: {details}")
+        } else if issue.contains("active runtime") || issue.contains("live runtime") {
+            format!("Ownership blocked by active runtime{owner}: {issue}")
+        } else {
+            format!("Ownership blocked{owner}: {issue}")
+        };
+        let mut line = line;
+        if let Some(workspace_root) = value_str(ownership, &["owner_workspace_root"]) {
+            line.push_str(&format!(" ({workspace_root})"));
+        }
+        lines.push(line);
+    }
+
+    if let Some(issue) = value_str(data, &["issue"]) {
+        lines.push(format!("Issue: {issue}"));
+    }
+    if let Some(actions) = data.get("next_actions").and_then(JsonValue::as_array)
+        && !actions.is_empty()
+    {
+        lines.push("Next actions:".to_string());
+        for action in actions {
+            if let Some(command) = value_str(action, &["command"]) {
+                lines.push(format!("  -> {command}"));
+            }
+        }
+    }
+
+    if let Some(debts) = data
+        .get("foreign_checkpoint_debt")
+        .and_then(JsonValue::as_array)
+        && !debts.is_empty()
+    {
+        lines.push("Foreign checkpoint debt:".to_string());
+        for debt in debts {
+            let project = value_str(debt, &["project"]).unwrap_or("?");
+            let file_count = debt
+                .get("files")
+                .and_then(JsonValue::as_array)
+                .map_or(0, Vec::len);
+            lines.push(format!("  - {project}: {file_count} file(s)"));
+            if let Some(actions) = debt.get("next_actions").and_then(JsonValue::as_array) {
+                for action in actions {
+                    if let Some(command) = value_str(action, &["command"]) {
+                        lines.push(format!("    -> {command}"));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 const fn rfc_stage_name(stage: u64) -> &'static str {
