@@ -4,10 +4,10 @@ Current status source: [RFC Reconstruction Current-State Recon](./rfc-reconstruc
 That checkpoint refreshes the public-tree corpus inventory after the clean-root
 cutover and supersedes the next-step recommendations in this older plan.
 
-This plan turns the initial inventory into a safe rewrite sequence. It avoids
-editing RFC files directly until each action can be expressed through the Exo
-RFC command surface (`supersede`, `archive`, `withdraw`, `edit`, `promote`,
-`repair`, or `rename`).
+This plan turns the inventory into an evidence-driven reconstruction sequence.
+It avoids editing RFC files directly until each action can be expressed through
+the Exo RFC command surface (`supersede`, `archive`, `withdraw`, `edit`,
+`promote`, `repair`, or `rename`).
 
 ## Current Findings
 
@@ -46,13 +46,39 @@ RFC command surface (`supersede`, `archive`, `withdraw`, `edit`, `promote`,
 
 1. Preserve RFC history. Supersede, archive, or withdraw instead of deleting.
 2. Do not promote a planning RFC to Stage 3/4 unless the behavior exists in code.
-3. Prefer the current implementation as truth, then rewrite the RFC around it.
+3. Use implemented behavior to determine Stage 3/4 readiness.
 4. Keep future plans as Stage 0/1/2 work, not as stable claims.
 5. Use high-number canonical records when they better describe the current
    system, but keep an explicit supersession trail from older low-number records.
 6. Separate implementation state from design trajectory. A current RFC can be
    transitional or away from the target direction, and a stale RFC can still
    contain an aligned future plan worth preserving.
+
+## Evidence-Driven Reconstruction Method
+
+RFC reconstruction starts from evidence: implementation, tests, CLI and MCP
+behavior, Exo state, `docs/vision.md`, specs, and accepted design packages.
+Implemented behavior determines Stage 3/4 readiness. Durable direction
+determines what to do with drift: stabilize, rewrite, supersede, archive,
+withdraw, or preserve as future work.
+
+Existing RFC text remains useful evidence when it explains current behavior,
+historical decisions, or aligned future direction. It does not become current
+law by being checked in; each reconstruction PR must account for the gap between
+the text, the implementation, and the durable direction.
+
+Every RFC rewrite follows this stage-aware loop:
+
+1. Observe the local RFC process, current stage, related RFCs, implementation,
+   tests, docs, Exo state, and durable design evidence.
+2. Ground the intended design role for the RFC within the workspace-centered
+   vision and current phase goals.
+3. Draft public design prose that serves the RFC's current stage.
+4. Evaluate stage readiness against the evidence.
+5. Record remaining gaps and next authoring or implementation work.
+
+Each cluster PR should state the current behavior, intended direction, canonical
+RFC role, stage decision, lifecycle decisions, and unresolved design questions.
 
 ## Directional Design Lens
 

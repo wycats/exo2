@@ -15,6 +15,14 @@ or explicitly record implemented history. Earlier-stage RFCs should preserve
 future plans only when they still map to current architecture and a plausible
 implementation path.
 
+The active stabilization phase uses the evidence-driven reconstruction method
+recorded in [RFC Reconstruction Plan](./rfc-reconstruction-plan.md). Each RFC
+cluster starts from implementation, tests, CLI/MCP behavior, Exo state,
+`docs/vision.md`, specs, and accepted design packages. Implemented behavior
+determines Stage 3/4 readiness; durable direction determines how drift should
+be stabilized, rewritten, superseded, archived, withdrawn, or preserved as
+future work.
+
 Success means:
 
 - Stage 3/4 records are current, archived, withdrawn, or clearly superseded;
@@ -103,6 +111,12 @@ rows have changed since it was written.
 | Public cutover | The new public repository was minted from signed clean root `61161ba0d91fae95918997c49595865d4195ce7e`; private history remains in `wycats/exo2-private-history`. | Reconstruction now runs in the public tree and should avoid relying on private-history-only artifacts. |
 
 ## Current Reconstruction Queue
+
+This is the first execution queue under the evidence-driven reconstruction
+method. The queue starts with RFC `10200` so Exo can reliably address that RFC
+by ID, then moves to full RFC rewrites and lifecycle cleanup. The separate
+`0060` numeric collision remains an ID-addressing exception until row 5 is
+processed.
 
 | Order | Work | Reason | Expected PR Shape |
 | ---: | --- | --- | --- |
