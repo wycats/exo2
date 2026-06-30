@@ -17,7 +17,7 @@
 > | ReactiveVTab (xUpdate)            | ✅ Complete       | Writable vtab writes mutate `*_data`, preserve the vtab write contract, persist `*_rev`, and bump `rowset_revisions` |
 > | RevisionStore                     | ✅ Complete       | `src/revisions.rs`                                                                                             |
 > | content_hash() function           | ✅ Complete       | `src/functions.rs`                                                                                             |
-> | Defensive mode + shadow boundary  | ✅ Complete       | `src/schema.rs`, `src/vtab/shadow.rs`; `xShadowName` marks `*_data`/`*_rev` as protected shadow tables          |
+> | Defensive mode + shadow boundary  | ✅ Complete       | `crates/exosuit-storage/src/schema.rs`, `crates/exosuit-storage/src/vtab/shadow.rs`; `xShadowName` and `SQLITE_DBCONFIG_DEFENSIVE` protect `*_data`/`*_rev` from ordinary direct writes |
 > | SqliteLoader (read path)          | ✅ Complete       | `tools/exo/src/context/sqlite_loader.rs`                                                                       |
 > | TOML → SQLite migration           | ✅ Complete       | `tools/exo/src/command/migrate.rs`                                                                             |
 > | StorageBackend::Toml removal      | ✅ Complete       | Variant deleted, all TOML match arms removed                                                                   |
@@ -29,12 +29,12 @@
 > | Extension daemon integration      | ✅ Complete       | `PlanService` → `plan.snapshot`, `context.snapshot`                                                            |
 > | Trace-backed sidebar freshness    | ✅ Complete       | `context.snapshot`, `context validate-trace`, VS Code `TraceCache`                                             |
 > | SqliteWriter reactive writes      | ✅ Complete       | Ordinary Exo state mutations write through reactive table names                                                |
-> | xShadowName shim                  | ⏳ Incomplete     | Direct `*_data` writes are not yet blocked by SQLite defensive mode                                             |
+> | xShadowName shim                  | ✅ Complete       | The reactive module patches rusqlite's module struct to advertise `data`/`rev` shadow suffixes                 |
 > | **`exosuit-reactivity-core`**     | ✅ Complete       | Shared types crate extracted. Both `exosuit-storage` and `exosuit-reactivity` depend on it.                    |
 > | **Persistent rowset revisions**   | ✅ Complete       | `Revision::Counter(u64)` variant, V011 migration drops epoch column, counters persist across restarts          |
 > | **Reactive extension roots**      | ✅ Complete       | Sidebar roots are served through daemon-trace-backed `TraceCache` validation and refetch                       |
 >
-> Focused storage and sidebar freshness coverage now includes file-backed cross-connection trace invalidation and VS Code `TraceCache` write-notification refetch coverage. `xShadowName` enforcement remains the first hardening item.
+> Focused storage and sidebar freshness coverage now includes file-backed cross-connection trace invalidation, VS Code `TraceCache` write-notification refetch coverage, and defensive-mode coverage for the ordinary shadow-table boundary.
 >
 > **Related RFCs:**
 >
@@ -48,7 +48,7 @@
 
 Replace bespoke TOML flat files (`plan.toml`, `ideas.toml`, `inbox.toml`, etc.) with SQLite as the query/storage engine, using **virtual tables** backed by **shadow tables** to intercept reads and ordinary Exo state writes for organic trace recording per the Revision Algebra (see `docs/specs/algebras/reactivity.md`).
 
-The virtual table layer provides two read interceptors — `xFilter` for **Membership** observations and `xColumn` for **Content** observations — plus a single write interceptor (`xUpdate`). Shadow tables store the actual data. `xShadowName` + defensive mode is still required before direct shadow-table writes are blocked by SQLite itself.
+The virtual table layer provides two read interceptors — `xFilter` for **Membership** observations and `xColumn` for **Content** observations — plus a single write interceptor (`xUpdate`). Shadow tables store the actual data, and `xShadowName` plus defensive mode blocks ordinary direct writes to those backing tables.
 
 Git-friendly diffs are preserved via sorted SQL text dumps.
 
@@ -344,7 +344,7 @@ SQLite provides many native mechanisms beyond virtual tables. We investigated th
 | Mechanism                                               | Purpose                                                    | Algebra Concept                      |
 | ------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------ |
 | Virtual table callbacks (`xFilter`/`xColumn`/`xUpdate`) | Read interception + write entry point                      | Organic Consumption, Mediated Access |
-| Shadow tables (`_data`, `_rev`)                         | Real SQLite storage; xShadowName protection remains incomplete | Backing store                     |
+| Shadow tables (`_data`, `_rev`)                         | Real SQLite storage protected from ordinary direct writes by `xShadowName` and defensive mode | Backing store                     |
 | Custom scalar function (`content_hash()`)               | Content digest computation via `sqlite3_create_function()` | $\mathcal{R}_{disk}$ (row revision)  |
 | `PRAGMA data_version`                                   | Cross-process invalidation detection                       | External change notification         |
 
@@ -632,7 +632,7 @@ Each virtual table also maintains a row-set revision (persistent monotonic count
 | Observation Kind: Membership        | `xFilter` → records `(CellId::root(T), Revision::Disk { counter })`   |
 | Trace `T = {(c₁,r₁), ..., (cₙ,rₙ)}` | `BTreeSet<TraceEntry>` where `TraceEntry { cell_id, revision }`       |
 | Organic Consumption                 | Side-effect of `xColumn` and `xFilter` — no app code changes          |
-| Mediated Access                     | `xFilter`/`xColumn`/`xUpdate` mediate the command path; `xShadowName` enforcement is incomplete |
+| Mediated Access                     | `xFilter`/`xColumn`/`xUpdate` mediate the command path; `xShadowName` and defensive mode protect shadow tables from ordinary direct writes |
 | Existential Dependency              | Membership invalid → Content entries on that collection revalidate    |
 | Write Bumping (conservative)        | Vtab DML bumps both row revision and Row-Set revision                 |
 | Zero-Execution Validation           | `trace.validate(&mut provider)` compares revision values only         |
@@ -689,7 +689,7 @@ Each virtual table also maintains a row-set revision (persistent monotonic count
 │  │  • xFilter → Record(Membership)                     │    │
 │  │  • xColumn → Record(Content)                        │    │
 │  │  • xUpdate → bump revisions (all DML bumps RowSet) │    │
-│  │  • xShadowName → remaining direct-shadow protection │    │
+│  │  • xShadowName → direct-shadow protection           │    │
 │  └─────────────────────────────────────────────────────┘    │
 └───────────────────────────┬─────────────────────────────────┘
                             │ persists to
@@ -828,7 +828,7 @@ impl StateProvider for RevisionStore {
 - [`libsqlite3-sys`](https://github.com/rusqlite/rusqlite/tree/master/libsqlite3-sys) with `bundled` feature — required for raw FFI calls in vtab cursor methods (see RefCell note above)
 - [`blake3`](https://github.com/BLAKE3-team/BLAKE3) for content digest computation
 
-**Remaining xShadowName shim**: rusqlite sets `iVersion: 1` on all module structs and zero-initializes `xShadowName`. Since `Module<'vtab, T>` is `#[repr(transparent)]` over `ffi::sqlite3_module`, the intended enforcement path is to patch the struct at registration time:
+**xShadowName shim**: rusqlite sets `iVersion: 1` on all module structs and zero-initializes `xShadowName`. Since `Module<'vtab, T>` is `#[repr(transparent)]` over `ffi::sqlite3_module`, Exo patches the struct at registration time:
 
 ```rust
 use rusqlite::ffi;
@@ -1143,7 +1143,7 @@ Removing these systems before migration reduces the schema surface and eliminate
 
 4. **Implement the `reactive` virtual table module** in Rust:
    - `xCreate`/`xConnect`: register shadow tables, call `sqlite3_declare_vtab`
-   - `xShadowName`: return true for `"data"` and `"rev"` suffixes (remaining)
+   - `xShadowName`: return true for `"data"` and `"rev"` suffixes
    - `xColumn`: read from `_data` shadow table, record Content trace
    - `xFilter`: query `_data` shadow table, record Membership trace
    - `xUpdate`: write to `_data`, compute digest, update `_rev`, bump Row-Set counter
