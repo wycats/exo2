@@ -1,10 +1,8 @@
-<!-- exo:60 ulid:01kmzxefd44gsr4dhr4g8ncksb -->
+<!-- exo:10201 ulid:01kmzxefd44gsr4dhr4g8ncksb -->
 
-# RFC 60: Phase-Aware Dirty Working Tree Steering
+# RFC 10201: Phase-Aware Dirty Working Tree Steering
 
-
-
-# RFC 0060: Phase-Aware Dirty Working Tree Steering
+- **Superseded by**: RFC 0117
 
 ## Summary
 

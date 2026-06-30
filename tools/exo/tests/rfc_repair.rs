@@ -947,6 +947,145 @@ fn rfc_repair_preserves_selected_text_id_when_duplicate_numbers_exist(backend: &
 }
 
 #[test_matrix(["sqlite"])]
+fn rfc_repair_can_renumber_duplicate_by_explicit_path(backend: &str) {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path();
+
+    write_minimal_context(root, backend);
+    exo_rfc_create(
+        root,
+        "Prompt Patterns",
+        "0060",
+        "1",
+        "rfc",
+        Some("Prompt body."),
+    );
+    let withdrawn =
+        root.join("docs/rfcs/withdrawn/0060-phase-aware-dirty-working-tree-steering.md");
+    std::fs::create_dir_all(withdrawn.parent().expect("withdrawn parent"))
+        .expect("create withdrawn dir");
+    std::fs::write(
+        &withdrawn,
+        "<!-- exo:60 ulid:01dirtytree0060 -->\n\n# RFC 60: Phase-Aware Dirty Working Tree Steering\n\n# RFC 0060: Phase-Aware Dirty Working Tree Steering\n\nDirty tree body.\n",
+    )
+    .expect("write duplicate withdrawn RFC");
+    let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).expect("open sqlite writer");
+    writer
+        .upsert_rfc(
+            "01dirtytree0060",
+            60,
+            "Phase-Aware Dirty Working Tree Steering",
+            0,
+            "withdrawn",
+            None,
+            "phase-aware-dirty-working-tree-steering",
+            "docs/rfcs/withdrawn/0060-phase-aware-dirty-working-tree-steering.md",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert duplicate withdrawn metadata row");
+
+    exo_cmd_with_storage(root, backend)
+        .args(["rfc", "repair", "0060"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("RFC 0060 is ambiguous"));
+
+    exo_cmd_with_storage(root, backend)
+        .args([
+            "rfc",
+            "repair",
+            "0060",
+            "--path",
+            "docs/rfcs/withdrawn/0060-phase-aware-dirty-working-tree-steering.md",
+            "--renumber-to",
+            "10201",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\": \"10201\""))
+        .stdout(predicate::str::contains("rfc_number_reassigned"));
+
+    let active = root.join("docs/rfcs/stage-1/0060-prompt-patterns.md");
+    assert!(active.exists(), "active RFC 0060 survivor remains in place");
+
+    let repaired =
+        root.join("docs/rfcs/withdrawn/10201-phase-aware-dirty-working-tree-steering.md");
+    assert!(
+        repaired.exists(),
+        "withdrawn duplicate should be renumbered"
+    );
+    let content = std::fs::read_to_string(&repaired).expect("read repaired RFC");
+    assert!(content.contains("<!-- exo:10201 ulid:01dirtytree0060 -->"));
+    assert!(content.contains("# RFC 10201: Phase-Aware Dirty Working Tree Steering"));
+    assert!(!content.contains("# RFC 0060: Phase-Aware Dirty Working Tree Steering"));
+
+    let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).expect("open sqlite loader");
+    let active_row = loader
+        .load_rfc_by_number(60)
+        .expect("load active rfc")
+        .expect("active 0060 should remain");
+    assert_eq!(active_row.title, "Prompt Patterns");
+    assert_eq!(
+        active_row.file_path,
+        "docs/rfcs/stage-1/0060-prompt-patterns.md"
+    );
+
+    let repaired_row = loader
+        .load_rfc_by_number(10201)
+        .expect("load repaired rfc")
+        .expect("repaired duplicate should be addressable");
+    assert_eq!(
+        repaired_row.title,
+        "Phase-Aware Dirty Working Tree Steering"
+    );
+    assert_eq!(
+        repaired_row.file_path,
+        "docs/rfcs/withdrawn/10201-phase-aware-dirty-working-tree-steering.md"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+fn rfc_repair_rejects_renumber_to_existing_rfc(backend: &str) {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path();
+
+    write_minimal_context(root, backend);
+    exo_rfc_create(root, "First", "0001", "0", "rfc", Some("Body."));
+    exo_rfc_create(root, "Second", "0002", "0", "rfc", Some("Body."));
+
+    exo_cmd_with_storage(root, backend)
+        .args([
+            "rfc",
+            "repair",
+            "0001",
+            "--path",
+            "docs/rfcs/stage-0/0001-first.md",
+            "--renumber-to",
+            "0002",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Refusing to renumber RFC to 00002",
+        ));
+
+    assert!(
+        root.join("docs/rfcs/stage-0/0001-first.md").exists(),
+        "source RFC must remain in place"
+    );
+    assert!(
+        root.join("docs/rfcs/stage-0/0002-second.md").exists(),
+        "target RFC must remain in place"
+    );
+}
+
+#[test_matrix(["sqlite"])]
 fn rfc_repair_rejects_malformed_filename_without_separator(backend: &str) {
     let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
     let root = temp.path();

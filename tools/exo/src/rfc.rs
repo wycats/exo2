@@ -150,6 +150,7 @@ pub struct RfcRepairOutcome {
     pub title: String,
     pub reasons: Vec<String>,
     pub repaired: bool,
+    pub renumbered_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,12 +1143,25 @@ pub fn detect_rfc_repair_candidate_for_text_id(
 
 #[allow(clippy::missing_errors_doc)]
 pub fn repair(root: &Path, id: &str) -> Result<RfcRepairOutcome> {
+    repair_with_options(root, id, None, None)
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn repair_with_options(
+    root: &Path,
+    id: &str,
+    path: Option<&str>,
+    renumber_to: Option<&str>,
+) -> Result<RfcRepairOutcome> {
     let rfc_root = root.join(RFCS_DIR);
     if !rfc_root.exists() {
         anyhow::bail!("RFC root not found at {}", rfc_root.display());
     }
 
-    let old_path = find_rfc_file_for_repair(root, &rfc_root, id)?;
+    let old_path = match path {
+        Some(path) => resolve_rfc_file_for_repair_path(root, &rfc_root, path, id)?,
+        None => find_rfc_file_for_repair(root, &rfc_root, id)?,
+    };
     let (parsed, candidate, malformed_repaired) = match parse_disk_rfc(root, &old_path) {
         Ok(parsed) => {
             let candidate = rfc_repair_candidate_for_path(
@@ -1168,7 +1182,17 @@ pub fn repair(root: &Path, id: &str) -> Result<RfcRepairOutcome> {
             (parsed, Some(debt.candidate), true)
         }
     };
-    let identity = rfc_repair_identity(root, &old_path, &parsed)?;
+    let mut identity = rfc_repair_identity(root, &old_path, &parsed)?;
+    let renumbered_to = match renumber_to {
+        Some(value) => {
+            let target_number = validate_rfc_id(value)
+                .with_context(|| format!("Invalid target RFC ID: {value}"))?;
+            ensure_rfc_number_available_for_renumber(root, &rfc_root, target_number, &old_path)?;
+            identity.rfc_number = target_number;
+            Some(format_rfc_number(target_number))
+        }
+        None => None,
+    };
     let expected_path = expected_rfc_path(
         root,
         &old_path,
@@ -1181,6 +1205,13 @@ pub fn repair(root: &Path, id: &str) -> Result<RfcRepairOutcome> {
     let mut reasons = candidate
         .as_ref()
         .map_or_else(Vec::new, |candidate| candidate.reasons.clone());
+    if renumbered_to.is_some()
+        && !reasons
+            .iter()
+            .any(|reason| reason == "rfc_number_reassigned")
+    {
+        reasons.push("rfc_number_reassigned".to_string());
+    }
 
     let mut final_path = old_path.clone();
     let moved = expected_path != old_path;
@@ -1208,14 +1239,30 @@ pub fn repair(root: &Path, id: &str) -> Result<RfcRepairOutcome> {
         reasons.push("metadata_relink".to_string());
     }
     let expected_text_id = identity.text_id.as_deref().unwrap_or(&final_parsed.text_id);
-    if final_parsed.rfc_number != identity.rfc_number || final_parsed.text_id != expected_text_id {
+    if let Some(display_id) = renumbered_to.as_deref() {
+        repair_rfc_file_identity(
+            &final_path,
+            identity.rfc_number,
+            expected_text_id,
+            display_id,
+            &final_parsed.title,
+        )?;
+    } else if final_parsed.rfc_number != identity.rfc_number
+        || final_parsed.text_id != expected_text_id
+    {
         repair_anchor_identity(&final_path, identity.rfc_number, expected_text_id)?;
     }
-    sync_rfc_rename(root, &final_path)?;
-    let outcome_id = candidate.as_ref().map_or_else(
-        || format_rfc_number(identity.rfc_number),
-        |candidate| candidate.id.clone(),
-    );
+    if renumbered_to.is_some() {
+        sync_rfc_renumber(root, &final_path)?;
+    } else {
+        sync_rfc_rename(root, &final_path)?;
+    }
+    let outcome_id = renumbered_to.clone().unwrap_or_else(|| {
+        candidate.as_ref().map_or_else(
+            || format_rfc_number(identity.rfc_number),
+            |candidate| candidate.id.clone(),
+        )
+    });
 
     Ok(RfcRepairOutcome {
         id: outcome_id,
@@ -1223,8 +1270,97 @@ pub fn repair(root: &Path, id: &str) -> Result<RfcRepairOutcome> {
         new_path: new_rel,
         title: parsed.title,
         reasons,
-        repaired: candidate.is_some() || moved || metadata_sync_needed || malformed_repaired,
+        repaired: candidate.is_some()
+            || moved
+            || metadata_sync_needed
+            || malformed_repaired
+            || renumbered_to.is_some(),
+        renumbered_to,
     })
+}
+
+fn resolve_rfc_file_for_repair_path(
+    root: &Path,
+    rfc_root: &Path,
+    path: &str,
+    id: &str,
+) -> Result<PathBuf> {
+    let requested_number = validate_rfc_id(id)?;
+    let file_path = {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    };
+
+    if !file_path.exists() {
+        anyhow::bail!("RFC file not found: {}", file_path.display());
+    }
+    if !is_rfc_document_path(rfc_root, &file_path) {
+        anyhow::bail!(
+            "Path is not a managed RFC document: {}",
+            file_path.display()
+        );
+    }
+
+    let filename_matches = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_rfc_number)
+        .is_some_and(|number| number == requested_number);
+    let path_matches = match parse_disk_rfc(root, &file_path) {
+        Ok(parsed) => {
+            let metadata_matches = load_rfc_record_by_text_id(root, &parsed.text_id)?
+                .is_some_and(|record| record.rfc_number == requested_number);
+            parsed.rfc_number == requested_number || metadata_matches
+        }
+        Err(_) => malformed_rfc_repair_debt_for_path(root, &file_path, None)?
+            .is_some_and(|debt| debt.identity_number == requested_number),
+    };
+
+    if !filename_matches && !path_matches {
+        anyhow::bail!(
+            "RFC path {} does not match requested RFC ID {id}",
+            relative_workspace_path(root, &file_path)
+        );
+    }
+
+    Ok(file_path)
+}
+
+fn ensure_rfc_number_available_for_renumber(
+    root: &Path,
+    rfc_root: &Path,
+    target_number: i64,
+    current_path: &Path,
+) -> Result<()> {
+    if let Some(existing_path) = find_optional_rfc_file(rfc_root, &target_number.to_string())?
+        && existing_path != current_path
+    {
+        anyhow::bail!(
+            "Refusing to renumber RFC to {}: target path already exists at {}",
+            format_rfc_number(target_number),
+            existing_path.display()
+        );
+    }
+
+    let current_rel = relative_workspace_path(root, current_path);
+    if let Some(loader) = maybe_open_rfc_loader(root)? {
+        for record in loader.load_rfcs()? {
+            if record.rfc_number == target_number && record.file_path != current_rel {
+                anyhow::bail!(
+                    "Refusing to renumber RFC to {}: metadata already exists for {} at {}",
+                    format_rfc_number(target_number),
+                    record.title,
+                    record.file_path
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct RfcRepairIdentity {
@@ -1890,6 +2026,53 @@ fn repair_anchor_identity(path: &Path, rfc_number: i64, text_id: &str) -> Result
         render_anchor_line_content(&format!("<!-- exo:{rfc_number} ulid:{text_id} -->"), body);
     utils::edit_cli_managed_file(path, move |_| Ok(repaired))
         .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn repair_rfc_file_identity(
+    path: &Path,
+    rfc_number: i64,
+    text_id: &str,
+    display_id: &str,
+    title: &str,
+) -> Result<()> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let (_, body) = split_anchor_and_body(&original)?;
+    let updated_body = update_rfc_identity_headings(body, display_id, title);
+    let repaired = render_anchor_line_content(
+        &format!("<!-- exo:{rfc_number} ulid:{text_id} -->"),
+        updated_body.trim_start_matches('\n'),
+    );
+    utils::edit_cli_managed_file(path, move |_| Ok(repaired))
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn update_rfc_identity_headings(body: &str, id: &str, title: &str) -> String {
+    let replacement = format!("# RFC {id}: {title}");
+    let mut out = String::with_capacity(body.len() + replacement.len());
+    let mut replaced = false;
+
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if trimmed.starts_with("# ") {
+            if !replaced {
+                out.push_str(&replacement);
+                out.push('\n');
+                replaced = true;
+                continue;
+            }
+            if extract_h1_title(trimmed).is_some_and(|line_title| line_title == title) {
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+
+    if replaced {
+        out
+    } else {
+        format!("\n\n{replacement}\n{body}")
+    }
 }
 
 fn edit_file(
@@ -2659,6 +2842,14 @@ fn sync_parsed_relationships(
 }
 
 fn sync_rfc_rename(root: &Path, file_path: &Path) -> Result<()> {
+    sync_rfc_identity(root, file_path, false)
+}
+
+fn sync_rfc_renumber(root: &Path, file_path: &Path) -> Result<()> {
+    sync_rfc_identity(root, file_path, true)
+}
+
+fn sync_rfc_identity(root: &Path, file_path: &Path, update_number: bool) -> Result<()> {
     let parsed = parse_disk_rfc(root, file_path)?;
     let mut record = load_rfc_record_by_text_id(root, &parsed.text_id)?.unwrap_or_else(|| {
         default_rfc_record(
@@ -2674,6 +2865,9 @@ fn sync_rfc_rename(root: &Path, file_path: &Path) -> Result<()> {
 
     sync_parsed_relationships(&mut record, &parsed, false);
     record.text_id = parsed.text_id;
+    if update_number {
+        record.rfc_number = parsed.rfc_number;
+    }
     record.title = parsed.title;
     record.stage = parsed.stage;
     record.status = parsed.status;
