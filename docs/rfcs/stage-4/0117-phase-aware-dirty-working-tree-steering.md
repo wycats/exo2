@@ -2,8 +2,7 @@
 
 # RFC 117: Phase-Aware Dirty Working Tree Steering
 
-
-# RFC 0117: Phase-Aware Dirty Working Tree Steering
+- **Supersedes**: RFC 10201
 
 ## Summary
 

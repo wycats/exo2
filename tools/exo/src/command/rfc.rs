@@ -394,6 +394,10 @@ pub enum RfcCommands {
     Repair {
         #[exo(positional, description = "The RFC ID to repair")]
         id: String,
+        #[exo(long, optional, description = "RFC file path to repair")]
+        path: Option<String>,
+        #[exo(long, optional, description = "Assign a new numeric RFC ID")]
+        renumber_to: Option<String>,
     },
 
     #[exo(
@@ -498,7 +502,11 @@ impl RfcCommands {
                 CommandBox::mutable(RfcEdit::new(id, path, title, feature, stage, body))
             }
             Self::Rename { id } => CommandBox::mutable(RfcRename::new(id)),
-            Self::Repair { id } => CommandBox::mutable(RfcRepair::new(id)),
+            Self::Repair {
+                id,
+                path,
+                renumber_to,
+            } => CommandBox::mutable(RfcRepair::with_options(id, path, renumber_to)),
             Self::Promote { id, stage } => {
                 let target_stage = u8::try_from(stage).map_err(|_| {
                     anyhow::anyhow!("Invalid target stage '{stage}'. Expected 0-4.")
@@ -1292,11 +1300,29 @@ impl MutableCommand for RfcRename {
 #[derive(Debug, Clone)]
 pub struct RfcRepair {
     pub id: String,
+    pub path: Option<String>,
+    pub renumber_to: Option<String>,
 }
 
 impl RfcRepair {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            path: None,
+            renumber_to: None,
+        }
+    }
+
+    pub fn with_options(
+        id: impl Into<String>,
+        path: Option<String>,
+        renumber_to: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            path,
+            renumber_to,
+        }
     }
 }
 
@@ -1310,6 +1336,7 @@ struct RfcRepairOutput {
     title: String,
     reasons: Vec<String>,
     repaired: bool,
+    renumbered_to: Option<String>,
 }
 
 impl Command for RfcRepair {
@@ -1340,7 +1367,12 @@ impl Command for RfcRepair {
 
 impl MutableCommand for RfcRepair {
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput> {
-        let outcome = rfc::repair(ctx.root, &self.id)?;
+        let outcome = rfc::repair_with_options(
+            ctx.root,
+            &self.id,
+            self.path.as_deref(),
+            self.renumber_to.as_deref(),
+        )?;
 
         let output = RfcRepairOutput {
             kind: "rfc.repair",
@@ -1351,6 +1383,7 @@ impl MutableCommand for RfcRepair {
             title: outcome.title.clone(),
             reasons: outcome.reasons.clone(),
             repaired: outcome.repaired,
+            renumbered_to: outcome.renumbered_to.clone(),
         };
 
         match ctx.format {

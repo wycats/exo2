@@ -2630,7 +2630,11 @@ fn mcp_stdio_serves_exo_run_status() {
         (43, "rfc --help", "rfc promote"),
         (44, "rfc help", "rfc promote"),
         (45, "rfc promote --help", "rfc promote <id> --stage <int>"),
-        (46, "rfc repair --help", "rfc repair <id>"),
+        (
+            46,
+            "rfc repair --help",
+            "rfc repair <id> [--path <string>] [--renumber-to <string>]",
+        ),
     ] {
         write_message(
             &mut stdin,
@@ -2662,7 +2666,11 @@ fn mcp_stdio_serves_exo_run_status() {
             "rfc promote --help --format json",
             "rfc promote <id> --stage <int>",
         ),
-        (53, "rfc repair --help --format json", "rfc repair <id>"),
+        (
+            53,
+            "rfc repair --help --format json",
+            "rfc repair <id> [--path <string>] [--renumber-to <string>]",
+        ),
     ] {
         write_message(
             &mut stdin,
@@ -2708,7 +2716,14 @@ fn mcp_stdio_serves_exo_run_status() {
                 assert_eq!(operation["args"][1]["value_type"], "int");
                 assert!(operation["args"][1]["keys"].is_null());
             } else {
-                assert_eq!(operation["args"].as_array().expect("args").len(), 1);
+                let args = operation["args"].as_array().expect("args");
+                assert_eq!(args.len(), 3);
+                assert_eq!(args[1]["name"], "path");
+                assert_eq!(args[1]["value_type"], "string");
+                assert_eq!(args[1]["optional"], true);
+                assert_eq!(args[2]["name"], "renumber-to");
+                assert_eq!(args[2]["value_type"], "string");
+                assert_eq!(args[2]["optional"], true);
             }
         }
     }
