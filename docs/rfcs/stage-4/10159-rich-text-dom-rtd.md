@@ -4,8 +4,6 @@
 # RFC 10159: Rich Text DOM (RTD)
 
 - **Supersedes**: RFC 0020
-
-
 - **Status**: Stage 4 (Stable)
 - **Created**: 2025-05-20
 - **Implemented**: `packages/exosuit-rtd`
