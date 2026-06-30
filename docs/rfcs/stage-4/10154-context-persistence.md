@@ -10,6 +10,9 @@ state root, the projection boundary, and the portability surface that carries
 that state across tools, machines, and repositories.
 
 Under repo policy, `docs/agent-context` carries generated SQL projections.
+Under sidecar policy, a user-named sidecar project carries the generated SQL
+projection, sidecar manifest, database, and runtime state outside the work
+repository.
 Durable project prose lives in RFCs, specifications, design notes, research
 notes, manuals, and configuration.
 
@@ -24,6 +27,11 @@ commands. Generated projections make selected state portable and reviewable.
 Human-authored documents carry durable design reasoning. Keeping those roles
 separate lets users, agents, and maintainers understand where state lives, which
 files Exo regenerates, and where project prose belongs.
+
+This distinction is especially important for public or upstream source
+repositories. A user can keep rich Exo state for that repository through a
+private sidecar while the public worktree carries source, documentation, and
+configuration.
 
 ## Detailed Design
 
@@ -71,6 +79,41 @@ sidecar-owned generated context files.
 
 Shadow policy keeps Exo state local to the machine and leaves workspace SQL
 projections unset by default.
+
+### Sidecar-Backed Persistence
+
+Sidecar policy is the primary persistence model for a public or upstream
+repository with user-owned Exo state. The selected sidecar key is the portable
+identity. The local project id is the machine-local binding between the current
+git checkout and that portable sidecar project.
+
+A sidecar-backed project resolves these paths from the sidecar binding:
+
+```text
+{sidecar_root}/projects/{sidecar_key}/sidecar.toml
+{sidecar_root}/projects/{sidecar_key}/cache/exo.db
+{sidecar_root}/projects/{sidecar_key}/runtime/
+{sidecar_root}/projects/{sidecar_key}/agent-context/*.sql
+```
+
+The sidecar manifest records the sidecar key and the local project id currently
+bound to that sidecar project. The SQLite database and runtime directory are
+the live operational state for that binding. The sidecar `agent-context/*.sql`
+files are the generated portability projection for personal sync, review, and
+reconstruction.
+
+Sidecar repository commands manage that portability boundary. `exo sidecar repo
+status` reports the sidecar git state. `exo sidecar repo commit --message
+<msg>` flushes the current SQL projection and commits sidecar-owned files. `exo
+sidecar repo push` and `exo sidecar repo sync` move that sidecar projection
+through the configured sidecar remote.
+
+When a checkout moves and its path-derived project id changes, `exo project
+move-root --key <sidecar-key> --to <checkout-root>` reconciles the binding. It
+preserves the sidecar key, sidecar project directory, database, runtime state,
+and generated projection while retargeting local policy, the sidecar manifest
+`project_id`, workspace active-phase rows, and workspace phase-ownership ids to
+the new checkout identity.
 
 ### Generated Projection Rules
 
@@ -146,6 +189,18 @@ under `docs/agent-context/*.sql`. That keeps the repository's state projection
 portable while preserving a clear distinction between generated operational
 data and human-authored documents.
 
+### Sidecar Projection As Personal Portable State
+
+Sidecar policy keeps Exo state available for a work repository while keeping
+the repository tree focused on public source, documentation, and configuration.
+The sidecar key is the user-facing handle for that state. The sidecar manifest
+records the local project binding, and the sidecar git repository carries the
+generated SQL projection through personal sync.
+
+The supported continuity path for a moved checkout is `exo project move-root`.
+The command reconciles path-derived local identity with the existing portable
+sidecar identity and preserves the sidecar state root.
+
 ### Local-Only State
 
 Shadow policy gives a project private machine-local Exo state. It fits local
@@ -159,7 +214,7 @@ Deterministic SQL dumps provide the portability bridge for policies that need a
 filesystem projection. RFC 10180 carries the classification rule that separates
 canonical state, generated projection, configuration, and documents.
 
-### Use Sidecar Policy For Every Project
+### Choosing Repo, Sidecar, Or Shadow
 
 Sidecar policy is the right fit for private portable personal state, especially
 when a public or team repository carries source and docs while Exo state stays
@@ -170,8 +225,8 @@ own shared Exo state. Shadow policy fits machine-local private state.
 
 - The exact exported table set and import ordering are owned by RFC 10178 and
   the Exo storage implementation.
-- Sidecar checkpointing, writer ownership, and sync failure recovery continue
-  in sidecar-specific RFCs and command behavior.
+- Sidecar writer ownership, checkpoint safety, and sync recovery continue in
+  the sidecar command surface and sidecar-specific RFCs.
 - Future lane-centered work can introduce additional scoped state views while
   keeping the same persistence roles: SQLite for operational state,
   policy-controlled generated projections for portability, and documents for
