@@ -3,6 +3,9 @@
 
 # RFC 10162: Exosuit UI Architecture
 
+- **Supersedes**: RFC 0024
+
+
 - **Status**: Stage 4 (Stable)
 - **Created**: 2025-05-20
 - **Implemented**: `packages/exosuit-vscode`

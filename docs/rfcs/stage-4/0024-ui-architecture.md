@@ -2,6 +2,9 @@
 
 # RFC 24: Exosuit UI Architecture
 
+- **Superseded by**: RFC 10162
+
+
 
 # RFC 0024: Exosuit UI Architecture
 

@@ -2,6 +2,9 @@
 
 # RFC 4: Modes of Collaboration
 
+- **Superseded by**: RFC 10155
+
+
 
 # RFC 0004: Modes of Collaboration
 

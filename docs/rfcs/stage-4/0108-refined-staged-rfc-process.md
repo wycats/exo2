@@ -2,6 +2,9 @@
 
 # RFC 108: Refined Staged RFC Process
 
+- **Supersedes**: RFC 0106
+
+
 
 # RFC 0108: Refined Staged RFC Process
 

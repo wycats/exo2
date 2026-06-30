@@ -3,6 +3,9 @@
 
 # RFC 10155: Modes of Collaboration
 
+- **Supersedes**: RFC 0004
+
+
 ## Summary
 
 Define distinct "Modes" (Thinking Partner, Chief of Staff, Maker) for the AI agent depending on the phase of work.
