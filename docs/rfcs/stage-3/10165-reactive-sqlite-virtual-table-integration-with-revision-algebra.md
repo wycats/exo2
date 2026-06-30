@@ -17,7 +17,7 @@
 > | ReactiveVTab (xUpdate)            | ✅ Complete       | Writable vtab writes mutate `*_data`, preserve the vtab write contract, persist `*_rev`, and bump `rowset_revisions` |
 > | RevisionStore                     | ✅ Complete       | `src/revisions.rs`                                                                                             |
 > | content_hash() function           | ✅ Complete       | `src/functions.rs`                                                                                             |
-> | Defensive mode + shadow boundary  | ✅ Complete       | `src/schema.rs`, `src/vtab/shadow.rs`; `xShadowName` and `SQLITE_DBCONFIG_DEFENSIVE` protect `*_data`/`*_rev` from ordinary direct writes |
+> | Defensive mode + shadow boundary  | ✅ Complete       | `crates/exosuit-storage/src/schema.rs`, `crates/exosuit-storage/src/vtab/shadow.rs`; `xShadowName` and `SQLITE_DBCONFIG_DEFENSIVE` protect `*_data`/`*_rev` from ordinary direct writes |
 > | SqliteLoader (read path)          | ✅ Complete       | `tools/exo/src/context/sqlite_loader.rs`                                                                       |
 > | TOML → SQLite migration           | ✅ Complete       | `tools/exo/src/command/migrate.rs`                                                                             |
 > | StorageBackend::Toml removal      | ✅ Complete       | Variant deleted, all TOML match arms removed                                                                   |
