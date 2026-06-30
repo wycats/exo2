@@ -13,7 +13,7 @@ Exo project context has four durable surfaces:
 - **Human-authored documents** carry design reasoning, specifications, research,
   manuals, and configuration.
 
-Repo, sidecar, and shadow policy decide who owns those surfaces. Repo policy
+Repo, sidecar, and shadow policies decide who owns those surfaces. Repo policy
 stores shared project state with the repository. Sidecar policy stores
 user-owned portable state outside the work repository. Shadow policy stores
 machine-local private state.
