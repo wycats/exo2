@@ -4,28 +4,26 @@
 
 ## Summary
 
-Exo persists project context as operational SQLite state at the resolved project
-state root. Repo, sidecar, and shadow policy determine whether Exo also emits a
-generated SQL portability projection and where that projection lives.
+Exo treats project context as durable operational state in SQLite at the
+resolved project state root. Repo, sidecar, and shadow policy determine the
+state root, the projection boundary, and the portability surface that carries
+that state across tools, machines, and repositories.
 
-`docs/agent-context` is a generated projection location under repo policy. It is
-not a human-authored project-memory directory.
+Under repo policy, `docs/agent-context` carries generated SQL projections.
+Durable project prose lives in RFCs, specifications, design notes, research
+notes, manuals, and configuration.
 
 ## Motivation
 
-Exo's context must survive across sessions, tools, worktrees, and machines. The
-original version of this RFC preserved that principle by requiring
-`docs/agent-context` to be checked into version control.
+Exo context must survive across sessions, tools, worktrees, and machines. The
+persistence policy gives that context one operational home and clear public
+surfaces around it.
 
-The current system keeps the same durability and portability goal, but the
-storage boundary has changed. Project context is now structured operational
-state, read and mutated through Exo commands. The filesystem carries two other
-kinds of material: generated projections for portability and human-authored
-documents for design reasoning.
-
-A stable persistence policy needs to name those roles separately so users,
-agents, and maintainers know where state lives, which files are generated, and
-where durable prose belongs.
+Project context is structured operational state, read and mutated through Exo
+commands. Generated projections make selected state portable and reviewable.
+Human-authored documents carry durable design reasoning. Keeping those roles
+separate lets users, agents, and maintainers understand where state lives, which
+files Exo regenerates, and where project prose belongs.
 
 ## Detailed Design
 
@@ -43,15 +41,14 @@ tasks, RFC metadata, ideas, inbox items, completion evidence, and related
 steering data. Exo commands and machine-channel operations read and mutate this
 state through the SQLite-backed command surface.
 
-Generated SQL files are portability projections of that database. They exist so
-selected operational state can be reviewed, diffed, synced, or reconstructed
-when the selected policy calls for that behavior. They are not a second source
-of truth, and production Exo code reads project state from SQLite rather than
-from the generated SQL files.
+Generated SQL files are portability projections of that database. They let
+selected operational state be reviewed, diffed, synced, or reconstructed when
+the selected policy calls for that behavior. SQLite remains the operational
+source of truth for Exo commands and services.
 
 Human-authored project knowledge lives in documents: RFCs, specifications,
-design notes, research notes, manuals, and tool configuration. Those files are
-not projections of SQLite state.
+design notes, research notes, manuals, and tool configuration. Documents carry
+design reasoning, usage guidance, and project intent.
 
 ### Policy-Specific Persistence
 
@@ -60,7 +57,7 @@ Project policy determines where the state root and generated projection live.
 | Policy | Operational State | Generated SQL Projection | Intended Use |
 | --- | --- | --- | --- |
 | `repo` | Repository-owned project state root. | `docs/agent-context/*.sql` in the work repository. | Team-owned Exo state that should be versioned with the repository. |
-| `sidecar` | Resolved sidecar-backed project state root. | Sidecar project `agent-context/*.sql`. | Private portable personal state for a work repository that should not carry Exo state in its public tree. |
+| `sidecar` | Resolved sidecar-backed project state root. | Sidecar project `agent-context/*.sql`. | Private portable personal state for a source/documentation repository whose Exo state lives outside its public tree. |
 | `shadow` | Machine-local project state root. | None by default. | Private state for one machine or one local user environment. |
 
 Repo policy is the only policy that writes generated SQL projections into the
@@ -72,13 +69,13 @@ sidecar project, outside the work repository. The sidecar key and sidecar root
 control that portable personal state. The work repository remains free of
 sidecar-owned generated context files.
 
-Shadow policy keeps Exo state local to the machine. It does not read from or
-write to workspace SQL projections by default.
+Shadow policy keeps Exo state local to the machine and leaves workspace SQL
+projections unset by default.
 
 ### Generated Projection Rules
 
-Generated SQL projections are infrastructure produced by Exo. They should be
-regenerated by Exo commands, not edited as human documents.
+Generated SQL projections are infrastructure produced by Exo. Exo commands
+regenerate them from operational state.
 
 The projection format and table order belong to RFC 10178. The classification
 of canonical state, tool configuration, and documents belongs to RFC 10180. This
@@ -95,24 +92,23 @@ The current durable prose homes are:
 - `docs/research/` for research checkpoints and reconstruction notes; and
 - ordinary repository configuration files for deterministic tool behavior.
 
-Authors should not place durable prose under `docs/agent-context`. In repo
-policy that directory is generated SQL output. In sidecar policy the analogous
-`agent-context` directory belongs to the sidecar projection. In shadow policy
-there is no workspace projection by default.
+Durable prose belongs in those document locations. Under repo policy,
+`docs/agent-context` carries generated SQL output. Under sidecar policy, the
+analogous `agent-context` directory belongs to the sidecar projection. Under
+shadow policy, machine-local state remains local by default.
 
-### Legacy Context Surfaces
+### Historical Context Surfaces
 
-Earlier Exo designs used mutable phase-context files and archive snapshots under
-`docs/agent-context/current` and `docs/agent-context/archive`. They also used
-TOML or Markdown files such as `plan.toml`, `implementation-plan.toml`,
-`task-list.toml`, `ideas.toml`, and `inbox.toml` as canonical or projected
-state.
+Readers may encounter older RFCs and migration notes that name mutable
+phase-context files, archive snapshots, or TOML/Markdown state files. Examples
+include `docs/agent-context/current`, `docs/agent-context/archive`, `plan.toml`,
+`implementation-plan.toml`, `task-list.toml`, `ideas.toml`, and `inbox.toml`.
 
-Those surfaces are historical context for older RFCs and migration notes. The
-current persistence policy is SQLite-backed operational state plus
-policy-controlled generated SQL projections. Phase completion no longer depends
-on a `complete-phase-transition` archive step, and merge-conflict policy for
-`task-list.md` is no longer part of the stable context persistence contract.
+Those names now map to the current persistence roles. Runtime state lives in
+SQLite. Policy-controlled SQL projections carry portable generated state.
+Documents carry durable prose. Phase completion, task views, ideas, inbox
+items, and completion evidence flow through the Exo state model and command
+surface.
 
 ### Shadow Terminology
 
@@ -137,50 +133,46 @@ models and mechanisms:
 - RFC 10165 defines reactive SQLite storage, virtual tables, shadow tables, row
   revisions, rowset revisions, and trace validation.
 
-The remaining RFC 10165 shadow-boundary status cleanup belongs to RFC 10165. It
-does not change this persistence policy: Exo operational state is SQLite-backed,
-and project policy controls generated projection placement.
+The remaining RFC 10165 shadow-boundary status cleanup belongs to RFC 10165.
+This persistence policy continues to use SQLite-backed operational state and
+policy-controlled generated projection placement.
 
-## Alternatives Considered
+## Design Guidance
 
-### Check In `docs/agent-context` As Human Context
+### Repository Projection As Generated SQL
 
-The original policy made all context visible in the repository by checking in
-`docs/agent-context`. That preserved history, but it mixed operational state,
-generated artifacts, mutable working context, and human-authored prose in one
-location.
+Repo policy keeps team-owned Exo state reviewable in Git through generated SQL
+under `docs/agent-context/*.sql`. That keeps the repository's state projection
+portable while preserving a clear distinction between generated operational
+data and human-authored documents.
 
-The current policy preserves durability while assigning each surface one role:
-SQLite for operational state, generated SQL for portability, and documents for
-prose.
+### Local-Only State
 
-### Ignore Exo Context Files Entirely
+Shadow policy gives a project private machine-local Exo state. It fits local
+experiments, private work, and environments where the repository should carry
+only source and documentation.
 
-Ignoring all context artifacts keeps the worktree clean, but it removes the
-portable/auditable representation that repo-policy projects need. Repo policy
-therefore writes generated SQL dumps when the repository owns Exo state.
+### Structured State Over TOML Or Markdown Projections
 
-### Keep TOML Or Markdown Projections Of State
-
-TOML and Markdown projections made state readable but created parallel update
-paths and stale derived files. RFC 10180 rejects that pattern for structured
-project state. Exo uses SQLite as the operational store and deterministic SQL
-dumps as the portability bridge.
+SQLite provides the operational state model for structured project data.
+Deterministic SQL dumps provide the portability bridge for policies that need a
+filesystem projection. RFC 10180 carries the classification rule that separates
+canonical state, generated projection, configuration, and documents.
 
 ### Use Sidecar Policy For Every Project
 
 Sidecar policy is the right fit for private portable personal state, especially
-when a public or team repository should not carry Exo state. Repo policy remains
-valid when the repository intentionally owns shared Exo state. Shadow policy
-remains valid for machine-local private state.
+when a public or team repository carries source and docs while Exo state stays
+portable in a sidecar project. Repo policy fits repositories that intentionally
+own shared Exo state. Shadow policy fits machine-local private state.
 
-## Unresolved Questions
+## Open Design Work
 
 - The exact exported table set and import ordering are owned by RFC 10178 and
   the Exo storage implementation.
-- Sidecar checkpointing, writer ownership, and sync failure recovery are owned
-  by sidecar-specific RFCs and command behavior.
-- Future lane-centered work may introduce additional scoped state views. Those
-  views should use the same persistence roles: SQLite for operational state,
+- Sidecar checkpointing, writer ownership, and sync failure recovery continue
+  in sidecar-specific RFCs and command behavior.
+- Future lane-centered work can introduce additional scoped state views while
+  keeping the same persistence roles: SQLite for operational state,
   policy-controlled generated projections for portability, and documents for
   human-authored design prose.
