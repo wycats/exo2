@@ -3,6 +3,9 @@
 
 # RFC 10153: Design Axioms
 
+- **Supersedes**: RFC 0002
+
+
 ## Summary
 
 Establish the fundamental principles that shape the Exosuit architecture and workflow.

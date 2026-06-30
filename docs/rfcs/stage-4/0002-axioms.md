@@ -2,6 +2,9 @@
 
 # RFC 2: Design Axioms
 
+- **Superseded by**: RFC 10153
+
+
 
 
 # RFC 0002: Design Axioms
