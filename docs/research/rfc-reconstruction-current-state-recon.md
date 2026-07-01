@@ -74,9 +74,9 @@ ambiguity is now narrow.
 | --- | --- | --- |
 | Duplicate numeric IDs | One remaining group: `0060` has active prompt-patterns and withdrawn dirty-tree steering records. | The clear-survivor numeric collision work landed; do not run ID-only lifecycle operations for `0060` until the prompt-patterns survivor is reviewed. |
 | Duplicate title families | 96 duplicate-title families affecting 193 managed RFC records. | Most remaining duplicate work is title/family consolidation rather than command-surface ambiguity. |
-| Stage 3/4 records | 42 managed records: 17 Stage 3 and 25 Stage 4. | This remains the first reconstruction surface because these records claim implemented or stable status. |
+| Stage 3/4 records | 41 managed records: 16 Stage 3 and 25 Stage 4. | This remains the first reconstruction surface because these records claim implemented or stable status. |
 | Archived records | `0022`, `0116`, and `0124` are archived. | `0022` is now completed project-state replacement history, not pending work. |
-| Withdrawn records | 114 records, including `0021` and the `0114` phase archive/current-file family. | Withdrawal work has removed several stale command/file-surface claims from the active corpus. |
+| Withdrawn records | 115 records, including `0021`, `0129`, and the `0114` phase archive/current-file family. | Withdrawal work has removed several stale command/file-surface claims from the active corpus. |
 
 ## Stage 3/4 Current-State Refresh
 
