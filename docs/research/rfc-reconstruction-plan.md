@@ -32,10 +32,10 @@ the Exo RFC command surface (`supersede`, `archive`, `withdraw`, `edit`,
   RFC `0114` and related current/archive-file RFCs were withdrawn, and RFC
   `10180` now names those phase context files as deleted legacy surfaces.
 - Recon validation found that some initial classifications needed sharper
-  wording: `0129` is an unimplemented placeholder/demotion candidate, `0121`
-  is materially implemented in the VS Code agent runtime layer, and `0123` is
-  best treated as a historical transition plan rather than as superseded by a
-  Stage 2 record.
+  wording: `0129` has now been withdrawn as an unimplemented configurable-runner
+  record, `0121` is materially implemented in the VS Code agent runtime layer,
+  and `0123` is best treated as a historical transition plan rather than as
+  superseded by a Stage 2 record.
 - The lane-centered workbench direction should influence what we do about
   drift, but this checkpoint does not implement lanes or rewrite RFCs around
   that design package.
@@ -136,7 +136,7 @@ or the RFC is rewritten around current behavior.
 | RFC | Status | Why |
 | ---: | --- | --- |
 | 0021 | withdrawn | Described `exo rfc triage`, but the current `rfc` command namespace has no gardener/triage operation. Withdrawn in the RFC 0021 triage-tooling PR. |
-| 0129 | candidate | Configurable TDD runners are not implemented; `exo status` can suggest `exo tdd`, but no `tdd` namespace or runner dispatch is registered. RFC 10165 already called this out as a demotion candidate. |
+| 0129 | withdrawn | Configurable TDD runners were never implemented in the current Exo command architecture; `0129` now records that lifecycle correction and future runner work should start as a fresh Stage 0/1 RFC. |
 
 ## Stage 3 Stabilization Candidates
 

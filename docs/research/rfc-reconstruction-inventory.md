@@ -7,13 +7,13 @@ This is not a final classification. It is a starting map: stage comes from the d
 ## Summary
 
 - Total RFC markdown files: 334
-- stage-0: 98
-- stage-1: 76
-- stage-2: 15
-- stage-3: 18
-- stage-4: 27
-- withdrawn: 96
-- archive: 2
+- stage-0: 90
+- stage-1: 71
+- stage-2: 12
+- stage-3: 16
+- stage-4: 25
+- withdrawn: 115
+- archive: 3
 - root: 2
 - Duplicate title families: 96
 - RFC files in duplicate families: 194
@@ -35,7 +35,7 @@ This is not a final classification. It is a starting map: stage comes from the d
 | `cli-command-for-axioms` | 2 | `stage-4` `156` CLI Command for Axioms (docs/rfcs/stage-4/0156-cli-command-for-axioms.md)<br>`withdrawn` `10152` CLI Command for Axioms (docs/rfcs/withdrawn/10152-cli-command-for-axioms.md) |
 | `code-based-mcp-runner` | 2 | `stage-0` `10082` Code-Based MCP Runner (docs/rfcs/stage-0/10082-code-based-mcp-runner.md)<br>`withdrawn` `161` Code-Based MCP Runner (docs/rfcs/withdrawn/0161-code-based-mcp.md) |
 | `coherence-bootstrap` | 2 | `stage-0` `51` Coherence Bootstrap (docs/rfcs/stage-0/0051-coherence-bootstrap.md)<br>`stage-0` `10068` Coherence Bootstrap (docs/rfcs/stage-0/10068-coherence-bootstrap.md) |
-| `configurable-tdd-runners` | 2 | `stage-3` `129` Configurable TDD Runners (docs/rfcs/stage-3/0129-configurable-tdd-runners.md)<br>`withdrawn` `10115` Configurable TDD Runners (docs/rfcs/withdrawn/10115-configurable-tdd-runners.md) |
+| `configurable-tdd-runners` | 2 | `withdrawn` `129` Configurable TDD Runners (docs/rfcs/withdrawn/0129-configurable-tdd-runners.md)<br>`withdrawn` `10115` Configurable TDD Runners (docs/rfcs/withdrawn/10115-configurable-tdd-runners.md) |
 | `consolidate-agent-workflow-into-status` | 2 | `stage-0` `10056` Consolidate Agent Workflow into rfc-status (docs/rfcs/stage-0/10056-consolidate-agent-workflow-into-rfc-status.md)<br>`withdrawn` `19` Consolidate Agent Workflow into rfc-status (docs/rfcs/withdrawn/0019-rfc-status-commands.md) |
 | `cwd-discipline-and-wrong-directory-mitigation` | 2 | `stage-0` `10084` CWD Discipline & Wrong Directory Mitigation (docs/rfcs/stage-0/10084-cwd-discipline-wrong-directory-mitigation.md)<br>`withdrawn` `163` CWD Discipline & Wrong Directory Mitigation (docs/rfcs/withdrawn/0163-cwd-discipline.md) |
 | `dashboard-v2` | 2 | `stage-2` `10136` Dashboard V2 (docs/rfcs/stage-2/10136-dashboard-v2.md)<br>`withdrawn` `126` Dashboard V2 (docs/rfcs/withdrawn/0126-dashboard-v2.md) |
@@ -174,7 +174,7 @@ id is repaired or a canonical survivor is selected.
 | `stage-3` | 81 | Exohook: File Expansion Worked Examples | `exohook-file-expansion-worked-examples` | `docs/rfcs/stage-3/0081-exohook-file-expansion-worked-examples.md` |
 | `stage-3` | 125 | Exosuit Capability Tree + Machine Channel v1 |  | `docs/rfcs/stage-3/0125-exosuit-capability-tree-machine-channel-v1.md` |
 | `stage-3` | 128 | The Exo-Shell Pattern (Unified Command Interface) |  | `docs/rfcs/stage-3/0128-the-exo-shell-pattern-unified-command-interface.md` |
-| `stage-3` | 129 | Configurable TDD Runners | `configurable-tdd-runners` | `docs/rfcs/stage-3/0129-configurable-tdd-runners.md` |
+| `withdrawn` | 129 | Configurable TDD Runners | `configurable-tdd-runners` | `docs/rfcs/withdrawn/0129-configurable-tdd-runners.md` |
 | `stage-3` | 130 | ULID-like Identifiers, Ordering Projections, and Human Slugs | `ulid-like-identifiers-ordering-projections-and-human-slugs` | `docs/rfcs/stage-3/0130-ulid-like-identifiers-ordering-projections-and-human-slugs.md` |
 | `stage-3` | 132 | CLI Patterns: Command Spec, Router, and Tool-Safe DSL |  | `docs/rfcs/stage-3/0132-cli-patterns-command-spec-router-and-tool-safe-dsl.md` |
 | `stage-3` | 136 | LM Tool Architecture v2 |  | `docs/rfcs/stage-3/0136-lm-tool-architecture-v2.md` |
