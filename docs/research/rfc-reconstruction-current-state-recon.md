@@ -61,10 +61,10 @@ Two of those are support files (`README.md` and `0000-template.md`), leaving
 | `stage-0` | 90 |
 | `stage-1` | 71 |
 | `stage-2` | 12 |
-| `stage-3` | 17 |
+| `stage-3` | 16 |
 | `stage-4` | 25 |
 | `archive` | 3 |
-| `withdrawn` | 114 |
+| `withdrawn` | 115 |
 | **Total managed records** | **332** |
 
 The current managed corpus still has broad title duplication, but numeric ID
@@ -89,7 +89,7 @@ rows have changed since it was written.
 | `0022` | Archived and superseded by `10176`. | `exo rfc show 0022` reports archived and `Superseded by: RFC 10176`. | Complete. Keep as implemented history; use `10176` as the project-state anchor. |
 | `0114` family | Withdrawn with the phase archive/current-file cleanup. | PR `#187` outcome and withdrawn RFC files. | Complete. Do not revive `docs/agent-context/current` or archive-file persistence language. |
 | `0121` | Implemented core remains current, with adjacent runtime drift. | VS Code `AgentRuntime` exists; MCP proxy/daemon lifecycle are separate strata. | Keep, then trim if later stabilization work needs sharper boundaries. |
-| `0129` | Stage 3 claim remains stale. | No registered `exo tdd` namespace or runner dispatch in the command registry. | Demote, withdraw, or rewrite as a future TDD runner plan after higher-priority stable cleanup. |
+| `0129` | Withdrawn. | No registered `exo tdd` namespace or runner dispatch exists in the current command registry. | Complete. Preserve adjacent TDD steering and metadata as implementation evidence; start future configurable-runner work as a fresh Stage 0/1 RFC. |
 | `10154` | Stable text is stale. | The RFC still says to check in `docs/agent-context`; current policy uses SQLite plus repo/sidecar/shadow projection rules. | Next rewrite target. Rewrite in place as current Stage 4 persistence policy. |
 | `10165` | Storage contract mostly implemented; text still contains an internal shadow-boundary contradiction. | `ReactiveVTab` implements `UpdateVTab`; `SqliteWriter` writes through reactive tables; the RFC says both that defensive shadow boundary is complete and that `xShadowName` enforcement remains incomplete. | Follow-up correction after `10154`, or pair with storage-status cleanup if the contradiction blocks readers. |
 | `10176` | Current project-state anchor. | SQLite migrations and Exo context commands use the epoch/phase/goal/task model; `0022` now points here. | Keep as the current reference. Later stabilization can promote or rewrite after adjacent stable records are cleaned. |
@@ -125,7 +125,7 @@ processed.
 | 3 | Correct RFC `10165` storage status wording. | The storage implementation landed, but the RFC simultaneously says the shadow boundary is complete and that `xShadowName` enforcement remains incomplete. | Narrow RFC edit that marks ordinary write mediation complete and shadow-table enforcement as the remaining hardening item unless code evidence changes. |
 | 4 | Re-check Stage 3/4 canonical stable duplicates. | `0002 -> 10153`, `0004 -> 10155`, `0020 -> 10159`, `0024 -> 10162`, and `0106 -> 0108` were recorded in Exo state, but the active markdown still contains duplicate stable records. | Reviewed lifecycle PRs that make the markdown/read surfaces reflect the selected canonical records. |
 | 5 | Resolve remaining numeric ID collision `0060`. | It is the only remaining duplicate numeric ID and still makes ID-only RFC operations unsafe for that number. | Review whether `stage-1/0060-prompt-patterns-promptspec-resourcespec-and-cross-spec-interpolation.md` remains the `0060` survivor, then repair `withdrawn/0060-phase-aware-dirty-working-tree-steering.md` as a duplicate/historical record behind canonical dirty-tree RFC `0117`. |
-| 6 | Process high-value Stage 3 drift. | `0129`, `0132`, `0136`, `10170`, and `10179` still need demotion, trimming, or stabilization decisions. | One focused PR per cluster; avoid mixing unrelated Stage 3 cleanup. |
+| 6 | Process high-value Stage 3 drift. | `0129` is withdrawn; `0132`, `0136`, `10170`, and `10179` still need trimming or stabilization decisions. | Continue with `10179` stabilization cleanup, then pair `0132`/`0136`, then trim/stabilize `10170`. |
 | 7 | Consolidate Stage 0/1 duplicate-title families. | 96 duplicate-title families remain, mostly future-work/history cleanup. | Batch by topic family after the Stage 3/4 surface is coherent. |
 | 8 | Decide lane adoption RFC shape. | The lane-centered package is current design direction but not yet an RFC adoption record. | Small adoption RFC or manual/current-architecture note after initial lane implementation planning starts. |
 
