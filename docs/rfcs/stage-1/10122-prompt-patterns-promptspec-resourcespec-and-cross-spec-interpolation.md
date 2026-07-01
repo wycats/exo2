@@ -3,5 +3,6 @@
 
 # RFC 10122: Prompt Patterns: PromptSpec, ResourceSpec, and Cross-Spec Interpolation
 
+- **Superseded by**: RFC 0060
 
 Write your RFC content here.
