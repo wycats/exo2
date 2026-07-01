@@ -22,7 +22,9 @@ hand-authored command strings.
   scope for CommandSpec validation until Exo grows a typed external-action
   model.
 - **Legacy Exo surfaces**: Exo-authored command strings that are not currently
-  represented in CommandSpec, such as the old `exo tdd new ...` steering.
+  represented in CommandSpec. The representative obsolete TDD steering sample
+  has been removed because the current Exo command surface no longer exposes a
+  `tdd` namespace.
 
 ## First Findings
 
@@ -37,6 +39,9 @@ hand-authored command strings.
   `command`. The harness classifies them as human actions for now; the typed
   command-reference slice should split command invocations from human
   validation prompts.
+- The obsolete TDD steering sample was removed from the representative
+  inventory. Current verification guidance should start or complete tasks and
+  record evidence through task logs, verification rows, and completion outcomes.
 
 ## Next Inventory Expansion
 

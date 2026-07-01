@@ -656,7 +656,8 @@ pub fn derive_phase_steering(
         WorkIntent::Record
     };
 
-    // Note: active TDD steering (red/green) is injected at world-steering level.
+    // Verification evidence is recorded through task logs, verification rows,
+    // and completion outcomes rather than an addressable TDD command surface.
 
     if let Some((next_goal_name, goal)) = &next_pending_goal_data {
         // Check if this is a promotion goal (has rfc + target_stage)
@@ -682,14 +683,14 @@ pub fn derive_phase_steering(
                 Some(0.85),
             ));
         } else {
-            // With task-level TDD, we can only start TDD once a concrete task exists.
-            // If tasks exist, suggest starting TDD for the first pending task.
+            // Regular phases advance through concrete tasks. Verification is
+            // recorded as evidence on the task before completion.
             if let Some((task_id, task_label, _)) = tasks.iter().find(|(_, _, s)| s == "pending") {
-                next_actions.push(SuggestedAction::legacy_exo_surface(
-                    "Start TDD cycle for next task",
-                    format!("exo tdd new -n \"{task_id}\" -t <test-file>"),
+                next_actions.push(SuggestedAction::exo(
+                    "Start next task",
+                    ExoCommandReference::new(&["task", "start"]).positional(task_id.clone()),
                     format!(
-                        "Goal '{next_goal_name}' is pending. Task '{task_label}' exists — start TDD at the task level.",
+                        "Goal '{next_goal_name}' is pending. Task '{task_label}' exists — start the task, then record verification evidence before completion.",
                     ),
                     WorkIntent::Execute,
                     Some(0.85),
@@ -2240,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_phase_suggests_tdd_for_pending_task() {
+    fn regular_phase_suggests_task_start_for_pending_task() {
         let goals = vec![Goal {
             id: "g1".to_string(),
             label: "Test goal".to_string(),
@@ -2261,8 +2262,25 @@ mod tests {
             "pending".to_string(),
         )];
         let block = super::derive_phase_steering(&tasks, &goals, PhaseKind::Regular);
+        let start_action = block
+            .next_actions
+            .iter()
+            .find(|a| a.label == "Start next task");
+        assert!(
+            start_action.is_some(),
+            "Regular phase should suggest starting the pending task"
+        );
+        let start_action = start_action.unwrap();
+        assert_eq!(start_action.command, "exo task start 'g1::t1'");
+        assert!(
+            start_action.rationale.contains("verification evidence"),
+            "Regular phase should route verification through current evidence surfaces"
+        );
         let tdd_action = block.next_actions.iter().find(|a| a.label.contains("TDD"));
-        assert!(tdd_action.is_some(), "Regular phase should suggest TDD");
+        assert!(
+            tdd_action.is_none(),
+            "Regular phase should not suggest unavailable TDD commands"
+        );
         assert!(
             block
                 .next_actions

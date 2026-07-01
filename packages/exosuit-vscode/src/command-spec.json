@@ -2463,6 +2463,24 @@
               "value_type": "string",
               "optional": false,
               "repeatable": false
+            },
+            {
+              "id": "path",
+              "name": "path",
+              "description": "RFC file path to repair",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "renumber-to",
+              "name": "renumber-to",
+              "description": "Assign a new numeric RFC ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
             }
           ]
         },

@@ -190,11 +190,6 @@ pub fn representative_command_guidance_inventory() -> Vec<CommandGuidance> {
             "Describe what is complete and ask for confirmation.",
         ),
         CommandGuidance::external_shell("phase.git-status", "phase finish recovery", "git status"),
-        CommandGuidance::legacy_exo_surface(
-            "steering.tdd-new",
-            "runtime steering",
-            "exo tdd new -n \"<task-id>\" -t <test-file>",
-        ),
     ]
 }
 

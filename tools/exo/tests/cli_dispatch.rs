@@ -139,12 +139,6 @@ fn namespace_dispatches_without_panic(backend: &str) {
             require_success: true,
         },
         DispatchCase {
-            name: "tdd",
-            args: vec!["tdd", "--help"],
-            expect_json: false,
-            require_success: true,
-        },
-        DispatchCase {
             name: "commit",
             args: vec!["--format", "json", "commit", "status"],
             expect_json: true,
