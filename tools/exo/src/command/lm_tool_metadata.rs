@@ -242,7 +242,7 @@ const LM_TOOL_OVERRIDES: &[LmToolOverride] = &[
         user_description: "Start a phase by ID.",
         model_description: r"Starts a phase, making it the active phase for the project.
 
-Phases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony — no TDD nudges, no RFC linkage requirement. Use chore for maintenance, cleanup, or housekeeping work.
+Phases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony for maintenance, cleanup, and housekeeping work.
 
 **Use this when**: User says 'start the next phase' or 'begin phase X'.
 
@@ -311,42 +311,6 @@ Phases have a `kind`: **regular** (default) or **chore**. Chore phases have ligh
 **Use this when**: Recording intermediate progress, decisions, or notes during task execution.
 
 **Do NOT use when**: The task is finished (use exo-task-complete instead).",
-    },
-    LmToolOverride {
-        namespace: "tdd",
-        operation: "new",
-        tool_reference_name: "tdd-start",
-        display_name: "Start TDD Cycle",
-        icon: "$(beaker)",
-        when_clause: Some("exosuit.hasActivePhase"),
-        tags: &["exosuit", "tdd", "mutation"],
-        tool_sets: &["exo-tasks"],
-        user_description: "Start a new TDD cycle for a task.",
-        model_description: "Starts a new TDD cycle for a task. Run BEFORE writing code. Marks the task as TDD RED (tdd_status=red) and records the test file. Instructs you to write a failing test first.",
-    },
-    LmToolOverride {
-        namespace: "tdd",
-        operation: "red",
-        tool_reference_name: "tdd-red",
-        display_name: "Confirm TDD Red",
-        icon: "$(circle-slash)",
-        when_clause: Some("exosuit.hasActivePhase"),
-        tags: &["exosuit", "tdd", "mutation"],
-        tool_sets: &["exo-tasks"],
-        user_description: "Confirm the failing test (red phase).",
-        model_description: "Confirms the test is failing (red phase). Run after writing a failing test. Moves the active task to TDD GREEN (tdd_status=green).",
-    },
-    LmToolOverride {
-        namespace: "tdd",
-        operation: "green",
-        tool_reference_name: "tdd-green",
-        display_name: "Confirm TDD Green",
-        icon: "$(check)",
-        when_clause: Some("exosuit.hasActivePhase"),
-        tags: &["exosuit", "tdd", "mutation"],
-        tool_sets: &["exo-tasks"],
-        user_description: "Confirm the tests pass (green phase).",
-        model_description: "Confirms the test is passing (green phase). Run after implementation passes tests. Leaves tdd_status=green as evidence and clears the active TDD pointer; complete the task separately with exo-task-complete.",
     },
     LmToolOverride {
         namespace: "task",

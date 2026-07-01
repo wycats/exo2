@@ -304,10 +304,6 @@ fn explain_command(command: &str) -> (Vec<String>, Vec<String>) {
         preconditions.push("An active phase exists".to_string());
         preconditions.push("Task id exists in the active phase".to_string());
         effects.push("Updates task status in SQLite state".to_string());
-    } else if command.starts_with("exo tdd ") {
-        effects.push(
-            "Updates task-level TDD state (tdd_status red/green) for the active task".to_string(),
-        );
     }
 
     (preconditions, effects)

@@ -1866,7 +1866,7 @@
           ],
           "lm_tool": {
             "displayName": "Start Phase",
-            "modelDescription": "Starts a phase, making it the active phase for the project.\n\nPhases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony — no TDD nudges, no RFC linkage requirement. Use chore for maintenance, cleanup, or housekeeping work.\n\n**Use this when**: User says 'start the next phase' or 'begin phase X'.\n\n**Do NOT use when**: A phase is already active (check exo-status).",
+            "modelDescription": "Starts a phase, making it the active phase for the project.\n\nPhases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony for maintenance, cleanup, and housekeeping work.\n\n**Use this when**: User says 'start the next phase' or 'begin phase X'.\n\n**Do NOT use when**: A phase is already active (check exo-status).",
             "userDescription": "Start a phase by ID.",
             "icon": "$(play)",
             "when": "exosuit.projectInitialized",
@@ -2462,6 +2462,24 @@
               "kind": "positional",
               "value_type": "string",
               "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "path",
+              "name": "path",
+              "description": "RFC file path to repair",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "renumber-to",
+              "name": "renumber-to",
+              "description": "Assign a new numeric RFC ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
               "repeatable": false
             }
           ]

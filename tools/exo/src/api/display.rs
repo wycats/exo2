@@ -59,7 +59,6 @@ pub fn tier_for_command(namespace: &str, operation: &str) -> DisplayTier {
         ("inbox", "add") => DisplayTier::OptionPreview {
             option_key: "subject",
         },
-        ("tdd", "new") => DisplayTier::OptionPreview { option_key: "name" },
 
         // Generic tier: everything else
         _ => DisplayTier::Generic,
@@ -278,8 +277,6 @@ fn past_tense_verb_for_operation(operation: &str) -> &'static str {
         "ack" => "Acknowledged",
         "resolve" => "Resolved",
         "new" => "Started",
-        "red" => "Confirmed test fails",
-        "green" => "Confirmed test passes",
         "review" => "Reviewed",
         "bankrupt" => "Bankrupted",
         "history" => "Showed",
@@ -328,8 +325,6 @@ fn verb_for_operation(operation: &str) -> &'static str {
         "ack" => "Acknowledging",
         "resolve" => "Resolving",
         "new" => "Starting",
-        "red" => "Confirming test fails",
-        "green" => "Confirming test passes",
         "review" => "Reviewing",
         "bankrupt" => "Bankrupting",
         "history" => "Showing",
@@ -380,9 +375,6 @@ fn noun_for_namespace(namespace: &str, operation: &str) -> String {
         ("idea", "to-rfc") => "idea to RFC".to_string(),
         ("idea", _) => if is_list { "ideas" } else { "idea" }.to_string(),
         ("inbox", _) => if is_list { "inbox" } else { "inbox item" }.to_string(),
-        ("tdd", "new") => "TDD cycle".to_string(),
-        ("tdd", "red") => "(RED)".to_string(),
-        ("tdd", "green") => "(GREEN)".to_string(),
 
         // Infrastructure
         ("commit", "create") => "commit".to_string(),
@@ -518,10 +510,6 @@ mod tests {
                 option_key: "subject"
             }
         ));
-        assert!(matches!(
-            tier_for_command("tdd", "new"),
-            DisplayTier::OptionPreview { option_key: "name" }
-        ));
     }
 
     #[test]
@@ -612,28 +600,6 @@ mod tests {
         assert_eq!(
             generate_preview_message("rfc", "show", &input),
             "Showing RFC '00224'"
-        );
-    }
-
-    #[test]
-    fn test_preview_message_tdd_new() {
-        let input = json!({"name": "preview-roundtrip::handle-preview"});
-        assert_eq!(
-            generate_preview_message("tdd", "new", &input),
-            "Starting TDD cycle \"preview-roundtrip::handle-preview\""
-        );
-    }
-
-    #[test]
-    fn test_preview_message_tdd_red_green() {
-        let input = json!({});
-        assert_eq!(
-            generate_preview_message("tdd", "red", &input),
-            "Confirming test fails (RED)"
-        );
-        assert_eq!(
-            generate_preview_message("tdd", "green", &input),
-            "Confirming test passes (GREEN)"
         );
     }
 
@@ -921,19 +887,6 @@ mod tests {
         assert_eq!(
             generate_past_tense_message("idea", "add", &input),
             "Added idea \"Symbol rename as a tool\""
-        );
-    }
-
-    #[test]
-    fn test_past_tense_tdd_red_green() {
-        let input = json!({});
-        assert_eq!(
-            generate_past_tense_message("tdd", "red", &input),
-            "Confirmed test fails (RED)"
-        );
-        assert_eq!(
-            generate_past_tense_message("tdd", "green", &input),
-            "Confirmed test passes (GREEN)"
         );
     }
 

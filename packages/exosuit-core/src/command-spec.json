@@ -58,6 +58,16 @@
               "optional": true,
               "default": "false",
               "repeatable": false
+            },
+            {
+              "id": "before-summary",
+              "name": "before-summary",
+              "description": "Get turns before the last summarization (context that was just compacted)",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
             }
           ],
           "lm_tool": {
@@ -66,9 +76,14 @@
             "userDescription": "Read recent conversation history from this chat session.",
             "icon": "$(history)",
             "toolReferenceName": "ai-chat-history",
-            "tags": ["exosuit", "context"],
+            "tags": [
+              "exosuit",
+              "context"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-context-ops"]
+            "toolSets": [
+              "exo-context-ops"
+            ]
           }
         },
         "context": {
@@ -103,7 +118,11 @@
             "userDescription": "Get full project context for session handoff.",
             "icon": "$(book)",
             "toolReferenceName": "context",
-            "tags": ["exosuit", "context", "handoff"],
+            "tags": [
+              "exosuit",
+              "context",
+              "handoff"
+            ],
             "canBeReferencedInPrompt": true
           }
         },
@@ -276,6 +295,30 @@
           "effect": "write",
           "needs_upgrade_gate": false,
           "args": []
+        },
+        "snapshot": {
+          "name": "snapshot",
+          "description": "Return full workspace state snapshot (plan, inbox, ideas) as JSON",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "validate-trace": {
+          "name": "validate-trace",
+          "description": "Validate a cached reactive trace against current revisions",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "trace_json",
+              "name": "trace_json",
+              "description": "JSON-serialized trace to validate",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
         }
       }
     },
@@ -330,6 +373,90 @@
               "description": "Docs link options",
               "kind": "option",
               "value_type": "json",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        }
+      }
+    },
+    "dogfood": {
+      "name": "dogfood",
+      "description": "Dogfood activation probes",
+      "operations": {
+        "receipt": {
+          "name": "receipt",
+          "description": "Save the dogfood activation baseline for this workspace",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "repair": {
+          "name": "repair",
+          "description": "Preview guided repair for divergent dogfood sidecar state",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "apply",
+              "name": "apply",
+              "description": "Apply the guided repair after confirmation",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "restart": {
+          "name": "restart",
+          "description": "Refresh Exo runtime health without terminating durable transports",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "verify": {
+          "name": "verify",
+          "description": "Verify Exosuit dogfood activation identity and state paths",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "skip-receipt",
+              "name": "skip-receipt",
+              "description": "Skip saved activation baseline comparison for pre-baseline checks",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            },
+            {
+              "id": "require-daemon",
+              "name": "require-daemon",
+              "description": "Require the workspace daemon socket to be reachable",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            },
+            {
+              "id": "extension-build-stamp",
+              "name": "extension-build-stamp",
+              "description": "VS Code extension build stamp, when invoked by the extension",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "extension-path",
+              "name": "extension-path",
+              "description": "VS Code extension installation path, when invoked by the extension",
+              "kind": "option",
+              "value_type": "string",
               "optional": true,
               "repeatable": false
             }
@@ -397,9 +524,15 @@
             "userDescription": "Finish the current active epoch.",
             "icon": "$(check)",
             "toolReferenceName": "epoch-finish",
-            "tags": ["exosuit", "epoch", "lifecycle"],
+            "tags": [
+              "exosuit",
+              "epoch",
+              "lifecycle"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-project"]
+            "toolSets": [
+              "exo-project"
+            ]
           }
         },
         "list": {
@@ -414,9 +547,14 @@
             "userDescription": "List all epochs with status.",
             "icon": "$(list-tree)",
             "toolReferenceName": "epoch-list",
-            "tags": ["exosuit", "epoch"],
+            "tags": [
+              "exosuit",
+              "epoch"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-project"]
+            "toolSets": [
+              "exo-project"
+            ]
           }
         },
         "remove": {
@@ -429,6 +567,32 @@
               "id": "id",
               "name": "id",
               "description": "The epoch ID to remove",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "reorder": {
+          "name": "reorder",
+          "description": "Reorder an epoch",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The epoch ID to reorder",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "position",
+              "name": "position",
+              "description": "Target position: top, bottom, before:<id>, or after:<id>",
               "kind": "positional",
               "value_type": "string",
               "optional": false,
@@ -475,9 +639,15 @@
             "userDescription": "Start an epoch by ID.",
             "icon": "$(play)",
             "toolReferenceName": "epoch-start",
-            "tags": ["exosuit", "epoch", "lifecycle"],
+            "tags": [
+              "exosuit",
+              "epoch",
+              "lifecycle"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-project"]
+            "toolSets": [
+              "exo-project"
+            ]
           }
         },
         "status": {
@@ -496,167 +666,29 @@
               "repeatable": false
             }
           ]
-        }
-      }
-    },
-    "feedback": {
-      "name": "feedback",
-      "description": "Feedback thread management commands",
-      "operations": {
-        "thread.create": {
-          "name": "thread.create",
-          "description": "Create a feedback thread",
+        },
+        "update": {
+          "name": "update",
+          "description": "Update epoch metadata",
           "effect": "write",
           "needs_upgrade_gate": false,
           "args": [
             {
-              "id": "target-file",
-              "name": "target-file",
-              "description": "Target file path",
-              "kind": "option",
+              "id": "id",
+              "name": "id",
+              "description": "The epoch ID to update",
+              "kind": "positional",
               "value_type": "string",
               "optional": false,
               "repeatable": false
             },
             {
-              "id": "target-id",
-              "name": "target-id",
-              "description": "Target element ID",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "repeatable": false
-            },
-            {
-              "id": "target-field",
-              "name": "target-field",
-              "description": "Target field",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "repeatable": false
-            },
-            {
-              "id": "status",
-              "name": "status",
-              "description": "Thread status",
+              "id": "title",
+              "name": "title",
+              "description": "New title for the epoch",
               "kind": "option",
               "value_type": "string",
               "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "author",
-              "name": "author",
-              "description": "Author name",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "content",
-              "name": "content",
-              "description": "Message content",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "tags",
-              "name": "tags",
-              "description": "Tags for the thread",
-              "kind": "option",
-              "value_type": "json",
-              "optional": true,
-              "repeatable": false
-            }
-          ]
-        },
-        "thread.reply": {
-          "name": "thread.reply",
-          "description": "Reply to a feedback thread",
-          "effect": "write",
-          "needs_upgrade_gate": false,
-          "args": [
-            {
-              "id": "thread-id",
-              "name": "thread-id",
-              "description": "Thread ID",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "author",
-              "name": "author",
-              "description": "Author name",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "content",
-              "name": "content",
-              "description": "Message content",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            }
-          ]
-        },
-        "thread.status": {
-          "name": "thread.status",
-          "description": "Update feedback thread status",
-          "effect": "write",
-          "needs_upgrade_gate": false,
-          "args": [
-            {
-              "id": "thread-id",
-              "name": "thread-id",
-              "description": "Thread ID",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            },
-            {
-              "id": "status",
-              "name": "status",
-              "description": "Thread status",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "repeatable": false
-            }
-          ]
-        },
-        "threads": {
-          "name": "threads",
-          "description": "List feedback threads",
-          "effect": "pure",
-          "needs_upgrade_gate": false,
-          "args": [
-            {
-              "id": "cursor",
-              "name": "cursor",
-              "description": "Pagination cursor",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "repeatable": false
-            },
-            {
-              "id": "limit",
-              "name": "limit",
-              "description": "Pagination limit",
-              "kind": "option",
-              "value_type": "int",
-              "optional": true,
               "repeatable": false
             }
           ]
@@ -785,14 +817,20 @@
             "icon": "$(add)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "add-goal",
-            "tags": ["exosuit", "mutation", "goal"],
+            "tags": [
+              "exosuit",
+              "mutation",
+              "goal"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "complete": {
           "name": "complete",
-          "description": "Mark a goal complete with a log message",
+          "description": "Record a goal's completed outcome",
           "effect": "write",
           "needs_upgrade_gate": true,
           "args": [
@@ -808,7 +846,7 @@
             {
               "id": "log",
               "name": "log",
-              "description": "Completion log message (defaults to 'Completed' if omitted)",
+              "description": "Completed outcome summary (stored as the completion log; defaults to 'Completed' if omitted)",
               "kind": "option",
               "value_type": "string",
               "optional": true,
@@ -829,10 +867,51 @@
             "userDescription": "List goals (planning tasks) in the active phase.",
             "icon": "$(target)",
             "toolReferenceName": "goal-list",
-            "tags": ["exosuit", "goal", "list"],
+            "tags": [
+              "exosuit",
+              "goal",
+              "list"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-discovery"]
+            "toolSets": [
+              "exo-discovery"
+            ]
           }
+        },
+        "move": {
+          "name": "move",
+          "description": "Move a goal to another phase",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The goal ID to move",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "phase",
+              "name": "phase",
+              "description": "Target phase ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "position",
+              "name": "position",
+              "description": "Target position: top, bottom, before:<id>, or after:<id>",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
         },
         "remove": {
           "name": "remove",
@@ -862,7 +941,7 @@
         },
         "reorder": {
           "name": "reorder",
-          "description": "Reorder a goal within the active phase",
+          "description": "Reorder a goal within its phase",
           "effect": "write",
           "needs_upgrade_gate": false,
           "args": [
@@ -878,7 +957,7 @@
             {
               "id": "position",
               "name": "position",
-              "description": "Target position (0-indexed number, 'top', or 'bottom')",
+              "description": "Target position: top, bottom, before:<id>, or after:<id>",
               "kind": "positional",
               "value_type": "string",
               "optional": false,
@@ -959,7 +1038,11 @@
             "icon": "$(lightbulb)",
             "when": "exosuit.projectInitialized",
             "toolReferenceName": "idea",
-            "tags": ["exosuit", "mutation", "idea"],
+            "tags": [
+              "exosuit",
+              "mutation",
+              "idea"
+            ],
             "canBeReferencedInPrompt": true
           }
         },
@@ -1002,6 +1085,23 @@
               "kind": "option",
               "value_type": "int",
               "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "show": {
+          "name": "show",
+          "description": "Show details of a specific idea",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The ID (or prefix) of the idea to show",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
               "repeatable": false
             }
           ]
@@ -1071,13 +1171,61 @@
               "repeatable": false
             },
             {
-              "id": "category",
-              "name": "category",
-              "description": "Category: correction, guidance, question, priority",
+              "id": "entity-type",
+              "name": "entity-type",
+              "description": "Entity type: goal, task, rfc, phase, epoch, project",
               "kind": "option",
               "value_type": "string",
               "optional": true,
-              "default": "guidance",
+              "default": "project",
+              "repeatable": false
+            },
+            {
+              "id": "entity-id",
+              "name": "entity-id",
+              "description": "Entity ID (required for non-project types)",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "source",
+              "name": "source",
+              "description": "Source: user-feedback, system-observation, plan-mutation",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "default": "user-feedback",
+              "repeatable": false
+            },
+            {
+              "id": "intent",
+              "name": "intent",
+              "description": "Intent: claim, concern, inquiry, fyi",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "default": "fyi",
+              "repeatable": false
+            },
+            {
+              "id": "priority",
+              "name": "priority",
+              "description": "Priority: immediate, next-touch, when-relevant",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "default": "next-touch",
+              "repeatable": false
+            },
+            {
+              "id": "confidence",
+              "name": "confidence",
+              "description": "Confidence: high, low (only for claim intent)",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
               "repeatable": false
             },
             {
@@ -1091,47 +1239,9 @@
               "repeatable": false
             },
             {
-              "id": "scope",
-              "name": "scope",
-              "description": "Scope: global, rust, typescript, or phase:<id> or file:<path>",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "default": "global",
-              "repeatable": false
-            },
-            {
-              "id": "urgency",
-              "name": "urgency",
-              "description": "Urgency: immediate, next-touch, when-relevant",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "default": "next-touch",
-              "repeatable": false
-            },
-            {
-              "id": "subject-ref",
-              "name": "subject-ref",
-              "description": "Subject reference: goal:<slug>, task:<id>, phase:<id>, rfc:<id>",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "repeatable": false
-            },
-            {
-              "id": "action",
-              "name": "action",
-              "description": "Action to take (e.g. complete-goal or toml type = \"complete-goal\")",
-              "kind": "option",
-              "value_type": "string",
-              "optional": true,
-              "repeatable": false
-            },
-            {
-              "id": "relevance",
-              "name": "relevance",
-              "description": "Relevance score (0.0 - 1.0)",
+              "id": "action-json",
+              "name": "action-json",
+              "description": "Machine-readable action payload JSON for agent-applied recommendations",
               "kind": "option",
               "value_type": "string",
               "optional": true,
@@ -1172,6 +1282,33 @@
               "repeatable": false
             },
             {
+              "id": "entity-type",
+              "name": "entity-type",
+              "description": "Filter by entity type: goal, task, rfc, phase, epoch, project",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "entity-id",
+              "name": "entity-id",
+              "description": "Filter by entity ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "source",
+              "name": "source",
+              "description": "Filter by source: user-feedback, system-observation, plan-mutation",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
               "id": "limit",
               "name": "limit",
               "description": "Maximum number of items",
@@ -1188,7 +1325,10 @@
             "icon": "$(inbox)",
             "when": "exosuit.projectInitialized",
             "toolReferenceName": "inbox",
-            "tags": ["exosuit", "inbox"],
+            "tags": [
+              "exosuit",
+              "inbox"
+            ],
             "canBeReferencedInPrompt": true
           }
         },
@@ -1211,6 +1351,15 @@
               "id": "resolution",
               "name": "resolution",
               "description": "Resolution note",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "promote",
+              "name": "promote",
+              "description": "Promote to: goal or idea",
               "kind": "option",
               "value_type": "string",
               "optional": true,
@@ -1481,10 +1630,33 @@
             "icon": "$(check)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "phase-finish",
-            "tags": ["exosuit", "phase", "lifecycle"],
+            "tags": [
+              "exosuit",
+              "phase",
+              "lifecycle"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-project"]
+            "toolSets": [
+              "exo-project"
+            ]
           }
+        },
+        "focus": {
+          "name": "focus",
+          "description": "Focus a phase in this workspace without claiming ownership",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID to focus",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
         },
         "history": {
           "name": "history",
@@ -1499,6 +1671,126 @@
               "kind": "option",
               "value_type": "int",
               "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "list": {
+          "name": "list",
+          "description": "List phases in the active epoch",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "epoch",
+              "name": "epoch",
+              "description": "Epoch ID (defaults to active epoch)",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "move": {
+          "name": "move",
+          "description": "Move a phase to another epoch",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The phase ID to move",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "epoch",
+              "name": "epoch",
+              "description": "Target epoch ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "position",
+              "name": "position",
+              "description": "Target position: top, bottom, before:<id>, or after:<id>",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "read-details": {
+          "name": "read-details",
+          "description": "Read canonical details for a phase (defaults to active phase)",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID (defaults to active phase)",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "read-goals": {
+          "name": "read-goals",
+          "description": "Read goals for a phase (defaults to active phase)",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID (defaults to active phase)",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "read-tasks": {
+          "name": "read-tasks",
+          "description": "Read tasks for a phase (defaults to active phase)",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID (defaults to active phase)",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "release": {
+          "name": "release",
+          "description": "Release this workspace's or a stale phase owner",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID whose owner should be released",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
               "repeatable": false
             }
           ]
@@ -1520,22 +1812,74 @@
             }
           ]
         },
+        "reorder": {
+          "name": "reorder",
+          "description": "Reorder a phase within its epoch",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The phase ID to reorder",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "position",
+              "name": "position",
+              "description": "Target position: top, bottom, before:<id>, or after:<id>",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
         "start": {
           "name": "start",
-          "description": "Start the next pending phase",
+          "description": "Start a pending phase",
           "effect": "write",
           "needs_upgrade_gate": true,
-          "args": [],
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Phase ID to start",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "take-over",
+              "name": "take-over",
+              "description": "Explicitly replace an existing phase owner",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ],
           "lm_tool": {
             "displayName": "Start Phase",
-            "modelDescription": "Starts a phase, making it the active phase for the project.\n\nPhases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony — no TDD nudges, no RFC linkage requirement. Use chore for maintenance, cleanup, or housekeeping work.\n\n**Use this when**: User says 'start the next phase' or 'begin phase X'.\n\n**Do NOT use when**: A phase is already active (check exo-status).",
+            "modelDescription": "Starts a phase, making it the active phase for the project.\n\nPhases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony for maintenance, cleanup, and housekeeping work.\n\n**Use this when**: User says 'start the next phase' or 'begin phase X'.\n\n**Do NOT use when**: A phase is already active (check exo-status).",
             "userDescription": "Start a phase by ID.",
             "icon": "$(play)",
             "when": "exosuit.projectInitialized",
             "toolReferenceName": "phase-start",
-            "tags": ["exosuit", "phase", "lifecycle"],
+            "tags": [
+              "exosuit",
+              "phase",
+              "lifecycle"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-project"]
+            "toolSets": [
+              "exo-project"
+            ]
           }
         },
         "status": {
@@ -1561,7 +1905,10 @@
             "userDescription": "Get detailed current phase information.",
             "icon": "$(milestone)",
             "toolReferenceName": "phase",
-            "tags": ["exosuit", "phase"],
+            "tags": [
+              "exosuit",
+              "phase"
+            ],
             "canBeReferencedInPrompt": true
           }
         },
@@ -1606,58 +1953,47 @@
       "name": "plan",
       "description": "Plan management commands",
       "operations": {
-        "health": {
-          "name": "health",
-          "description": "Check plan health metrics",
-          "effect": "pure",
-          "needs_upgrade_gate": false,
-          "args": []
-        },
-        "linearize": {
-          "name": "linearize",
-          "description": "Linearize phase numbering (dry-run by default)",
+        "move-goals": {
+          "name": "move-goals",
+          "description": "Move goals to a different phase",
           "effect": "write",
           "needs_upgrade_gate": true,
           "args": [
             {
-              "id": "start",
-              "name": "start",
-              "description": "Starting phase number",
-              "kind": "option",
-              "value_type": "int",
-              "optional": true,
-              "default": "1",
+              "id": "source_phase_id",
+              "name": "source_phase_id",
+              "description": "The source phase ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
               "repeatable": false
             },
             {
-              "id": "apply",
-              "name": "apply",
-              "description": "Apply changes (default is dry-run)",
-              "kind": "flag",
-              "value_type": "bool",
-              "optional": true,
-              "default": "false",
+              "id": "target_phase_id",
+              "name": "target_phase_id",
+              "description": "The target phase ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "goal_ids",
+              "name": "goal_ids",
+              "description": "Comma-separated goal IDs to move",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
               "repeatable": false
             }
           ]
         },
-        "migrate-ids": {
-          "name": "migrate-ids",
-          "description": "Migrate to ULID-based IDs (dry-run by default)",
-          "effect": "write",
-          "needs_upgrade_gate": true,
-          "args": [
-            {
-              "id": "apply",
-              "name": "apply",
-              "description": "Apply changes (default is dry-run)",
-              "kind": "flag",
-              "value_type": "bool",
-              "optional": true,
-              "default": "false",
-              "repeatable": false
-            }
-          ]
+        "read": {
+          "name": "read",
+          "description": "Read the full plan state as JSON",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
         },
         "review": {
           "name": "review",
@@ -1682,9 +2018,19 @@
             "userDescription": "Get high-level project roadmap and plan health.",
             "icon": "$(list-tree)",
             "toolReferenceName": "plan",
-            "tags": ["exosuit", "plan"],
+            "tags": [
+              "exosuit",
+              "plan"
+            ],
             "canBeReferencedInPrompt": true
           }
+        },
+        "snapshot": {
+          "name": "snapshot",
+          "description": "Return the full plan state as JSON (for extension consumption)",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
         },
         "update-status": {
           "name": "update-status",
@@ -1705,6 +2051,115 @@
               "id": "status",
               "name": "status",
               "description": "The new status value",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        }
+      }
+    },
+    "project": {
+      "name": "project",
+      "description": "Project identity and path commands",
+      "operations": {
+        "list": {
+          "name": "list",
+          "description": "List locally known Exo projects from project policy and sidecars",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "move-root": {
+          "name": "move-root",
+          "description": "Retarget a sidecar-backed project to a new checkout root",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "key",
+              "name": "key",
+              "description": "Sidecar project key",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "to",
+              "name": "to",
+              "description": "New workspace root",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "dry-run",
+              "name": "dry-run",
+              "description": "Show every change without writing",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "repair": {
+          "name": "repair",
+          "description": "Preview project policy repairs",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "stale-sidecars",
+              "name": "stale-sidecars",
+              "description": "Repair stale local-policy sidecar entries",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "repair-apply": {
+          "name": "repair-apply",
+          "description": "Apply project policy repairs after reviewing the preview",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "stale-sidecars",
+              "name": "stale-sidecars",
+              "description": "Repair stale local-policy sidecar entries",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "resolve": {
+          "name": "resolve",
+          "description": "Resolve project identity and state/runtime paths",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "snapshot": {
+          "name": "snapshot",
+          "description": "Read project-scoped cockpit roots by project id",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Project id from `project list`",
               "kind": "positional",
               "value_type": "string",
               "optional": false,
@@ -1814,9 +2269,15 @@
             "userDescription": "Create a new RFC.",
             "icon": "$(add)",
             "toolReferenceName": "rfc-create",
-            "tags": ["exosuit", "rfc", "mutation"],
+            "tags": [
+              "exosuit",
+              "rfc",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-rfc"]
+            "toolSets": [
+              "exo-rfc"
+            ]
           }
         },
         "edit": {
@@ -1912,14 +2373,26 @@
             "userDescription": "List RFCs, optionally filtered by stage.",
             "icon": "$(list-tree)",
             "toolReferenceName": "rfc-list",
-            "tags": ["exosuit", "rfc"],
+            "tags": [
+              "exosuit",
+              "rfc"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-rfc"]
+            "toolSets": [
+              "exo-rfc"
+            ]
           }
+        },
+        "pipeline": {
+          "name": "pipeline",
+          "description": "Show RFC pipeline for the active phase",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
         },
         "promote": {
           "name": "promote",
-          "description": "Promote RFC to next stage",
+          "description": "Promote RFC to the specified next stage",
           "effect": "write",
           "needs_upgrade_gate": true,
           "args": [
@@ -1935,10 +2408,10 @@
             {
               "id": "stage",
               "name": "stage",
-              "description": "Ignored — promote always advances to the next stage",
+              "description": "Required target stage. Must equal the RFC's current stage plus one.",
               "kind": "option",
               "value_type": "int",
-              "optional": true,
+              "optional": false,
               "repeatable": false
             }
           ],
@@ -1948,9 +2421,15 @@
             "userDescription": "Promote an RFC to the next stage.",
             "icon": "$(arrow-up)",
             "toolReferenceName": "rfc-promote",
-            "tags": ["exosuit", "rfc", "mutation"],
+            "tags": [
+              "exosuit",
+              "rfc",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-rfc"]
+            "toolSets": [
+              "exo-rfc"
+            ]
           }
         },
         "rename": {
@@ -1966,6 +2445,41 @@
               "kind": "positional",
               "value_type": "string",
               "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "repair": {
+          "name": "repair",
+          "description": "Repair RFC filename identity and metadata path drift",
+          "effect": "write",
+          "needs_upgrade_gate": true,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The RFC ID to repair",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "path",
+              "name": "path",
+              "description": "RFC file path to repair",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "renumber-to",
+              "name": "renumber-to",
+              "description": "Assign a new numeric RFC ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
               "repeatable": false
             }
           ]
@@ -2106,6 +2620,339 @@
         }
       }
     },
+    "sidecar": {
+      "name": "sidecar",
+      "description": "Portable sidecar state commands",
+      "operations": {
+        "bootstrap": {
+          "name": "bootstrap",
+          "description": "Bootstrap sidecar-backed Exosuit state for this repo",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "key",
+              "name": "key",
+              "description": "Portable sidecar key",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "root",
+              "name": "root",
+              "description": "Portable sidecar root directory",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "no-git",
+              "name": "no-git",
+              "description": "Do not initialize a git repo at the sidecar root",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            },
+            {
+              "id": "discover",
+              "name": "discover",
+              "description": "Use discovered sidecar configuration",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            },
+            {
+              "id": "registry-file",
+              "name": "registry-file",
+              "description": "Read registry TOML from a local file",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "accept-discovered-remote",
+              "name": "accept-discovered-remote",
+              "description": "Accept a discovered template/default remote",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "checkpoint": {
+          "name": "checkpoint",
+          "description": "Create a local checkpoint for sidecar-backed project state",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "project",
+              "name": "project",
+              "description": "Sidecar project key to checkpoint",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "message",
+              "name": "message",
+              "description": "Checkpoint commit message",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "short": "m",
+              "repeatable": false
+            }
+          ]
+        },
+        "discover": {
+          "name": "discover",
+          "description": "Discover sidecar configuration for this repo",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "registry-file",
+              "name": "registry-file",
+              "description": "Read registry TOML from a local file",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "init": {
+          "name": "init",
+          "description": "Create or reuse sidecar state for this repo",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "key",
+              "name": "key",
+              "description": "Portable sidecar key",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "root",
+              "name": "root",
+              "description": "Portable sidecar root directory",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "git",
+              "name": "git",
+              "description": "Initialize a git repo at the sidecar root",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "link": {
+          "name": "link",
+          "description": "Bind this repo to sidecar state",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "key",
+              "name": "key",
+              "description": "Portable sidecar key",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "root",
+              "name": "root",
+              "description": "Portable sidecar root directory",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "repo": {
+          "name": "repo",
+          "description": "Inspect or mutate the sidecar git repo. The status action is read-only at runtime, but this combined operation is classified as write for command-spec metadata.",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "action",
+              "name": "action",
+              "description": "Repo action: status, commit, remote, push, or sync",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "message",
+              "name": "message",
+              "description": "Commit message",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "short": "m",
+              "repeatable": false
+            },
+            {
+              "id": "remote",
+              "name": "remote",
+              "description": "Remote to push to",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "branch",
+              "name": "branch",
+              "description": "Branch to push",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "url",
+              "name": "url",
+              "description": "Remote URL for sidecar repo remote",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "replace",
+              "name": "replace",
+              "description": "Replace an existing sidecar repo remote URL",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "setup": {
+          "name": "setup",
+          "description": "Create missing GitHub sidecar repo and profile registry setup",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "dry-run",
+              "name": "dry-run",
+              "description": "Show planned setup without creating GitHub resources",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            },
+            {
+              "id": "profile-owner",
+              "name": "profile-owner",
+              "description": "GitHub profile owner for .exosuit/sidecars.toml",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "state-repo",
+              "name": "state-repo",
+              "description": "GitHub sidecar state repository name",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "remote-url",
+              "name": "remote-url",
+              "description": "Remote URL for sidecar state repository",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            },
+            {
+              "id": "replace-remote",
+              "name": "replace-remote",
+              "description": "Replace an existing origin remote on the sidecar repository",
+              "kind": "flag",
+              "value_type": "bool",
+              "optional": true,
+              "default": "false",
+              "repeatable": false
+            }
+          ]
+        },
+        "status": {
+          "name": "status",
+          "description": "Show sidecar binding status",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "registry-file",
+              "name": "registry-file",
+              "description": "Read registry TOML from a local file",
+              "kind": "option",
+              "value_type": "string",
+              "optional": true,
+              "repeatable": false
+            }
+          ]
+        },
+        "unlink": {
+          "name": "unlink",
+          "description": "Remove this repo's local sidecar binding",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": []
+        }
+      }
+    },
+    "storage": {
+      "name": "storage",
+      "description": "storage operations",
+      "operations": {
+        "maintain": {
+          "name": "maintain",
+          "description": "Run bounded physical SQLite maintenance for the current project",
+          "effect": "exec",
+          "needs_upgrade_gate": false,
+          "args": []
+        }
+      }
+    },
     "strike": {
       "name": "strike",
       "description": "Surgical strike commands",
@@ -2208,9 +3055,15 @@
             "icon": "$(add)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "add-task",
-            "tags": ["exosuit", "mutation", "task"],
+            "tags": [
+              "exosuit",
+              "mutation",
+              "task"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "complete": {
@@ -2246,9 +3099,15 @@
             "icon": "$(check)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-complete",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "list": {
@@ -2263,9 +3122,15 @@
             "userDescription": "List tasks in the active phase.",
             "icon": "$(list-ordered)",
             "toolReferenceName": "list-tasks",
-            "tags": ["exosuit", "task", "list"],
+            "tags": [
+              "exosuit",
+              "task",
+              "list"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-discovery"]
+            "toolSets": [
+              "exo-discovery"
+            ]
           }
         },
         "log": {
@@ -2300,9 +3165,15 @@
             "icon": "$(note)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-log",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "remove": {
@@ -2328,10 +3199,42 @@
             "icon": "$(trash)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-remove",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
+        },
+        "rename": {
+          "name": "rename",
+          "description": "Rename a task handle while preserving the old handle as an alias",
+          "effect": "write",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "The current task ID or alias",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "to",
+              "name": "to",
+              "description": "The new canonical task ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
         },
         "reorder": {
           "name": "reorder",
@@ -2365,9 +3268,15 @@
             "icon": "$(move)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-reorder",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "start": {
@@ -2393,9 +3302,15 @@
             "icon": "$(play)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-start",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         },
         "update": {
@@ -2431,90 +3346,15 @@
             "icon": "$(edit)",
             "when": "exosuit.hasActivePhase",
             "toolReferenceName": "task-update",
-            "tags": ["exosuit", "task", "mutation"],
+            "tags": [
+              "exosuit",
+              "task",
+              "mutation"
+            ],
             "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
-          }
-        }
-      }
-    },
-    "tdd": {
-      "name": "tdd",
-      "description": "TDD workflow commands",
-      "operations": {
-        "green": {
-          "name": "green",
-          "description": "Confirm the test passes (verifies GREEN and clears active TDD step)",
-          "effect": "exec",
-          "needs_upgrade_gate": false,
-          "args": [],
-          "lm_tool": {
-            "displayName": "Confirm TDD Green",
-            "modelDescription": "Confirms the test is passing (green phase). Run after implementation passes tests. Leaves tdd_status=green as evidence and clears the active TDD pointer; complete the task separately with exo-task-complete.",
-            "userDescription": "Confirm the tests pass (green phase).",
-            "icon": "$(check)",
-            "when": "exosuit.hasActivePhase",
-            "toolReferenceName": "tdd-green",
-            "tags": ["exosuit", "tdd", "mutation"],
-            "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
-          }
-        },
-        "new": {
-          "name": "new",
-          "description": "Start a new TDD cycle for a task (sets tdd_status=red)",
-          "effect": "exec",
-          "needs_upgrade_gate": false,
-          "args": [
-            {
-              "id": "name",
-              "name": "name",
-              "description": "The task selector (task id or goal::task)",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "short": "n",
-              "repeatable": false
-            },
-            {
-              "id": "test",
-              "name": "test",
-              "description": "The test command or file",
-              "kind": "option",
-              "value_type": "string",
-              "optional": false,
-              "short": "t",
-              "repeatable": false
-            }
-          ],
-          "lm_tool": {
-            "displayName": "Start TDD Cycle",
-            "modelDescription": "Starts a new TDD cycle for a task. Run BEFORE writing code. Marks the task as TDD RED (tdd_status=red) and records the test file. Instructs you to write a failing test first.",
-            "userDescription": "Start a new TDD cycle for a task.",
-            "icon": "$(beaker)",
-            "when": "exosuit.hasActivePhase",
-            "toolReferenceName": "tdd-start",
-            "tags": ["exosuit", "tdd", "mutation"],
-            "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
-          }
-        },
-        "red": {
-          "name": "red",
-          "description": "Confirm the test fails (transitions RED -> GREEN)",
-          "effect": "exec",
-          "needs_upgrade_gate": false,
-          "args": [],
-          "lm_tool": {
-            "displayName": "Confirm TDD Red",
-            "modelDescription": "Confirms the test is failing (red phase). Run after writing a failing test. Moves the active task to TDD GREEN (tdd_status=green).",
-            "userDescription": "Confirm the failing test (red phase).",
-            "icon": "$(circle-slash)",
-            "when": "exosuit.hasActivePhase",
-            "toolReferenceName": "tdd-red",
-            "tags": ["exosuit", "tdd", "mutation"],
-            "canBeReferencedInPrompt": true,
-            "toolSets": ["exo-tasks"]
+            "toolSets": [
+              "exo-tasks"
+            ]
           }
         }
       }
@@ -2590,23 +3430,17 @@
       "name": "verify",
       "description": "Verification commands",
       "operations": {
+        "dump": {
+          "name": "dump",
+          "description": "Verify SQL dump round-trip on live database",
+          "effect": "pure",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
         "run": {
           "name": "run",
           "description": "Run phase verification",
           "effect": "exec",
-          "needs_upgrade_gate": false,
-          "args": []
-        }
-      }
-    },
-    "walkthrough": {
-      "name": "walkthrough",
-      "description": "Walkthrough commands",
-      "operations": {
-        "list": {
-          "name": "list",
-          "description": "List walkthrough entries",
-          "effect": "pure",
           "needs_upgrade_gate": false,
           "args": []
         }
@@ -2646,7 +3480,11 @@
         "userDescription": "Get AI-scored navigation with next action suggestions.",
         "icon": "$(compass)",
         "toolReferenceName": "steering",
-        "tags": ["exosuit", "navigation", "steering"],
+        "tags": [
+          "exosuit",
+          "navigation",
+          "steering"
+        ],
         "canBeReferencedInPrompt": true
       }
     },
@@ -2662,7 +3500,10 @@
         "userDescription": "Get current project phase, active goals, and next steps.",
         "icon": "$(info)",
         "toolReferenceName": "status",
-        "tags": ["exosuit", "status"],
+        "tags": [
+          "exosuit",
+          "status"
+        ],
         "canBeReferencedInPrompt": true
       }
     },
@@ -2701,5 +3542,5 @@
       ]
     }
   },
-  "operation_count": 95
+  "operation_count": 125
 }
