@@ -628,6 +628,8 @@ pub fn derive_phase_steering(
     // Task-level TDD no longer uses goal.status = red/green.
     let any_red = false;
     let any_pending_tasks = tasks.iter().any(|(_, _, s)| s == "pending");
+    let any_in_progress_tasks = tasks.iter().any(|(_, _, s)| s == "in-progress");
+    let any_open_tasks = any_pending_tasks || any_in_progress_tasks;
     // Find the next pending goal, returning both the name and the goal itself
     // so we can check for promotion metadata (rfc + target_stage)
     let next_pending_goal_data = goals.iter().find_map(|goal| {
@@ -650,7 +652,7 @@ pub fn derive_phase_steering(
 
     let primary_intent = if any_red {
         WorkIntent::Verify
-    } else if any_pending_tasks || any_pending_goals {
+    } else if any_open_tasks || any_pending_goals {
         WorkIntent::Execute
     } else {
         WorkIntent::Record
@@ -699,12 +701,35 @@ pub fn derive_phase_steering(
         }
     }
 
-    if any_pending_tasks {
+    if let Some((task_id, task_label, _)) = tasks.iter().find(|(_, _, s)| s == "in-progress") {
+        next_actions.push(SuggestedAction::exo(
+            "Log active task progress",
+            ExoCommandReference::new(&["task", "log"])
+                .positional(task_id.clone())
+                .option_placeholder("message", "message", "recorded verification evidence"),
+            format!(
+                "Task '{task_label}' is in progress. Record progress or verification evidence before completion."
+            ),
+            WorkIntent::Record,
+            Some(0.8),
+        ));
+        next_actions.push(SuggestedAction::exo(
+            "Complete active task",
+            ExoCommandReference::new(&["task", "complete"])
+                .positional(task_id.clone())
+                .option_placeholder("log", "summary", "completed the task"),
+            format!(
+                "Task '{task_label}' is in progress. Complete it when the outcome and verification evidence are ready."
+            ),
+            WorkIntent::Record,
+            Some(0.7),
+        ));
+    } else if any_pending_tasks {
         next_actions.push(SuggestedAction::exo(
             "Complete a task",
             ExoCommandReference::new(&["task", "complete"])
                 .positional_placeholder("id", "sample-task"),
-            "There are pending tasks in the active phase; close one when done.",
+            "There are pending tasks in the active phase; close one when done after recording verification evidence.",
             WorkIntent::Record,
             Some(0.6),
         ));
@@ -2292,6 +2317,59 @@ mod tests {
                 .next_actions
                 .iter()
                 .any(|a| a.command.contains("--label"))
+        );
+    }
+
+    #[test]
+    fn regular_phase_suggests_log_and_complete_for_in_progress_task() {
+        let goals = vec![Goal {
+            id: "g1".to_string(),
+            label: "Test goal".to_string(),
+            status: "pending".to_string(),
+            completion_log: None,
+            kind: None,
+            started_at: None,
+            description: None,
+            ulid: None,
+            slug: None,
+            aliases: vec![],
+            rfc: None,
+            target_stage: None,
+        }];
+        let tasks = vec![(
+            "g1::t1".to_string(),
+            "Task 1".to_string(),
+            "in-progress".to_string(),
+        )];
+        let block = super::derive_phase_steering(&tasks, &goals, PhaseKind::Regular);
+        assert!(
+            !block
+                .next_actions
+                .iter()
+                .any(|a| a.label == "Start next task"),
+            "Regular phase should not suggest starting an already active task"
+        );
+        let log_action = block
+            .next_actions
+            .iter()
+            .find(|a| a.label == "Log active task progress")
+            .expect("Regular phase should suggest logging active task progress");
+        assert_eq!(
+            log_action.command,
+            "exo task log 'g1::t1' --message <message>"
+        );
+        assert!(
+            log_action.rationale.contains("verification evidence"),
+            "Active task guidance should keep verification evidence visible"
+        );
+        let complete_action = block
+            .next_actions
+            .iter()
+            .find(|a| a.label == "Complete active task")
+            .expect("Regular phase should suggest completing the active task");
+        assert_eq!(
+            complete_action.command,
+            "exo task complete 'g1::t1' --log <summary>"
         );
     }
 

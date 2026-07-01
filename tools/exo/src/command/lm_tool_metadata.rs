@@ -242,7 +242,7 @@ const LM_TOOL_OVERRIDES: &[LmToolOverride] = &[
         user_description: "Start a phase by ID.",
         model_description: r"Starts a phase, making it the active phase for the project.
 
-Phases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony — no TDD nudges, no RFC linkage requirement. Use chore for maintenance, cleanup, or housekeeping work.
+Phases have a `kind`: **regular** (default) or **chore**. Chore phases have lighter ceremony for maintenance, cleanup, and housekeeping work.
 
 **Use this when**: User says 'start the next phase' or 'begin phase X'.
 
