@@ -36,6 +36,9 @@ export interface DaemonRuntimePaths {
 }
 
 export interface DaemonEnsureResult extends DaemonRuntimePaths {
+  pid?: number | null;
+  instanceId?: string | null;
+  probeOk?: boolean | null;
   reused: boolean | null;
   spawned: boolean | null;
   state: string | null;
@@ -102,6 +105,9 @@ interface DaemonEnsureJson {
     socket_path?: unknown;
     endpoint?: unknown;
     pid_path?: unknown;
+    pid?: unknown;
+    instance_id?: unknown;
+    probe_ok?: unknown;
     reused?: unknown;
     spawned?: unknown;
     state?: unknown;
@@ -202,6 +208,9 @@ function parseDaemonEnsureResult(stdout: string): DaemonEnsureResult {
     socketPath: paths.socket_path,
     endpoint: optionalString(paths.endpoint) ?? paths.socket_path,
     pidPath: paths.pid_path,
+    pid: optionalNumber(paths.pid),
+    instanceId: optionalString(paths.instance_id),
+    probeOk: optionalBoolean(paths.probe_ok),
     reused: optionalBoolean(paths.reused),
     spawned: optionalBoolean(paths.spawned),
     state: optionalString(paths.state),
@@ -648,6 +657,25 @@ export async function ensureDaemonWithConnector(
 ): Promise<Socket> {
   assertNotFilesystemRoot(workspaceRoot);
   const paths = await coalescedEnsureDaemonLifecycle(workspaceRoot);
+  return connectToEnsuredDaemonWithConnector(workspaceRoot, paths, connector);
+}
+
+export async function connectToEnsuredDaemon(
+  workspaceRoot: string,
+  paths: DaemonEnsureResult,
+): Promise<Socket> {
+  return connectToEnsuredDaemonWithConnector(
+    workspaceRoot,
+    paths,
+    defaultSocketConnector,
+  );
+}
+
+async function connectToEnsuredDaemonWithConnector(
+  workspaceRoot: string,
+  paths: DaemonEnsureResult,
+  connector: DaemonSocketConnector,
+): Promise<Socket> {
   const endpoint = getEndpoint(paths);
   const socket = await connector.connectToSocket(endpoint);
   if (!socket) {
