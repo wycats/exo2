@@ -843,6 +843,7 @@ fn daemon_command_args_match<'a>(
     has_daemon_run && has_workspace
 }
 
+#[cfg(any(target_os = "macos", windows))]
 fn daemon_command_text_matches(workspace_root: &Path, command: &str) -> bool {
     let workspace = workspace_root.to_string_lossy();
     command.contains("daemon run")
