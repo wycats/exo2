@@ -20,8 +20,17 @@ fn list_active_phase_tasks_via_sqlite(
     root: &Path,
 ) -> ExoResult<Option<Vec<(String, String, String)>>> {
     let ctx = AgentContext::load(root.to_path_buf()).ok();
-    let workspace_root = ctx.as_ref().and_then(AgentContext::workspace_root_key);
-    let db_path = crate::context::db_path(root, ctx.as_ref().and_then(|ctx| ctx.project.as_ref()));
+    let Some(ctx) = ctx.as_ref() else {
+        return Ok(None);
+    };
+    list_active_phase_tasks_from_context(ctx)
+}
+
+fn list_active_phase_tasks_from_context(
+    ctx: &AgentContext,
+) -> ExoResult<Option<Vec<(String, String, String)>>> {
+    let workspace_root = ctx.workspace_root_key();
+    let db_path = crate::context::db_path(&ctx.root, ctx.project.as_ref());
     if !db_path.exists() {
         return Ok(None);
     }
@@ -80,6 +89,23 @@ pub(crate) fn list_tasks(root: &Path) -> ExoResult<Vec<(String, String, String)>
 
     let ctx = AgentContext::load(root.to_path_buf())?;
     if ctx.find_workspace_active_phase()?.is_none() {
+        return Err(anyhow!(
+            "No active phase found. Use `exo phase start <id>` to start one."
+        ));
+    }
+
+    Ok(Vec::new())
+}
+
+/// List tasks using the context already loaded for the current command.
+pub(crate) fn list_tasks_for_context(
+    context: &AgentContext,
+) -> ExoResult<Vec<(String, String, String)>> {
+    if let Some(tasks) = list_active_phase_tasks_from_context(context)? {
+        return Ok(tasks);
+    }
+
+    if context.find_workspace_active_phase()?.is_none() {
         return Err(anyhow!(
             "No active phase found. Use `exo phase start <id>` to start one."
         ));

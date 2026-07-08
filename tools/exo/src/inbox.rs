@@ -414,6 +414,20 @@ pub fn get_surfaced_intents(
         root,
         agent_ctx.as_ref().and_then(|ctx| ctx.project.as_ref()),
     );
+    get_surfaced_intents_from_db(
+        &db_path,
+        workspace_root.as_deref(),
+        active_phase_id,
+        suppress_agent_id,
+    )
+}
+
+pub fn get_surfaced_intents_from_db(
+    db_path: &Path,
+    workspace_root: Option<&str>,
+    active_phase_id: Option<&str>,
+    suppress_agent_id: Option<&str>,
+) -> anyhow::Result<Vec<SurfacedIntent>> {
     if !db_path.exists() {
         return Ok(Vec::new());
     }
@@ -423,7 +437,7 @@ pub fn get_surfaced_intents(
         items: loader.load_inbox()?,
     };
 
-    let context = build_relevance_context(&loader, active_phase_id, workspace_root.as_deref())?;
+    let context = build_relevance_context(&loader, active_phase_id, workspace_root)?;
 
     let mut surfaced: Vec<SurfacedIntent> = inbox
         .items

@@ -32,6 +32,8 @@ fn make_world_state(
 ) -> WorldState {
     WorldState {
         root: PathBuf::from("/tmp"),
+        db_path: PathBuf::from("/tmp/.cache/exo.db"),
+        workspace_root_key: None,
         active_phase,
         next_phase: None,
         epoch_state: EpochBoundaryState {

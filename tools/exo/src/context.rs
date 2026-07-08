@@ -1136,6 +1136,16 @@ impl AgentContext {
     #[allow(clippy::missing_errors_doc)]
     pub fn load_with_backend(root: PathBuf, _backend: StorageBackend) -> ExoResult<Self> {
         let project = Project::resolve(&root).ok();
+        Self::load_with_project(root, project)
+    }
+
+    /// Load context using a project that the transport already resolved.
+    ///
+    /// Daemon and CLI dispatch resolve project identity before command
+    /// execution. Reusing that value keeps command reads from spawning a new
+    /// Git discovery process for every storage helper they call.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn load_with_project(root: PathBuf, project: Option<Project>) -> ExoResult<Self> {
         let plan = Self::load_from_sqlite(&root, project.as_ref())?;
         Ok(Self {
             root,

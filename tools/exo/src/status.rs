@@ -177,7 +177,9 @@ pub fn build_status_json(
     context: &AgentContext,
     agent_id: Option<&str>,
 ) -> ExoResult<serde_json::Value> {
-    let current_owner = phase_owner::current_owner_view(&context.root, context.project.as_ref());
+    let owner_context =
+        phase_owner::PhaseOwnerViewContext::new(&context.root, context.project.as_ref());
+    let current_owner = owner_context.current_owner_view();
 
     // Check for critical upgrades first
     let registry = UpgradeRegistry::new();
@@ -240,9 +242,7 @@ pub fn build_status_json(
         untracked: changes.untracked,
     });
     let phase_owner = match world.active_phase.as_ref() {
-        Some(phase) => phase_owner::owner_view_for_phase(
-            &context.root,
-            context.project.as_ref(),
+        Some(phase) => owner_context.owner_view_for_phase(
             &crate::context::db_path(&context.root, context.project.as_ref()),
             &phase.id,
         )?,
@@ -271,6 +271,8 @@ pub fn build_status_json(
 
 /// Show human-readable status output
 pub fn show_status_human(context: &AgentContext, agent_id: Option<&str>) -> ExoResult<()> {
+    let owner_context =
+        phase_owner::PhaseOwnerViewContext::new(&context.root, context.project.as_ref());
     // Check for critical upgrades first
     let registry = UpgradeRegistry::new();
     let upgrade_check = registry.check_all(context)?;
@@ -291,7 +293,7 @@ pub fn show_status_human(context: &AgentContext, agent_id: Option<&str>) -> ExoR
     let world = WorldState::probe(context)?;
     let steering = steering::derive_world_steering(&world, agent_id);
     let progress_mode = steering::derive_progress_mode(&world);
-    let current_owner = phase_owner::current_owner_view(&context.root, context.project.as_ref());
+    let current_owner = owner_context.current_owner_view();
     let owner_basis = phase_owner::current_owner_basis_label(&current_owner);
 
     // Header with phase info
@@ -299,9 +301,7 @@ pub fn show_status_human(context: &AgentContext, agent_id: Option<&str>) -> ExoR
         println!("# Exosuit Status\n");
         println!("**Phase**: {}", phase.title);
         println!("**Epoch**: {}", phase.epoch_title);
-        if let Some(owner) = phase_owner::owner_view_for_phase(
-            &context.root,
-            context.project.as_ref(),
+        if let Some(owner) = owner_context.owner_view_for_phase(
             &crate::context::db_path(&context.root, context.project.as_ref()),
             &phase.id,
         )? {

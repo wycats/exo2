@@ -38,8 +38,12 @@ pub struct RecentFileArea {
 /// Returns the most frequently referenced (`entity_type`, `entity_id`) pair
 /// from the last 10 minutes, or `None` if there are no matching events.
 pub fn active_entity(root: &Path) -> Option<ActiveEntity> {
+    active_entity_from_db(&event_db_path(root))
+}
+
+pub fn active_entity_from_db(db_path: &Path) -> Option<ActiveEntity> {
     let cutoff = (Utc::now() - Duration::minutes(10)).to_rfc3339();
-    with_event_db(&event_db_path(root), |conn| {
+    with_event_db(db_path, |conn| {
         conn.query_row(
             "SELECT entity_type, entity_id, COUNT(*) as cnt
              FROM agent_events
@@ -64,8 +68,12 @@ pub fn active_entity(root: &Path) -> Option<ActiveEntity> {
 /// Returns the current session window, defined as all events after the
 /// most recent 30-minute inactivity gap (looking back up to 24 hours).
 pub fn session_window(root: &Path) -> Option<SessionWindow> {
+    session_window_from_db(&event_db_path(root))
+}
+
+pub fn session_window_from_db(db_path: &Path) -> Option<SessionWindow> {
     let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
-    let raw_timestamps: Vec<String> = with_event_db(&event_db_path(root), |conn| {
+    let raw_timestamps: Vec<String> = with_event_db(db_path, |conn| {
         let mut stmt = conn.prepare(
             "SELECT timestamp FROM agent_events
              WHERE timestamp > ?1
@@ -126,6 +134,10 @@ pub struct PreviousSessionSummary {
 /// Looks back up to 24 hours. Returns `None` if there is no gap (single
 /// continuous session) or if there are too few events to form a previous session.
 pub fn previous_session_summary(root: &Path) -> Option<PreviousSessionSummary> {
+    previous_session_summary_from_db(&event_db_path(root))
+}
+
+pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessionSummary> {
     let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
 
     struct EventRow {
@@ -136,7 +148,7 @@ pub fn previous_session_summary(root: &Path) -> Option<PreviousSessionSummary> {
     }
 
     let raw_events: Vec<(String, Option<String>, Option<String>, String)> =
-        with_event_db(&event_db_path(root), |conn| {
+        with_event_db(db_path, |conn| {
             let mut stmt = conn.prepare(
                 "SELECT timestamp, entity_type, entity_id, summary FROM agent_events
                  WHERE timestamp > ?1
@@ -214,8 +226,12 @@ pub fn previous_session_summary(root: &Path) -> Option<PreviousSessionSummary> {
 /// Returns file paths from `file_save` events in the last 15 minutes,
 /// grouped by path with save counts, most frequent first (up to 10).
 pub fn recent_file_areas(root: &Path) -> Vec<RecentFileArea> {
+    recent_file_areas_from_db(&event_db_path(root))
+}
+
+pub fn recent_file_areas_from_db(db_path: &Path) -> Vec<RecentFileArea> {
     let cutoff = (Utc::now() - Duration::minutes(15)).to_rfc3339();
-    with_event_db(&event_db_path(root), |conn| {
+    with_event_db(db_path, |conn| {
         let mut stmt = conn.prepare(
             "SELECT summary, COUNT(*) as cnt
              FROM agent_events
@@ -257,12 +273,16 @@ fn top_directory(path: &str) -> Option<&str> {
 /// Returns the top 3 directory prefixes by save count. If no session data or
 /// no file saves exist, returns an empty vec.
 pub fn infer_entity_scope(root: &Path) -> Vec<String> {
-    let session = match session_window(root) {
+    infer_entity_scope_from_db(&event_db_path(root))
+}
+
+pub fn infer_entity_scope_from_db(db_path: &Path) -> Vec<String> {
+    let session = match session_window_from_db(db_path) {
         Some(s) => s,
         None => return vec![],
     };
 
-    let summaries: Vec<String> = with_event_db(&event_db_path(root), |conn| {
+    let summaries: Vec<String> = with_event_db(db_path, |conn| {
         let mut stmt = conn.prepare(
             "SELECT summary
              FROM agent_events
@@ -348,10 +368,14 @@ pub struct ActivityContext {
 
 impl ActivityContext {
     pub fn collect(root: &Path) -> Self {
+        Self::collect_from_db(&event_db_path(root))
+    }
+
+    pub fn collect_from_db(db_path: &Path) -> Self {
         Self {
-            active_entity: active_entity(root),
-            session: session_window(root),
-            recent_files: recent_file_areas(root),
+            active_entity: active_entity_from_db(db_path),
+            session: session_window_from_db(db_path),
+            recent_files: recent_file_areas_from_db(db_path),
         }
     }
 }

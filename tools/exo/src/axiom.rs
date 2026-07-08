@@ -1,4 +1,5 @@
 use crate::ExoResult;
+use crate::project::Project;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -23,7 +24,16 @@ pub struct Axiom {
     pub tags: Vec<String>,
 }
 pub fn list_axioms(root: &Path, scope: &str) -> ExoResult<Vec<Axiom>> {
-    let db_path = crate::context::db_path_resolving_project(root);
+    list_axioms_with_project(root, None, scope)
+}
+
+pub fn list_axioms_with_project(
+    root: &Path,
+    project: Option<&Project>,
+    scope: &str,
+) -> ExoResult<Vec<Axiom>> {
+    let project = project.cloned().or_else(|| Project::resolve(root).ok());
+    let db_path = crate::context::db_path(root, project.as_ref());
     let loader = crate::context::SqliteLoader::open(&db_path)?;
     loader.list_axioms(Some(scope))
 }

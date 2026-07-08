@@ -908,7 +908,19 @@ pub fn derive_entity_steering(
     agent_id: Option<&str>,
     activity: Option<&crate::activity::ActivityContext>,
 ) -> SteeringBlock {
-    match derive_entity_steering_inner(root, entity_type, entity_id, agent_id, activity) {
+    let project = crate::project::Project::resolve(root).ok();
+    let db_path = crate::context::db_path(root, project.as_ref());
+    derive_entity_steering_from_db(&db_path, entity_type, entity_id, agent_id, activity)
+}
+
+pub(crate) fn derive_entity_steering_from_db(
+    db_path: &Path,
+    entity_type: &str,
+    entity_id: &str,
+    agent_id: Option<&str>,
+    activity: Option<&crate::activity::ActivityContext>,
+) -> SteeringBlock {
+    match derive_entity_steering_inner(db_path, entity_type, entity_id, agent_id, activity) {
         Ok(block) => block,
         Err(_) => SteeringBlock {
             primary_intent: WorkIntent::Execute,
@@ -926,14 +938,13 @@ pub fn derive_entity_steering(
 }
 
 fn derive_entity_steering_inner(
-    root: &Path,
+    db_path: &Path,
     entity_type: &str,
     entity_id: &str,
     agent_id: Option<&str>,
     activity: Option<&crate::activity::ActivityContext>,
 ) -> anyhow::Result<SteeringBlock> {
-    let db_path = root.join(crate::context::SQLITE_DB_PATH);
-    let loader = SqliteLoader::open(&db_path)?;
+    let loader = SqliteLoader::open(db_path)?;
 
     let ancestors = loader.resolve_entity_tree(entity_type, entity_id)?;
 
@@ -1023,7 +1034,7 @@ fn derive_entity_steering_inner(
         }
 
         // Drift detection: compare recent file areas against session scope
-        let scope = crate::activity::infer_entity_scope(root);
+        let scope = crate::activity::infer_entity_scope_from_db(db_path);
         if let Some(drift) = crate::activity::detect_drift(&ctx.recent_files, &scope) {
             repair_actions.push(SuggestedAction::human_action(
                 "Review: file edits outside usual scope",
@@ -1191,7 +1202,12 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
     // Populate grouped perception summaries from inbox (before boundary enrichment so we can
     // include intent counts in the situation).
     let active_phase_id = world.active_phase.as_ref().map(|p| p.id.as_str());
-    match crate::inbox::get_surfaced_intents(&world.root, active_phase_id, agent_id) {
+    match crate::inbox::get_surfaced_intents_from_db(
+        &world.db_path,
+        world.workspace_root_key.as_deref(),
+        active_phase_id,
+        agent_id,
+    ) {
         Ok(intents) => {
             steering.perception_summaries = summarize_surfaced_intents(intents);
         }
@@ -1205,7 +1221,7 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
         }
     }
 
-    match load_world_completion_digests(&world.root, active_phase_id) {
+    match load_world_completion_digests(world, active_phase_id) {
         Ok(digests) => {
             steering.completion_digests = digests;
         }
@@ -1239,10 +1255,10 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
 
     // Implicit entity scoping: if the event log shows recent activity on a
     // specific entity, merge entity-scoped perception into world steering.
-    if let Some(ae) = crate::activity::active_entity(&world.root) {
-        let activity = crate::activity::ActivityContext::collect(&world.root);
-        let entity_steering = derive_entity_steering(
-            &world.root,
+    if let Some(ae) = crate::activity::active_entity_from_db(&world.db_path) {
+        let activity = crate::activity::ActivityContext::collect_from_db(&world.db_path);
+        let entity_steering = derive_entity_steering_from_db(
+            &world.db_path,
             &ae.entity_type,
             &ae.entity_id,
             agent_id,
@@ -1310,28 +1326,20 @@ pub(crate) fn completion_outcome_digest_summary_from_loader(
 }
 
 fn load_world_completion_digests(
-    root: &Path,
+    world: &WorldState,
     active_phase_id: Option<&str>,
 ) -> anyhow::Result<Vec<CompletionOutcomeDigestSummary>> {
     let Some(_active_phase_id) = active_phase_id else {
         return Ok(vec![]);
     };
 
-    let agent_ctx = crate::context::AgentContext::load(root.to_path_buf()).ok();
-    let workspace_root = agent_ctx
-        .as_ref()
-        .and_then(crate::context::AgentContext::workspace_root_key);
-    let db_path = crate::context::db_path(
-        root,
-        agent_ctx.as_ref().and_then(|ctx| ctx.project.as_ref()),
-    );
-    if !db_path.exists() {
+    if !world.db_path.exists() {
         return Ok(vec![]);
     }
 
-    let loader = SqliteLoader::open(&db_path)?;
-    let active_entities =
-        loader.collect_active_phase_entity_ids_for_workspace(workspace_root.as_deref())?;
+    let loader = SqliteLoader::open(&world.db_path)?;
+    let active_entities = loader
+        .collect_active_phase_entity_ids_for_workspace(world.workspace_root_key.as_deref())?;
     let mut entities = active_entities
         .iter()
         .filter_map(|(entity_type, entity_id)| {
@@ -1939,27 +1947,15 @@ fn apply_rfc_context(context: Option<&String>, rationale: String) -> String {
 /// suggest `exo goal complete <id> --log`. This fires per-goal, not waiting
 /// for the entire phase to complete—the agent has the best context right
 /// after finishing a goal's tasks.
-fn task_log_lines_by_goal(root: &Path) -> HashMap<String, Vec<String>> {
+fn task_log_lines_by_goal(world: &WorldState) -> HashMap<String, Vec<String>> {
     {
-        // SQLite: Get active phase goals from ExoState, then query task logs
         let mut by_goal = HashMap::new();
-        let context = match crate::context::AgentContext::load(root.to_path_buf()) {
-            Ok(context) => context,
-            Err(_) => return by_goal,
-        };
-        let workspace_root = context.workspace_root_key();
-        let db_path = crate::context::db_path(root, context.project.as_ref());
-        let loader = match SqliteLoader::open(&db_path) {
+        let loader = match SqliteLoader::open(&world.db_path) {
             Ok(loader) => loader,
             Err(_) => return by_goal,
         };
 
-        // Find active phase and its goals
-        let active_phase = context.find_workspace_active_phase().ok().flatten();
-        let goals = match active_phase {
-            Some(info) => &info.phase.goals,
-            None => return by_goal,
-        };
+        let goals = &world.goals;
 
         // For each goal, get task logs from the tasks_data table
         // Note: In SQLite, tasks are stored under goals, and logs are in task_logs table
@@ -1970,11 +1966,12 @@ fn task_log_lines_by_goal(root: &Path) -> HashMap<String, Vec<String>> {
             }
 
             // Get tasks for this goal and their logs
-            let tasks =
-                match loader.list_active_phase_tasks_for_workspace(workspace_root.as_deref()) {
-                    Ok(tasks) => tasks,
-                    Err(_) => continue,
-                };
+            let tasks = match loader
+                .list_active_phase_tasks_for_workspace(world.workspace_root_key.as_deref())
+            {
+                Ok(tasks) => tasks,
+                Err(_) => continue,
+            };
 
             let mut lines = Vec::new();
             for (composite_id, title, _status) in &tasks {
@@ -2093,7 +2090,7 @@ fn add_concern_on_completed_repairs(
 }
 
 fn add_goal_completion_log_nudges(world: &WorldState, next_actions: &mut Vec<SuggestedAction>) {
-    let task_log_lines = task_log_lines_by_goal(&world.root);
+    let task_log_lines = task_log_lines_by_goal(world);
 
     for goal in &world.goals {
         // Skip goals that already have a completion log

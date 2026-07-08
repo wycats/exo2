@@ -110,7 +110,7 @@ impl Command for StatusCommand {
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
         let root = resolve_workspace_root(ctx.root);
-        let agent_ctx = AgentContext::load(root)?;
+        let agent_ctx = AgentContext::load_with_project(root, ctx.project.cloned())?;
 
         match ctx.format {
             OutputFormat::Json => {

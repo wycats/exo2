@@ -377,12 +377,42 @@ pub fn configure_sql_dump_merge_driver(root: &std::path::Path) -> Result<bool, s
 
 /// Returns whether the repo-local SQL dump merge driver is configured.
 pub fn sql_dump_merge_driver_configured(root: &std::path::Path) -> Result<bool, std::io::Error> {
-    if !is_git_worktree(root)? {
+    let Some(git_common_dir) = crate::project::git_common_dir_from_filesystem(root) else {
         return Ok(true);
-    }
+    };
 
-    let driver_key = format!("merge.{SQL_DUMP_MERGE_DRIVER}.driver");
-    Ok(git_config_get(root, &driver_key)?.as_deref() == Some("true"))
+    let config = std::fs::read_to_string(git_common_dir.join("config"))?;
+    Ok(
+        git_config_section_value(&config, "merge", SQL_DUMP_MERGE_DRIVER, "driver")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+    )
+}
+
+fn git_config_section_value<'a>(
+    config: &'a str,
+    section: &str,
+    subsection: &str,
+    key: &str,
+) -> Option<&'a str> {
+    let expected_header = format!("[{section} \"{subsection}\"]");
+    let mut in_section = false;
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') {
+            in_section = line.eq_ignore_ascii_case(&expected_header);
+            continue;
+        }
+        if !in_section || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((candidate, value)) = line.split_once('=') else {
+            continue;
+        };
+        if candidate.trim().eq_ignore_ascii_case(key) {
+            return Some(value.trim());
+        }
+    }
+    None
 }
 
 /// Install default hooks.toml.

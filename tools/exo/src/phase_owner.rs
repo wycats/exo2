@@ -77,13 +77,33 @@ impl PhaseOwnerViewContext {
     pub(crate) fn new(root: &Path, project: Option<&Project>) -> Self {
         Self {
             current: current_owner(root, project),
-            local_branches: local_branch_names(root),
-            worktrees: worktree_index(root),
+            local_branches: project
+                .and_then(Project::local_branch_names)
+                .or_else(|| local_branch_names(root)),
+            worktrees: project
+                .and_then(Project::worktree_index)
+                .or_else(|| worktree_index(root)),
         }
     }
 
     pub(crate) fn current_owner(&self) -> &CurrentPhaseOwner {
         &self.current
+    }
+
+    pub(crate) fn current_owner_view(&self) -> CurrentOwnerView {
+        self.current.clone().into()
+    }
+
+    pub(crate) fn owner_view_for_phase(
+        &self,
+        db_path: &Path,
+        phase_id: &str,
+    ) -> Result<Option<PhaseOwnerView>> {
+        let loader = SqliteLoader::open(db_path)?;
+        Ok(loader
+            .load_phase_owner(phase_id)?
+            .as_ref()
+            .map(|owner| self.owner_view(owner)))
     }
 
     pub(crate) fn owner_view(&self, owner: &PhaseOwnerData) -> PhaseOwnerView {
@@ -143,7 +163,9 @@ impl PhaseOwnerViewContext {
 pub(crate) fn current_owner(root: &Path, project: Option<&Project>) -> CurrentPhaseOwner {
     let workspace_root = workspace_root_text(root, project);
     let project_id = project.map_or_else(|| "unresolved".to_string(), |p| p.id.to_string());
-    let branch = current_branch(root);
+    let branch = project
+        .and_then(Project::current_branch)
+        .or_else(|| current_branch(root));
     derive_current_owner(&project_id, workspace_root, branch)
 }
 
