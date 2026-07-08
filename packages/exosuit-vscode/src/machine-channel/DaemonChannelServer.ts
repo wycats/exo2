@@ -12,6 +12,7 @@
  * - Graceful reconnection on socket close
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   MachineChannelRequestEnvelope,
   MachineChannelResponseEnvelope,
@@ -83,6 +84,7 @@ function isReconnectableConnectionLoss(error: unknown): boolean {
 
   return (
     error.message.includes("Connection closed") ||
+    error.message.includes("timed out") ||
     error.message.includes("stream was destroyed") ||
     error.message.includes("ECANCELED") ||
     error.message.includes("EPIPE") ||
@@ -444,6 +446,13 @@ export class DaemonChannelServer {
       throw new Error("DaemonChannelServer is shutting down");
     }
 
+    // Bind one globally unique identity to this logical invocation. Every
+    // socket reconnect below reuses this exact envelope.
+    envelope = {
+      ...envelope,
+      id: `${envelope.id}.${randomUUID()}`,
+    };
+
     // No extension-local request handling remains here.
     const localResponse = this.tryHandleLocally(envelope);
     if (localResponse) {
@@ -456,8 +465,8 @@ export class DaemonChannelServer {
       return this.requestPureRead(envelope);
     }
 
-    // Ensure connected to daemon. Retry once if the connection was destroyed
-    // between ensureConnected() and request().
+    // Retry once with the same globally unique request ID after a connection
+    // loss. The daemon outcome ledger makes write/exec recovery idempotent.
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.ensureConnected();
 
@@ -483,19 +492,10 @@ export class DaemonChannelServer {
 
         return daemonResponse;
       } catch (error) {
-        // If a read request loses its connection, retry once. Do not retry
-        // operation calls without an idempotency contract.
-        if (
-          attempt === 0 &&
-          isPureReadRequest(envelope) &&
-          isReconnectableConnectionLoss(error)
-        ) {
+        if (attempt === 0 && isReconnectableConnectionLoss(error)) {
           logger.info(
-            `[DaemonChannelServer] request(): connection lost during request, retrying...`,
+            `[DaemonChannelServer] request(): connection lost during request ${envelope.id}, recovering recorded outcome...`,
           );
-          // Don't call cleanup() here — that would destroy the connection
-          // for other concurrent callers too. Just null our reference and
-          // let ensureConnected() handle reconnection.
           this.connection = null;
           continue;
         }

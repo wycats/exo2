@@ -20,7 +20,7 @@ MCP clients commonly treat their configured server process as the durable tool c
 - keeping the server process alive can preserve stale Exo semantics;
 - killing the process forces the client to reconnect and may require a fresh chat or host reload;
 - self-reexec helps only when the process can safely replace itself and replay the current request;
-- mutations and exec effects need drain or retry-required behavior, not hidden replay.
+- mutations and exec effects need stable invocation identity and recorded-outcome recovery so transport repair does not execute them twice.
 
 Codex plugin packaging adds a second workspace-binding problem. A packaged stdio MCP server can start with its process cwd set to the plugin package root. That directory is part of the plugin install, not the user's active Exo workspace. The active workspace is available on each tool call through Codex sandbox metadata. `exo-mcp` needs to bind workers to the resolved Exo project for the call, not to the package cwd that happened to launch the process.
 
@@ -117,12 +117,12 @@ Worker protocol errors use JSON-RPC error objects. Exo command errors remain MCP
 
 ### Effect Classification Boundary
 
-The proxy needs request effect information for retry, drain, and retry-required decisions. The worker supplies that information through `worker/classify` using the same command registry and `CommandSpec` effect metadata as execution.
+The proxy needs request effect information to choose between read replay and durable outcome recovery. The worker supplies that information through `worker/classify` using the same command registry and `CommandSpec` effect metadata as execution.
 
 The classification result includes:
 
 - `effect`: `pure`, `write`, or `exec`;
-- `retry_policy`: `auto_retry_read`, `drain_before_restart`, or `retry_required_on_interrupt`;
+- `retry_policy`: `auto_retry_read` for pure reads or `auto_recover_outcome` for writes and execs;
 - `requires_confirmation`: whether Exo requires execution confirmation;
 - `tool_schema_identity`;
 - `command_spec_identity`.
@@ -153,19 +153,23 @@ The proxy may replace the worker when:
 - the worker exits or crashes;
 - the worker reports an incompatible protocol or project identity.
 
-Pure reads may be retried automatically across a worker restart. Writes and execs drain when possible and return retry-required errors when interrupted.
+Pure reads may be retried automatically across a worker restart. Writes and execs preserve one invocation identity across worker replacement and retry the transport with that identity. The daemon returns a completed response from its durable outcome ledger without executing the mutation twice.
 
-### Retry-Required Error
+### Outcome Recovery And Indeterminate Results
 
-Interrupted writes and execs return an MCP error whose text says the operation may or may not have completed and must be reviewed before retry. Structured error data includes:
+The daemon reserves a write or exec request identity before command execution and records the complete response before socket delivery. Reusing the same identity and payload returns the recorded response. Reusing an identity with a different payload is rejected.
+
+If a daemon instance disappears after reserving an identity but before recording a response, its replacement does not execute that mutation again. It returns a structured `daemon.request_outcome_indeterminate` result identifying the request and effect. This preserves at-most-once mutation safety for the process-crash window that cannot yet be associated atomically with the canonical state transaction.
+
+If the proxy cannot retrieve a recorded outcome after automatic worker recovery, it returns an MCP transport error with:
 
 - `code`: `exo.retry_required`;
 - `effect`: `write` or `exec`;
 - `worker_restart_reason`;
 - `request_summary`;
-- whether confirmation or workflow replay data was present.
+- whether the original worker request started.
 
-The proxy keeps hidden confirmation tickets and workflow confirmation payloads out of human text and does not replay them on its own.
+The proxy keeps hidden confirmation tickets and workflow confirmation payloads out of human text. Automatic recovery reuses the original tool-call parameters and durable invocation identity rather than constructing a new command.
 
 ### Diagnostics
 

@@ -480,6 +480,7 @@ fn write_stateful_fake_worker(
     let identity_file = root.join(format!("{name}.identity.json"));
     let call_count_file = root.join(format!("{name}.calls"));
     let classify_count_file = root.join(format!("{name}.classify"));
+    let outcome_id_file = root.join(format!("{name}.outcome-id"));
     let script = format!(
         r#"#!/usr/bin/env python3
 import json
@@ -489,6 +490,7 @@ import sys
 IDENTITY_FILE = pathlib.Path({identity_file})
 CALL_COUNT_FILE = pathlib.Path({call_count_file})
 CLASSIFY_COUNT_FILE = pathlib.Path({classify_count_file})
+OUTCOME_ID_FILE = pathlib.Path({outcome_id_file})
 SELF_PATH = pathlib.Path(sys.argv[0])
 EFFECT = {effect}
 MODE = {mode}
@@ -609,7 +611,7 @@ for raw_line in sys.stdin:
             "result": {{
                 "tool_name": "exo-run",
                 "effect": effect,
-                "retry_policy": "auto_retry_read" if effect == "pure" else "retry_required_on_interrupt",
+                "retry_policy": "auto_retry_read" if effect == "pure" else "auto_recover_outcome",
                 "requires_confirmation": effect == "exec",
                 "request_summary": {{
                     "tool_name": "exo-run",
@@ -624,8 +626,22 @@ for raw_line in sys.stdin:
     elif method == "worker/call":
         count = call_count() + 1
         set_call_count(count)
+        outcome_id = message.get("params", {{}}).get("_exo_outcome_request_id", "")
         if MODE == "exit_first_then_success" and count == 1:
+            OUTCOME_ID_FILE.write_text(outcome_id)
             sys.exit(0)
+        if MODE == "exit_first_then_success" and (
+            not outcome_id or OUTCOME_ID_FILE.read_text() != outcome_id
+        ):
+            emit({{
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {{
+                    "content": [{{"type": "text", "text": "outcome request id changed"}}],
+                    "isError": True
+                }}
+            }})
+            continue
         if MODE == "exit_classify_after_first_call" and count == 1:
             sys.exit(0)
         if MODE == "tool_error_after_first_call" and count == 1:
@@ -656,6 +672,7 @@ for raw_line in sys.stdin:
         call_count_file = serde_json::to_string(&call_count_file).expect("call count path json"),
         classify_count_file =
             serde_json::to_string(&classify_count_file).expect("classify count path json"),
+        outcome_id_file = serde_json::to_string(&outcome_id_file).expect("outcome id path json"),
         effect = serde_json::to_string(effect).expect("effect json"),
         mode = serde_json::to_string(mode).expect("mode json"),
     );
@@ -1034,19 +1051,19 @@ fn mcp_worker_classifies_exo_run_effects_from_command_spec() {
             "argument-dependent-exec",
             "dogfood repair --apply",
             "exec",
-            "retry_required_on_interrupt",
+            "auto_recover_outcome",
         ),
         (
             "write",
             "task add \"Classified write\"",
             "write",
-            "retry_required_on_interrupt",
+            "auto_recover_outcome",
         ),
         (
             "exec",
             "strike start --name classify-demo --goal \"Classified exec\"",
             "exec",
-            "retry_required_on_interrupt",
+            "auto_recover_outcome",
         ),
     ] {
         write_message(
@@ -1234,7 +1251,7 @@ fn exo_mcp_proxy_retry_required_reports_protocol_failures_distinctly() {
         response["error"]["data"]["request_state"], "may_have_started",
         "{response}"
     );
-    assert_eq!(fake_worker_call_count(&call_count_file), 1);
+    assert_eq!(fake_worker_call_count(&call_count_file), 2);
 
     let proxy_status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-protocol-failure");
     assert_eq!(
@@ -1495,7 +1512,7 @@ fn exo_mcp_proxy_returns_retry_classified_tool_error_without_calling_again() {
 
 #[cfg(unix)]
 #[test]
-fn exo_mcp_proxy_does_not_replay_interrupted_write_or_exec_worker_call() {
+fn exo_mcp_proxy_recovers_interrupted_write_and_exec_worker_calls() {
     for (effect, command) in [
         ("write", "task complete secret-task --log Done"),
         ("exec", "strike start --name secret-strike --goal Done"),
@@ -1508,7 +1525,7 @@ fn exo_mcp_proxy_does_not_replay_interrupted_write_or_exec_worker_call() {
             temp.path(),
             &format!("{effect}-worker.py"),
             effect,
-            "exit_always",
+            "exit_first_then_success",
         );
         let mut child =
             spawn_exo_mcp_proxy_with_env(temp.path(), [("EXO_MCP_WORKER", worker.as_path())]);
@@ -1543,25 +1560,9 @@ fn exo_mcp_proxy_does_not_replay_interrupted_write_or_exec_worker_call() {
         );
         let response = read_message(&mut stdout);
         assert_eq!(response["id"], effect, "{response}");
-        assert_eq!(
-            response["error"]["data"]["code"], "exo.retry_required",
-            "{response}"
-        );
-        assert_eq!(response["error"]["data"]["effect"], effect, "{response}");
-        assert_eq!(
-            response["error"]["data"]["worker_restart_reason"], "worker_exited",
-            "{response}"
-        );
-        assert_eq!(response["error"]["data"]["has_auth"], true, "{response}");
-        assert_eq!(
-            response["error"]["data"]["has_workflow_confirmation"], true,
-            "{response}"
-        );
-        assert_eq!(
-            response["error"]["data"]["request_summary"]["command"], command,
-            "{response}"
-        );
-        assert_eq!(fake_worker_call_count(&call_count_file), 1);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(tool_text(&response), "retried pure read");
+        assert_eq!(fake_worker_call_count(&call_count_file), 2);
 
         let serialized = serde_json::to_string(&response).expect("serialize response");
         assert!(!serialized.contains("secret-ticket"), "{serialized}");

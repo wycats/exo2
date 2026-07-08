@@ -619,6 +619,7 @@ describe("DaemonConnection", () => {
 
     expect(socket.writes).toHaveLength(1);
     const firstId = JSON.parse(socket.writes[0] ?? "{}").id as string;
+    expect(firstId).toBe("test.request");
     socket.emitLine(responseFor(firstId));
 
     await expect(first).resolves.toMatchObject({ status: "ok" });

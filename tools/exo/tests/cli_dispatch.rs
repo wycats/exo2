@@ -74,6 +74,36 @@ fn approved_flag_is_not_a_completion_option() {
     }
 }
 
+#[test]
+fn direct_json_server_write_stays_in_process() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let git_init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .expect("git init");
+    assert!(git_init.status.success(), "git init failed");
+    test_support::exo_init_with_storage(root, "sqlite");
+    let request = r#"{"protocol_version":1,"id":"direct-json-write","op":{"kind":"call","params":{"address":{"kind":"operation","path":["epoch","add"]},"input":{"title":"Direct JSON Epoch"}}}}"#;
+
+    let assert = exo_cli(root)
+        .args(["--direct", "json", "server"])
+        .write_stdin(format!("{request}\n"))
+        .assert()
+        .success();
+    let response: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("JSON server response");
+
+    assert_eq!(response["id"], "direct-json-write");
+    assert_eq!(response["status"], "ok");
+    let project = exo::project::Project::resolve(root).expect("resolve test project");
+    assert!(
+        !project.pid_path().exists(),
+        "direct JSON server must not start a project daemon"
+    );
+}
+
 struct DispatchCase {
     name: &'static str,
     args: Vec<&'static str>,

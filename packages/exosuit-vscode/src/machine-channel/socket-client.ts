@@ -703,7 +703,6 @@ async function connectToEnsuredDaemonWithConnector(
  * - Timeout handling
  */
 export class DaemonConnection {
-  private static nextId = 0;
   private socket: Socket;
   private readline: ReadlineInterface;
   private queuedRequests: QueuedRequest[] = [];
@@ -748,12 +747,14 @@ export class DaemonConnection {
     if (this.closed) {
       throw new Error("Connection is closed");
     }
+    if (!envelope.id) {
+      throw new Error("Daemon request envelope requires a stable request id");
+    }
 
     return new Promise((resolve, reject) => {
-      // The connection owns ID generation to guarantee uniqueness.
-      // Callers can set envelope.id for logging, but it's overwritten here.
-      const id = `req.${++DaemonConnection.nextId}`;
-      envelope = { ...envelope, id };
+      // The caller owns globally unique request identity. Preserving it across
+      // reconnects lets the daemon return a recorded mutation outcome.
+      const id = envelope.id;
       const requestPath = requestPathForLog(envelope);
       this.queuedRequests.push({
         envelope,

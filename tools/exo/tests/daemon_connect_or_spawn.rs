@@ -153,6 +153,17 @@ fn assert_db_has_epoch(db_path: &Path, title: &str) {
     );
 }
 
+fn epoch_count(db_path: &Path, title: &str) -> usize {
+    let loader = exo::context::SqliteLoader::open(db_path).expect("open sqlite db");
+    loader
+        .load_state()
+        .expect("load sqlite state")
+        .epochs
+        .iter()
+        .filter(|epoch| epoch.title == title)
+        .count()
+}
+
 async fn send_machine_request(
     stream: exo::daemon_transport::DaemonStream,
     request: &str,
@@ -1494,6 +1505,57 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
     assert!(
         !linked.join(".cache/exo.db").exists(),
         "linked legacy root DB should not exist"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let request = r#"{"protocol_version":1,"id":"lost-write-response","op":{"kind":"call","params":{"address":{"kind":"operation","path":["epoch","add"]},"input":{"title":"Recovered Daemon Epoch"}}}}"#;
+
+    let mut first_stream = exo::daemon::ensure_daemon(&workspace)
+        .await
+        .expect("spawn daemon");
+    first_stream.write_all(request.as_bytes()).await.unwrap();
+    first_stream.write_all(b"\n").await.unwrap();
+    first_stream.flush().await.unwrap();
+    drop(first_stream);
+
+    let wait_start = std::time::Instant::now();
+    while epoch_count(&project.db_path(), "Recovered Daemon Epoch") == 0
+        && wait_start.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        epoch_count(&project.db_path(), "Recovered Daemon Epoch"),
+        1,
+        "first request should commit before outcome replay"
+    );
+
+    let replay_stream = exo::daemon::connect_to_daemon(&workspace)
+        .await
+        .expect("reconnect to daemon");
+    let replay = send_machine_request(replay_stream, request).await;
+
+    assert_eq!(replay["status"], "ok", "{replay}");
+    assert_eq!(replay["id"], "lost-write-response", "{replay}");
+    assert_eq!(
+        epoch_count(&project.db_path(), "Recovered Daemon Epoch"),
+        1,
+        "replayed request id must not execute the mutation twice"
+    );
+    assert!(
+        exo::daemon::paths_for_workspace(&workspace)
+            .expect("daemon paths")
+            .outcome_ledger_path()
+            .exists(),
+        "daemon should persist request outcomes in the project runtime"
     );
 }
 

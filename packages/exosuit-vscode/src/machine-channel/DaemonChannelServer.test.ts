@@ -610,11 +610,13 @@ describe("DaemonChannelServer", () => {
 
     expect(connect).toHaveBeenCalledTimes(2);
     expect(readConnection.request).toHaveBeenCalledWith(
-      makePhaseExecutionTasksEnvelope(),
+      expect.objectContaining({
+        op: makePhaseExecutionTasksEnvelope().op,
+      }),
       expect.any(Number),
     );
     expect(primaryConnection.request).toHaveBeenCalledWith(
-      makeTaskCompleteEnvelope(),
+      expect.objectContaining({ op: makeTaskCompleteEnvelope().op }),
       expect.any(Number),
     );
   });
@@ -1158,23 +1160,32 @@ describe("DaemonChannelServer", () => {
     expect(firstConnection.request).toHaveBeenCalledTimes(1);
   });
 
-  it("does not retry write operation calls after connection loss", async () => {
+  it("recovers write operation outcomes with the same request id after connection loss", async () => {
     const traceCache = { notifyWrite: vi.fn() };
     const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
     const firstConnection = createConnection();
     firstConnection.request.mockRejectedValueOnce(epipe);
-    const connect = vi.fn(async () => firstConnection);
+    const secondConnection = createConnection(makeResponse("write"));
+    const connect = vi
+      .fn<(_: string) => Promise<ConnectionLike>>()
+      .mockResolvedValueOnce(firstConnection)
+      .mockResolvedValueOnce(secondConnection);
     const server = DaemonChannelServer.createForTesting("/tmp/exo2-daemon-9", {
       connect,
       traceCache,
     });
+    const request = makeTaskCompleteEnvelope();
 
-    await expect(server.request(makeTaskCompleteEnvelope())).rejects.toThrow(
-      "write EPIPE",
-    );
+    await expect(server.request(request)).resolves.toMatchObject({ status: "ok" });
 
-    expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenCalledTimes(2);
     expect(firstConnection.request).toHaveBeenCalledTimes(1);
+    expect(secondConnection.request).toHaveBeenCalledTimes(1);
+    const firstRequest = firstConnection.request.mock.calls[0]?.[0];
+    const secondRequest = secondConnection.request.mock.calls[0]?.[0];
+    expect(firstRequest.id).toBe(secondRequest.id);
+    expect(firstRequest.id).toMatch(new RegExp(`^${request.id}\\.`));
+    expect(traceCache.notifyWrite).toHaveBeenCalledTimes(2);
   });
 
   it("enters reconnect cooldown after transient failures and self-heals after cooldown", async () => {

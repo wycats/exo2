@@ -192,6 +192,72 @@ pub fn send_request(
     serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Send a request through an ensured daemon, reconnecting once with the same
+/// request envelope when the transport is interrupted.
+///
+/// Mutating requests are safe to resend because the daemon records their
+/// outcomes by request ID before delivering the socket response.
+pub fn send_request_with_recovery_report(
+    workspace_path: &Path,
+    request: &RequestEnvelope,
+) -> std::io::Result<(ResponseEnvelope, DaemonEnsureReport)> {
+    send_request_with_recovery_report_inner(workspace_path, None, request)
+}
+
+/// Project-resolved variant of [`send_request_with_recovery_report`].
+pub fn send_request_with_project_recovery_report(
+    workspace_path: &Path,
+    project: &Project,
+    request: &RequestEnvelope,
+) -> std::io::Result<(ResponseEnvelope, DaemonEnsureReport)> {
+    send_request_with_recovery_report_inner(workspace_path, Some(project), request)
+}
+
+fn send_request_with_recovery_report_inner(
+    workspace_path: &Path,
+    project: Option<&Project>,
+    request: &RequestEnvelope,
+) -> std::io::Result<(ResponseEnvelope, DaemonEnsureReport)> {
+    let connect = || match project {
+        Some(project) => connect_or_spawn_with_project_report(workspace_path, project),
+        None => connect_or_spawn_with_report(workspace_path),
+    };
+    let ((response, report), _) = send_request_with_recovery_using(request, connect, send_request)?;
+    Ok((response, report))
+}
+
+pub fn is_reconnectable_daemon_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::TimedOut
+    )
+}
+
+fn send_request_with_recovery_using<Stream, Report, Connect, Send>(
+    request: &RequestEnvelope,
+    mut connect: Connect,
+    mut send: Send,
+) -> std::io::Result<((ResponseEnvelope, Report), bool)>
+where
+    Connect: FnMut() -> std::io::Result<(Stream, Report)>,
+    Send: FnMut(&mut Stream, &RequestEnvelope) -> std::io::Result<ResponseEnvelope>,
+{
+    let (mut stream, report) = connect()?;
+    match send(&mut stream, request) {
+        Ok(response) => Ok(((response, report), false)),
+        Err(error) if is_reconnectable_daemon_error(&error) => {
+            let (mut retry_stream, retry_report) = connect()?;
+            send(&mut retry_stream, request).map(|response| ((response, retry_report), true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn client_diagnostics() -> DaemonDiagnostics {
     CLIENT_DIAGNOSTICS.with(|cell| cell.borrow().clone())
 }
@@ -269,6 +335,67 @@ mod tests {
             err.to_string()
                 .contains("daemon closed the connection without sending a response"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn recovery_resends_the_same_request_id_after_connection_loss() {
+        let request = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "stable-request-id".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec!["task".to_string(), "complete".to_string()],
+                },
+                input: serde_json::json!({ "id": "example", "log": "Done" }),
+            }),
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        };
+        let connect_count = std::cell::Cell::new(0);
+        let send_count = std::cell::Cell::new(0);
+        let seen_ids = std::cell::RefCell::new(Vec::new());
+
+        let ((response, report), recovered) = send_request_with_recovery_using(
+            &request,
+            || {
+                let count = connect_count.get() + 1;
+                connect_count.set(count);
+                Ok(((), count))
+            },
+            |(), request| {
+                seen_ids.borrow_mut().push(request.id.clone());
+                let count = send_count.get() + 1;
+                send_count.set(count);
+                if count == 1 {
+                    Err(Error::new(ErrorKind::UnexpectedEof, "lost response"))
+                } else {
+                    Ok(ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        id: request.id.clone(),
+                        status: crate::api::protocol::Status::Ok,
+                        result: Some(serde_json::json!({ "completed": true })),
+                        error: None,
+                        ticket: None,
+                        steering: None,
+                        reminders: None,
+                        display: None,
+                        preview: None,
+                        effect: Some(crate::api::protocol::Effect::Write),
+                        trace: None,
+                    })
+                }
+            },
+        )
+        .expect("request should recover");
+
+        assert!(recovered);
+        assert_eq!(report, 2);
+        assert_eq!(response.id, "stable-request-id");
+        assert_eq!(
+            seen_ids.into_inner(),
+            ["stable-request-id", "stable-request-id"]
         );
     }
 }
