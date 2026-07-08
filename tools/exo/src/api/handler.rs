@@ -1659,7 +1659,7 @@ fn handle_preview(id: String, params: &CallParams) -> ResponseEnvelope {
     }
 }
 
-fn sidecar_writer_ensure_outcome(state: DaemonEnsureState) -> &'static str {
+const fn daemon_writer_ensure_outcome(state: DaemonEnsureState) -> &'static str {
     match state {
         DaemonEnsureState::ConnectedExisting | DaemonEnsureState::WaitedForLock => {
             "writer_available"
@@ -1668,47 +1668,56 @@ fn sidecar_writer_ensure_outcome(state: DaemonEnsureState) -> &'static str {
     }
 }
 
-fn should_use_sidecar_writer_lane(
+fn should_use_daemon_writer_lane(
     runtime: HandlerRuntime,
     project: Option<&Project>,
-    namespace: &str,
-    operation: &str,
     effect: Effect,
 ) -> bool {
     runtime == HandlerRuntime::External
-        && crate::post_write::should_auto_persist_after_success(
-            effect, namespace, operation, project,
-        )
+        && project.is_some()
+        && matches!(effect, Effect::Write | Effect::Exec)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn call_ensured_sidecar_writer(
+fn call_ensured_daemon_writer(
     workspace_root: &Path,
     project: Option<&Project>,
     id: String,
     params: &CallParams,
-    auth: &Option<Auth>,
-    agent_id: &Option<String>,
-    workflow_confirmation: &Option<crate::api::protocol::WorkflowConfirmationInput>,
+    auth: Option<&Auth>,
+    agent_id: Option<&String>,
+    workflow_confirmation: Option<&crate::api::protocol::WorkflowConfirmationInput>,
     diagnostics: &DaemonDiagnostics,
 ) -> ResponseEnvelope {
     diagnostics.record(
-        "request.sidecar_writer_ensure_start",
+        "request.daemon_writer_ensure_start",
         json!({ "request_id": id }),
     );
 
-    let writer_connection = match project {
-        Some(project) => {
-            crate::daemon_client::connect_or_spawn_with_project_report(workspace_root, project)
+    let writer_request = RequestEnvelope {
+        protocol_version: protocol::PROTOCOL_VERSION,
+        id: id.clone(),
+        op: Op::Call(params.clone()),
+        auth: auth.cloned(),
+        workflow_confirmation: workflow_confirmation.cloned(),
+        agent_id: agent_id.cloned(),
+    };
+    let writer_response = match project {
+        Some(project) => crate::daemon_client::send_request_with_project_recovery_report(
+            workspace_root,
+            project,
+            &writer_request,
+        ),
+        None => {
+            crate::daemon_client::send_request_with_recovery_report(workspace_root, &writer_request)
         }
-        None => crate::daemon_client::connect_or_spawn_with_report(workspace_root),
     };
 
-    let (mut stream, report) = match writer_connection {
+    let (response, report) = match writer_response {
         Ok(outcome) => outcome,
         Err(connect_error) => {
             diagnostics.record(
-                "request.sidecar_writer_ensure_end",
+                "request.daemon_writer_ensure_end",
                 json!({
                     "request_id": id,
                     "status": "error",
@@ -1719,9 +1728,9 @@ fn call_ensured_sidecar_writer(
             return error(
                 id,
                 ErrorCode::PreconditionFailed,
-                format!("sidecar writer ensure failed: {connect_error}"),
+                format!("daemon writer ensure failed: {connect_error}"),
                 Some(json!({
-                    "kind": "sidecar.writer_ensure",
+                    "kind": "daemon.writer_ensure",
                     "outcome": "writer_incompatible",
                     "error": connect_error.to_string(),
                 })),
@@ -1730,9 +1739,9 @@ fn call_ensured_sidecar_writer(
         }
     };
 
-    let outcome = sidecar_writer_ensure_outcome(report.state);
+    let outcome = daemon_writer_ensure_outcome(report.state);
     diagnostics.record(
-        "request.sidecar_writer_ensure_end",
+        "request.daemon_writer_ensure_end",
         json!({
             "request_id": id,
             "status": "ok",
@@ -1740,40 +1749,7 @@ fn call_ensured_sidecar_writer(
             "report": report,
         }),
     );
-
-    let writer_request = RequestEnvelope {
-        protocol_version: protocol::PROTOCOL_VERSION,
-        id: id.clone(),
-        op: Op::Call(params.clone()),
-        auth: auth.clone(),
-        workflow_confirmation: workflow_confirmation.clone(),
-        agent_id: agent_id.clone(),
-    };
-
-    match crate::daemon_client::send_request(&mut stream, &writer_request) {
-        Ok(response) => response,
-        Err(call_error) => {
-            diagnostics.record(
-                "request.sidecar_writer_call_failed",
-                json!({
-                    "request_id": id,
-                    "outcome": "writer_incompatible",
-                    "error": call_error.to_string(),
-                }),
-            );
-            error(
-                id,
-                ErrorCode::PreconditionFailed,
-                format!("sidecar writer call failed: {call_error}"),
-                Some(json!({
-                    "kind": "sidecar.writer_ensure",
-                    "outcome": "writer_incompatible",
-                    "error": call_error.to_string(),
-                })),
-                steer_help_root(),
-            )
-        }
-    }
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1942,15 +1918,15 @@ fn handle_call_with_namespace_operation(
             };
 
             let effect = cmd_box.effect();
-            if should_use_sidecar_writer_lane(runtime, project, namespace, operation, effect) {
-                return call_ensured_sidecar_writer(
+            if should_use_daemon_writer_lane(runtime, project, effect) {
+                return call_ensured_daemon_writer(
                     workspace_root,
                     project,
                     id,
                     params,
-                    &auth,
-                    &agent_id,
-                    &workflow_confirmation,
+                    auth.as_ref(),
+                    agent_id.as_ref(),
+                    workflow_confirmation.as_ref(),
                     diagnostics,
                 );
             }

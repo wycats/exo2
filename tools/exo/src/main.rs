@@ -600,7 +600,8 @@ fn send_daemon_request_with_recovery(
 }
 
 fn should_retry_daemon_request(effect: Effect, err: &std::io::Error) -> bool {
-    effect == Effect::Pure && err.kind() == std::io::ErrorKind::UnexpectedEof
+    let _ = effect;
+    exo::daemon_client::is_reconnectable_daemon_error(err)
 }
 
 fn send_daemon_request_with_recovery_using<Stream, Connect, Send>(
@@ -617,11 +618,18 @@ where
         .map_err(|source| DaemonDispatchError::new(request, effect, source, false, false, false))?;
     match send(&mut stream, request) {
         Ok(response) => Ok(response),
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => match connect() {
+        Err(err) if exo::daemon_client::is_reconnectable_daemon_error(&err) => match connect() {
             Ok(mut retry_stream) => {
                 if should_retry_daemon_request(effect, &err) {
                     send(&mut retry_stream, request).map_err(|source| {
-                        DaemonDispatchError::new(request, effect, source, true, true, false)
+                        DaemonDispatchError::new(
+                            request,
+                            effect,
+                            source,
+                            true,
+                            true,
+                            effect != Effect::Pure,
+                        )
                     })
                 } else {
                     Err(DaemonDispatchError::new(
@@ -2768,18 +2776,18 @@ mod tests {
     }
 
     #[test]
-    fn daemon_retry_policy_only_replays_pure_unexpected_eof() {
+    fn daemon_retry_policy_replays_all_effects_with_durable_request_identity() {
         let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed");
         assert!(should_retry_daemon_request(Effect::Pure, &eof));
 
         let write_eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed");
-        assert!(!should_retry_daemon_request(Effect::Write, &write_eof));
+        assert!(should_retry_daemon_request(Effect::Write, &write_eof));
 
         let exec_eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed");
-        assert!(!should_retry_daemon_request(Effect::Exec, &exec_eof));
+        assert!(should_retry_daemon_request(Effect::Exec, &exec_eof));
 
         let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        assert!(!should_retry_daemon_request(Effect::Pure, &reset));
+        assert!(should_retry_daemon_request(Effect::Pure, &reset));
     }
 
     #[test]
@@ -2813,68 +2821,63 @@ mod tests {
     }
 
     #[test]
-    fn daemon_eof_repair_does_not_replay_write_requests() {
+    fn daemon_eof_repair_replays_write_request_with_same_id() {
         let request = test_daemon_request();
         let connects = Cell::new(0);
         let sends = Cell::new(0);
 
-        let err = send_daemon_request_with_recovery_using(
+        let response = send_daemon_request_with_recovery_using(
             &request,
             Effect::Write,
             || {
                 connects.set(connects.get() + 1);
                 Ok(())
             },
-            |_, _| {
-                sends.set(sends.get() + 1);
-                Err(eof_error())
+            |_, request| {
+                let attempt = sends.get();
+                sends.set(attempt + 1);
+                if attempt == 0 {
+                    Err(eof_error())
+                } else {
+                    Ok(ok_daemon_response(&request.id))
+                }
             },
         )
-        .expect_err("write EOF should remain ambiguous after repair");
+        .expect("write response should be recovered from durable request id");
 
         assert_eq!(connects.get(), 2, "EOF should trigger daemon repair");
-        assert_eq!(sends.get(), 1, "write request must not be replayed");
-        assert!(err.daemon_repaired);
-        assert!(err.ambiguous_outcome);
-
-        let response = daemon_dispatch_error_response(&err);
-        let details = response
-            .error
-            .as_ref()
-            .and_then(|error| error.details.as_ref())
-            .expect("structured daemon error details");
-        assert_eq!(details["code"], "exo.daemon_outcome_ambiguous");
-        assert_eq!(details["effect"], "write");
-        assert_eq!(details["daemon_repaired"], true);
-        assert_eq!(details["replayed"], false);
-        assert_eq!(details["request_summary"]["op_path"][0], "task");
-        assert_eq!(details["request_summary"]["op_path"][1], "complete");
+        assert_eq!(sends.get(), 2, "write request id should be retried once");
+        assert_eq!(response.id, request.id);
     }
 
     #[test]
-    fn daemon_eof_repair_does_not_replay_exec_requests() {
+    fn daemon_eof_repair_replays_exec_request_with_same_id() {
         let request = test_daemon_request();
         let connects = Cell::new(0);
         let sends = Cell::new(0);
 
-        let err = send_daemon_request_with_recovery_using(
+        let response = send_daemon_request_with_recovery_using(
             &request,
             Effect::Exec,
             || {
                 connects.set(connects.get() + 1);
                 Ok(())
             },
-            |_, _| {
-                sends.set(sends.get() + 1);
-                Err(eof_error())
+            |_, request| {
+                let attempt = sends.get();
+                sends.set(attempt + 1);
+                if attempt == 0 {
+                    Err(eof_error())
+                } else {
+                    Ok(ok_daemon_response(&request.id))
+                }
             },
         )
-        .expect_err("exec EOF should remain ambiguous after repair");
+        .expect("exec response should be recovered from durable request id");
 
         assert_eq!(connects.get(), 2, "EOF should trigger daemon repair");
-        assert_eq!(sends.get(), 1, "exec request must not be replayed");
-        assert!(err.daemon_repaired);
-        assert!(err.ambiguous_outcome);
+        assert_eq!(sends.get(), 2, "exec request id should be retried once");
+        assert_eq!(response.id, request.id);
     }
 
     #[test]

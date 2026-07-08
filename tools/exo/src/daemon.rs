@@ -36,6 +36,9 @@ use crate::daemon_diagnostics::{
     DaemonDiagnostics, DaemonDiagnosticsConfig, effect_name, elapsed_ms, request_op_path,
     response_status,
 };
+use crate::daemon_outcomes::{
+    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, declared_request_effect,
+};
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
 use fs2::FileExt;
@@ -149,6 +152,11 @@ impl LocalRuntimePaths {
     /// Daemon executable identity path: `{state_root}/runtime/daemon.identity.json`
     pub fn identity_path(&self) -> PathBuf {
         self.identity_path.clone()
+    }
+
+    /// Durable request/outcome ledger used to recover interrupted mutations.
+    pub fn outcome_ledger_path(&self) -> PathBuf {
+        self.runtime_dir.join(DAEMON_OUTCOME_DB_NAME)
     }
 
     /// The workspace root this runtime is for.
@@ -1818,6 +1826,20 @@ pub async fn run_daemon(
         .process_start_id
         .expect("daemon runtime identity includes a process start identity")
         .into();
+    let outcome_ledger = match RequestOutcomeLedger::open(paths.outcome_ledger_path()) {
+        Ok(ledger) => Arc::new(ledger),
+        Err(error) => {
+            diagnostics.record(
+                "daemon.outcome_ledger_open_failed",
+                serde_json::json!({
+                    "path": paths.outcome_ledger_path(),
+                    "error": error.to_string(),
+                }),
+            );
+            eprintln!("exo daemon: failed to open request outcome ledger: {error}");
+            return;
+        }
+    };
 
     // Keep lock_file alive - dropping it releases the lock
     // We'll drop it explicitly at the end for clarity
@@ -1866,6 +1888,8 @@ pub async fn run_daemon(
     let cleanup_workspace = Arc::clone(&workspace);
     let cleanup_project = Arc::clone(&project);
     let request_project = Arc::clone(&project);
+    let request_outcome_ledger = Arc::clone(&outcome_ledger);
+    let request_instance_id = Arc::clone(&instance_id);
     let server_handle = tokio::spawn(async move {
         run_socket_server(
             &paths_clone,
@@ -1880,56 +1904,54 @@ pub async fn run_daemon(
                 let workspace = Arc::clone(&workspace);
                 let project = Arc::clone(&request_project);
                 let diagnostics = handler_diagnostics.clone();
+                let outcome_ledger = Arc::clone(&request_outcome_ledger);
+                let instance_id = Arc::clone(&request_instance_id);
                 async move {
                     let request_id = req.id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let project = daemon_request_project(project.as_ref())?;
-                        Ok::<_, io::Error>(handle_request_with_project_and_diagnostics_as_writer(
-                            &workspace,
-                            Some(&project),
-                            req,
-                            &diagnostics,
-                        ))
+                        let effect = declared_request_effect(&req);
+                        let execute = |req: RequestEnvelope| {
+                            let request_id = req.id.clone();
+                            match daemon_request_project(project.as_ref()) {
+                                Ok(project) => {
+                                    handle_request_with_project_and_diagnostics_as_writer(
+                                        &workspace,
+                                        Some(&project),
+                                        req,
+                                        &diagnostics,
+                                    )
+                                }
+                                Err(error) => daemon_handler_error_response(
+                                    request_id,
+                                    ErrorCode::PreconditionFailed,
+                                    error.to_string(),
+                                ),
+                            }
+                        };
+
+                        match effect {
+                            Some(effect @ (Effect::Write | Effect::Exec)) => {
+                                outcome_ledger
+                                    .execute(
+                                        req,
+                                        effect,
+                                        &instance_id,
+                                        Duration::from_secs(30),
+                                        execute,
+                                    )
+                                    .response
+                            }
+                            _ => execute(req),
+                        }
                     })
                     .await
                     {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(error)) => ResponseEnvelope {
-                            protocol_version: PROTOCOL_VERSION,
-                            id: request_id,
-                            status: Status::Error,
-                            result: None,
-                            error: Some(ErrorBody {
-                                code: ErrorCode::PreconditionFailed,
-                                message: error.to_string(),
-                                details: None,
-                            }),
-                            ticket: None,
-                            steering: None,
-                            reminders: None,
-                            display: None,
-                            preview: None,
-                            effect: None,
-                            trace: None,
-                        },
-                        Err(error) => ResponseEnvelope {
-                            protocol_version: PROTOCOL_VERSION,
-                            id: request_id,
-                            status: Status::Error,
-                            result: None,
-                            error: Some(ErrorBody {
-                                code: ErrorCode::Internal,
-                                message: format!("daemon handler task failed: {error}"),
-                                details: None,
-                            }),
-                            ticket: None,
-                            steering: None,
-                            reminders: None,
-                            display: None,
-                            preview: None,
-                            effect: None,
-                            trace: None,
-                        },
+                        Ok(response) => response,
+                        Err(error) => daemon_handler_error_response(
+                            request_id,
+                            ErrorCode::Internal,
+                            format!("daemon handler task failed: {error}"),
+                        ),
                     }
                 }
             },
@@ -2021,6 +2043,31 @@ pub async fn run_daemon(
     // Explicitly drop the lock file to release the flock
     // (This happens automatically, but being explicit is clearer)
     drop(lock_file);
+}
+
+const fn daemon_handler_error_response(
+    id: String,
+    code: ErrorCode,
+    message: String,
+) -> ResponseEnvelope {
+    ResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id,
+        status: Status::Error,
+        result: None,
+        error: Some(ErrorBody {
+            code,
+            message,
+            details: None,
+        }),
+        ticket: None,
+        steering: None,
+        reminders: None,
+        display: None,
+        preview: None,
+        effect: None,
+        trace: None,
+    }
 }
 
 /// Log a file-save event to the `agent_events` table.

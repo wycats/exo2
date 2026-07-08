@@ -65,6 +65,7 @@ pub mod context;
 pub mod daemon;
 pub mod daemon_client;
 pub mod daemon_diagnostics;
+pub mod daemon_outcomes;
 pub mod daemon_transport;
 pub mod derived;
 pub mod diagnostics;

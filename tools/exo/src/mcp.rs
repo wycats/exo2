@@ -23,6 +23,7 @@ use crate::router::{Compilation, compile_argv};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MCP_WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const MCP_OUTCOME_REQUEST_ID_PARAM: &str = "_exo_outcome_request_id";
 const EXO_RUN_TOOL_NAME: &str = "exo-run";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -642,7 +643,8 @@ fn handle_tools_call(
         Err(error) => return Some(error),
     };
 
-    let result = call_exo_run_tool(workspace_root, project, input);
+    let request_id = tool_call_request_id(&id, params.as_ref());
+    let result = call_exo_run_tool_with_request_id(workspace_root, project, input, request_id);
     Some(json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -664,7 +666,7 @@ fn worker_classify_tools_call(
     let has_auth = input.auth.is_some();
     let has_workflow_confirmation = input.workflow_confirmation.is_some();
 
-    let request_id = worker_classification_request_id(&id);
+    let request_id = tool_call_request_id(&id, params.as_ref());
     let prepared = match prepare_exo_run_tool_call(workspace_root, input, request_id) {
         Ok(prepared) => prepared,
         Err(response) => {
@@ -760,9 +762,15 @@ fn worker_tool_error_classification(
     })
 }
 
-fn worker_classification_request_id(id: &JsonValue) -> String {
+fn tool_call_request_id(id: &JsonValue, params: Option<&JsonValue>) -> String {
+    if let Some(request_id) = params
+        .and_then(|params| params.get(MCP_OUTCOME_REQUEST_ID_PARAM))
+        .and_then(JsonValue::as_str)
+    {
+        return format!("mcp.exo-run.{request_id}");
+    }
     let serialized = serde_json::to_vec(id).unwrap_or_else(|_| b"null".to_vec());
-    format!("mcp.worker.classify.{}", blake3::hash(&serialized).to_hex())
+    format!("mcp.exo-run.{}", blake3::hash(&serialized).to_hex())
 }
 
 fn exo_run_input_from_tools_call_params(
@@ -927,7 +935,7 @@ fn effect_for_address(address: &Address) -> Result<Effect, String> {
 const fn retry_policy_for_effect(effect: Effect) -> &'static str {
     match effect {
         Effect::Pure => "auto_retry_read",
-        Effect::Write | Effect::Exec => "retry_required_on_interrupt",
+        Effect::Write | Effect::Exec => "auto_recover_outcome",
     }
 }
 
@@ -958,6 +966,15 @@ pub fn call_exo_run_tool(
     input: ExoRunInput,
 ) -> McpToolResult {
     let request_id = format!("mcp.exo-run.{}", Uuid::new_v4());
+    call_exo_run_tool_with_request_id(workspace_root, project, input, request_id)
+}
+
+fn call_exo_run_tool_with_request_id(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    input: ExoRunInput,
+    request_id: String,
+) -> McpToolResult {
     let include_structured = explicit_json_output_requested(&input);
     let compiled = match compile_exo_run_input(input, request_id) {
         Ok(compiled) => compiled,
@@ -2776,13 +2793,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_classification_request_ids_are_derived_from_worker_request_ids() {
-        let first = worker_classification_request_id(&json!("exo-proxy-worker-1-worker.classify"));
-        let second = worker_classification_request_id(&json!("exo-proxy-worker-2-worker.classify"));
+    fn tool_call_request_ids_prefer_the_proxy_outcome_identity() {
+        let params = json!({ MCP_OUTCOME_REQUEST_ID_PARAM: "stable-call" });
+        let first =
+            tool_call_request_id(&json!("exo-proxy-worker-1-worker.classify"), Some(&params));
+        let second =
+            tool_call_request_id(&json!("exo-proxy-worker-2-worker.classify"), Some(&params));
 
-        assert_ne!(first, second);
-        assert!(first.starts_with("mcp.worker.classify."));
-        assert!(second.starts_with("mcp.worker.classify."));
+        assert_eq!(first, "mcp.exo-run.stable-call");
+        assert_eq!(second, first);
     }
 
     fn handle_json_rpc_value_for_test(value: JsonValue) -> Option<JsonValue> {

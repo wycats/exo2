@@ -14,6 +14,7 @@ use exo::mcp::{
 use exosuit_process_host::{HostError, JsonLineWorker, LineResponse, WorkerSpec, serve_json_lines};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use uuid::Uuid;
 
 fn main() {
     exo_reexec::maybe_reexec();
@@ -147,6 +148,7 @@ impl ProxyWorker {
         client_id: JsonValue,
         params: Option<JsonValue>,
     ) -> Result<JsonValue, HostError> {
+        let params = bind_outcome_request_id(params);
         let mut classification_response = self.classify_worker_call(params.clone())?;
         let mut pre_call_restart_reclassifications = 0;
 
@@ -179,7 +181,7 @@ impl ProxyWorker {
                     pre_call_restart_reclassifications += 1;
                     classification_response = self.classify_worker_call(params.clone())?;
                 }
-                Err(failure) if classification.effect == Effect::Pure => {
+                Err(failure) => {
                     let retry_classification_response =
                         match self.call_worker_method("worker/classify", params.clone()) {
                             Ok(output) => output.response,
@@ -206,7 +208,7 @@ impl ProxyWorker {
                             "result": tool_result,
                         }));
                     }
-                    if retry_classification.effect != Effect::Pure {
+                    if retry_classification.effect != classification.effect {
                         return Ok(retry_required_response(
                             client_id,
                             &retry_classification,
@@ -224,13 +226,6 @@ impl ProxyWorker {
                             &failure,
                         )),
                     };
-                }
-                Err(failure) => {
-                    return Ok(retry_required_response(
-                        client_id,
-                        &classification,
-                        &failure,
-                    ));
                 }
             }
         }
@@ -515,6 +510,18 @@ impl ProxyWorker {
     }
 }
 
+fn bind_outcome_request_id(params: Option<JsonValue>) -> Option<JsonValue> {
+    params.map(|mut params| {
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM.to_string(),
+                JsonValue::String(Uuid::new_v4().to_string()),
+            );
+        }
+        params
+    })
+}
+
 #[derive(Debug, Clone)]
 struct ProxyExecutableIdentity {
     executable_path: PathBuf,
@@ -701,7 +708,7 @@ fn retry_required_response(
     };
     let message = if failure.request_started {
         format!(
-            "Exo MCP worker failed during a {effect} request. Check whether it completed before retrying."
+            "Exo could not retrieve the recorded {effect} outcome after automatic worker recovery."
         )
     } else {
         format!(
