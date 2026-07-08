@@ -511,15 +511,13 @@ impl ProxyWorker {
 }
 
 fn bind_outcome_request_id(params: Option<JsonValue>) -> Option<JsonValue> {
-    params.map(|mut params| {
-        if let Some(object) = params.as_object_mut() {
-            object.insert(
-                exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM.to_string(),
-                JsonValue::String(Uuid::new_v4().to_string()),
-            );
-        }
-        params
-    })
+    let mut params = params.unwrap_or_else(|| json!({}));
+    if let Some(object) = params.as_object_mut() {
+        object
+            .entry(exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM)
+            .or_insert_with(|| JsonValue::String(Uuid::new_v4().to_string()));
+    }
+    Some(params)
 }
 
 #[derive(Debug, Clone)]
@@ -875,7 +873,50 @@ fn json_rpc_id(line: &str) -> JsonValue {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{exo_worker_spec, worker_binary_name, worker_identity_check_path, worker_spec_for};
+    use serde_json::json;
+
+    use super::{
+        bind_outcome_request_id, exo_worker_spec, worker_binary_name, worker_identity_check_path,
+        worker_spec_for,
+    };
+
+    #[test]
+    fn outcome_request_id_is_added_when_params_are_absent() {
+        let params = bind_outcome_request_id(None).expect("params object");
+        assert!(
+            params
+                .get(exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn existing_outcome_request_id_is_preserved() {
+        let params = bind_outcome_request_id(Some(json!({
+            exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM: "caller-owned-id",
+            "command": "status",
+        })))
+        .expect("params object");
+
+        assert_eq!(
+            params[exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM],
+            "caller-owned-id"
+        );
+    }
+
+    #[test]
+    fn outcome_request_id_is_added_to_existing_params_object() {
+        let params =
+            bind_outcome_request_id(Some(json!({ "command": "status" }))).expect("params object");
+        assert!(
+            params
+                .get(exo::mcp::MCP_OUTCOME_REQUEST_ID_PARAM)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(params["command"], "status");
+    }
 
     #[test]
     fn worker_spec_prefers_sibling_exo_binary() {

@@ -10,7 +10,8 @@ use crate::api::protocol::{
     Status,
 };
 use crate::command::command_spec::CommandSpec;
-use crate::command::registry::default_registry;
+use crate::command::registry::{build_command_from_invocation, default_registry};
+use crate::command::router::Invocation;
 use anyhow::{Context, Result, anyhow};
 use exosuit_storage::rusqlite::TransactionBehavior;
 use exosuit_storage::{Connection, OptionalExtension, params};
@@ -303,7 +304,7 @@ impl RequestOutcomeLedger {
     }
 }
 
-pub fn declared_request_effect(request: &RequestEnvelope) -> Option<Effect> {
+pub fn resolved_request_effect(workspace_root: &Path, request: &RequestEnvelope) -> Option<Effect> {
     let Op::Call(params) = &request.op else {
         return None;
     };
@@ -317,10 +318,11 @@ pub fn declared_request_effect(request: &RequestEnvelope) -> Option<Effect> {
         _ => return None,
     };
     static COMMAND_SPEC: OnceLock<CommandSpec> = OnceLock::new();
-    COMMAND_SPEC
-        .get_or_init(|| CommandSpec::from_registry(&default_registry()))
-        .operation(namespace, &operation)
-        .map(|operation| operation.effect)
+    let spec = COMMAND_SPEC.get_or_init(|| CommandSpec::from_registry(&default_registry()));
+    let invocation = Invocation::from_json(&params.input, namespace, &operation, spec).ok()?;
+    build_command_from_invocation(&invocation, workspace_root)
+        .ok()?
+        .map(|command| command.effect())
 }
 
 fn request_hash(request: &RequestEnvelope) -> Result<String> {
@@ -584,10 +586,38 @@ mod tests {
     }
 
     #[test]
-    fn declared_effect_comes_from_command_spec() {
+    fn resolved_effect_comes_from_built_command() {
         assert_eq!(
-            declared_request_effect(&request("request-1", "task-a")),
+            resolved_request_effect(Path::new("."), &request("request-1", "task-a")),
             Some(Effect::Write)
+        );
+    }
+
+    #[test]
+    fn resolved_effect_honors_argument_dependent_exec_commands() {
+        let mut apply = request("request-1", "task-a");
+        {
+            let Op::Call(params) = &mut apply.op else {
+                unreachable!("test request is a call");
+            };
+            params.address = Address::Operation {
+                path: vec!["dogfood".to_string(), "repair".to_string()],
+            };
+            params.input = serde_json::json!({ "apply": true });
+        }
+
+        assert_eq!(
+            resolved_request_effect(Path::new("."), &apply),
+            Some(Effect::Exec)
+        );
+
+        let Op::Call(params) = &mut apply.op else {
+            unreachable!("test request is a call");
+        };
+        params.input = serde_json::json!({ "apply": false });
+        assert_eq!(
+            resolved_request_effect(Path::new("."), &apply),
+            Some(Effect::Pure)
         );
     }
 }

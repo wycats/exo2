@@ -492,6 +492,23 @@ pub fn run_machine_channel_in_process_with_project(
     project: Option<&exo::project::Project>,
     request: &exo::api::protocol::RequestEnvelope,
 ) -> exo::api::protocol::ResponseEnvelope {
+    run_machine_channel_in_process_with_project_runtime(repo_root, project, request, false)
+}
+
+pub fn run_machine_channel_in_process_with_project_as_writer(
+    repo_root: &std::path::Path,
+    project: Option<&exo::project::Project>,
+    request: &exo::api::protocol::RequestEnvelope,
+) -> exo::api::protocol::ResponseEnvelope {
+    run_machine_channel_in_process_with_project_runtime(repo_root, project, request, true)
+}
+
+fn run_machine_channel_in_process_with_project_runtime(
+    repo_root: &std::path::Path,
+    project: Option<&exo::project::Project>,
+    request: &exo::api::protocol::RequestEnvelope,
+    as_writer: bool,
+) -> exo::api::protocol::ResponseEnvelope {
     // Simulate the process boundary: serialize/deserialize, then call the handler.
     // Note: this runs the handler in-process. Requests that can touch sidecar
     // surfaces should pass a project resolved against fixture policy paths.
@@ -499,11 +516,19 @@ pub fn run_machine_channel_in_process_with_project(
     let parsed: exo::api::protocol::RequestEnvelope =
         serde_json::from_str(&input).expect("deserialize request");
 
-    let mut response = match project {
-        Some(project) => {
+    let mut response = match (project, as_writer) {
+        (Some(project), true) => {
+            exo::api::handler::handle_request_with_project_and_diagnostics_as_writer(
+                repo_root,
+                Some(project),
+                parsed,
+                &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
+            )
+        }
+        (Some(project), false) => {
             exo::api::handler::handle_request_with_project(repo_root, Some(project), parsed)
         }
-        None => exo::api::handler::handle_request(repo_root, parsed),
+        (None, _) => exo::api::handler::handle_request(repo_root, parsed),
     };
 
     // Match machine-channel behavior: attach global verifier reminders.

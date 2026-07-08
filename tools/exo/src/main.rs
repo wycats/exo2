@@ -1752,7 +1752,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
             let context = load_context_or_exit(format, true, cwd);
-            if let Err(e) = handle_json_server(&context, context.project.as_ref()) {
+            if let Err(e) = handle_json_server(&context, context.project.as_ref(), is_direct) {
                 render_fatal_error(format, Some(&context), &*e);
                 std::process::exit(if format == OutputFormat::Json { 2 } else { 1 });
             }
@@ -2403,6 +2403,7 @@ fn emit_verifier_reminders(reminders: &[exo::api::protocol::Reminder]) {
 fn handle_json_server(
     context: &AgentContext,
     project: Option<&Project>,
+    is_direct: bool,
 ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     use exo::api;
     use exo::api::protocol::{ErrorBody, ErrorCode, PROTOCOL_VERSION, ResponseEnvelope, Status};
@@ -2430,6 +2431,14 @@ fn handle_json_server(
 
         let mut response: ResponseEnvelope =
             match serde_json::from_str::<api::protocol::RequestEnvelope>(&input) {
+                Ok(request) if is_direct => {
+                    api::handler::handle_request_with_project_and_diagnostics_as_writer(
+                        &context.root,
+                        project,
+                        request,
+                        &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
+                    )
+                }
                 Ok(request) => {
                     api::handler::handle_request_with_project(&context.root, project, request)
                 }

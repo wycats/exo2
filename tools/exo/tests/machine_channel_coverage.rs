@@ -28,8 +28,7 @@ use std::process::Command;
 use test_case::test_matrix;
 
 use test_support::exo_init_with_storage;
-use test_support::run_machine_channel_in_process;
-use test_support::run_machine_channel_in_process_with_project;
+use test_support::run_machine_channel_in_process_with_project_as_writer;
 
 #[derive(Debug, Clone)]
 struct OperationCase {
@@ -203,11 +202,11 @@ fn machine_channel_coverage_all_operations(backend: &str) {
 
     for op in operations {
         let request = build_request(&op, root);
-        let resp = if op.path.first().is_some_and(|ns| ns == "sidecar") {
-            run_machine_channel_in_process_with_project(root, Some(&fixture_project), &request)
-        } else {
-            run_machine_channel_in_process(root, &request)
-        };
+        let resp = run_machine_channel_in_process_with_project_as_writer(
+            root,
+            Some(&fixture_project),
+            &request,
+        );
 
         let status = resp.status;
         let error_code = resp.error.as_ref().map(|e| e.code);

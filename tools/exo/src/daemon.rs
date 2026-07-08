@@ -37,7 +37,7 @@ use crate::daemon_diagnostics::{
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, declared_request_effect,
+    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, resolved_request_effect,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -1909,7 +1909,7 @@ pub async fn run_daemon(
                 async move {
                     let request_id = req.id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let effect = declared_request_effect(&req);
+                        let effect = resolved_request_effect(&workspace, &req);
                         let execute = |req: RequestEnvelope| {
                             let request_id = req.id.clone();
                             match daemon_request_project(project.as_ref()) {
