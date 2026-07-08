@@ -1,5 +1,6 @@
 use crate::ExoResult;
 use crate::context::SqliteLoader;
+use crate::project::Project;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,7 +12,15 @@ pub struct RfcIndexEntry {
 }
 
 pub fn index_rfcs(root: &Path) -> ExoResult<HashMap<String, RfcIndexEntry>> {
-    let db_path = crate::context::db_path_resolving_project(root);
+    let project = Project::resolve(root).ok();
+    index_rfcs_with_project(root, project.as_ref())
+}
+
+pub fn index_rfcs_with_project(
+    root: &Path,
+    project: Option<&Project>,
+) -> ExoResult<HashMap<String, RfcIndexEntry>> {
+    let db_path = crate::context::db_path(root, project);
     if !db_path.exists() {
         return Ok(HashMap::new());
     }

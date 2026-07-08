@@ -107,6 +107,8 @@ pub struct EpochBoundaryState {
 #[derive(Debug)]
 pub struct WorldState {
     pub root: PathBuf,
+    pub db_path: PathBuf,
+    pub workspace_root_key: Option<String>,
     pub active_phase: Option<ActivePhase>,
     /// Next phase to start (when no active phase)
     pub next_phase: Option<NextPhase>,
@@ -127,6 +129,8 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn probe(context: &AgentContext) -> ExoResult<Self> {
+        let db_path = crate::context::db_path(&context.root, context.project.as_ref());
+        let workspace_root_key = context.workspace_root_key();
         let active_phase = context
             .find_workspace_active_phase()?
             .map(|info| info.to_owned_data());
@@ -141,22 +145,33 @@ impl WorldState {
         // Compute epoch boundary state for multi-level steering
         let epoch_state = Self::compute_epoch_state(context);
 
-        let tasks = task::list_tasks(&context.root).unwrap_or_default();
+        let tasks = task::list_tasks_for_context(context).unwrap_or_default();
         let goals = if let Some(phase_info) = context.find_workspace_active_phase()? {
             phase_info.phase.goals.clone()
         } else {
             Vec::new()
         };
 
-        let git_porcelain = git_status_porcelain(&context.root);
+        let (git_porcelain, sidecar_sync) = std::thread::scope(|scope| {
+            let git_status = scope.spawn(|| git_status_porcelain(&context.root));
+            let sidecar_status = scope.spawn(|| {
+                crate::command::sidecar::sidecar_repo_sync_status_with_project(
+                    &context.root,
+                    context.project.as_ref(),
+                )
+            });
+            (
+                git_status.join().unwrap_or_default(),
+                sidecar_status.join().unwrap_or_default(),
+            )
+        });
         let git_dirty = git_porcelain
             .as_ref()
             .is_some_and(|stdout| !stdout.trim().is_empty());
         let git_changes = git_porcelain.as_deref().map(summarize_git_porcelain);
-        let sidecar_sync = crate::command::sidecar::sidecar_repo_sync_status(&context.root);
         let current_snapshots = snapshot_statuses(&context.root);
 
-        let rfc_index = rfc::index_rfcs(&context.root)?;
+        let rfc_index = rfc::index_rfcs_with_project(&context.root, context.project.as_ref())?;
         let rfc_pipeline = build_rfc_pipeline(active_phase.as_ref(), &rfc_index);
 
         // Find unreviewed completed epochs
@@ -175,6 +190,8 @@ impl WorldState {
         // Instead, we inline the detection here since it needs the same fields.
         let partial = Self {
             root: context.root.clone(),
+            db_path,
+            workspace_root_key,
             active_phase,
             next_phase,
             epoch_state,

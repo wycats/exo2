@@ -377,12 +377,15 @@ pub fn configure_sql_dump_merge_driver(root: &std::path::Path) -> Result<bool, s
 
 /// Returns whether the repo-local SQL dump merge driver is configured.
 pub fn sql_dump_merge_driver_configured(root: &std::path::Path) -> Result<bool, std::io::Error> {
-    if !is_git_worktree(root)? {
+    let Some(git_common_dir) = crate::project::git_common_dir_from_filesystem(root) else {
         return Ok(true);
-    }
+    };
 
-    let driver_key = format!("merge.{SQL_DUMP_MERGE_DRIVER}.driver");
-    Ok(git_config_get(root, &driver_key)?.as_deref() == Some("true"))
+    let config = crate::git_config::read_repo_git_config(root, &git_common_dir.join("config"))?;
+    Ok(
+        crate::git_config::last_value(&config, "merge", Some(SQL_DUMP_MERGE_DRIVER), "driver")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+    )
 }
 
 /// Install default hooks.toml.
@@ -438,5 +441,31 @@ fn git_config_set(root: &std::path::Path, key: &str, value: &str) -> Result<(), 
         Err(std::io::Error::other(format!(
             "git config failed for {key}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_driver_detection_uses_the_last_repeated_section_value() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(repo)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str(
+            "\n[merge \"exo-sql-dump\"]\n\tdriver = false\n[merge \"exo-sql-dump\"]\n\tdriver = true\n",
+        );
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert!(sql_dump_merge_driver_configured(repo).expect("read merge driver"));
     }
 }

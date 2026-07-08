@@ -1,7 +1,7 @@
 use crate::ExoResult;
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -97,6 +97,42 @@ pub struct StaleSidecarPolicyEntry {
 impl Project {
     pub fn resolve(cwd: &Path) -> ExoResult<Self> {
         ProjectResolver::default().resolve(cwd)
+    }
+
+    pub(crate) fn refresh_policy(&self) -> ExoResult<Self> {
+        let Some(projects_config_path) = self.projects_config_path.as_deref() else {
+            return Ok(self.clone());
+        };
+        let resolver = ProjectResolver::default().with_projects_config_path(projects_config_path);
+        let (policy, state_root, sidecar_key, sidecar_root, sidecar_auto_commit, sidecar_auto_push) =
+            resolver.resolve_state_root(&self.id, &self.git_common_dir)?;
+
+        Ok(Self {
+            id: self.id.clone(),
+            git_common_dir: self.git_common_dir.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy,
+            projects_config_path: self.projects_config_path.clone(),
+            state_root,
+            sidecar_key,
+            sidecar_root,
+            sidecar_auto_commit,
+            sidecar_auto_push,
+        })
+    }
+
+    pub(crate) fn current_branch(&self) -> Option<String> {
+        let workspace_root = self.workspace_root.as_ref()?;
+        let git_dir = workspace_git_dir(workspace_root)?;
+        read_git_head_branch(&git_dir)
+    }
+
+    pub(crate) fn local_branch_names(&self) -> Option<HashSet<String>> {
+        read_local_branch_names(&self.git_common_dir)
+    }
+
+    pub(crate) fn worktree_index(&self) -> Option<HashMap<PathBuf, bool>> {
+        read_worktree_index(&self.git_common_dir)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -250,8 +286,7 @@ impl ProjectResolver {
     }
 
     pub fn resolve(&self, cwd: &Path) -> ExoResult<Project> {
-        let git_common_dir = self.resolve_git_common_dir(cwd)?;
-        let workspace_root = self.resolve_workspace_root(cwd)?;
+        let (git_common_dir, workspace_root) = self.resolve_git_layout(cwd)?;
         let id = ProjectId::from_git_common_dir(&git_common_dir);
         let projects_config_path = self.projects_config_path();
         let (policy, state_root, sidecar_key, sidecar_root, sidecar_auto_commit, sidecar_auto_push) =
@@ -269,6 +304,58 @@ impl ProjectResolver {
             sidecar_auto_commit,
             sidecar_auto_push,
         })
+    }
+
+    fn resolve_git_layout(&self, cwd: &Path) -> ExoResult<(PathBuf, Option<PathBuf>)> {
+        if let Some((git_common_dir, workspace_root)) = filesystem_git_layout(cwd) {
+            return Ok((git_common_dir, Some(workspace_root)));
+        }
+
+        let output = run_git(
+            cwd,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+        )?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut paths = stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(PathBuf::from);
+            let common_dir = paths.next().ok_or_else(|| {
+                anyhow!(
+                    "git did not report a common git directory for {}",
+                    cwd.display()
+                )
+            })?;
+            let workspace_root = paths.next().ok_or_else(|| {
+                anyhow!("git did not report a workspace root for {}", cwd.display())
+            })?;
+            let common_dir = common_dir.canonicalize().with_context(|| {
+                format!(
+                    "Failed to canonicalize git common directory {}",
+                    common_dir.display()
+                )
+            })?;
+            let workspace_root = workspace_root.canonicalize().with_context(|| {
+                format!(
+                    "Failed to canonicalize workspace root {}",
+                    workspace_root.display()
+                )
+            })?;
+            return Ok((common_dir, Some(workspace_root)));
+        }
+
+        // Bare repositories and older Git versions need the established
+        // individual probes. Normal worktrees use the single command above.
+        let git_common_dir = self.resolve_git_common_dir(cwd)?;
+        let workspace_root = self.resolve_workspace_root(cwd)?;
+        Ok((git_common_dir, workspace_root))
     }
 
     pub fn list_catalog(&self, cwd: &Path) -> ExoResult<ProjectCatalog> {
@@ -1566,6 +1653,151 @@ struct SidecarManifestSection {
     project_id: Option<String>,
 }
 
+fn filesystem_git_layout(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let start = cwd.canonicalize().ok()?;
+    let start = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start
+    };
+
+    for workspace_root in start.ancestors() {
+        let marker = workspace_root.join(".git");
+        if !marker.exists() {
+            continue;
+        }
+        let git_dir = workspace_git_dir(workspace_root)?;
+        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .ok()
+            .and_then(|value| {
+                let path = PathBuf::from(value.trim());
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    git_dir.join(path)
+                };
+                path.canonicalize().ok()
+            })
+            .unwrap_or_else(|| git_dir.clone());
+        return Some((common_dir, workspace_root.to_path_buf()));
+    }
+
+    None
+}
+
+pub(crate) fn git_common_dir_from_filesystem(cwd: &Path) -> Option<PathBuf> {
+    filesystem_git_layout(cwd).map(|(common_dir, _)| common_dir)
+}
+
+fn workspace_git_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let marker = workspace_root.join(".git");
+    if marker.is_dir() {
+        return marker.canonicalize().ok();
+    }
+
+    let marker_text = std::fs::read_to_string(marker).ok()?;
+    let path = marker_text.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    };
+    path.canonicalize().ok()
+}
+
+fn read_git_head_branch(git_dir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(ToOwned::to_owned)
+}
+
+fn read_local_branch_names(git_common_dir: &Path) -> Option<HashSet<String>> {
+    if !git_common_dir.is_dir() {
+        return None;
+    }
+
+    let mut branches = HashSet::new();
+    let heads = git_common_dir.join("refs").join("heads");
+    if heads.exists() {
+        collect_ref_names(&heads, &heads, &mut branches).ok()?;
+    }
+
+    if let Ok(packed_refs) = std::fs::read_to_string(git_common_dir.join("packed-refs")) {
+        for line in packed_refs.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let Some(reference) = line.split_whitespace().nth(1) else {
+                continue;
+            };
+            if let Some(branch) = reference.strip_prefix("refs/heads/") {
+                branches.insert(branch.to_string());
+            }
+        }
+    }
+
+    Some(branches)
+}
+
+fn collect_ref_names(
+    root: &Path,
+    current: &Path,
+    names: &mut HashSet<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_ref_names(root, &path, names)?;
+        } else if let Ok(relative) = path.strip_prefix(root) {
+            names.insert(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn read_worktree_index(git_common_dir: &Path) -> Option<HashMap<PathBuf, bool>> {
+    if !git_common_dir.is_dir() {
+        return None;
+    }
+
+    let mut worktrees = HashMap::new();
+    if git_common_dir
+        .file_name()
+        .is_some_and(|name| name == ".git")
+        && let Some(primary_root) = git_common_dir.parent()
+    {
+        let primary_root = primary_root
+            .canonicalize()
+            .unwrap_or_else(|_| primary_root.to_path_buf());
+        worktrees.insert(primary_root, false);
+    }
+
+    let linked = git_common_dir.join("worktrees");
+    if linked.exists() {
+        for entry in std::fs::read_dir(linked).ok()? {
+            let entry = entry.ok()?;
+            let gitdir_path = entry.path().join("gitdir");
+            let value = std::fs::read_to_string(&gitdir_path).ok()?;
+            let marker = PathBuf::from(value.trim());
+            let marker = if marker.is_absolute() {
+                marker
+            } else {
+                entry.path().join(marker)
+            };
+            let Some(root) = marker.parent() else {
+                continue;
+            };
+            let prunable = !root.exists() || !marker.exists();
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            worktrees.insert(root, prunable);
+        }
+    }
+
+    Some(worktrees)
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> ExoResult<Output> {
     Command::new("git")
         .args(args)
@@ -1753,6 +1985,14 @@ mod tests {
             linked_project.workspace_root,
             Some(linked.canonicalize().unwrap())
         );
+        let primary_branch = primary_project.current_branch().unwrap();
+        assert_eq!(linked_project.current_branch().as_deref(), Some("linked"));
+        let branches = linked_project.local_branch_names().unwrap();
+        assert!(branches.contains(&primary_branch));
+        assert!(branches.contains("linked"));
+        let worktrees = linked_project.worktree_index().unwrap();
+        assert_eq!(worktrees.get(&repo.canonicalize().unwrap()), Some(&false));
+        assert_eq!(worktrees.get(&linked.canonicalize().unwrap()), Some(&false));
     }
 
     #[test]

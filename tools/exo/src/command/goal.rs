@@ -1012,8 +1012,8 @@ impl MutableCommand for GoalComplete {
         writer.update_goal_completion_log(&self.id, &self.log)?;
         // NOTE: completion_log is stored in SQLite per RFC 00177.
 
-        let steering = crate::steering::derive_entity_steering(
-            ctx.root,
+        let steering = crate::steering::derive_entity_steering_from_db(
+            &ctx.db_path(),
             "goal",
             &self.id,
             ctx.agent_id.as_deref(),

@@ -58,19 +58,27 @@ The re-exec logic is extracted into a small shared crate (`crates/exo-reexec` or
 
 ### Daemon Freshness
 
-The daemon checks the binary's content digest on every incoming request:
+Daemon freshness is enforced at the Rust lifecycle boundary rather than by
+statting or re-executing from every request:
 
-1. On startup, stat the running binary and cache its mtime + size
-2. On each request, stat the binary — if mtime or size changed, compute a content digest
-3. If the digest differs from the startup digest, re-exec (the new process picks up the fresh binary via the re-exec protocol)
+1. The daemon records its executable identity, instance ID, PID, and
+   process-start identity when it starts.
+2. Before a client reuses a daemon connection, `daemon ensure` compares the
+   recorded executable/workspace identity with the current binary and performs
+   a bounded probe for that exact instance.
+3. A stale or unresponsive instance is identity-verified, terminated, and
+   replaced. The client connects to the ensured socket and receives the new
+   instance ID.
+4. Long-lived clients discard every socket lane and invalidate cached state
+   whenever ensure reports a different daemon instance.
 
-Cost: stat is ~0.1ms per request. Digest recomputation (only when mtime changes) is ~10ms for a 13MB binary. Result: `cargo build` → next daemon request runs the new code, no manual restart needed.
-
-The re-exec replaces the process in-place. The extension's daemon connection sees a brief disconnect — the existing reconnect logic handles this.
+This keeps binary freshness off the request hot path while preserving the
+development contract: after a workspace-local build changes, the next ensured
+tool request replaces the stale runtime and continues through the fresh binary.
 
 ### Extension Integration
 
-The VS Code extension's `exosuit.exoBinaryDir` setting is **removed** (not deprecated — we are the only user). The extension calls `exo` on PATH; the re-exec protocol handles the rest. This unifies binary resolution for CLI, daemon, and extension into one mechanism.
+The VS Code extension's `exosuit.exoBinaryDir` setting is **removed** (not deprecated — we are the only user). The extension calls `exo` on PATH; the re-exec protocol selects the workspace-local CLI, and Rust `daemon ensure` selects and repairs the daemon instance. This unifies binary resolution for CLI, daemon, and extension into one mechanism.
 
 ### Security
 

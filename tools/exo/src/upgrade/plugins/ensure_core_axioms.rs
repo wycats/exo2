@@ -27,7 +27,8 @@ impl EnsureCoreAxiomsPlugin {
             return Ok(false);
         }
 
-        let axioms = axiom::list_axioms(&context.root, "workflow")?;
+        let axioms =
+            axiom::list_axioms_with_project(&context.root, context.project.as_ref(), "workflow")?;
 
         Ok(axioms.iter().any(|a| {
             matches!(a.id.as_str(), "context-is-king" | "1-context-is-king")

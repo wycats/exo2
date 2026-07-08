@@ -50,6 +50,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default idle timeout in seconds (5 minutes).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_PROBE_KIND: &str = "daemon_probe";
+const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
 
 #[cfg(windows)]
 fn daemon_startup_timeout() -> Duration {
@@ -58,7 +61,7 @@ fn daemon_startup_timeout() -> Duration {
 
 #[cfg(not(windows))]
 fn daemon_startup_timeout() -> Duration {
-    Duration::from_secs(5)
+    Duration::from_secs(15)
 }
 
 /// Error returned when a daemon caller tries to use a filesystem root as the workspace root.
@@ -190,6 +193,8 @@ pub struct DaemonEnsureReport {
     pub endpoint: String,
     pub pid_path: PathBuf,
     pub pid: Option<u32>,
+    pub instance_id: Option<String>,
+    pub probe_ok: bool,
     pub state: DaemonEnsureState,
     pub connected: bool,
     pub spawned: bool,
@@ -218,9 +223,11 @@ pub struct DaemonStatusReport {
     pub pid_path: Option<PathBuf>,
     pub identity_path: Option<PathBuf>,
     pub pid: Option<u32>,
+    pub instance_id: Option<String>,
     pub pid_alive: Option<bool>,
     pub socket_exists: Option<bool>,
     pub socket_connectable: Option<bool>,
+    pub probe_ok: Option<bool>,
     pub identity_exists: Option<bool>,
     pub identity_readable: Option<bool>,
     pub identity_matches_workspace: Option<bool>,
@@ -235,6 +242,12 @@ pub struct DaemonStatusReport {
 struct RuntimeDaemonIdentity {
     workspace_root: PathBuf,
     executable: RuntimeExecutableIdentity,
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    process_start_id: Option<String>,
 }
 
 impl RuntimeDaemonIdentity {
@@ -242,7 +255,24 @@ impl RuntimeDaemonIdentity {
         Ok(Self {
             workspace_root: paths.workspace().to_path_buf(),
             executable: RuntimeExecutableIdentity::current()?,
+            instance_id: None,
+            pid: None,
+            process_start_id: None,
         })
+    }
+
+    fn for_daemon(paths: &LocalRuntimePaths) -> io::Result<Self> {
+        Ok(Self {
+            workspace_root: paths.workspace().to_path_buf(),
+            executable: RuntimeExecutableIdentity::current()?,
+            instance_id: Some(ulid::Ulid::new().to_string().to_lowercase()),
+            pid: Some(std::process::id()),
+            process_start_id: Some(process_start_identity(std::process::id())?),
+        })
+    }
+
+    fn matches_runtime(&self, current: &Self) -> bool {
+        self.workspace_root == current.workspace_root && self.executable == current.executable
     }
 }
 
@@ -299,6 +329,10 @@ impl DaemonEnsureReport {
             endpoint: paths.endpoint().display(),
             pid_path: paths.pid_path(),
             pid: read_pid_file(&paths.pid_path()),
+            instance_id: read_daemon_identity(paths)
+                .ok()
+                .and_then(|identity| identity.instance_id),
+            probe_ok: true,
             state,
             connected: true,
             spawned,
@@ -407,11 +441,12 @@ fn read_pid_file(pid_path: &Path) -> Option<u32> {
         .and_then(|pid| pid.trim().parse().ok())
 }
 
-fn write_daemon_identity(paths: &LocalRuntimePaths) -> io::Result<()> {
-    let identity = RuntimeDaemonIdentity::current(paths)?;
+fn write_daemon_identity(paths: &LocalRuntimePaths) -> io::Result<RuntimeDaemonIdentity> {
+    let identity = RuntimeDaemonIdentity::for_daemon(paths)?;
     let path = paths.identity_path();
     let content = serde_json::to_vec_pretty(&identity).map_err(io::Error::other)?;
-    std::fs::write(path, content)
+    std::fs::write(path, content)?;
+    Ok(identity)
 }
 
 fn read_daemon_identity(paths: &LocalRuntimePaths) -> io::Result<RuntimeDaemonIdentity> {
@@ -426,7 +461,20 @@ fn daemon_identity_matches_current(paths: &LocalRuntimePaths) -> bool {
     let Ok(current) = RuntimeDaemonIdentity::current(paths) else {
         return false;
     };
-    recorded == current
+    recorded.matches_runtime(&current)
+        && recorded.pid.is_some()
+        && recorded.pid == read_pid_file(&paths.pid_path())
+        && recorded.instance_id.is_some()
+        && recorded
+            .process_start_id
+            .as_deref()
+            .is_some_and(|start_id| {
+                recorded
+                    .pid
+                    .and_then(|pid| process_start_identity(pid).ok())
+                    .as_deref()
+                    == Some(start_id)
+            })
 }
 
 pub fn daemon_status(workspace_path: &Path) -> DaemonStatusReport {
@@ -442,9 +490,11 @@ pub fn daemon_status(workspace_path: &Path) -> DaemonStatusReport {
             pid_path: None,
             identity_path: None,
             pid: None,
+            instance_id: None,
             pid_alive: None,
             socket_exists: None,
             socket_connectable: None,
+            probe_ok: None,
             identity_exists: None,
             identity_readable: None,
             identity_matches_workspace: None,
@@ -470,9 +520,11 @@ pub fn daemon_status_for_project(workspace_path: &Path, project: &Project) -> Da
             pid_path: None,
             identity_path: None,
             pid: None,
+            instance_id: None,
             pid_alive: None,
             socket_exists: None,
             socket_connectable: None,
+            probe_ok: None,
             identity_exists: None,
             identity_readable: None,
             identity_matches_workspace: None,
@@ -494,11 +546,17 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     let pid_alive = pid.map(process_alive);
     let pid_path_exists = pid_path.exists();
     let socket_exists = socket_path.exists();
-    let socket_connectable = endpoint.is_connectable_blocking();
     let identity_exists = identity_path.exists();
     let recorded_identity_result = read_daemon_identity(&paths);
     let identity_readable = recorded_identity_result.is_ok();
     let current_identity_result = RuntimeDaemonIdentity::current(&paths);
+    let (socket_connectable, probe_ok) = inspect_daemon_endpoint(
+        &paths,
+        recorded_identity_result
+            .as_ref()
+            .ok()
+            .and_then(|identity| identity.instance_id.as_deref()),
+    );
 
     let identity_matches_workspace = recorded_identity_result
         .as_ref()
@@ -514,14 +572,25 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .as_ref()
         .ok()
         .and_then(|identity| serde_json::to_value(identity).ok());
+    let instance_id = recorded_identity_result
+        .as_ref()
+        .ok()
+        .and_then(|identity| identity.instance_id.clone());
     let current_identity = current_identity_result
         .as_ref()
         .ok()
         .and_then(|identity| serde_json::to_value(identity).ok());
 
     let state = if socket_connectable {
-        if identity_matches_workspace == Some(true) && identity_matches_executable == Some(true) {
+        if identity_matches_workspace == Some(true)
+            && identity_matches_executable == Some(true)
+            && probe_ok == Some(true)
+        {
             DaemonStatusState::RunningCurrent
+        } else if identity_matches_workspace == Some(true)
+            && identity_matches_executable == Some(true)
+        {
+            DaemonStatusState::Unreachable
         } else {
             DaemonStatusState::StaleIdentity
         }
@@ -538,9 +607,11 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
             "daemon identity is missing or does not match the current executable/workspace"
                 .to_string(),
         ),
-        DaemonStatusState::Unreachable => Some(
-            "daemon runtime files exist but the socket is not accepting connections".to_string(),
-        ),
+        DaemonStatusState::Unreachable => Some(if socket_connectable {
+            "daemon socket accepts connections but the bounded instance probe failed".to_string()
+        } else {
+            "daemon runtime files exist but the socket is not accepting connections".to_string()
+        }),
         DaemonStatusState::InvalidWorkspace => None,
     };
 
@@ -554,9 +625,11 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         pid_path: Some(pid_path),
         identity_path: Some(identity_path),
         pid,
+        instance_id,
         pid_alive,
         socket_exists: Some(socket_exists),
         socket_connectable: Some(socket_connectable),
+        probe_ok,
         identity_exists: Some(identity_exists),
         identity_readable: Some(identity_readable),
         identity_matches_workspace,
@@ -568,15 +641,225 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     }
 }
 
+fn inspect_daemon_endpoint(
+    paths: &LocalRuntimePaths,
+    expected_instance_id: Option<&str>,
+) -> (bool, Option<bool>) {
+    let paths = paths.clone();
+    let expected_instance_id = expected_instance_id.map(ToOwned::to_owned);
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return (false, None);
+        };
+        runtime.block_on(async {
+            let Ok(mut stream) = connect_to_daemon_paths(&paths).await else {
+                return (false, None);
+            };
+            let probe = probe_daemon_stream_with_timeout(
+                &mut stream,
+                expected_instance_id.as_deref(),
+                DAEMON_PROBE_TIMEOUT,
+            )
+            .await;
+            (true, Some(probe.is_ok()))
+        })
+    })
+    .join()
+    .unwrap_or((false, None))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PID 0 is invalid",
+        ));
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close_paren = stat
+        .rfind(')')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process stat"))?;
+    let start_time_ticks = stat[close_paren + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?;
+    Ok(format!("linux-starttime:{start_time_ticks}"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PID 0 is invalid",
+        ));
+    }
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()?;
+    let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || start.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process start time is unavailable",
+        ));
+    }
+    Ok(format!("macos-lstart:{start}"))
+}
+
+#[cfg(windows)]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    let script =
+        format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process start time is unavailable",
+        ));
+    }
+    let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if start.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process start time is unavailable",
+        ));
+    }
+    Ok(format!("windows-starttime:{start}"))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_start_identity(pid: u32) -> io::Result<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()?;
+    let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || start.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process start time is unavailable",
+        ));
+    }
+    Ok(format!("unix-lstart:{start}"))
+}
+
+fn daemon_process_identity_matches(
+    paths: &LocalRuntimePaths,
+    pid: u32,
+    probed_process_start_id: Option<&str>,
+    legacy_endpoint_connected: bool,
+) -> bool {
+    if probed_process_start_id.is_some_and(|recorded| {
+        process_start_identity(pid).is_ok_and(|current| current == recorded)
+    }) {
+        return true;
+    }
+    let Ok(identity) = read_daemon_identity(paths) else {
+        return false;
+    };
+    let start_matches = identity.pid == Some(pid)
+        && identity
+            .process_start_id
+            .as_deref()
+            .is_some_and(|recorded| {
+                process_start_identity(pid).is_ok_and(|current| current == recorded)
+            });
+    if start_matches {
+        return true;
+    }
+
+    legacy_endpoint_connected
+        && paths_for_workspace(&identity.workspace_root)
+            .is_ok_and(|recorded_paths| recorded_paths.runtime_dir() == paths.runtime_dir())
+        && legacy_daemon_command_matches(&identity.workspace_root, pid)
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
+    let Ok(command_line) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args = command_line
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg))
+        .collect::<Vec<_>>();
+    daemon_command_args_match(workspace_root, args.iter().map(|arg| arg.as_ref()))
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && daemon_command_text_matches(
+            workspace_root,
+            String::from_utf8_lossy(&output.stdout).trim(),
+        )
+}
+
+#[cfg(windows)]
+fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
+    let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
+    let Ok(output) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && daemon_command_text_matches(
+            workspace_root,
+            String::from_utf8_lossy(&output.stdout).trim(),
+        )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn legacy_daemon_command_matches(_workspace_root: &Path, _pid: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_command_args_match<'a>(
+    workspace_root: &Path,
+    args: impl Iterator<Item = &'a str>,
+) -> bool {
+    let args = args.collect::<Vec<_>>();
+    let has_daemon_run = args.windows(2).any(|pair| pair == ["daemon", "run"]);
+    let workspace = workspace_root.to_string_lossy();
+    let has_workspace = args
+        .windows(2)
+        .any(|pair| pair[0] == "--workspace" && pair[1] == workspace);
+    has_daemon_run && has_workspace
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn daemon_command_text_matches(workspace_root: &Path, command: &str) -> bool {
+    let workspace = workspace_root.to_string_lossy();
+    command.contains("daemon run")
+        && command.contains("--workspace")
+        && command.contains(workspace.as_ref())
+}
+
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(unix))]
@@ -594,12 +877,16 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_pid(pid: u32) -> bool {
-    Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    matches!(
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        ),
+        Ok(()) | Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(not(unix))]
@@ -615,13 +902,16 @@ fn terminate_pid(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn force_terminate_pid(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    matches!(
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        ),
+        Ok(()) | Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(not(unix))]
@@ -635,10 +925,28 @@ fn force_terminate_pid(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-async fn restart_stale_daemon_once(paths: &LocalRuntimePaths) -> Vec<String> {
+async fn restart_stale_daemon_once(
+    paths: &LocalRuntimePaths,
+    probed_process: Option<&DaemonProbeResponse>,
+    legacy_endpoint_connected: bool,
+) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    if let Some(pid) = read_pid_file(&paths.pid_path()) {
+    let process = probed_process
+        .map(|process| (process.pid, Some(process.process_start_id.as_str())))
+        .or_else(|| read_pid_file(&paths.pid_path()).map(|pid| (pid, None)));
+    if let Some((pid, probed_process_start_id)) = process {
         if process_alive(pid) {
+            if !daemon_process_identity_matches(
+                paths,
+                pid,
+                probed_process_start_id,
+                legacy_endpoint_connected,
+            ) {
+                diagnostics.push(format!(
+                    "refused to signal unverified stale daemon PID {pid}"
+                ));
+                return diagnostics;
+            }
             if terminate_pid(pid) {
                 diagnostics.push(format!("terminated stale daemon process {pid}"));
             } else {
@@ -650,6 +958,17 @@ async fn restart_stale_daemon_once(paths: &LocalRuntimePaths) -> Vec<String> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             if process_alive(pid) {
+                if !daemon_process_identity_matches(
+                    paths,
+                    pid,
+                    probed_process_start_id,
+                    legacy_endpoint_connected,
+                ) {
+                    diagnostics.push(format!(
+                        "refused to force-terminate changed stale daemon PID {pid}"
+                    ));
+                    return diagnostics;
+                }
                 if force_terminate_pid(pid) {
                     diagnostics.push(format!("force-terminated stale daemon process {pid}"));
                 } else {
@@ -671,6 +990,16 @@ async fn restart_stale_daemon_once(paths: &LocalRuntimePaths) -> Vec<String> {
     // Stale socket cleanup is safe only after this process owns the PID lock.
 
     diagnostics
+}
+
+fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
+    let current = startup_project.refresh_policy().map_err(to_io_error)?;
+    if current.runtime_dir() != startup_project.runtime_dir() {
+        return Err(io::Error::other(
+            "project state policy changed the daemon runtime; reconnect through the current project runtime",
+        ));
+    }
+    Ok(current)
 }
 
 fn spawn_daemon_after_lock(
@@ -712,7 +1041,7 @@ async fn restart_after_socket_wait_failure(
         }),
     );
     diagnostics_messages.push(format!("daemon socket wait failed {context}: {error}"));
-    diagnostics_messages.append(&mut restart_stale_daemon_once(paths).await);
+    diagnostics_messages.append(&mut restart_stale_daemon_once(paths, None, false).await);
 
     if let Some(lock_file) = try_lock_pid_file(&paths.lock_path()) {
         diagnostics.record(
@@ -773,6 +1102,122 @@ pub async fn connect_to_daemon(workspace_path: &Path) -> std::io::Result<DaemonS
 
 async fn connect_to_daemon_paths(paths: &LocalRuntimePaths) -> std::io::Result<DaemonStream> {
     paths.endpoint().connect().await
+}
+
+async fn probe_daemon_stream<S>(stream: &mut S, expected_instance_id: &str) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    probe_daemon_stream_with_timeout(stream, Some(expected_instance_id), DAEMON_PROBE_TIMEOUT)
+        .await
+        .map(|_| ())
+}
+
+#[derive(Debug)]
+struct DaemonProbeResponse {
+    instance_id: String,
+    pid: u32,
+    process_start_id: String,
+}
+
+async fn discover_daemon_stream<S>(stream: &mut S) -> std::io::Result<DaemonProbeResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    probe_daemon_stream_with_timeout(stream, None, DAEMON_PROBE_TIMEOUT).await
+}
+
+async fn probe_daemon_stream_with_timeout<S>(
+    stream: &mut S,
+    expected_instance_id: Option<&str>,
+    timeout: Duration,
+) -> std::io::Result<DaemonProbeResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let nonce = ulid::Ulid::new().to_string().to_lowercase();
+    let mut request = serde_json::to_vec(&serde_json::json!({
+        "kind": DAEMON_PROBE_KIND,
+        "nonce": nonce,
+    }))
+    .map_err(io::Error::other)?;
+    request.push(b'\n');
+    stream.write_all(&request).await?;
+    stream.flush().await?;
+
+    let mut response = String::new();
+    let read = async {
+        let mut reader = BufReader::new(stream);
+        reader.read_line(&mut response).await
+    };
+    let bytes_read = tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon probe timed out"))??;
+    if bytes_read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "daemon closed the probe connection",
+        ));
+    }
+
+    let response: serde_json::Value = serde_json::from_str(&response).map_err(io::Error::other)?;
+    let kind = response.get("kind").and_then(serde_json::Value::as_str);
+    let response_nonce = response.get("nonce").and_then(serde_json::Value::as_str);
+    let instance_id = response
+        .get("instance_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon probe omitted instance id",
+            )
+        })?;
+    let pid = response
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon probe omitted PID"))?;
+    let process_start_id = response
+        .get("process_start_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon probe omitted process start identity",
+            )
+        })?;
+    if kind != Some(DAEMON_PROBE_OK_KIND)
+        || response_nonce != Some(nonce.as_str())
+        || expected_instance_id.is_some_and(|expected| instance_id != expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon probe response did not match the expected runtime instance",
+        ));
+    }
+
+    Ok(DaemonProbeResponse {
+        instance_id: instance_id.to_string(),
+        pid,
+        process_start_id: process_start_id.to_string(),
+    })
+}
+
+async fn connect_and_probe_daemon_paths(
+    paths: &LocalRuntimePaths,
+) -> std::io::Result<DaemonStream> {
+    let identity = read_daemon_identity(paths)?;
+    let instance_id = identity.instance_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon identity does not include an instance id",
+        )
+    })?;
+    let mut stream = connect_to_daemon_paths(paths).await?;
+    probe_daemon_stream(&mut stream, instance_id).await?;
+    Ok(stream)
 }
 
 /// Spawn a new daemon process for the workspace.
@@ -1079,7 +1524,7 @@ async fn restart_daemon_paths_with_report(
             "lock_path": lock_path,
         }),
     );
-    diagnostics_messages.append(&mut restart_stale_daemon_once(&paths).await);
+    diagnostics_messages.append(&mut restart_stale_daemon_once(&paths, None, false).await);
 
     let (state, spawned) = if let Some(lock_file) = try_lock_pid_file(&lock_path) {
         diagnostics.record(
@@ -1112,7 +1557,7 @@ async fn restart_daemon_paths_with_report(
         (DaemonEnsureState::WaitedForLock, false)
     };
 
-    let stream = connect_to_daemon_paths(&paths).await?;
+    let stream = connect_and_probe_daemon_paths(&paths).await?;
     let mut report = DaemonEnsureReport::new(&paths, state);
     report.kind = "daemon.restart";
     report.spawned = spawned;
@@ -1126,14 +1571,45 @@ async fn restart_daemon_paths_with_report(
 async fn ensure_daemon_paths_with_report(
     paths: LocalRuntimePaths,
 ) -> std::io::Result<DaemonEnsureOutcome> {
-    // Step 1: Try to connect to existing daemon. Reuse it only if its
-    // recorded executable identity still matches the current exo binary.
-    let mut stale_restart_diagnostics = if let Ok(stream) = connect_to_daemon_paths(&paths).await {
-        if daemon_identity_matches_current(&paths) {
-            let mut report = DaemonEnsureReport::new(&paths, DaemonEnsureState::ConnectedExisting);
-            report.diagnostic("connected to existing daemon socket");
-            return Ok(DaemonEnsureOutcome { stream, report });
-        }
+    // Step 1: Reuse an existing daemon only when its runtime identity is
+    // current and the process answers a bounded probe for that exact instance.
+    let mut stale_restart_diagnostics = if let Ok(mut stream) =
+        connect_to_daemon_paths(&paths).await
+    {
+        let recorded_identity = read_daemon_identity(&paths).ok();
+        let instance_id = recorded_identity
+            .as_ref()
+            .and_then(|identity| identity.instance_id.as_deref());
+        let identity_current = daemon_identity_matches_current(&paths);
+        let (probe_error, observed_probe) = match instance_id {
+            Some(instance_id) if identity_current => {
+                match probe_daemon_stream_with_timeout(
+                    &mut stream,
+                    Some(instance_id),
+                    DAEMON_PROBE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let mut report =
+                            DaemonEnsureReport::new(&paths, DaemonEnsureState::ConnectedExisting);
+                        report.diagnostic("connected to responsive daemon instance");
+                        return Ok(DaemonEnsureOutcome { stream, report });
+                    }
+                    Err(error) => (error, None),
+                }
+            }
+            _ => match discover_daemon_stream(&mut stream).await {
+                Ok(observed) => (
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "daemon runtime identity is stale or incomplete",
+                    ),
+                    Some(observed),
+                ),
+                Err(error) => (error, None),
+            },
+        };
 
         drop(stream);
         let diagnostics = DaemonDiagnostics::from_runtime_dir(&paths.runtime_dir());
@@ -1142,10 +1618,13 @@ async fn ensure_daemon_paths_with_report(
             serde_json::json!({
                 "identity_path": paths.identity_path(),
                 "workspace_root": paths.workspace(),
+                "probe_error": probe_error.to_string(),
+                "observed_instance_id": observed_probe.as_ref().map(|probe| probe.instance_id.as_str()),
+                "observed_pid": observed_probe.as_ref().map(|probe| probe.pid),
                 "action": "restart"
             }),
         );
-        restart_stale_daemon_once(&paths).await
+        restart_stale_daemon_once(&paths, observed_probe.as_ref(), true).await
     } else {
         Vec::new()
     };
@@ -1217,7 +1696,7 @@ async fn ensure_daemon_paths_with_report(
         };
 
     // Step 5: Connect to daemon
-    let stream = connect_to_daemon_paths(&paths).await?;
+    let stream = connect_and_probe_daemon_paths(&paths).await?;
     let mut report = DaemonEnsureReport::new(&paths, state);
     report.spawned = spawned;
     report.reused = !spawned;
@@ -1308,11 +1787,17 @@ pub async fn run_daemon(
         "daemon.pid_written",
         serde_json::json!({ "pid": std::process::id(), "pid_path": paths.pid_path() }),
     );
-    match write_daemon_identity(&paths) {
-        Ok(()) => diagnostics.record(
-            "daemon.identity_written",
-            serde_json::json!({ "identity_path": paths.identity_path() }),
-        ),
+    let runtime_identity = match write_daemon_identity(&paths) {
+        Ok(identity) => {
+            diagnostics.record(
+                "daemon.identity_written",
+                serde_json::json!({
+                    "identity_path": paths.identity_path(),
+                    "instance_id": identity.instance_id.as_deref(),
+                }),
+            );
+            identity
+        }
         Err(error) => {
             diagnostics.record(
                 "daemon.identity_write_failed",
@@ -1324,7 +1809,15 @@ pub async fn run_daemon(
             eprintln!("exo daemon: failed to write executable identity: {error}");
             return;
         }
-    }
+    };
+    let instance_id: Arc<str> = runtime_identity
+        .instance_id
+        .expect("daemon runtime identity includes an instance id")
+        .into();
+    let process_start_id: Arc<str> = runtime_identity
+        .process_start_id
+        .expect("daemon runtime identity includes a process start identity")
+        .into();
 
     // Keep lock_file alive - dropping it releases the lock
     // We'll drop it explicitly at the end for clarity
@@ -1372,31 +1865,53 @@ pub async fn run_daemon(
     let last_activity_clone = Arc::clone(&last_activity);
     let cleanup_workspace = Arc::clone(&workspace);
     let cleanup_project = Arc::clone(&project);
+    let request_project = Arc::clone(&project);
     let server_handle = tokio::spawn(async move {
         run_socket_server(
             &paths_clone,
             Arc::clone(&workspace),
             Arc::clone(&project),
+            Arc::clone(&instance_id),
+            Arc::clone(&process_start_id),
             last_activity_clone,
             write_tx,
             diagnostics_clone,
             move |req: RequestEnvelope| {
                 let workspace = Arc::clone(&workspace);
+                let project = Arc::clone(&request_project);
                 let diagnostics = handler_diagnostics.clone();
                 async move {
                     let request_id = req.id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let project = Project::resolve(&workspace).ok();
-                        handle_request_with_project_and_diagnostics_as_writer(
+                        let project = daemon_request_project(project.as_ref())?;
+                        Ok::<_, io::Error>(handle_request_with_project_and_diagnostics_as_writer(
                             &workspace,
-                            project.as_ref(),
+                            Some(&project),
                             req,
                             &diagnostics,
-                        )
+                        ))
                     })
                     .await
                     {
-                        Ok(response) => response,
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            id: request_id,
+                            status: Status::Error,
+                            result: None,
+                            error: Some(ErrorBody {
+                                code: ErrorCode::PreconditionFailed,
+                                message: error.to_string(),
+                                details: None,
+                            }),
+                            ticket: None,
+                            steering: None,
+                            reminders: None,
+                            display: None,
+                            preview: None,
+                            effect: None,
+                            trace: None,
+                        },
                         Err(error) => ResponseEnvelope {
                             protocol_version: PROTOCOL_VERSION,
                             id: request_id,
@@ -1542,6 +2057,8 @@ async fn run_socket_server<F, Fut>(
     paths: &LocalRuntimePaths,
     workspace_root: Arc<PathBuf>,
     project: Arc<Project>,
+    instance_id: Arc<str>,
+    process_start_id: Arc<str>,
     last_activity: Arc<AtomicU64>,
     write_tx: tokio::sync::broadcast::Sender<()>,
     diagnostics: DaemonDiagnostics,
@@ -1586,6 +2103,8 @@ async fn run_socket_server<F, Fut>(
         let last_activity = Arc::clone(&last_activity);
         let workspace_root = Arc::clone(&workspace_root);
         let project = Arc::clone(&project);
+        let instance_id = Arc::clone(&instance_id);
+        let process_start_id = Arc::clone(&process_start_id);
         let write_tx = write_tx.clone();
         let mut write_rx = write_tx.subscribe();
         let diagnostics = diagnostics.clone();
@@ -1612,6 +2131,28 @@ async fn run_socket_server<F, Fut>(
                                 continue;
                             }
                         };
+
+                        if raw.get("kind").and_then(|v| v.as_str()) == Some(DAEMON_PROBE_KIND) {
+                            let response = serde_json::json!({
+                                "kind": DAEMON_PROBE_OK_KIND,
+                                "nonce": raw.get("nonce").cloned().unwrap_or(serde_json::Value::Null),
+                                "instance_id": instance_id.as_ref(),
+                                "pid": std::process::id(),
+                                "process_start_id": process_start_id.as_ref(),
+                            });
+                            let mut data = match serde_json::to_vec(&response) {
+                                Ok(data) => data,
+                                Err(error) => {
+                                    eprintln!("exo daemon: failed to serialize probe response: {error}");
+                                    continue;
+                                }
+                            };
+                            data.push(b'\n');
+                            if writer.write_all(&data).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
 
                         // Notifications have "kind" — fire-and-forget, no response
                         if raw.get("kind").and_then(|v| v.as_str()) == Some("activity_event") {
@@ -1696,6 +2237,54 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    #[tokio::test]
+    async fn daemon_probe_requires_matching_instance_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let responder = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.expect("read probe");
+            let request: serde_json::Value = serde_json::from_str(&request).expect("parse probe");
+            let response = serde_json::json!({
+                "kind": DAEMON_PROBE_OK_KIND,
+                "nonce": request["nonce"],
+                "instance_id": "instance-a",
+                "pid": 42,
+                "process_start_id": "test-start-42",
+            });
+            let mut server = reader.into_inner();
+            server
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("write probe response");
+        });
+
+        probe_daemon_stream_with_timeout(
+            &mut client,
+            Some("instance-a"),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("matching daemon probe");
+        responder.await.expect("probe responder");
+    }
+
+    #[tokio::test]
+    async fn daemon_probe_times_out_when_socket_does_not_answer() {
+        let (mut client, _server) = tokio::io::duplex(1024);
+        let error = probe_daemon_stream_with_timeout(
+            &mut client,
+            Some("instance-a"),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("unanswered probe should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
     fn test_project(workspace: &Path, state_root: PathBuf) -> Project {
         Project {
             id: ProjectId::from_git_common_dir(&workspace.join(".git")),
@@ -1709,6 +2298,46 @@ mod tests {
             sidecar_auto_commit: false,
             sidecar_auto_push: SidecarAutoPushPolicy::Never,
         }
+    }
+
+    #[test]
+    fn daemon_request_project_refreshes_mutable_sidecar_policy() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let git_common_dir = temp.path().join("repo/.git");
+        let sidecar_root = temp.path().join("sidecars");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config dir");
+        let id = ProjectId::from_git_common_dir(&git_common_dir);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[projects.\"{id}\"]\nstate = \"sidecar\"\nsidecar_key = \"repo\"\nsidecar_root = {:?}\nauto_commit = false\nauto_push = \"always\"\n",
+                sidecar_root.display().to_string()
+            ),
+        )
+        .expect("write projects policy");
+        let state_root = sidecar_root.join("projects/repo");
+        let startup = Project {
+            id,
+            git_common_dir,
+            workspace_root: Some(temp.path().join("repo")),
+            policy: crate::project::StatePolicy::Sidecar,
+            projects_config_path: Some(config_path),
+            state_root: state_root.clone(),
+            sidecar_key: Some("repo".to_string()),
+            sidecar_root: Some(sidecar_root),
+            sidecar_auto_commit: true,
+            sidecar_auto_push: crate::project::SidecarAutoPushPolicy::Never,
+        };
+
+        let refreshed = daemon_request_project(&startup).expect("refresh daemon project");
+        assert_eq!(refreshed.runtime_dir(), startup.runtime_dir());
+        assert!(!refreshed.sidecar_auto_commit);
+        assert_eq!(
+            refreshed.sidecar_auto_push,
+            crate::project::SidecarAutoPushPolicy::Always
+        );
     }
 
     #[test]

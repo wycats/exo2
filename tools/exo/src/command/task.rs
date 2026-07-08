@@ -1040,8 +1040,8 @@ impl MutableCommand for TaskComplete {
             format!("Task '{canonical_id}' marked as completed.")
         };
 
-        let steering = crate::steering::derive_entity_steering(
-            ctx.root,
+        let steering = crate::steering::derive_entity_steering_from_db(
+            &ctx.db_path(),
             "task",
             canonical_id,
             ctx.agent_id.as_deref(),
@@ -1137,8 +1137,8 @@ impl MutableCommand for TaskLog {
             task.task_id, task.title
         );
 
-        let steering = crate::steering::derive_entity_steering(
-            ctx.root,
+        let steering = crate::steering::derive_entity_steering_from_db(
+            &ctx.db_path(),
             "task",
             &task.task_id,
             ctx.agent_id.as_deref(),
@@ -1223,8 +1223,8 @@ impl MutableCommand for TaskStart {
         writer.update_task_status_by_row_id(task.row_id, "in-progress")?;
         let message = format!("Started task '{}' ({}).", task.task_id, task.title);
 
-        let steering = crate::steering::derive_entity_steering(
-            ctx.root,
+        let steering = crate::steering::derive_entity_steering_from_db(
+            &ctx.db_path(),
             "task",
             &task.task_id,
             ctx.agent_id.as_deref(),

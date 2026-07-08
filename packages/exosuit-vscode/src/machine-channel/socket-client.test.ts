@@ -137,6 +137,8 @@ const daemonEnsureJson = JSON.stringify({
     endpoint: "/project/.exo/runtime/daemon.sock",
     pid_path: "/project/.exo/runtime/daemon.pid",
     pid: 12345,
+    instance_id: "daemon-test",
+    probe_ok: true,
     state: "spawned",
     connected: true,
     spawned: true,
@@ -227,6 +229,9 @@ describe("socket-client daemon runtime paths", () => {
 
     expect(result).toEqual({
       ...projectPaths,
+      pid: 12345,
+      instanceId: "daemon-test",
+      probeOk: true,
       reused: false,
       spawned: true,
       state: "spawned",
@@ -240,6 +245,9 @@ describe("socket-client daemon runtime paths", () => {
 
     expect(result).toEqual({
       ...projectPaths,
+      pid: 12345,
+      instanceId: "daemon-test",
+      probeOk: true,
       reused: false,
       spawned: true,
       state: "spawned",

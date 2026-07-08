@@ -185,6 +185,21 @@ fn run_exo_status(workspace: &Path, envs: &[(&str, &OsStr)]) -> std::process::Ou
     command.output().unwrap()
 }
 
+#[cfg(unix)]
+fn run_exo_json_command(workspace: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_exo"))
+        .args(["--format", "json"])
+        .args(args)
+        .current_dir(workspace)
+        .env("EXO_NO_REEXEC", "1")
+        .env("HOME", workspace.join(".test-home"))
+        .env("XDG_CONFIG_HOME", workspace.join(".test-home/config"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap()
+}
+
 fn run_exo_status_from_subdir(workspace: &Path, subdir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_exo"))
         .arg("status")
@@ -863,6 +878,7 @@ async fn daemon_status_reports_running_current_identity(backend: &str) {
         result.get("socket_connectable").and_then(|v| v.as_bool()),
         Some(true)
     );
+    assert_eq!(result.get("probe_ok").and_then(|v| v.as_bool()), Some(true));
     assert!(
         result
             .get("endpoint")
@@ -1110,6 +1126,60 @@ async fn ensure_daemon_restarts_existing_daemon_when_identity_is_missing(backend
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
+async fn ensure_daemon_restarts_probed_daemon_when_pid_file_is_missing_or_invalid(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let paths = exo::daemon::paths_for_workspace(&workspace).unwrap();
+
+    let first = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("first ensure should spawn daemon")
+        .into_report();
+    let first_pid = first.pid.expect("first ensure should report pid");
+    std::fs::remove_file(paths.pid_path()).expect("remove daemon pid file");
+
+    let second = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("second ensure should restart daemon discovered by probe")
+        .into_report();
+    let second_pid = second.pid.expect("second ensure should report pid");
+
+    assert_ne!(
+        first_pid, second_pid,
+        "missing PID metadata should restart the daemon identified by the socket probe"
+    );
+    assert!(
+        second
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("terminated stale daemon process")),
+        "restart diagnostics should mention probed daemon termination: {:?}",
+        second.diagnostics
+    );
+
+    std::fs::write(paths.pid_path(), "not-a-pid").expect("write invalid daemon pid file");
+    let third = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("third ensure should restart daemon discovered past invalid PID metadata")
+        .into_report();
+    let third_pid = third.pid.expect("third ensure should report pid");
+    assert_ne!(
+        second_pid, third_pid,
+        "invalid PID metadata should restart the daemon identified by the socket probe"
+    );
+    assert!(
+        third
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("terminated stale daemon process")),
+        "restart diagnostics should mention probed daemon termination: {:?}",
+        third.diagnostics
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
 async fn ensure_daemon_restarts_existing_daemon_when_workspace_identity_differs(backend: &str) {
     assert_eq!(backend, "sqlite");
     let dir = TempDir::new().unwrap();
@@ -1142,6 +1212,88 @@ async fn ensure_daemon_restarts_existing_daemon_when_workspace_identity_differs(
             .any(|message| message.contains("terminated stale daemon process")),
         "restart diagnostics should mention stale daemon termination: {:?}",
         second.diagnostics
+    );
+}
+
+#[cfg(unix)]
+#[test_matrix(["sqlite"])]
+fn tool_calls_repair_a_wedged_daemon_between_status_and_task_list(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let paths = exo::daemon::paths_for_workspace(&workspace).unwrap();
+
+    let status = run_exo_json_command(&workspace, &["status"]);
+    assert!(
+        status.status.success(),
+        "initial status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(
+        parse_cli_json(&status)
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+
+    let first_pid = std::fs::read_to_string(paths.pid_path())
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(first_pid),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .unwrap();
+
+    let wedged_status = run_exo_daemon_status(&workspace);
+    assert!(
+        wedged_status.status.success(),
+        "daemon status failed: {}",
+        String::from_utf8_lossy(&wedged_status.stderr)
+    );
+    let wedged_status = parse_cli_json(&wedged_status);
+    let wedged_result = wedged_status.get("result").expect("daemon status result");
+    assert_eq!(
+        wedged_result
+            .get("state")
+            .and_then(serde_json::Value::as_str),
+        Some("unreachable")
+    );
+    assert_eq!(
+        wedged_result
+            .get("socket_connectable")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        wedged_result
+            .get("probe_ok")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+
+    let tasks = run_exo_json_command(&workspace, &["task", "list"]);
+    assert!(
+        tasks.status.success(),
+        "task list should repair the wedged daemon: {}",
+        String::from_utf8_lossy(&tasks.stderr)
+    );
+    assert_eq!(
+        parse_cli_json(&tasks)
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+    let second_pid = std::fs::read_to_string(paths.pid_path())
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert_ne!(
+        first_pid, second_pid,
+        "the wedged daemon should be replaced"
     );
 }
 

@@ -20,6 +20,7 @@ import { getLogger } from "../logging";
 
 import {
   DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+  connectToEnsuredDaemon,
   ensureDaemon,
   ensureDaemonLifecycle,
   restartDaemonLifecycle,
@@ -104,7 +105,10 @@ export interface ConnectionLike {
 }
 
 export interface DaemonChannelServerDeps {
-  connect(root: string): Promise<ConnectionLike>;
+  connect(
+    root: string,
+    lifecycle?: DaemonEnsureResult,
+  ): Promise<ConnectionLike>;
   ensureLifecycle?(root: string): Promise<DaemonEnsureResult>;
   restartLifecycle?(root: string): Promise<DaemonEnsureResult>;
   traceCache: {
@@ -175,8 +179,13 @@ export type ServerModeAvailability =
 
 function createDefaultDeps(): ResolvedDaemonChannelServerDeps {
   return {
-    async connect(root: string): Promise<ConnectionLike> {
-      const socket = await ensureDaemon(root);
+    async connect(
+      root: string,
+      lifecycle?: DaemonEnsureResult,
+    ): Promise<ConnectionLike> {
+      const socket = lifecycle
+        ? await connectToEnsuredDaemon(root, lifecycle)
+        : await ensureDaemon(root);
       return new DaemonConnection(socket);
     },
     ensureLifecycle: ensureDaemonLifecycle,
@@ -350,6 +359,7 @@ export class DaemonChannelServer {
   private hasEverConnected = false;
   private generation = 0;
   private lastLifecycleResetGeneration: number | null = null;
+  private daemonInstanceId: string | null = null;
 
   private readonly deps: ResolvedDaemonChannelServerDeps;
   private readonly config: DaemonChannelServerConfig;
@@ -360,10 +370,20 @@ export class DaemonChannelServer {
     deps: Partial<DaemonChannelServerDeps> = {},
   ) {
     const defaultDeps = createDefaultDeps();
+    const testingLifecycle = async (): Promise<DaemonEnsureResult> => ({
+      runtimeDir: "<test-runtime>",
+      socketPath: "<test-socket>",
+      pidPath: "<test-pid>",
+      reused: true,
+      spawned: false,
+      state: "connected_existing",
+    });
     this.deps = {
       ...defaultDeps,
       ...deps,
-      ensureLifecycle: deps.ensureLifecycle ?? defaultDeps.ensureLifecycle,
+      ensureLifecycle:
+        deps.ensureLifecycle ??
+        (deps.connect ? testingLifecycle : defaultDeps.ensureLifecycle),
       restartLifecycle: deps.restartLifecycle ?? defaultDeps.restartLifecycle,
     };
     this.config = {
@@ -567,7 +587,7 @@ export class DaemonChannelServer {
     }
 
     if (this.connection && !this.connection.isClosed()) {
-      if (await this.ensureDaemonLifecycleReused()) {
+      if ((await this.ensureDaemonLifecycleReused()) !== null) {
         return;
       }
       return this.ensureConnected();
@@ -582,20 +602,22 @@ export class DaemonChannelServer {
       return this.connectPromise;
     }
     if (this.connection && !this.connection.isClosed()) {
-      if (await this.ensureDaemonLifecycleReused()) {
+      if ((await this.ensureDaemonLifecycleReused()) !== null) {
         return;
       }
       return this.ensureConnected();
     }
 
+    let lifecycle: DaemonEnsureResult | undefined;
     if (this.hasLiveConnection()) {
-      if (!(await this.ensureDaemonLifecycleReused())) {
+      lifecycle = (await this.ensureDaemonLifecycleReused()) ?? undefined;
+      if (!lifecycle) {
         return this.ensureConnected();
       }
     }
 
     // Connect to daemon
-    const connectPromise = this.connect(connectGeneration);
+    const connectPromise = this.connect(connectGeneration, lifecycle);
     this.connectPromise = connectPromise;
     try {
       await connectPromise;
@@ -619,20 +641,32 @@ export class DaemonChannelServer {
     return lane;
   }
 
-  private async ensureDaemonLifecycleReused(): Promise<boolean> {
+  private async ensureDaemonLifecycleReused(): Promise<DaemonEnsureResult | null> {
     const result = await this.deps.ensureLifecycle(this.workspaceRoot);
-    if (result.state === "connected_existing") {
-      return true;
+    const nextInstanceId = result.instanceId ?? null;
+    const instanceChanged =
+      this.daemonInstanceId !== null &&
+      nextInstanceId !== null &&
+      this.daemonInstanceId !== nextInstanceId;
+    const instanceBecameKnown =
+      this.daemonInstanceId === null && nextInstanceId !== null;
+    if (
+      result.state === "connected_existing" &&
+      !instanceChanged &&
+      !instanceBecameKnown
+    ) {
+      return result;
     }
 
     logger.info(
-      `[DaemonChannelServer] Rust daemon lifecycle changed for ${this.workspaceRoot}; state=${result.state ?? "<unknown>"}; reused=${result.reused ?? "<unknown>"}; spawned=${result.spawned ?? "<unknown>"}`,
+      `[DaemonChannelServer] Rust daemon lifecycle changed for ${this.workspaceRoot}; state=${result.state ?? "<unknown>"}; instance=${nextInstanceId ?? "<unknown>"}; previousInstance=${this.daemonInstanceId ?? "<unknown>"}; reused=${result.reused ?? "<unknown>"}; spawned=${result.spawned ?? "<unknown>"}`,
     );
+    this.daemonInstanceId = null;
     this.generation++;
     this.lastLifecycleResetGeneration = this.generation;
     this.cleanup();
     this.deps.traceCache.notifyWrite();
-    return false;
+    return null;
   }
 
   private hasLiveConnection(): boolean {
@@ -654,7 +688,7 @@ export class DaemonChannelServer {
 
     const existing = this.readConnections[index];
     if (existing && !existing.isClosed()) {
-      if (await this.ensureDaemonLifecycleReused()) {
+      if ((await this.ensureDaemonLifecycleReused()) !== null) {
         return;
       }
     }
@@ -673,18 +707,20 @@ export class DaemonChannelServer {
     }
     const afterDelayExisting = this.readConnections[index];
     if (afterDelayExisting && !afterDelayExisting.isClosed()) {
-      if (await this.ensureDaemonLifecycleReused()) {
+      if ((await this.ensureDaemonLifecycleReused()) !== null) {
         return;
       }
       return this.ensureReadConnection(index);
     }
+    let lifecycle: DaemonEnsureResult | undefined;
     if (this.hasLiveConnection()) {
-      if (!(await this.ensureDaemonLifecycleReused())) {
+      lifecycle = (await this.ensureDaemonLifecycleReused()) ?? undefined;
+      if (!lifecycle) {
         return this.ensureReadConnection(index);
       }
     }
 
-    const promise = this.connectReadLane(index, connectGeneration);
+    const promise = this.connectReadLane(index, connectGeneration, lifecycle);
     this.readConnectPromises[index] = promise;
     try {
       await promise;
@@ -698,6 +734,7 @@ export class DaemonChannelServer {
   private async connectReadLane(
     index: number,
     connectGeneration: number,
+    ensuredLifecycle?: DaemonEnsureResult,
   ): Promise<void> {
     const existing = this.readConnections[index];
     if (existing) {
@@ -708,7 +745,10 @@ export class DaemonChannelServer {
 
     this.beginReadLaneConnect();
     try {
-      const connection = await this.deps.connect(this.workspaceRoot);
+      const lifecycle =
+        ensuredLifecycle ??
+        (await this.deps.ensureLifecycle(this.workspaceRoot));
+      const connection = await this.deps.connect(this.workspaceRoot, lifecycle);
       if (this.generation !== connectGeneration) {
         connection.close();
         throw new Error(
@@ -717,6 +757,7 @@ export class DaemonChannelServer {
       }
 
       this.readConnections[index] = connection;
+      this.daemonInstanceId = lifecycle.instanceId ?? null;
       this.markConnected();
 
       connection.onNotification = (notification) => {
@@ -802,19 +843,26 @@ export class DaemonChannelServer {
   /**
    * Connect to the daemon.
    */
-  private async connect(connectGeneration: number): Promise<void> {
+  private async connect(
+    connectGeneration: number,
+    ensuredLifecycle?: DaemonEnsureResult,
+  ): Promise<void> {
     // Clean up only the primary connection. Read lanes are independent and may
     // still be serving pure reads while the primary socket reconnects.
     this.cleanupPrimaryConnection();
 
     try {
-      const connection = await this.deps.connect(this.workspaceRoot);
+      const lifecycle =
+        ensuredLifecycle ??
+        (await this.deps.ensureLifecycle(this.workspaceRoot));
+      const connection = await this.deps.connect(this.workspaceRoot, lifecycle);
       if (this.generation !== connectGeneration) {
         connection.close();
         throw new Error("Stale daemon connection ignored after restart");
       }
 
       this.connection = connection;
+      this.daemonInstanceId = lifecycle.instanceId ?? null;
 
       this.markConnected();
 

@@ -31,11 +31,40 @@ That means the next improvement should not be another proxy process around the d
 
 A bounded current-epoch slice should focus on daemon lifecycle authority and sidebar resync:
 
-- Add or strengthen a machine-readable daemon status surface with daemon PID, socket path, identity path, executable identity, restart count or reason where available, and last lifecycle error where available.
-- Make `daemon ensure` the authoritative stale-binary replacement path for VS Code and other clients.
-- Reduce duplicate VS Code restart policy over time so the extension does not need to independently decide when the daemon binary is stale.
-- Preserve the good extension behavior: reconnect on connection loss, retry pure reads only where safe, invalidate TraceCache after daemon restart/reconnect, and keep write/exec non-replay boundaries intact.
+- Keep a machine-readable daemon status surface with daemon PID, instance ID,
+  socket path, identity path, executable identity, and bounded health
+  observations.
+- Make `daemon ensure` the authoritative stale-binary and unresponsive-runtime
+  replacement path for every client. Reuse requires both matching recorded
+  identity and a successful bounded probe for the exact daemon instance.
+- Keep VS Code as a lifecycle client: it reconnects when ensure reports a new
+  instance, resets all socket lanes, and invalidates TraceCache without
+  signaling daemon processes itself.
+- Resolve project identity once at the tool boundary and carry that resolved
+  project through status, steering, storage, and daemon request handling.
+  Status must not repeatedly rediscover the same worktree or serialize
+  independent repository observations.
 - Validate the observed sidebar out-of-sync case: after daemon restart, state mutation, or reconnect, sidebar providers should not keep stale epoch/phase/task state.
+
+## Language-Model Tool Reliability Contract
+
+An agent calls the Exo tool available in its environment. Project resolution,
+daemon discovery, stale or wedged runtime replacement, reconnection, and cache
+invalidation happen behind that tool boundary. A successful repair returns the
+requested command response; lifecycle commands are not normal recovery
+instructions for the agent.
+
+Every daemon process has a non-reusable runtime identity: instance ID, PID, and
+process-start identity. The client probes that exact instance before reuse and
+revalidates process identity before each termination signal. This prevents a
+stale PID file or PID reuse from authorizing a signal to another process.
+
+Pure requests may be replayed with the same request ID after automatic repair.
+Write and exec requests require a durable request/outcome record before they
+can be recovered transparently: reconnecting clients must query or replay the
+same globally unique request ID and receive the recorded response without
+executing a committed mutation twice. Until that ledger is implemented, the
+non-replay safety boundary remains in force.
 
 ## Cockpit / Workbench Direction
 
@@ -60,9 +89,10 @@ target for this phase.
 
 ## Open Questions
 
-- What identity and status fields should the daemon expose so VS Code can stop duplicating stale-binary checks?
-- Should daemon lifecycle diagnostics mirror `exo/proxy/status`, or should they be a simpler `daemon status` contract?
-- Which cache invalidation event is authoritative for sidebar refresh after daemon restart: daemon reconnect, explicit write notification, lifecycle generation change, or all of the above?
+- What transaction boundary should atomically associate a mutating command's
+  durable state change with its replayable response?
+- How long should completed daemon request outcomes be retained, and which
+  bounded maintenance path removes expired entries?
 - What is the minimum lane-centered workbench slice that proves a lane can be
   created, focused, and resumed from canonical project state?
 - Which daemon/API surfaces should the first lane workbench implementation

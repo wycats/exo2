@@ -197,15 +197,8 @@ fn client_diagnostics() -> DaemonDiagnostics {
 }
 
 /// Generate a unique request ID.
-///
-/// Uses a simple counter with a random prefix to ensure uniqueness
-/// across CLI invocations.
 pub fn generate_request_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("cli-{count}")
+    format!("cli-{}", ulid::Ulid::new().to_string().to_lowercase())
 }
 
 #[cfg(test)]

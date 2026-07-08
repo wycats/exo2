@@ -3135,12 +3135,19 @@ fn human_sidecar_write_ownership(ownership: &SidecarWriteOwnershipStatus) -> Opt
 }
 
 pub fn sidecar_repo_sync_status(root: &Path) -> Option<SidecarRepoSyncStatus> {
-    let project = Project::resolve(root).ok()?;
+    sidecar_repo_sync_status_with_project(root, None)
+}
+
+pub fn sidecar_repo_sync_status_with_project(
+    root: &Path,
+    project: Option<&Project>,
+) -> Option<SidecarRepoSyncStatus> {
+    let project = project.cloned().or_else(|| Project::resolve(root).ok())?;
     if project.policy != StatePolicy::Sidecar {
         return None;
     }
-    let sidecar_root = project.sidecar_root?;
-    let repo = match resolve_sidecar_repo(root) {
+    let sidecar_root = project.sidecar_root.clone()?;
+    let repo = match resolve_sidecar_repo_from_project(&project) {
         Ok(repo) => repo,
         Err(error) => {
             return Some(SidecarRepoSyncStatus {
@@ -3814,30 +3821,62 @@ fn ensure_git_repo(root: &Path) -> ExoResult<()> {
 }
 
 fn is_independent_git_repo(root: &Path) -> ExoResult<bool> {
-    let output = run_git(
-        root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let git_dir = PathBuf::from(git_stdout(&output)).canonicalize().ok();
-    let expected_git_dir = root.join(".git").canonicalize().ok();
-    Ok(git_dir == expected_git_dir)
+    Ok(root.join(".git").is_dir())
+}
+
+struct SidecarRepoReadSnapshot {
+    files: Vec<SidecarRepoFileStatus>,
+    known_project_keys: Vec<String>,
+    remote: Option<String>,
+    branch: Option<String>,
+    upstream_relation: Option<SidecarUpstreamRelation>,
+}
+
+fn read_sidecar_repo_snapshot(repo: &ResolvedSidecarRepo) -> ExoResult<SidecarRepoReadSnapshot> {
+    let remote = first_remote(&repo.sidecar_root)?;
+    let branch = current_branch(&repo.sidecar_root)?;
+    let (files, known_project_keys, upstream_relation) = std::thread::scope(|scope| {
+        let files = scope.spawn(|| read_status_files(&repo.sidecar_root));
+        let known_keys = scope.spawn(|| known_sidecar_project_keys(repo));
+        let upstream = scope.spawn(|| {
+            branch
+                .as_deref()
+                .map(|branch| read_upstream_relation(&repo.sidecar_root, branch))
+                .transpose()
+                .map(Option::flatten)
+        });
+        let files = files
+            .join()
+            .map_err(|_| anyhow::anyhow!("sidecar status worker panicked"))??;
+        let known_keys = known_keys
+            .join()
+            .map_err(|_| anyhow::anyhow!("sidecar project-key worker panicked"))??;
+        let upstream = upstream
+            .join()
+            .map_err(|_| anyhow::anyhow!("sidecar upstream worker panicked"))??;
+        Ok::<_, anyhow::Error>((files, known_keys, upstream))
+    })?;
+
+    Ok(SidecarRepoReadSnapshot {
+        files,
+        known_project_keys,
+        remote,
+        branch,
+        upstream_relation,
+    })
 }
 
 fn read_sidecar_repo_status(repo: &ResolvedSidecarRepo) -> ExoResult<SidecarRepoStatusOutput> {
-    let files = read_status_files(&repo.sidecar_root)?;
-    let project_files = owned_sidecar_status_files(repo)?;
-    let foreign_checkpoint_debt = foreign_checkpoint_debt(repo, &files)?;
-    let remote = first_remote(&repo.sidecar_root)?;
-    let branch = current_branch(&repo.sidecar_root)?;
+    let snapshot = read_sidecar_repo_snapshot(repo)?;
+    let files = snapshot.files;
+    let project_files =
+        owned_sidecar_status_files_from(repo, &files, &snapshot.known_project_keys)?;
+    let foreign_checkpoint_debt =
+        foreign_checkpoint_debt_with_keys(repo, &files, &snapshot.known_project_keys)?;
+    let remote = snapshot.remote;
+    let branch = snapshot.branch;
     let ownership = read_sidecar_write_ownership_status(repo)?;
-    let upstream_relation = branch
-        .as_deref()
-        .map(|branch| read_upstream_relation(&repo.sidecar_root, branch))
-        .transpose()?
-        .flatten();
+    let upstream_relation = snapshot.upstream_relation;
     let (ahead, behind) = upstream_relation
         .as_ref()
         .map(|relation| (relation.ahead, relation.behind))
@@ -3894,16 +3933,15 @@ fn read_sidecar_repo_sync_status(repo: &ResolvedSidecarRepo) -> ExoResult<Sideca
             foreign_checkpoint_debt: Vec::new(),
         });
     }
-    let files = read_status_files(&repo.sidecar_root)?;
-    let project_files = owned_sidecar_status_files(repo)?;
-    let foreign_checkpoint_debt = foreign_checkpoint_debt(repo, &files)?;
-    let remote = first_remote(&repo.sidecar_root)?;
-    let branch = current_branch(&repo.sidecar_root)?;
-    let upstream_relation = branch
-        .as_deref()
-        .map(|branch| read_upstream_relation(&repo.sidecar_root, branch))
-        .transpose()?
-        .flatten();
+    let snapshot = read_sidecar_repo_snapshot(repo)?;
+    let files = snapshot.files;
+    let project_files =
+        owned_sidecar_status_files_from(repo, &files, &snapshot.known_project_keys)?;
+    let foreign_checkpoint_debt =
+        foreign_checkpoint_debt_with_keys(repo, &files, &snapshot.known_project_keys)?;
+    let remote = snapshot.remote;
+    let branch = snapshot.branch;
+    let upstream_relation = snapshot.upstream_relation;
     let (ahead, behind) = upstream_relation
         .as_ref()
         .map(|relation| (relation.ahead, relation.behind))
@@ -4033,8 +4071,16 @@ fn foreign_checkpoint_debt(
     repo: &ResolvedSidecarRepo,
     files: &[SidecarRepoFileStatus],
 ) -> ExoResult<Vec<SidecarForeignCheckpointDebt>> {
-    let current_project_path = owned_sidecar_project_path(repo)?;
     let known_project_keys = known_sidecar_project_keys(repo)?;
+    foreign_checkpoint_debt_with_keys(repo, files, &known_project_keys)
+}
+
+fn foreign_checkpoint_debt_with_keys(
+    repo: &ResolvedSidecarRepo,
+    files: &[SidecarRepoFileStatus],
+    known_project_keys: &[String],
+) -> ExoResult<Vec<SidecarForeignCheckpointDebt>> {
+    let current_project_path = owned_sidecar_project_path(repo)?;
     let mut grouped: BTreeMap<String, Vec<SidecarRepoFileStatus>> = BTreeMap::new();
     let mut cross_project_files = Vec::new();
     for file in files {
@@ -4612,14 +4658,24 @@ fn commit_sidecar_changes(
 }
 
 fn owned_sidecar_status_files(repo: &ResolvedSidecarRepo) -> ExoResult<Vec<SidecarRepoFileStatus>> {
-    let project_path = owned_sidecar_project_path(repo)?;
     let known_project_keys = known_sidecar_project_keys(repo)?;
-    Ok(read_status_files(&repo.sidecar_root)?
-        .into_iter()
+    let files = read_status_files(&repo.sidecar_root)?;
+    owned_sidecar_status_files_from(repo, &files, &known_project_keys)
+}
+
+fn owned_sidecar_status_files_from(
+    repo: &ResolvedSidecarRepo,
+    files: &[SidecarRepoFileStatus],
+    known_project_keys: &[String],
+) -> ExoResult<Vec<SidecarRepoFileStatus>> {
+    let project_path = owned_sidecar_project_path(repo)?;
+    Ok(files
+        .iter()
         .filter(|file| {
-            !sidecar_status_file_is_untracked_project_runtime(file, &known_project_keys)
+            !sidecar_status_file_is_untracked_project_runtime(file, known_project_keys)
                 && sidecar_status_path_is_owned(&file.path, &project_path)
         })
+        .cloned()
         .collect())
 }
 
@@ -5826,12 +5882,15 @@ fn read_status_files(root: &Path) -> ExoResult<Vec<SidecarRepoFileStatus>> {
 }
 
 fn current_branch(root: &Path) -> ExoResult<Option<String>> {
-    let output = run_git(root, &["branch", "--show-current"])?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let branch = git_stdout(&output);
-    Ok((!branch.is_empty()).then_some(branch))
+    let head = match std::fs::read_to_string(root.join(".git").join("HEAD")) {
+        Ok(head) => head,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(head
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(ToOwned::to_owned))
 }
 
 fn first_remote(root: &Path) -> ExoResult<Option<String>> {
@@ -5846,37 +5905,39 @@ fn first_remote_url(root: &Path) -> ExoResult<Option<String>> {
 }
 
 fn remote_names(root: &Path) -> ExoResult<Vec<String>> {
-    let output = run_git(
-        root,
-        &[
-            "config",
-            "--local",
-            "--includes",
-            "--get-regexp",
-            r"^remote\..*\.url$",
-        ],
-    )?;
-    if !output.status.success() {
+    let Some(config) = read_local_git_config(root)? else {
         return Ok(Vec::new());
-    }
+    };
+    Ok(
+        crate::git_config::subsections_with_key(&config, "remote", "url")
+            .into_iter()
+            .collect(),
+    )
+}
 
-    let mut names = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(key) = line.split_whitespace().next() else {
-            continue;
-        };
-        let Some(name) = key
-            .strip_prefix("remote.")
-            .and_then(|value| value.strip_suffix(".url"))
-        else {
-            continue;
-        };
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.to_string());
-        }
+fn git_config_subsection_value(
+    root: &Path,
+    section: &str,
+    subsection: &str,
+    key: &str,
+) -> ExoResult<Option<String>> {
+    let Some(config) = read_local_git_config(root)? else {
+        return Ok(None);
+    };
+    Ok(
+        crate::git_config::last_value(&config, section, Some(subsection), key)
+            .map(ToOwned::to_owned),
+    )
+}
+
+fn read_local_git_config(root: &Path) -> ExoResult<Option<Vec<crate::git_config::GitConfigEntry>>> {
+    let config_path = root.join(".git").join("config");
+    if !config_path.exists() {
+        return Ok(None);
     }
-    names.sort();
-    Ok(names)
+    crate::git_config::read_repo_git_config(root, &config_path)
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn remote_url(root: &Path, remote: &str) -> ExoResult<Option<String>> {
@@ -5934,16 +5995,23 @@ fn read_upstream_relation_with_remote(
         return Ok(None);
     };
     let range = format!("{upstream}...{branch}");
-    let output = run_git_checked(
-        root,
-        &["rev-list", "--left-right", "--count", &range],
-        "git rev-list --left-right --count",
-    )?;
+    let output = run_git(root, &["rev-list", "--left-right", "--count", &range])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() || stderr.contains("no merge base") {
+            return Ok(Some(SidecarUpstreamRelation {
+                ahead: None,
+                behind: None,
+                has_merge_base: false,
+            }));
+        }
+        anyhow::bail!("git rev-list failed in {}: {stderr}", root.display());
+    }
     let stdout = git_stdout(&output);
     let mut parts = stdout.split_whitespace();
     let behind = parts.next().and_then(|part| part.parse::<u32>().ok());
     let ahead = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let merge_base = run_git(root, &["merge-base", "HEAD", &upstream])?;
+    let merge_base = run_git(root, &["merge-base", branch, &upstream])?;
     let has_merge_base = if merge_base.status.success() {
         true
     } else {
@@ -5975,9 +6043,19 @@ fn ahead_behind_for_remote(
 }
 
 fn branch_has_upstream(root: &Path, branch: &str) -> ExoResult<bool> {
-    let upstream = format!("{branch}@{{upstream}}");
-    let output = run_git(root, &["rev-parse", "--abbrev-ref", &upstream])?;
-    Ok(output.status.success())
+    let remote = git_config_subsection_value(root, "branch", branch, "remote")?;
+    let merge_ref = git_config_subsection_value(root, "branch", branch, "merge")?;
+    let (Some(remote), Some(merge_ref)) = (remote, merge_ref) else {
+        return Ok(false);
+    };
+    let upstream = if remote == "." {
+        merge_ref
+    } else if let Some(name) = merge_ref.strip_prefix("refs/heads/") {
+        format!("refs/remotes/{remote}/{name}")
+    } else {
+        merge_ref
+    };
+    Ok(git_ref_exists(root, &upstream))
 }
 
 fn upstream_ref_for_branch(
@@ -5985,8 +6063,19 @@ fn upstream_ref_for_branch(
     branch: &str,
     fallback_remote: Option<&str>,
 ) -> ExoResult<Option<String>> {
-    if branch_has_upstream(root, branch)? {
-        return Ok(Some(format!("{branch}@{{upstream}}")));
+    let configured_remote = git_config_subsection_value(root, "branch", branch, "remote")?;
+    let configured_merge = git_config_subsection_value(root, "branch", branch, "merge")?;
+    if let (Some(remote), Some(merge_ref)) = (configured_remote, configured_merge) {
+        let upstream = if remote == "." {
+            merge_ref
+        } else if let Some(name) = merge_ref.strip_prefix("refs/heads/") {
+            format!("refs/remotes/{remote}/{name}")
+        } else {
+            merge_ref
+        };
+        if git_ref_exists(root, &upstream) {
+            return Ok(Some(upstream));
+        }
     }
     match fallback_remote {
         Some(remote) => same_named_remote_branch(root, remote, branch),
@@ -6001,8 +6090,22 @@ fn upstream_ref_for_branch(
 
 fn same_named_remote_branch(root: &Path, remote: &str, branch: &str) -> ExoResult<Option<String>> {
     let remote_branch = format!("refs/remotes/{remote}/{branch}");
-    let output = run_git(root, &["rev-parse", "--verify", "--quiet", &remote_branch])?;
-    Ok(output.status.success().then_some(remote_branch))
+    Ok(git_ref_exists(root, &remote_branch).then_some(remote_branch))
+}
+
+fn git_ref_exists(root: &Path, reference: &str) -> bool {
+    if root.join(".git").join(reference).is_file() {
+        return true;
+    }
+    std::fs::read_to_string(root.join(".git").join("packed-refs"))
+        .ok()
+        .is_some_and(|packed| {
+            packed.lines().any(|line| {
+                !line.starts_with('#')
+                    && !line.starts_with('^')
+                    && line.split_whitespace().nth(1) == Some(reference)
+            })
+        })
 }
 
 fn run_git(root: &Path, args: &[&str]) -> ExoResult<Output> {
@@ -6202,6 +6305,52 @@ mod remote_order_tests {
         assert_eq!(
             configured_remote_url(repo, "origin").expect("read configured remote url"),
             Some("https://github.com/origin/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn later_parent_branch_config_overrides_an_included_value() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git_ok(repo, &["init"]);
+        let include_path = repo.join("branch.inc");
+        std::fs::write(&include_path, "[branch \"main\"]\n\tremote = included\n")
+            .expect("write include config");
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str(
+            "\n[include]\n\tpath = ../branch.inc\n[branch \"main\"]\n\tremote = parent\n",
+        );
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert_eq!(
+            git_config_subsection_value(repo, "branch", "main", "remote")
+                .expect("read branch remote"),
+            Some("parent".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_names_honor_matching_conditional_includes() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git_ok(repo, &["init"]);
+        let include_path = repo.join("conditional.inc");
+        std::fs::write(
+            &include_path,
+            "[remote \"conditional\"]\n\turl = https://example.invalid/repo.git\n",
+        )
+        .expect("write conditional include");
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str("\n[includeIf \"gitdir:**/.git\"]\n\tpath = ../conditional.inc\n");
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert_eq!(
+            remote_names(repo).expect("read remote names"),
+            vec!["conditional".to_string()]
         );
     }
 

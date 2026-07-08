@@ -13,6 +13,8 @@ use std::path::PathBuf;
 fn world_steering_includes_repair_actions_for_dirty_and_missing_snapshots() {
     let world = WorldState {
         root: PathBuf::from("/tmp"),
+        db_path: PathBuf::from("/tmp/.cache/exo.db"),
+        workspace_root_key: None,
         active_phase: Some(ActivePhase {
             id: "phase-1".to_string(),
             title: "Phase 1".to_string(),
@@ -182,6 +184,8 @@ fn make_world_state(
 ) -> WorldState {
     WorldState {
         root: PathBuf::from("/tmp"),
+        db_path: PathBuf::from("/tmp/.cache/exo.db"),
+        workspace_root_key: None,
         active_phase,
         next_phase: Some(NextPhase {
             id: "next-phase".to_string(),

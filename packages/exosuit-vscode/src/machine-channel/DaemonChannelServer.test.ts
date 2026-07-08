@@ -26,6 +26,7 @@ import {
   DaemonChannelServer,
   type ConnectionLike,
 } from "./DaemonChannelServer";
+import type { DaemonEnsureResult } from "./socket-client";
 import type {
   MachineChannelRequestEnvelope,
   MachineChannelResponseEnvelope,
@@ -273,7 +274,7 @@ describe("DaemonChannelServer", () => {
     await server.request(makeRequestEnvelope());
     await server.request(makeRequestEnvelope());
 
-    expect(ensureLifecycle).toHaveBeenCalledTimes(1);
+    expect(ensureLifecycle).toHaveBeenCalledTimes(2);
     expect(connect).toHaveBeenCalledTimes(1);
     expect(readConnection.request).toHaveBeenCalledTimes(2);
   });
@@ -287,18 +288,21 @@ describe("DaemonChannelServer", () => {
       .mockResolvedValueOnce(firstConnection)
       .mockResolvedValueOnce(secondConnection);
     const ensureLifecycle = vi
-      .fn<(_: string) => Promise<{
-        runtimeDir: string;
-        socketPath: string;
-        pidPath: string;
-        reused: boolean;
-        spawned: boolean;
-        state: string;
-      }>>()
+      .fn<(_: string) => Promise<DaemonEnsureResult>>()
       .mockResolvedValueOnce({
         runtimeDir: "/tmp/exo-runtime",
         socketPath: "/tmp/exo-runtime/daemon.sock",
         pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-a",
+        reused: true,
+        spawned: false,
+        state: "connected_existing",
+      })
+      .mockResolvedValueOnce({
+        runtimeDir: "/tmp/exo-runtime",
+        socketPath: "/tmp/exo-runtime/daemon.sock",
+        pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-b",
         reused: false,
         spawned: true,
         state: "spawned",
@@ -307,6 +311,7 @@ describe("DaemonChannelServer", () => {
         runtimeDir: "/tmp/exo-runtime",
         socketPath: "/tmp/exo-runtime/daemon.sock",
         pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-b",
         reused: true,
         spawned: false,
         state: "connected_existing",
@@ -376,9 +381,46 @@ describe("DaemonChannelServer", () => {
     await server.request(makeTaskCompleteEnvelope());
     await server.request(makeTaskCompleteEnvelope());
 
-    expect(ensureLifecycle).toHaveBeenCalledTimes(1);
+    expect(ensureLifecycle).toHaveBeenCalledTimes(2);
     expect(connect).toHaveBeenCalledTimes(1);
     expect(primaryConnection.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconnects when connected-existing names a different daemon instance", async () => {
+    const traceCache = { notifyWrite: vi.fn() };
+    const firstConnection = createConnection(makeResponse("write"));
+    const secondConnection = createConnection(makeResponse("write"));
+    const connect = vi
+      .fn<(_: string) => Promise<ConnectionLike>>()
+      .mockResolvedValueOnce(firstConnection)
+      .mockResolvedValueOnce(secondConnection);
+    const lifecycle = (instanceId: string) => ({
+      runtimeDir: "/tmp/exo-runtime",
+      socketPath: "/tmp/exo-runtime/daemon.sock",
+      pidPath: "/tmp/exo-runtime/daemon.pid",
+      pid: instanceId === "daemon-a" ? 100 : 200,
+      instanceId,
+      probeOk: true,
+      reused: true,
+      spawned: false,
+      state: "connected_existing",
+    });
+    const ensureLifecycle = vi
+      .fn()
+      .mockResolvedValueOnce(lifecycle("daemon-a"))
+      .mockResolvedValue(lifecycle("daemon-b"));
+    const server = DaemonChannelServer.createForTesting(
+      "/tmp/exo2-daemon-instance-replaced",
+      { connect, ensureLifecycle, traceCache },
+    );
+
+    await server.request(makeTaskCompleteEnvelope());
+    await server.request(makeTaskCompleteEnvelope());
+
+    expect(firstConnection.close).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(secondConnection.request).toHaveBeenCalledTimes(1);
+    expect(traceCache.notifyWrite).toHaveBeenCalled();
   });
 
   it("reconnects through daemon ensure when Rust lifecycle replaces the primary daemon", async () => {
@@ -409,7 +451,7 @@ describe("DaemonChannelServer", () => {
     await server.request(makeTaskCompleteEnvelope());
     await server.request(makeTaskCompleteEnvelope());
 
-    expect(ensureLifecycle).toHaveBeenCalledTimes(1);
+    expect(ensureLifecycle).toHaveBeenCalledTimes(3);
     expect(firstConnection.close).toHaveBeenCalledTimes(1);
     expect(connect).toHaveBeenCalledTimes(2);
     expect(secondConnection.request).toHaveBeenCalledTimes(1);
@@ -443,7 +485,7 @@ describe("DaemonChannelServer", () => {
     await server.request(makeTaskCompleteEnvelope());
     await server.request(makeTaskCompleteEnvelope());
 
-    expect(ensureLifecycle).toHaveBeenCalledTimes(1);
+    expect(ensureLifecycle).toHaveBeenCalledTimes(3);
     expect(firstConnection.close).toHaveBeenCalledTimes(1);
     expect(connect).toHaveBeenCalledTimes(2);
     expect(secondConnection.request).toHaveBeenCalledTimes(1);
@@ -494,18 +536,21 @@ describe("DaemonChannelServer", () => {
       .mockResolvedValueOnce(readConnection)
       .mockResolvedValueOnce(replacementPrimaryConnection);
     const ensureLifecycle = vi
-      .fn<(_: string) => Promise<{
-        runtimeDir: string;
-        socketPath: string;
-        pidPath: string;
-        reused: boolean;
-        spawned: boolean;
-        state: string;
-      }>>()
+      .fn<(_: string) => Promise<DaemonEnsureResult>>()
       .mockResolvedValueOnce({
         runtimeDir: "/tmp/exo-runtime",
         socketPath: "/tmp/exo-runtime/daemon.sock",
         pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-a",
+        reused: true,
+        spawned: false,
+        state: "connected_existing",
+      })
+      .mockResolvedValueOnce({
+        runtimeDir: "/tmp/exo-runtime",
+        socketPath: "/tmp/exo-runtime/daemon.sock",
+        pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-b",
         reused: false,
         spawned: true,
         state: "spawned",
@@ -514,6 +559,7 @@ describe("DaemonChannelServer", () => {
         runtimeDir: "/tmp/exo-runtime",
         socketPath: "/tmp/exo-runtime/daemon.sock",
         pidPath: "/tmp/exo-runtime/daemon.pid",
+        instanceId: "daemon-b",
         reused: true,
         spawned: false,
         state: "connected_existing",
@@ -1307,8 +1353,9 @@ describe("DaemonChannelServer", () => {
     });
 
     const staleRequest = server.request(makeTaskCompleteEnvelope());
-    await Promise.resolve();
-    expect(connect).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(connect).toHaveBeenCalledTimes(1);
+    });
 
     await server.restart();
     rejectFirstConnect?.(new Error("stale connect failed after restart"));

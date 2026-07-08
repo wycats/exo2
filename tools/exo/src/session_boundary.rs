@@ -81,7 +81,7 @@ pub fn detect_boundary(world: &WorldState) -> BoundaryDetection {
     }
 
     // === Event-based detection (primary) ===
-    if let Some(last_event) = last_event_at(&world.root) {
+    if let Some(last_event) = last_event_at(&world.db_path) {
         let now = Utc::now();
         let gap = now.signed_duration_since(last_event);
         let gap_minutes = gap.num_minutes();
@@ -94,7 +94,7 @@ pub fn detect_boundary(world: &WorldState) -> BoundaryDetection {
                 rationale: format!(
                     "No agent activity for {gap_minutes} minutes — likely a new session."
                 ),
-                previous_session: crate::activity::previous_session_summary(&world.root),
+                previous_session: crate::activity::previous_session_summary_from_db(&world.db_path),
             };
         }
 
@@ -129,9 +129,8 @@ pub fn detect_boundary(world: &WorldState) -> BoundaryDetection {
 ///
 /// Returns `None` if the database doesn't exist, the table is empty,
 /// or any error occurs.
-fn last_event_at(root: &Path) -> Option<DateTime<Utc>> {
-    let db_path = crate::event_db::event_db_path(root);
-    let ts = crate::event_db::with_event_db(&db_path, |conn| {
+fn last_event_at(db_path: &Path) -> Option<DateTime<Utc>> {
+    let ts = crate::event_db::with_event_db(db_path, |conn| {
         conn.query_row("SELECT MAX(timestamp) FROM agent_events", [], |row| {
             row.get::<_, Option<String>>(0)
         })
@@ -226,6 +225,8 @@ mod tests {
     /// Build a minimal `WorldState` for boundary detection tests.
     fn test_world(root: std::path::PathBuf) -> WorldState {
         WorldState {
+            db_path: root.join(crate::context::SQLITE_DB_PATH),
+            workspace_root_key: None,
             root,
             active_phase: None,
             next_phase: None,
