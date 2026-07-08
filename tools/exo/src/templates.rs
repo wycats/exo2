@@ -381,38 +381,11 @@ pub fn sql_dump_merge_driver_configured(root: &std::path::Path) -> Result<bool, 
         return Ok(true);
     };
 
-    let config = std::fs::read_to_string(git_common_dir.join("config"))?;
+    let config = crate::git_config::read_repo_git_config(root, &git_common_dir.join("config"))?;
     Ok(
-        git_config_section_value(&config, "merge", SQL_DUMP_MERGE_DRIVER, "driver")
+        crate::git_config::last_value(&config, "merge", Some(SQL_DUMP_MERGE_DRIVER), "driver")
             .is_some_and(|value| value.eq_ignore_ascii_case("true")),
     )
-}
-
-fn git_config_section_value<'a>(
-    config: &'a str,
-    section: &str,
-    subsection: &str,
-    key: &str,
-) -> Option<&'a str> {
-    let expected_header = format!("[{section} \"{subsection}\"]");
-    let mut in_section = false;
-    for raw_line in config.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') {
-            in_section = line.eq_ignore_ascii_case(&expected_header);
-            continue;
-        }
-        if !in_section || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some((candidate, value)) = line.split_once('=') else {
-            continue;
-        };
-        if candidate.trim().eq_ignore_ascii_case(key) {
-            return Some(value.trim());
-        }
-    }
-    None
 }
 
 /// Install default hooks.toml.
@@ -468,5 +441,31 @@ fn git_config_set(root: &std::path::Path, key: &str, value: &str) -> Result<(), 
         Err(std::io::Error::other(format!(
             "git config failed for {key}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_driver_detection_uses_the_last_repeated_section_value() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(repo)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str(
+            "\n[merge \"exo-sql-dump\"]\n\tdriver = false\n[merge \"exo-sql-dump\"]\n\tdriver = true\n",
+        );
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert!(sql_dump_merge_driver_configured(repo).expect("read merge driver"));
     }
 }

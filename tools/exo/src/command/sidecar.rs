@@ -5908,32 +5908,11 @@ fn remote_names(root: &Path) -> ExoResult<Vec<String>> {
     let Some(config) = read_local_git_config(root)? else {
         return Ok(Vec::new());
     };
-    let mut names = BTreeSet::new();
-    let mut remote = None;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            remote = git_config_subsection(line, "remote");
-            continue;
-        }
-        if remote.is_some() && git_config_key_value(line).is_some_and(|(key, _)| key == "url") {
-            names.insert(remote.clone().unwrap_or_default());
-        }
-    }
-    Ok(names.into_iter().collect())
-}
-
-fn git_config_subsection(header: &str, section: &str) -> Option<String> {
-    let prefix = format!("[{section} \"");
-    header
-        .strip_prefix(&prefix)
-        .and_then(|value| value.strip_suffix("\"]"))
-        .map(ToOwned::to_owned)
-}
-
-fn git_config_key_value(line: &str) -> Option<(&str, &str)> {
-    let (key, value) = line.split_once('=')?;
-    Some((key.trim(), value.trim()))
+    Ok(
+        crate::git_config::subsections_with_key(&config, "remote", "url")
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn git_config_subsection_value(
@@ -5945,78 +5924,20 @@ fn git_config_subsection_value(
     let Some(config) = read_local_git_config(root)? else {
         return Ok(None);
     };
-    let mut in_section = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_section = git_config_subsection(line, section).as_deref() == Some(subsection);
-            continue;
-        }
-        if in_section
-            && let Some((candidate, value)) = git_config_key_value(line)
-            && candidate == key
-        {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(None)
+    Ok(
+        crate::git_config::last_value(&config, section, Some(subsection), key)
+            .map(ToOwned::to_owned),
+    )
 }
 
-fn read_local_git_config(root: &Path) -> ExoResult<Option<String>> {
+fn read_local_git_config(root: &Path) -> ExoResult<Option<Vec<crate::git_config::GitConfigEntry>>> {
     let config_path = root.join(".git").join("config");
     if !config_path.exists() {
         return Ok(None);
     }
-    let mut visited = BTreeSet::new();
-    read_git_config_file(&config_path, &mut visited, 0).map(Some)
-}
-
-fn read_git_config_file(
-    path: &Path,
-    visited: &mut BTreeSet<PathBuf>,
-    depth: usize,
-) -> ExoResult<String> {
-    if depth >= 8 {
-        anyhow::bail!(
-            "git config include depth exceeded while reading {}",
-            path.display()
-        );
-    }
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical) {
-        return Ok(String::new());
-    }
-
-    let config = std::fs::read_to_string(path)?;
-    let mut combined = config.clone();
-    let mut in_include = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_include = line.eq_ignore_ascii_case("[include]");
-            continue;
-        }
-        if !in_include {
-            continue;
-        }
-        let Some((key, value)) = git_config_key_value(line) else {
-            continue;
-        };
-        if key != "path" {
-            continue;
-        }
-        let include_path = PathBuf::from(value);
-        let include_path = if include_path.is_absolute() {
-            include_path
-        } else {
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(include_path)
-        };
-        combined.push('\n');
-        combined.push_str(&read_git_config_file(&include_path, visited, depth + 1)?);
-    }
-    Ok(combined)
+    crate::git_config::read_repo_git_config(root, &config_path)
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn remote_url(root: &Path, remote: &str) -> ExoResult<Option<String>> {
@@ -6384,6 +6305,52 @@ mod remote_order_tests {
         assert_eq!(
             configured_remote_url(repo, "origin").expect("read configured remote url"),
             Some("https://github.com/origin/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn later_parent_branch_config_overrides_an_included_value() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git_ok(repo, &["init"]);
+        let include_path = repo.join("branch.inc");
+        std::fs::write(&include_path, "[branch \"main\"]\n\tremote = included\n")
+            .expect("write include config");
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str(
+            "\n[include]\n\tpath = ../branch.inc\n[branch \"main\"]\n\tremote = parent\n",
+        );
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert_eq!(
+            git_config_subsection_value(repo, "branch", "main", "remote")
+                .expect("read branch remote"),
+            Some("parent".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_names_honor_matching_conditional_includes() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git_ok(repo, &["init"]);
+        let include_path = repo.join("conditional.inc");
+        std::fs::write(
+            &include_path,
+            "[remote \"conditional\"]\n\turl = https://example.invalid/repo.git\n",
+        )
+        .expect("write conditional include");
+
+        let config_path = repo.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).expect("read config");
+        config.push_str("\n[includeIf \"gitdir:**/.git\"]\n\tpath = ../conditional.inc\n");
+        std::fs::write(&config_path, config).expect("write config");
+
+        assert_eq!(
+            remote_names(repo).expect("read remote names"),
+            vec!["conditional".to_string()]
         );
     }
 

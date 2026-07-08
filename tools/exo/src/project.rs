@@ -99,6 +99,28 @@ impl Project {
         ProjectResolver::default().resolve(cwd)
     }
 
+    pub(crate) fn refresh_policy(&self) -> ExoResult<Self> {
+        let Some(projects_config_path) = self.projects_config_path.as_deref() else {
+            return Ok(self.clone());
+        };
+        let resolver = ProjectResolver::default().with_projects_config_path(projects_config_path);
+        let (policy, state_root, sidecar_key, sidecar_root, sidecar_auto_commit, sidecar_auto_push) =
+            resolver.resolve_state_root(&self.id, &self.git_common_dir)?;
+
+        Ok(Self {
+            id: self.id.clone(),
+            git_common_dir: self.git_common_dir.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy,
+            projects_config_path: self.projects_config_path.clone(),
+            state_root,
+            sidecar_key,
+            sidecar_root,
+            sidecar_auto_commit,
+            sidecar_auto_push,
+        })
+    }
+
     pub(crate) fn current_branch(&self) -> Option<String> {
         let workspace_root = self.workspace_root.as_ref()?;
         let git_dir = workspace_git_dir(workspace_root)?;

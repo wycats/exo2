@@ -185,6 +185,7 @@ fn run_exo_status(workspace: &Path, envs: &[(&str, &OsStr)]) -> std::process::Ou
     command.output().unwrap()
 }
 
+#[cfg(unix)]
 fn run_exo_json_command(workspace: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_exo"))
         .args(["--format", "json"])
@@ -1120,6 +1121,60 @@ async fn ensure_daemon_restarts_existing_daemon_when_identity_is_missing(backend
     assert!(
         paths.identity_path().exists(),
         "restarted daemon should write fresh identity"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn ensure_daemon_restarts_probed_daemon_when_pid_file_is_missing_or_invalid(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let paths = exo::daemon::paths_for_workspace(&workspace).unwrap();
+
+    let first = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("first ensure should spawn daemon")
+        .into_report();
+    let first_pid = first.pid.expect("first ensure should report pid");
+    std::fs::remove_file(paths.pid_path()).expect("remove daemon pid file");
+
+    let second = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("second ensure should restart daemon discovered by probe")
+        .into_report();
+    let second_pid = second.pid.expect("second ensure should report pid");
+
+    assert_ne!(
+        first_pid, second_pid,
+        "missing PID metadata should restart the daemon identified by the socket probe"
+    );
+    assert!(
+        second
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("terminated stale daemon process")),
+        "restart diagnostics should mention probed daemon termination: {:?}",
+        second.diagnostics
+    );
+
+    std::fs::write(paths.pid_path(), "not-a-pid").expect("write invalid daemon pid file");
+    let third = exo::daemon::ensure_daemon_with_report(&workspace)
+        .await
+        .expect("third ensure should restart daemon discovered past invalid PID metadata")
+        .into_report();
+    let third_pid = third.pid.expect("third ensure should report pid");
+    assert_ne!(
+        second_pid, third_pid,
+        "invalid PID metadata should restart the daemon identified by the socket probe"
+    );
+    assert!(
+        third
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("terminated stale daemon process")),
+        "restart diagnostics should mention probed daemon termination: {:?}",
+        third.diagnostics
     );
 }
 

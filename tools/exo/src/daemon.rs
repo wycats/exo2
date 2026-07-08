@@ -931,11 +931,11 @@ async fn restart_stale_daemon_once(
     legacy_endpoint_connected: bool,
 ) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    if let Some(pid) = read_pid_file(&paths.pid_path()) {
+    let process = probed_process
+        .map(|process| (process.pid, Some(process.process_start_id.as_str())))
+        .or_else(|| read_pid_file(&paths.pid_path()).map(|pid| (pid, None)));
+    if let Some((pid, probed_process_start_id)) = process {
         if process_alive(pid) {
-            let probed_process_start_id = probed_process
-                .filter(|process| process.pid == pid)
-                .map(|process| process.process_start_id.as_str());
             if !daemon_process_identity_matches(
                 paths,
                 pid,
@@ -990,6 +990,16 @@ async fn restart_stale_daemon_once(
     // Stale socket cleanup is safe only after this process owns the PID lock.
 
     diagnostics
+}
+
+fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
+    let current = startup_project.refresh_policy().map_err(to_io_error)?;
+    if current.runtime_dir() != startup_project.runtime_dir() {
+        return Err(io::Error::other(
+            "project state policy changed the daemon runtime; reconnect through the current project runtime",
+        ));
+    }
+    Ok(current)
 }
 
 fn spawn_daemon_after_lock(
@@ -1873,16 +1883,35 @@ pub async fn run_daemon(
                 async move {
                     let request_id = req.id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        handle_request_with_project_and_diagnostics_as_writer(
+                        let project = daemon_request_project(project.as_ref())?;
+                        Ok::<_, io::Error>(handle_request_with_project_and_diagnostics_as_writer(
                             &workspace,
-                            Some(project.as_ref()),
+                            Some(&project),
                             req,
                             &diagnostics,
-                        )
+                        ))
                     })
                     .await
                     {
-                        Ok(response) => response,
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            id: request_id,
+                            status: Status::Error,
+                            result: None,
+                            error: Some(ErrorBody {
+                                code: ErrorCode::PreconditionFailed,
+                                message: error.to_string(),
+                                details: None,
+                            }),
+                            ticket: None,
+                            steering: None,
+                            reminders: None,
+                            display: None,
+                            preview: None,
+                            effect: None,
+                            trace: None,
+                        },
                         Err(error) => ResponseEnvelope {
                             protocol_version: PROTOCOL_VERSION,
                             id: request_id,
@@ -2269,6 +2298,46 @@ mod tests {
             sidecar_auto_commit: false,
             sidecar_auto_push: SidecarAutoPushPolicy::Never,
         }
+    }
+
+    #[test]
+    fn daemon_request_project_refreshes_mutable_sidecar_policy() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let git_common_dir = temp.path().join("repo/.git");
+        let sidecar_root = temp.path().join("sidecars");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config dir");
+        let id = ProjectId::from_git_common_dir(&git_common_dir);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[projects.\"{id}\"]\nstate = \"sidecar\"\nsidecar_key = \"repo\"\nsidecar_root = {:?}\nauto_commit = false\nauto_push = \"always\"\n",
+                sidecar_root.display().to_string()
+            ),
+        )
+        .expect("write projects policy");
+        let state_root = sidecar_root.join("projects/repo");
+        let startup = Project {
+            id,
+            git_common_dir,
+            workspace_root: Some(temp.path().join("repo")),
+            policy: crate::project::StatePolicy::Sidecar,
+            projects_config_path: Some(config_path),
+            state_root: state_root.clone(),
+            sidecar_key: Some("repo".to_string()),
+            sidecar_root: Some(sidecar_root),
+            sidecar_auto_commit: true,
+            sidecar_auto_push: crate::project::SidecarAutoPushPolicy::Never,
+        };
+
+        let refreshed = daemon_request_project(&startup).expect("refresh daemon project");
+        assert_eq!(refreshed.runtime_dir(), startup.runtime_dir());
+        assert!(!refreshed.sidecar_auto_commit);
+        assert_eq!(
+            refreshed.sidecar_auto_push,
+            crate::project::SidecarAutoPushPolicy::Always
+        );
     }
 
     #[test]
