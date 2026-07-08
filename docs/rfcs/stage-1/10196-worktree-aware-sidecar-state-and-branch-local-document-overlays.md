@@ -2,8 +2,8 @@
 
 # RFC 10196: Worktree-Aware Sidecar State and Branch-Local Document Overlays
 
-**Status:** Stage 1 Proposal
-**Feature:** sidecar
+**Status**: Stage 1 Proposal
+**Feature**: sidecar
 
 ## Summary
 
