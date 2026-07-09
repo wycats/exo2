@@ -5,6 +5,7 @@
 //! maintenance paths may still address shadow tables directly.
 
 use crate::api::protocol::ErrorCode;
+use crate::context::sqlite_loader::RfcRecord;
 use crate::failure::ExoFailure;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -1405,116 +1406,137 @@ impl SqliteWriter {
     ) -> Result<()> {
         let conn = self.db.connection();
         let now = Utc::now().to_rfc3339();
-        let rows = conn
-            .execute(
-                "UPDATE rfcs
-                 SET rfc_number = ?2,
-                     title = ?3,
-                     stage = ?4,
-                     status = ?5,
-                     feature = ?6,
-                     slug = ?7,
-                     file_path = ?8,
-                     superseded_by = ?9,
-                     supersedes = ?10,
-                     withdrawal_reason = ?11,
-                     archived_reason = ?12,
-                     consolidated_into = ?13,
-                     updated_at = ?14
-                 WHERE text_id = ?1",
+        upsert_rfc_on(
+            conn,
+            text_id,
+            rfc_number,
+            title,
+            stage,
+            status,
+            feature,
+            slug,
+            file_path,
+            superseded_by,
+            supersedes,
+            withdrawal_reason,
+            archived_reason,
+            consolidated_into,
+            &now,
+        )
+    }
+
+    /// Return whether pre-overlay RFC metadata has been reconciled to a canonical Git tree.
+    pub fn has_rfc_canonical_baseline(&self) -> Result<bool> {
+        self.db
+            .connection()
+            .query_row(
+                "SELECT 1 FROM rfc_canonical_baseline WHERE singleton = 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .context("Failed to read RFC canonical baseline")
+            .map(|row| row.is_some())
+    }
+
+    /// Atomically publish canonical RFC changes and establish the migration baseline.
+    pub fn reconcile_canonical_rfcs(
+        &self,
+        changed_records: &[RfcRecord],
+        quarantined_records: &[RfcRecord],
+        relinked_canonical_text_ids: &BTreeSet<String>,
+        canonical_ref: &str,
+        canonical_oid: &str,
+        establish_baseline: bool,
+    ) -> Result<()> {
+        let conn = self.db.connection();
+        let tx = conn
+            .unchecked_transaction()
+            .context("Failed to start canonical RFC reconciliation transaction")?;
+        let now = Utc::now().to_rfc3339();
+
+        for record in changed_records {
+            upsert_rfc_on(
+                &tx,
+                &record.text_id,
+                record.rfc_number,
+                &record.title,
+                record.stage,
+                &record.status,
+                record.feature.as_deref(),
+                &record.slug,
+                &record.file_path,
+                record.superseded_by.as_deref(),
+                record.supersedes.as_deref(),
+                record.withdrawal_reason.as_deref(),
+                record.archived_reason.as_deref(),
+                record.consolidated_into.as_deref(),
+                &now,
+            )?;
+        }
+
+        for text_id in relinked_canonical_text_ids {
+            tx.execute(
+                "DELETE FROM rfc_canonical_quarantine WHERE text_id = ?1",
+                [text_id],
+            )
+            .context("Failed to clear canonical RFC quarantine")?;
+        }
+
+        let quarantine_reason = if establish_baseline {
+            "missing_from_initial_canonical_tree"
+        } else {
+            "missing_from_canonical_history"
+        };
+        for record in quarantined_records {
+            let serialized = serde_json::to_string(record)
+                .context("Failed to serialize quarantined RFC metadata")?;
+            tx.execute(
+                "INSERT INTO rfc_canonical_quarantine (
+                    text_id, rfc_number, serialized_row, quarantine_reason, quarantined_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(text_id) DO UPDATE SET
+                    rfc_number = excluded.rfc_number,
+                    serialized_row = excluded.serialized_row,
+                    quarantine_reason = excluded.quarantine_reason,
+                    quarantined_at = excluded.quarantined_at",
                 (
-                    text_id,
-                    rfc_number,
-                    title,
-                    stage,
-                    status,
-                    feature,
-                    slug,
-                    file_path,
-                    superseded_by,
-                    supersedes,
-                    withdrawal_reason,
-                    archived_reason,
-                    consolidated_into,
+                    &record.text_id,
+                    record.rfc_number,
+                    &serialized,
+                    quarantine_reason,
                     &now,
                 ),
             )
-            .context("Failed to update RFC metadata")?;
-
-        if rows == 0 {
-            let inserted = conn
-                .execute(
-                    "INSERT OR IGNORE INTO rfcs (
-                    text_id, rfc_number, title, stage, status, feature, slug, file_path,
-                    superseded_by, supersedes, withdrawal_reason, archived_reason,
-                    consolidated_into, created_at, updated_at
+            .context("Failed to quarantine non-canonical RFC metadata")?;
+            if let Some(row_id) = tx
+                .query_row(
+                    "SELECT id FROM rfcs_data WHERE text_id = ?1",
+                    [&record.text_id],
+                    |row| row.get::<_, i64>(0),
                 )
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM rfcs_data WHERE text_id = ?1
-                )",
-                    (
-                        text_id,
-                        rfc_number,
-                        title,
-                        stage,
-                        status,
-                        feature,
-                        slug,
-                        file_path,
-                        superseded_by,
-                        supersedes,
-                        withdrawal_reason,
-                        archived_reason,
-                        consolidated_into,
-                        &now,
-                    ),
-                )
-                .context("Failed to insert RFC metadata")?;
-
-            if inserted == 0 {
-                let rows = conn
-                    .execute(
-                        "UPDATE rfcs
-                         SET rfc_number = ?2,
-                             title = ?3,
-                             stage = ?4,
-                             status = ?5,
-                             feature = ?6,
-                             slug = ?7,
-                             file_path = ?8,
-                             superseded_by = ?9,
-                             supersedes = ?10,
-                             withdrawal_reason = ?11,
-                             archived_reason = ?12,
-                             consolidated_into = ?13,
-                             updated_at = ?14
-                         WHERE text_id = ?1",
-                        (
-                            text_id,
-                            rfc_number,
-                            title,
-                            stage,
-                            status,
-                            feature,
-                            slug,
-                            file_path,
-                            superseded_by,
-                            supersedes,
-                            withdrawal_reason,
-                            archived_reason,
-                            consolidated_into,
-                            &now,
-                        ),
-                    )
-                    .context("Failed to update RFC metadata after concurrent insert")?;
-                if rows == 0 {
-                    return Err(anyhow!("RFC metadata could not be upserted for {text_id}"));
-                }
+                .optional()
+                .context("Failed to resolve quarantined RFC row")?
+            {
+                tx.execute("DELETE FROM rfc_relations WHERE rfc_id = ?1", [row_id])
+                    .context("Failed to remove quarantined RFC relationships")?;
             }
+            tx.execute("DELETE FROM rfcs WHERE text_id = ?1", [&record.text_id])
+                .context("Failed to remove quarantined RFC metadata")?;
         }
 
-        Ok(())
+        if establish_baseline {
+            tx.execute(
+                "INSERT INTO rfc_canonical_baseline (
+                    singleton, canonical_ref, canonical_oid, completed_at
+                 ) VALUES (1, ?1, ?2, ?3)",
+                (canonical_ref, canonical_oid, &now),
+            )
+            .context("Failed to record RFC canonical baseline")?;
+        }
+
+        tx.commit()
+            .context("Failed to commit canonical RFC reconciliation")
     }
 
     /// Update just the stage and `file_path` for an RFC (used by rfc promote).
@@ -1550,6 +1572,136 @@ impl SqliteWriter {
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_rfc_on(
+    conn: &Connection,
+    text_id: &str,
+    rfc_number: i64,
+    title: &str,
+    stage: u8,
+    status: &str,
+    feature: Option<&str>,
+    slug: &str,
+    file_path: &str,
+    superseded_by: Option<&str>,
+    supersedes: Option<&str>,
+    withdrawal_reason: Option<&str>,
+    archived_reason: Option<&str>,
+    consolidated_into: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let rows = conn
+        .execute(
+            "UPDATE rfcs
+             SET rfc_number = ?2,
+                 title = ?3,
+                 stage = ?4,
+                 status = ?5,
+                 feature = ?6,
+                 slug = ?7,
+                 file_path = ?8,
+                 superseded_by = ?9,
+                 supersedes = ?10,
+                 withdrawal_reason = ?11,
+                 archived_reason = ?12,
+                 consolidated_into = ?13,
+                 updated_at = ?14
+             WHERE text_id = ?1",
+            (
+                text_id,
+                rfc_number,
+                title,
+                stage,
+                status,
+                feature,
+                slug,
+                file_path,
+                superseded_by,
+                supersedes,
+                withdrawal_reason,
+                archived_reason,
+                consolidated_into,
+                now,
+            ),
+        )
+        .context("Failed to update RFC metadata")?;
+
+    if rows == 0 {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO rfcs (
+                    text_id, rfc_number, title, stage, status, feature, slug, file_path,
+                    superseded_by, supersedes, withdrawal_reason, archived_reason,
+                    consolidated_into, created_at, updated_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM rfcs_data WHERE text_id = ?1
+                 )",
+                (
+                    text_id,
+                    rfc_number,
+                    title,
+                    stage,
+                    status,
+                    feature,
+                    slug,
+                    file_path,
+                    superseded_by,
+                    supersedes,
+                    withdrawal_reason,
+                    archived_reason,
+                    consolidated_into,
+                    now,
+                ),
+            )
+            .context("Failed to insert RFC metadata")?;
+
+        if inserted == 0 {
+            let rows = conn
+                .execute(
+                    "UPDATE rfcs
+                     SET rfc_number = ?2,
+                         title = ?3,
+                         stage = ?4,
+                         status = ?5,
+                         feature = ?6,
+                         slug = ?7,
+                         file_path = ?8,
+                         superseded_by = ?9,
+                         supersedes = ?10,
+                         withdrawal_reason = ?11,
+                         archived_reason = ?12,
+                         consolidated_into = ?13,
+                         updated_at = ?14
+                     WHERE text_id = ?1",
+                    (
+                        text_id,
+                        rfc_number,
+                        title,
+                        stage,
+                        status,
+                        feature,
+                        slug,
+                        file_path,
+                        superseded_by,
+                        supersedes,
+                        withdrawal_reason,
+                        archived_reason,
+                        consolidated_into,
+                        now,
+                    ),
+                )
+                .context("Failed to update RFC metadata after concurrent insert")?;
+            if rows == 0 {
+                return Err(anyhow!("RFC metadata could not be upserted for {text_id}"));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Resolve a `text_id` to an integer rowid.
 fn resolve_id(conn: &Connection, table: &str, text_id: &str) -> Result<i64> {

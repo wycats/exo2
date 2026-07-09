@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use walkdir::WalkDir;
 
@@ -45,13 +46,15 @@ static RECONCILED_RFC_KEYS: OnceLock<Mutex<HashSet<ReconcileKey>>> = OnceLock::n
 struct ReconcileKey {
     root: PathBuf,
     db_path: PathBuf,
+    canonical_oid: Option<String>,
 }
 
 impl ReconcileKey {
-    fn new(root: &Path, project: Option<&Project>) -> Self {
+    fn new(root: &Path, project: Option<&Project>, source: &CanonicalReconcileSource) -> Self {
         Self {
             root: normalize_key_path(root),
             db_path: normalize_key_path(&crate::context::db_path(root, project)),
+            canonical_oid: canonical_reconcile_cache_oid(source),
         }
     }
 }
@@ -98,6 +101,51 @@ struct DiskRfcRecord {
     supersedes: Option<String>,
     superseded_by_declared: bool,
     supersedes_declared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredRfcValue {
+    value: Option<String>,
+    declared: bool,
+}
+
+impl DeclaredRfcValue {
+    const fn absent() -> Self {
+        Self {
+            value: None,
+            declared: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRfcDocument {
+    disk: DiskRfcRecord,
+    filename_number: i64,
+    canonical_metadata_conflict: bool,
+    feature: DeclaredRfcValue,
+    withdrawal_reason: DeclaredRfcValue,
+    archived_reason: DeclaredRfcValue,
+    consolidated_into: DeclaredRfcValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalGitRef {
+    ref_name: String,
+    oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalReconcileSource {
+    Canonical(CanonicalGitRef),
+    PreserveShared,
+    WorkspaceFallback,
+}
+
+#[derive(Debug)]
+struct CanonicalRfcBlob {
+    file_path: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,7 +324,7 @@ pub fn strip_frontmatter(content: &str) -> String {
 pub fn extract_rfc_relationships(content: &str) -> DiskRfcRelationships {
     let mut relationships = DiskRfcRelationships::default();
 
-    if let Some(frontmatter) = content.strip_prefix("---\n")
+    if let Some(frontmatter) = content.trim_start().strip_prefix("---\n")
         && let Some(end) = frontmatter.find("\n---")
     {
         for line in frontmatter[..end].lines() {
@@ -299,7 +347,16 @@ pub fn extract_rfc_relationships(content: &str) -> DiskRfcRelationships {
     }
 
     let mut collect_supersedes = false;
+    let mut in_fence = false;
     for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         let line = line.trim();
         if collect_supersedes {
             if line.starts_with("- ") || line.starts_with("* ") {
@@ -537,23 +594,292 @@ pub fn reconcile_rfcs(root: &Path) -> Result<ReconcileResult> {
     reconcile_rfcs_with_project(root, project.as_ref())
 }
 
+fn canonical_reconcile_cache_oid(source: &CanonicalReconcileSource) -> Option<String> {
+    match source {
+        CanonicalReconcileSource::Canonical(canonical) => Some(canonical.oid.clone()),
+        CanonicalReconcileSource::WorkspaceFallback => Some("workspace-fallback".to_string()),
+        CanonicalReconcileSource::PreserveShared => None,
+    }
+}
+
+fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
+    if let Some(canonical) = resolve_canonical_ref(root, "refs/remotes/origin/HEAD")? {
+        return Ok(CanonicalReconcileSource::Canonical(canonical));
+    }
+
+    let Some(inside_worktree) = git_stdout(root, &["rev-parse", "--is-inside-work-tree"])? else {
+        return Ok(CanonicalReconcileSource::WorkspaceFallback);
+    };
+    if inside_worktree.trim() != "true" {
+        return Ok(CanonicalReconcileSource::WorkspaceFallback);
+    }
+
+    let other_remote_heads = git_stdout(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/*/HEAD"],
+    )?
+    .unwrap_or_default()
+    .lines()
+    .filter(|ref_name| *ref_name != "refs/remotes/origin/HEAD")
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let mut resolved_remote_heads = Vec::new();
+    for ref_name in other_remote_heads {
+        if let Some(canonical) = resolve_canonical_ref(root, &ref_name)? {
+            resolved_remote_heads.push(canonical);
+        }
+    }
+    if resolved_remote_heads.len() == 1 {
+        return Ok(CanonicalReconcileSource::Canonical(
+            resolved_remote_heads.remove(0),
+        ));
+    }
+    if resolved_remote_heads.len() > 1 {
+        return Ok(CanonicalReconcileSource::PreserveShared);
+    }
+
+    for ref_name in ["refs/heads/main", "refs/heads/master"] {
+        if let Some(canonical) = resolve_canonical_ref(root, ref_name)? {
+            return Ok(CanonicalReconcileSource::Canonical(canonical));
+        }
+    }
+
+    let worktree_count = git_stdout(root, &["worktree", "list", "--porcelain"])?
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count();
+    if worktree_count == 1 {
+        if let Some(canonical) = resolve_canonical_ref(root, "HEAD")? {
+            return Ok(CanonicalReconcileSource::Canonical(canonical));
+        }
+        return Ok(CanonicalReconcileSource::WorkspaceFallback);
+    }
+
+    Ok(CanonicalReconcileSource::PreserveShared)
+}
+
+fn resolve_canonical_ref(root: &Path, ref_name: &str) -> Result<Option<CanonicalGitRef>> {
+    let revision = format!("{ref_name}^{{commit}}");
+    let Some(oid) = git_stdout(root, &["rev-parse", "--verify", "--quiet", &revision])? else {
+        return Ok(None);
+    };
+    let oid = oid.trim();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CanonicalGitRef {
+        ref_name: ref_name.to_string(),
+        oid: oid.to_string(),
+    }))
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run git in {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    String::from_utf8(output.stdout)
+        .context("Git returned non-UTF-8 output")
+        .map(|output| Some(output.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+fn canonical_rfc_blobs(root: &Path, canonical: &CanonicalGitRef) -> Result<Vec<CanonicalRfcBlob>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            &canonical.oid,
+            "--",
+            RFCS_DIR,
+        ])
+        .output()
+        .with_context(|| format!("Failed to enumerate RFCs from {}", canonical.ref_name))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to enumerate RFCs from {} at {}",
+            canonical.ref_name,
+            canonical.oid
+        );
+    }
+
+    let mut entries = Vec::new();
+    for raw_entry in output.stdout.split(|byte| *byte == 0) {
+        if raw_entry.is_empty() {
+            continue;
+        }
+        let entry = std::str::from_utf8(raw_entry).context("Git tree entry was not UTF-8")?;
+        let Some((metadata, file_path)) = entry.split_once('\t') else {
+            anyhow::bail!("Unexpected git ls-tree entry: {entry}");
+        };
+        let mut metadata = metadata.split_whitespace();
+        let _mode = metadata.next();
+        let object_type = metadata.next();
+        let object_id = metadata.next();
+        if object_type != Some("blob") {
+            continue;
+        }
+        let Some(object_id) = object_id else {
+            anyhow::bail!("Git tree entry had no object ID: {entry}");
+        };
+        let path = Path::new(file_path);
+        if !is_rfc_document_path(Path::new(RFCS_DIR), path) {
+            continue;
+        }
+        let filename = path.file_name().and_then(|name| name.to_str());
+        if filename.is_some_and(|filename| SKIP_RFC_FILES.contains(&filename)) {
+            continue;
+        }
+        entries.push((object_id.to_string(), file_path.to_string()));
+    }
+
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Failed to start git cat-file --batch")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Git cat-file stdin unavailable")?;
+    let requested_object_ids = entries
+        .iter()
+        .map(|(object_id, _)| object_id.clone())
+        .collect::<Vec<_>>();
+    let request_writer = std::thread::spawn(move || -> Result<()> {
+        for object_id in requested_object_ids {
+            writeln!(stdin, "{object_id}").context("Failed to request Git RFC blob")?;
+        }
+        Ok(())
+    });
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("Git cat-file stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+    let mut blobs = Vec::with_capacity(entries.len());
+    for (expected_oid, file_path) in entries {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .context("Failed to read Git RFC blob header")?;
+        let mut parts = header.split_whitespace();
+        let actual_oid = parts.next().unwrap_or_default();
+        let object_type = parts.next().unwrap_or_default();
+        let size = parts
+            .next()
+            .with_context(|| format!("Git blob header had no size: {header:?}"))?
+            .parse::<usize>()
+            .with_context(|| format!("Git blob header had invalid size: {header:?}"))?;
+        if actual_oid != expected_oid || object_type != "blob" {
+            anyhow::bail!(
+                "Git returned unexpected object for {file_path}: expected {expected_oid}, got {header:?}"
+            );
+        }
+        let mut content = vec![0; size];
+        reader
+            .read_exact(&mut content)
+            .with_context(|| format!("Failed to read RFC blob {file_path}"))?;
+        let mut terminator = [0_u8; 1];
+        reader
+            .read_exact(&mut terminator)
+            .with_context(|| format!("Failed to finish RFC blob {file_path}"))?;
+        if terminator[0] != b'\n' {
+            anyhow::bail!("Git RFC blob {file_path} had an invalid terminator");
+        }
+        blobs.push(CanonicalRfcBlob {
+            file_path,
+            content: String::from_utf8(content)
+                .context("RFC document in canonical Git tree was not UTF-8")?,
+        });
+    }
+
+    let status = child.wait().context("Failed to wait for git cat-file")?;
+    request_writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git RFC blob request writer panicked"))?
+        .context("Failed to write Git RFC blob requests")?;
+    if !status.success() {
+        anyhow::bail!("git cat-file --batch failed for canonical RFC tree");
+    }
+    Ok(blobs)
+}
+
+fn canonical_history_contains_anchor(
+    root: &Path,
+    canonical: &CanonicalGitRef,
+    text_id: &str,
+) -> Result<bool> {
+    let anchor = format!("ulid:{text_id}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "--format=%H",
+            "-S",
+            &anchor,
+            &canonical.oid,
+            "--",
+            RFCS_DIR,
+        ])
+        .output()
+        .with_context(|| format!("Failed to inspect RFC history from {}", canonical.ref_name))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to inspect RFC history from {} at {}",
+            canonical.ref_name,
+            canonical.oid
+        );
+    }
+    Ok(!output.stdout.is_empty())
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn reconcile_rfcs_once_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
-    let key = ReconcileKey::new(root, project);
+    let observed_source = canonical_reconcile_source(root)?;
+    let observed_key = ReconcileKey::new(root, project, &observed_source);
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut reconciled_keys = reconciled_keys
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if reconciled_keys.contains(&key) {
+    if reconciled_keys.contains(&observed_key) {
         return Ok(ReconcileResult::default());
     }
 
-    let result = with_reconcile_lock(root, project, || reconcile_rfcs_with_project(root, project))?;
-    reconciled_keys.insert(key);
+    let (result, locked_key, reconciled) = with_reconcile_lock(root, project, || {
+        let locked_source = canonical_reconcile_source(root)?;
+        let locked_key = ReconcileKey::new(root, project, &locked_source);
+        if reconciled_keys.contains(&locked_key) {
+            return Ok((ReconcileResult::default(), locked_key, false));
+        }
+        let result = reconcile_rfcs_from_source(root, project, locked_source)?;
+        Ok((result, locked_key, true))
+    })?;
+    if reconciled && locked_key.canonical_oid.is_some() {
+        reconciled_keys.insert(locked_key);
+    }
     drop(reconciled_keys);
     Ok(result)
 }
@@ -608,13 +934,205 @@ pub fn reconcile_rfcs_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
+    with_reconcile_lock(root, project, || {
+        let source = canonical_reconcile_source(root)?;
+        reconcile_rfcs_from_source(root, project, source)
+    })
+}
+
+fn reconcile_rfcs_from_source(
+    root: &Path,
+    project: Option<&Project>,
+    source: CanonicalReconcileSource,
+) -> Result<ReconcileResult> {
+    match source {
+        CanonicalReconcileSource::Canonical(canonical) => {
+            reconcile_canonical_rfcs(root, project, &canonical)
+        }
+        CanonicalReconcileSource::PreserveShared => Ok(ReconcileResult::default()),
+        CanonicalReconcileSource::WorkspaceFallback => reconcile_workspace_rfcs(root, project),
+    }
+}
+
+fn reconcile_canonical_rfcs(
+    root: &Path,
+    project: Option<&Project>,
+    canonical: &CanonicalGitRef,
+) -> Result<ReconcileResult> {
     let db_path = crate::context::db_path(root, project);
     let loader = SqliteLoader::open(&db_path)
         .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
     let writer = SqliteWriter::open(&db_path)
         .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
 
-    let mut existing_by_text_id: HashMap<String, crate::context::sqlite_loader::RfcRecord> = loader
+    let existing_by_text_id: HashMap<String, RfcRecord> = loader
+        .load_rfcs()?
+        .into_iter()
+        .map(|row| (row.text_id.clone(), row))
+        .collect();
+    let existing_by_path = existing_by_text_id
+        .values()
+        .map(|record| (record.file_path.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut result = ReconcileResult::default();
+    let blobs = canonical_rfc_blobs(root, canonical)?;
+    let mut canonical_presence_anchors = BTreeSet::new();
+    let mut parsed_documents = Vec::new();
+    for blob in blobs {
+        let anchor = extract_anchor_ulid(&blob.content);
+        let existing_at_path = existing_by_path.get(&blob.file_path).copied();
+        if let Some(text_id) = anchor.as_deref() {
+            canonical_presence_anchors.insert(text_id.to_string());
+        }
+        let existing = anchor
+            .as_deref()
+            .and_then(|text_id| existing_by_text_id.get(text_id))
+            .or_else(|| anchor.is_none().then_some(existing_at_path).flatten());
+        match parse_rfc_document(&blob.file_path, &blob.content, existing) {
+            Ok(parsed) => {
+                if parsed.canonical_metadata_conflict
+                    || parsed.filename_number != parsed.disk.rfc_number
+                {
+                    result.unchanged += 1;
+                } else {
+                    parsed_documents.push(parsed);
+                }
+            }
+            Err(_) => result.unchanged += 1,
+        }
+    }
+
+    let mut text_id_counts = HashMap::new();
+    for parsed in &parsed_documents {
+        *text_id_counts
+            .entry(parsed.disk.text_id.clone())
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut changed_records = Vec::new();
+    let mut relinked_canonical_anchors = BTreeSet::new();
+    for parsed in parsed_documents {
+        if text_id_counts.get(&parsed.disk.text_id) != Some(&1) {
+            result.unchanged += 1;
+            continue;
+        }
+        relinked_canonical_anchors.insert(parsed.disk.text_id.clone());
+        let existing = existing_by_text_id.get(&parsed.disk.text_id);
+        let record = canonical_rfc_record(&parsed, existing);
+        match existing {
+            Some(existing) if rfc_records_equal(existing, &record) => result.unchanged += 1,
+            Some(_) => {
+                result.updated += 1;
+                changed_records.push(record);
+            }
+            None => {
+                result.inserted += 1;
+                changed_records.push(record);
+            }
+        }
+    }
+
+    let establish_baseline = !writer.has_rfc_canonical_baseline()?;
+    let mut quarantined = Vec::new();
+    for record in existing_by_text_id
+        .values()
+        .filter(|record| !canonical_presence_anchors.contains(&record.text_id))
+    {
+        let has_canonical_history = !establish_baseline
+            && canonical_history_contains_anchor(root, canonical, &record.text_id)?;
+        if establish_baseline || !has_canonical_history {
+            quarantined.push(record.clone());
+        }
+    }
+    result.deleted += quarantined.len();
+    writer.reconcile_canonical_rfcs(
+        &changed_records,
+        &quarantined,
+        &relinked_canonical_anchors,
+        &canonical.ref_name,
+        &canonical.oid,
+        establish_baseline,
+    )?;
+    Ok(result)
+}
+
+fn canonical_rfc_record(parsed: &ParsedRfcDocument, existing: Option<&RfcRecord>) -> RfcRecord {
+    let compatibility_value = |declared: &DeclaredRfcValue, existing: Option<&String>| {
+        if declared.declared {
+            declared.value.clone()
+        } else {
+            existing.cloned()
+        }
+    };
+    RfcRecord {
+        text_id: parsed.disk.text_id.clone(),
+        rfc_number: parsed.disk.rfc_number,
+        title: parsed.disk.title.clone(),
+        stage: parsed.disk.stage,
+        status: parsed.disk.status.clone(),
+        feature: compatibility_value(
+            &parsed.feature,
+            existing.and_then(|row| row.feature.as_ref()),
+        ),
+        slug: parsed.disk.slug.clone(),
+        file_path: parsed.disk.file_path.clone(),
+        superseded_by: if parsed.disk.superseded_by_declared {
+            parsed.disk.superseded_by.clone()
+        } else {
+            existing.and_then(|row| row.superseded_by.clone())
+        },
+        supersedes: if parsed.disk.supersedes_declared {
+            parsed.disk.supersedes.clone()
+        } else {
+            existing.and_then(|row| row.supersedes.clone())
+        },
+        withdrawal_reason: if parsed.disk.status == "withdrawn" {
+            compatibility_value(
+                &parsed.withdrawal_reason,
+                existing.and_then(|row| row.withdrawal_reason.as_ref()),
+            )
+        } else {
+            None
+        },
+        archived_reason: if parsed.disk.status == "archived" {
+            compatibility_value(
+                &parsed.archived_reason,
+                existing.and_then(|row| row.archived_reason.as_ref()),
+            )
+        } else {
+            None
+        },
+        consolidated_into: compatibility_value(
+            &parsed.consolidated_into,
+            existing.and_then(|row| row.consolidated_into.as_ref()),
+        ),
+    }
+}
+
+fn rfc_records_equal(left: &RfcRecord, right: &RfcRecord) -> bool {
+    left.text_id == right.text_id
+        && left.rfc_number == right.rfc_number
+        && left.title == right.title
+        && left.stage == right.stage
+        && left.status == right.status
+        && left.feature == right.feature
+        && left.slug == right.slug
+        && left.file_path == right.file_path
+        && left.superseded_by == right.superseded_by
+        && left.supersedes == right.supersedes
+        && left.withdrawal_reason == right.withdrawal_reason
+        && left.archived_reason == right.archived_reason
+        && left.consolidated_into == right.consolidated_into
+}
+
+fn reconcile_workspace_rfcs(root: &Path, project: Option<&Project>) -> Result<ReconcileResult> {
+    let db_path = crate::context::db_path(root, project);
+    let loader = SqliteLoader::open(&db_path)
+        .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
+    let writer = SqliteWriter::open(&db_path)
+        .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
+
+    let mut existing_by_text_id: HashMap<String, RfcRecord> = loader
         .load_rfcs()?
         .into_iter()
         .map(|row| (row.text_id.clone(), row))
@@ -2184,7 +2702,11 @@ fn replace_first_h1_line(body: &str, replacement: &str) -> String {
 pub fn promote(path: &Path, id: &str) -> Result<()> {
     let file_path = find_rfc_file(path, id)?;
     let workspace_root = workspace_root_from_rfc_root(path)?;
-    ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
+    ensure_no_rfc_repair_debt_matching(
+        workspace_root,
+        &file_path,
+        is_blocking_rfc_promote_candidate,
+    )?;
     let file_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
     let filename = file_path
@@ -2233,7 +2755,12 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
         }
     }
 
-    if let Some(writer) = maybe_open_rfc_writer(workspace_root)? {
+    if matches!(
+        canonical_reconcile_source(workspace_root)?,
+        CanonicalReconcileSource::WorkspaceFallback
+    ) && load_rfc_record_by_text_id(workspace_root, &text_id)?.is_some()
+        && let Some(writer) = maybe_open_rfc_writer(workspace_root)?
+    {
         let relative_path = relative_workspace_path(workspace_root, &new_path);
         writer.update_rfc_stage(&text_id, new_stage, &relative_path)?;
     }
@@ -2515,6 +3042,16 @@ pub(crate) fn is_blocking_rfc_repair_candidate(candidate: &RfcRepairCandidate) -
         .any(|reason| reason != "filename_slug_drift" && reason != "metadata_path_drift")
 }
 
+pub(crate) fn is_blocking_rfc_promote_candidate(candidate: &RfcRepairCandidate) -> bool {
+    is_blocking_rfc_repair_candidate(candidate)
+        && !(candidate.current_path == candidate.expected_path
+            && !candidate.reasons.is_empty()
+            && candidate
+                .reasons
+                .iter()
+                .all(|reason| reason == "metadata_relink" || reason == "metadata_path_drift"))
+}
+
 fn is_blocking_rfc_rename_candidate(candidate: &RfcRepairCandidate) -> bool {
     !candidate
         .reasons
@@ -2579,44 +3116,205 @@ fn is_legacy_flat_rfc_filename(filename: &str) -> bool {
 }
 
 fn parse_disk_rfc(root: &Path, path: &Path) -> Result<DiskRfcRecord> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let relative_path = relative_workspace_path(root, path);
+    Ok(parse_rfc_document(&relative_path, &content, None)?.disk)
+}
+
+pub(crate) fn workspace_rfc_record(root: &Path, id: &str) -> Result<Option<RfcRecord>> {
+    let Some(file_path) = find_optional_rfc_file(&root.join(RFCS_DIR), id)? else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    let relative_path = relative_workspace_path(root, &file_path);
+    let parsed = parse_rfc_document(&relative_path, &content, None)?;
+    Ok(Some(canonical_rfc_record(&parsed, None)))
+}
+
+fn parse_rfc_document(
+    relative_path: &str,
+    content: &str,
+    existing: Option<&RfcRecord>,
+) -> Result<ParsedRfcDocument> {
+    let path = Path::new(relative_path);
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
-        .with_context(|| format!("Invalid RFC filename: {}", path.display()))?;
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+        .with_context(|| format!("Invalid RFC filename: {relative_path}"))?;
 
     if !has_anchor(&content) {
-        anyhow::bail!("RFC file missing anchor comment: {}", path.display());
+        anyhow::bail!("RFC file missing anchor comment: {relative_path}");
     }
 
-    parse_rfc_number(filename)
+    let filename_number = parse_rfc_number(filename)
         .with_context(|| format!("Could not parse RFC number from {filename}"))?;
     let text_id = extract_anchor_ulid(&content)
-        .with_context(|| format!("RFC file has invalid anchor ULID: {}", path.display()))?;
+        .with_context(|| format!("RFC file has invalid anchor ULID: {relative_path}"))?;
     let rfc_number = extract_anchor_rfc_number(&content)
-        .with_context(|| format!("RFC file has invalid anchor number: {}", path.display()))?;
+        .with_context(|| format!("RFC file has invalid anchor number: {relative_path}"))?;
     let title = extract_h1_title(&content).unwrap_or_else(|| format!("RFC {rfc_number}"));
-    let relationships = extract_rfc_relationships(&content);
+    let metadata = rfc_metadata_preamble(content);
+    let relationships = extract_rfc_relationships(content);
     let status = parse_status(path).to_string();
-    let lifecycle_status_declared =
-        declared_lifecycle_status(&content).is_some_and(|declared| declared == status);
-    let relative_path = relative_workspace_path(root, path);
+    let declared_status = declared_lifecycle_status(&metadata);
+    let lifecycle_status_conflicts = declared_status.is_some_and(|declared| declared != status);
+    let lifecycle_status_declared = declared_status.is_some_and(|declared| declared == status);
+    let stage_marker = declared_metadata_value(&metadata, "Stage");
+    let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
+    let invalid_stage_marker = stage_marker.declared && declared_stage.is_none();
+    let path_stage = parse_stage(path);
+    let stage_marker_conflicts = status == "active"
+        && declared_stage.is_some_and(|declared_stage| declared_stage != path_stage);
+    let stage = if status == "active" {
+        path_stage
+    } else if let Some(stage) = declared_stage {
+        stage
+    } else if let Some(existing) = existing {
+        existing.stage
+    } else {
+        0
+    };
 
-    Ok(DiskRfcRecord {
-        text_id,
-        rfc_number,
-        title,
-        stage: parse_stage(path),
-        status,
-        lifecycle_status_declared,
-        slug: parse_slug(filename),
-        file_path: relative_path,
-        superseded_by: relationships.superseded_by,
-        supersedes: relationships.supersedes,
-        superseded_by_declared: relationships.superseded_by_declared,
-        supersedes_declared: relationships.supersedes_declared,
+    let feature = declared_metadata_value_with_yaml(&metadata, "Feature", "feature");
+    let reason = declared_metadata_value(&metadata, "Reason");
+    let withdrawal_reason = first_declared_value(
+        declared_metadata_value(&metadata, "Withdrawal reason"),
+        (status == "withdrawn").then_some(reason.clone()),
+    );
+    let archived_reason = first_declared_value(
+        declared_metadata_value(&metadata, "Archived reason"),
+        (status == "archived").then_some(reason),
+    );
+    let mut consolidated_into = declared_metadata_value(&metadata, "Consolidated into");
+    if consolidated_into.declared {
+        consolidated_into.value = consolidated_into
+            .value
+            .as_deref()
+            .map(clean_relationship_value)
+            .filter(|value| !value.is_empty());
+    }
+
+    Ok(ParsedRfcDocument {
+        disk: DiskRfcRecord {
+            text_id,
+            rfc_number,
+            title,
+            stage,
+            status,
+            lifecycle_status_declared,
+            slug: parse_slug(filename),
+            file_path: relative_path.to_string(),
+            superseded_by: relationships.superseded_by,
+            supersedes: relationships.supersedes,
+            superseded_by_declared: relationships.superseded_by_declared,
+            supersedes_declared: relationships.supersedes_declared,
+        },
+        filename_number,
+        canonical_metadata_conflict: lifecycle_status_conflicts
+            || invalid_stage_marker
+            || stage_marker_conflicts,
+        feature,
+        withdrawal_reason,
+        archived_reason,
+        consolidated_into,
     })
+}
+
+fn rfc_metadata_preamble(content: &str) -> String {
+    let mut saw_h1 = false;
+    let mut in_fence = false;
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if !saw_h1 {
+            if line.starts_with("# ") {
+                saw_h1 = true;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            break;
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn parse_declared_stage(value: &str) -> Option<u8> {
+    value
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .find_map(|part| part.parse::<u8>().ok().filter(|stage| *stage <= 4))
+}
+
+fn declared_metadata_value(content: &str, label: &str) -> DeclaredRfcValue {
+    for line in content.lines() {
+        let line = normalize_relationship_line(line);
+        let Some(value) = line
+            .strip_prefix(label)
+            .or_else(|| line.strip_prefix(&format!("**{label}**")))
+        else {
+            continue;
+        };
+        let value = value.trim_start();
+        let Some(value) = value
+            .strip_prefix(':')
+            .or_else(|| value.strip_prefix("**:"))
+            .or_else(|| value.strip_prefix('|'))
+        else {
+            continue;
+        };
+        let value = value.trim().trim_matches('|').trim();
+        return DeclaredRfcValue {
+            value: (!value.is_empty()).then(|| value.to_string()),
+            declared: true,
+        };
+    }
+    DeclaredRfcValue::absent()
+}
+
+fn declared_metadata_value_with_yaml(
+    content: &str,
+    label: &str,
+    yaml_key: &str,
+) -> DeclaredRfcValue {
+    let markdown = declared_metadata_value(content, label);
+    if markdown.declared {
+        return markdown;
+    }
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() == yaml_key {
+            let value = value.trim().trim_matches(['"', '\'']);
+            return DeclaredRfcValue {
+                value: (!value.is_empty()).then(|| value.to_string()),
+                declared: true,
+            };
+        }
+    }
+    DeclaredRfcValue::absent()
+}
+
+fn first_declared_value(
+    primary: DeclaredRfcValue,
+    fallback: Option<DeclaredRfcValue>,
+) -> DeclaredRfcValue {
+    if primary.declared {
+        primary
+    } else {
+        fallback.unwrap_or_else(DeclaredRfcValue::absent)
+    }
 }
 
 fn render_anchor_rfc_content(rfc_number: i64, text_id: &str, title: &str, body: &str) -> String {
@@ -3244,6 +3942,47 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn init_git_repository(root: &Path) {
+        run_git(root, &["init", "--initial-branch=main"]);
+        run_git(root, &["config", "user.name", "Exo Test"]);
+        run_git(root, &["config", "user.email", "exo-test@example.invalid"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_all(root: &Path, message: &str) -> String {
+        run_git(root, &["add", "-A", "--", "docs/rfcs"]);
+        run_git(root, &["commit", "-m", message]);
+        run_git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn publish_origin_main(root: &Path, oid: &str) {
+        run_git(root, &["update-ref", "refs/remotes/origin/main", oid]);
+        run_git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+
     #[test]
     fn test_parse_rfc_frontmatter() {
         let content = r"---
@@ -3467,6 +4206,547 @@ This RFC supersedes:
             strip_frontmatter("---\ntitle: Example\n---\n\n# RFC 1: Example\n"),
             "\n# RFC 1: Example\n"
         );
+    }
+
+    #[test]
+    fn canonical_reconciliation_reads_origin_head_instead_of_feature_branch() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-canonical.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01canonical -->\n\n# RFC 1: Canonical Title\n\n**Feature**: core\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let main_oid = commit_all(root, "canonical main");
+        publish_origin_main(root, &main_oid);
+
+        run_git(root, &["checkout", "-b", "feature"]);
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01canonical -->\n\n# RFC 1: Feature Title\n\n**Feature**: feature-only\n\n## Summary\n\nFeature.\n",
+        )
+        .unwrap();
+        commit_all(root, "feature edit");
+
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(1).unwrap().unwrap();
+        assert_eq!(record.title, "Canonical Title");
+        assert_eq!(record.feature.as_deref(), Some("core"));
+        assert_eq!(record.file_path, "docs/rfcs/stage-1/00001-canonical.md");
+        let rowset_before: i64 = loader
+            .database()
+            .connection()
+            .query_row(
+                "SELECT counter FROM rowset_revisions WHERE table_name = 'rfcs_data'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        reconcile_rfcs_with_project(root, None).unwrap();
+        let rowset_after: i64 = loader
+            .database()
+            .connection()
+            .query_row(
+                "SELECT counter FROM rowset_revisions WHERE table_name = 'rfcs_data'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rowset_after, rowset_before);
+    }
+
+    #[test]
+    fn unborn_single_worktree_uses_workspace_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        init_git_repository(temp.path());
+
+        assert_eq!(
+            canonical_reconcile_source(temp.path()).unwrap(),
+            CanonicalReconcileSource::WorkspaceFallback
+        );
+    }
+
+    #[test]
+    fn direct_reconciliation_waits_for_the_cross_process_lock() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-lock.md"),
+            "<!-- exo:1 ulid:01lock -->\n\n# RFC 1: Lock\n\n## Summary\n\nLocked.\n",
+        )
+        .unwrap();
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = reconcile_rfcs_with_project(&thread_root, None)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "reconciliation completed while another owner held the lock"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        worker.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn once_reconciliation_resolves_canonical_ref_after_lock_acquisition() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-lock-ref.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01lockref -->\n\n# RFC 1: Before Lock\n\n## Summary\n\nBefore.\n",
+        )
+        .unwrap();
+        let before_oid = commit_all(root, "before lock");
+        publish_origin_main(root, &before_oid);
+
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01lockref -->\n\n# RFC 1: After Lock\n\n## Summary\n\nAfter.\n",
+        )
+        .unwrap();
+        let after_oid = commit_all(root, "after lock");
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = reconcile_rfcs_once_with_project(&thread_root, None)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            publish_origin_main(root, &after_oid);
+            Ok(())
+        })
+        .unwrap();
+
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        worker.unwrap().join().unwrap();
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(1).unwrap().unwrap();
+        assert_eq!(record.title, "After Lock");
+    }
+
+    #[test]
+    fn canonical_oid_advance_updates_shared_state_from_a_stale_worktree() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-3")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let active_path = root.join("docs/rfcs/stage-3/00129-runner.md");
+        fs::write(
+            &active_path,
+            "<!-- exo:129 ulid:01runner -->\n\n# RFC 129: Runner\n\n## Summary\n\nActive.\n",
+        )
+        .unwrap();
+        let active_oid = commit_all(root, "active candidate");
+        publish_origin_main(root, &active_oid);
+        run_git(root, &["branch", "stale-worktree"]);
+
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01runner",
+                129,
+                "Runner",
+                3,
+                "active",
+                None,
+                "runner",
+                "docs/rfcs/stage-3/00129-runner.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        reconcile_rfcs_once_with_project(root, None).unwrap();
+
+        fs::create_dir_all(root.join("docs/rfcs/withdrawn")).unwrap();
+        let withdrawn_path = root.join("docs/rfcs/withdrawn/00129-runner.md");
+        fs::rename(&active_path, &withdrawn_path).unwrap();
+        fs::write(
+            &withdrawn_path,
+            "<!-- exo:129 ulid:01runner -->\n\n# RFC 129: Runner\n\n**Status**: Withdrawn\n**Stage**: 3\n**Reason**: The runner surface was not implemented.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+        let withdrawn_oid = commit_all(root, "withdraw candidate");
+        publish_origin_main(root, &withdrawn_oid);
+        run_git(root, &["checkout", "stale-worktree"]);
+
+        let result = reconcile_rfcs_once_with_project(root, None).unwrap();
+        assert_eq!(result.updated, 1);
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(129).unwrap().unwrap();
+        assert_eq!(record.stage, 3);
+        assert_eq!(record.status, "withdrawn");
+        assert_eq!(
+            record.withdrawal_reason.as_deref(),
+            Some("The runner surface was not implemented.")
+        );
+        assert_eq!(record.file_path, "docs/rfcs/withdrawn/00129-runner.md");
+    }
+
+    #[test]
+    fn canonical_baseline_quarantines_branch_only_rows_and_later_absence_preserves_state() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let canonical_path = root.join("docs/rfcs/stage-1/10200-canonical.md");
+        fs::write(
+            &canonical_path,
+            "<!-- exo:10200 ulid:01canonical -->\n\n# RFC 10200: Canonical\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let initial_oid = commit_all(root, "canonical RFC");
+        publish_origin_main(root, &initial_oid);
+
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01branchonly",
+                10999,
+                "Branch Only",
+                1,
+                "active",
+                None,
+                "branch-only",
+                "docs/rfcs/stage-1/10999-branch-only.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.deleted, 1);
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        assert!(loader.load_rfc_by_number(10200).unwrap().is_some());
+        assert!(loader.load_rfc_by_number(10999).unwrap().is_none());
+        let quarantined: i64 = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM rfc_canonical_quarantine WHERE text_id = '01branchonly'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+
+        let invalid_relink_path = root.join("docs/rfcs/stage-1/10999-branch-only.md");
+        fs::write(
+            &invalid_relink_path,
+            "<!-- exo:10998 ulid:01branchonly -->\n\n# RFC 10998: Invalid Relink\n\n## Summary\n\nInvalid.\n",
+        )
+        .unwrap();
+        let invalid_oid = commit_all(root, "invalid canonical relink");
+        publish_origin_main(root, &invalid_oid);
+        reconcile_rfcs_with_project(root, None).unwrap();
+        assert!(loader.load_rfc_by_number(10999).unwrap().is_none());
+        let quarantined: i64 = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM rfc_canonical_quarantine WHERE text_id = '01branchonly'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined, 1,
+            "an invalid canonical document cannot clear quarantine"
+        );
+
+        writer
+            .upsert_rfc(
+                "01laterbranch",
+                10998,
+                "Later Branch Only",
+                1,
+                "active",
+                None,
+                "later-branch-only",
+                "docs/rfcs/stage-1/10998-later-branch-only.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert!(loader.load_rfc_by_number(10998).unwrap().is_none());
+        let quarantine_reason: String = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT quarantine_reason FROM rfc_canonical_quarantine
+                 WHERE text_id = '01laterbranch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_reason, "missing_from_canonical_history");
+
+        fs::remove_file(&canonical_path).unwrap();
+        let absent_oid = commit_all(root, "remove canonical document");
+        publish_origin_main(root, &absent_oid);
+        reconcile_rfcs_with_project(root, None).unwrap();
+        assert!(
+            loader.load_rfc_by_number(10200).unwrap().is_some(),
+            "canonical absence after baseline preserves shared identity"
+        );
+    }
+
+    #[test]
+    fn canonical_reconciliation_replaces_stale_path_owner_with_valid_anchor() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let canonical_path = root.join("docs/rfcs/stage-1/00123-canonical.md");
+        fs::write(
+            &canonical_path,
+            "<!-- exo:123 ulid:01canonicalpath -->\n\n# RFC 123: Canonical\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical path owner");
+        publish_origin_main(root, &canonical_oid);
+
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01stalepath",
+                122,
+                "Stale Path Owner",
+                1,
+                "active",
+                None,
+                "stale-path-owner",
+                "docs/rfcs/stage-1/00123-canonical.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.deleted, 1);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let canonical = loader.load_rfc_by_number(123).unwrap().unwrap();
+        assert_eq!(canonical.text_id, "01canonicalpath");
+        assert!(loader.load_rfc_by_number(122).unwrap().is_none());
+        let quarantined: i64 = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM rfc_canonical_quarantine WHERE text_id = '01stalepath'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn canonical_reconciliation_relinks_legacy_lifecycle_rfc_without_stage_marker() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/withdrawn")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/withdrawn/00129-legacy.md"),
+            "<!-- exo:129 ulid:01legacy -->\n\n# RFC 129: Legacy\n\n**Reason**: Retired.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+        let oid = commit_all(root, "legacy withdrawn RFC");
+        publish_origin_main(root, &oid);
+
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(129).unwrap().unwrap();
+        assert_eq!(record.status, "withdrawn");
+        assert_eq!(record.stage, 0);
+        assert_eq!(record.withdrawal_reason.as_deref(), Some("Retired."));
+    }
+
+    #[test]
+    fn canonical_reconciliation_preserves_distinct_anchors_with_the_same_number() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join("docs/rfcs/withdrawn")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/stage-1/00100-current.md"),
+            "<!-- exo:100 ulid:01current -->\n\n# RFC 100: Current\n\n## Summary\n\nCurrent.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/rfcs/withdrawn/00100-historical.md"),
+            "<!-- exo:100 ulid:01historical -->\n\n# RFC 100: Historical\n\n**Stage**: 1\n**Reason**: Replaced.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+        let oid = commit_all(root, "same-number RFCs");
+        publish_origin_main(root, &oid);
+
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 2);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let mut records = loader
+            .load_rfcs()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.rfc_number == 100)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.text_id.cmp(&right.text_id));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text_id, "01current");
+        assert_eq!(records[1].text_id, "01historical");
+    }
+
+    #[test]
+    fn canonical_parser_ignores_fenced_metadata_examples() {
+        let parsed = parse_rfc_document(
+            "docs/rfcs/stage-2/10196-overlays.md",
+            "<!-- exo:10196 ulid:01overlay -->\n\n# RFC 10196: Overlays\n\n**Feature**: sidecar\n\n```markdown\n- **Superseded by**: RFC 99999\n```\n\n## Summary\n\nBody.\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.feature.value.as_deref(), Some("sidecar"));
+        assert_eq!(parsed.disk.superseded_by, None);
+        assert!(!parsed.disk.superseded_by_declared);
+    }
+
+    #[test]
+    fn canonical_parser_preserves_section_style_relationships() {
+        let parsed = parse_rfc_document(
+            "docs/rfcs/stage-2/10196-overlays.md",
+            "<!-- exo:10196 ulid:01overlay -->\n\n# RFC 10196: Overlays\n\n## Superseded Documents\n\nThis RFC supersedes:\n\n- RFC 10184\n\n```markdown\nThis RFC supersedes:\n\n- RFC 99999\n```\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.disk.supersedes.as_deref(), Some("10184"));
+        assert!(parsed.disk.supersedes_declared);
+    }
+
+    #[test]
+    fn canonical_metadata_preserves_undeclared_values_and_clears_declared_empty_values() {
+        let existing = RfcRecord {
+            text_id: "01overlay".to_string(),
+            rfc_number: 10196,
+            title: "Overlays".to_string(),
+            stage: 2,
+            status: "active".to_string(),
+            feature: Some("sidecar".to_string()),
+            slug: "overlays".to_string(),
+            file_path: "docs/rfcs/stage-2/10196-overlays.md".to_string(),
+            superseded_by: None,
+            supersedes: Some("10184".to_string()),
+            withdrawal_reason: Some("obsolete".to_string()),
+            archived_reason: Some("old archive reason".to_string()),
+            consolidated_into: None,
+        };
+        let inherited = parse_rfc_document(
+            "docs/rfcs/stage-2/10196-overlays.md",
+            "<!-- exo:10196 ulid:01overlay -->\n\n# RFC 10196: Overlays\n\n## Summary\n\nBody.\n",
+            Some(&existing),
+        )
+        .unwrap();
+        let inherited = canonical_rfc_record(&inherited, Some(&existing));
+        assert_eq!(inherited.feature.as_deref(), Some("sidecar"));
+        assert_eq!(inherited.supersedes.as_deref(), Some("10184"));
+        assert_eq!(inherited.withdrawal_reason, None);
+        assert_eq!(inherited.archived_reason, None);
+
+        let cleared = parse_rfc_document(
+            "docs/rfcs/stage-2/10196-overlays.md",
+            "<!-- exo:10196 ulid:01overlay -->\n\n# RFC 10196: Overlays\n\n**Feature**:\n- **Supersedes**: -\n\n## Summary\n\nBody.\n",
+            Some(&existing),
+        )
+        .unwrap();
+        let cleared = canonical_rfc_record(&cleared, Some(&existing));
+        assert_eq!(cleared.feature, None);
+        assert_eq!(cleared.supersedes, None);
     }
 
     #[test]
