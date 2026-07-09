@@ -641,10 +641,11 @@ fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
         .lines()
         .filter(|line| line.starts_with("worktree "))
         .count();
-    if worktree_count == 1
-        && let Some(canonical) = resolve_canonical_ref(root, "HEAD")?
-    {
-        return Ok(CanonicalReconcileSource::Canonical(canonical));
+    if worktree_count == 1 {
+        if let Some(canonical) = resolve_canonical_ref(root, "HEAD")? {
+            return Ok(CanonicalReconcileSource::Canonical(canonical));
+        }
+        return Ok(CanonicalReconcileSource::WorkspaceFallback);
     }
 
     Ok(CanonicalReconcileSource::PreserveShared)
@@ -889,8 +890,10 @@ pub fn reconcile_rfcs_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
-    let source = canonical_reconcile_source(root)?;
-    reconcile_rfcs_from_source(root, project, source)
+    with_reconcile_lock(root, project, || {
+        let source = canonical_reconcile_source(root)?;
+        reconcile_rfcs_from_source(root, project, source)
+    })
 }
 
 fn reconcile_rfcs_from_source(
@@ -4185,6 +4188,64 @@ This RFC supersedes:
             )
             .unwrap();
         assert_eq!(rowset_after, rowset_before);
+    }
+
+    #[test]
+    fn unborn_single_worktree_uses_workspace_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        init_git_repository(temp.path());
+
+        assert_eq!(
+            canonical_reconcile_source(temp.path()).unwrap(),
+            CanonicalReconcileSource::WorkspaceFallback
+        );
+    }
+
+    #[test]
+    fn direct_reconciliation_waits_for_the_cross_process_lock() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-lock.md"),
+            "<!-- exo:1 ulid:01lock -->\n\n# RFC 1: Lock\n\n## Summary\n\nLocked.\n",
+        )
+        .unwrap();
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = reconcile_rfcs_with_project(&thread_root, None)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "reconciliation completed while another owner held the lock"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        worker.unwrap().join().unwrap();
     }
 
     #[test]
