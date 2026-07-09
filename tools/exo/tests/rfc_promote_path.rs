@@ -10,6 +10,7 @@ use exo::context::{SQLITE_DB_PATH, SqliteLoader};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value as JsonValue;
+use std::process::Command;
 use test_case::test_matrix;
 use test_support::{exo_cmd_with_storage, exo_init_with_storage, exo_rfc_create};
 
@@ -27,6 +28,25 @@ fn write_stage_2_rfc(root: &std::path::Path) -> std::path::PathBuf {
         Some("Draft body."),
     );
     root.join("docs/rfcs/stage-2/0001-config-editing-cli.md")
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_string()
 }
 
 #[test_matrix(["sqlite"])]
@@ -424,6 +444,61 @@ fn rfc_promote_reconciles_manual_stage_move_before_target_check(backend: &str) {
             .join("docs/rfcs/stage-2/0001-command-transport.md")
             .exists(),
         "promote must not advance on-disk stage when the target is stale"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+fn rfc_promote_uses_workspace_stage_when_canonical_metadata_is_older(backend: &str) {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path();
+
+    run_git(root, &["init", "--initial-branch=main"]);
+    run_git(root, &["config", "user.name", "Exo Test"]);
+    run_git(root, &["config", "user.email", "exo@example.invalid"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    write_minimal_context(root, backend);
+    run_git(root, &["add", "-A"]);
+    run_git(root, &["commit", "-m", "initial context"]);
+
+    exo_rfc_create(
+        root,
+        "Workspace Stage",
+        "0001",
+        "1",
+        "Workspace",
+        Some("Body."),
+    );
+    run_git(root, &["add", "-A", "--", "docs/rfcs"]);
+    run_git(root, &["commit", "-m", "canonical stage one"]);
+    let canonical_oid = run_git(root, &["rev-parse", "HEAD"]);
+    run_git(
+        root,
+        &["update-ref", "refs/remotes/origin/main", &canonical_oid],
+    );
+    run_git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let stage1 = root.join("docs/rfcs/stage-1/0001-workspace-stage.md");
+    let stage2 = root.join("docs/rfcs/stage-2/0001-workspace-stage.md");
+    std::fs::create_dir_all(stage2.parent().expect("stage-2 parent")).expect("create stage-2");
+    std::fs::rename(&stage1, &stage2).expect("move RFC to workspace stage 2");
+
+    exo_cmd_with_storage(root, backend)
+        .args(["rfc", "promote", "0001", "--stage", "3"])
+        .assert()
+        .success()
+        .stdout(contains("from stage 2"));
+
+    assert!(
+        root.join("docs/rfcs/stage-3/0001-workspace-stage.md")
+            .exists(),
+        "promotion must advance the workspace file from stage 2 to stage 3"
     );
 }
 

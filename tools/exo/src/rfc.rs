@@ -347,7 +347,16 @@ pub fn extract_rfc_relationships(content: &str) -> DiskRfcRelationships {
     }
 
     let mut collect_supersedes = false;
+    let mut in_fence = false;
     for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         let line = line.trim();
         if collect_supersedes {
             if line.starts_with("- ") || line.starts_with("* ") {
@@ -848,22 +857,28 @@ pub fn reconcile_rfcs_once_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
-    let source = canonical_reconcile_source(root)?;
-    let key = ReconcileKey::new(root, project, &source);
+    let observed_source = canonical_reconcile_source(root)?;
+    let observed_key = ReconcileKey::new(root, project, &observed_source);
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut reconciled_keys = reconciled_keys
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if reconciled_keys.contains(&key) {
+    if reconciled_keys.contains(&observed_key) {
         return Ok(ReconcileResult::default());
     }
 
-    let result = with_reconcile_lock(root, project, || {
-        reconcile_rfcs_from_source(root, project, source)
+    let (result, locked_key, reconciled) = with_reconcile_lock(root, project, || {
+        let locked_source = canonical_reconcile_source(root)?;
+        let locked_key = ReconcileKey::new(root, project, &locked_source);
+        if reconciled_keys.contains(&locked_key) {
+            return Ok((ReconcileResult::default(), locked_key, false));
+        }
+        let result = reconcile_rfcs_from_source(root, project, locked_source)?;
+        Ok((result, locked_key, true))
     })?;
-    if key.canonical_oid.is_some() {
-        reconciled_keys.insert(key);
+    if reconciled && locked_key.canonical_oid.is_some() {
+        reconciled_keys.insert(locked_key);
     }
     drop(reconciled_keys);
     Ok(result)
@@ -3028,9 +3043,12 @@ pub(crate) fn is_blocking_rfc_repair_candidate(candidate: &RfcRepairCandidate) -
 
 pub(crate) fn is_blocking_rfc_promote_candidate(candidate: &RfcRepairCandidate) -> bool {
     is_blocking_rfc_repair_candidate(candidate)
-        && !(candidate.stored_metadata.is_none()
-            && candidate.reasons.len() == 1
-            && candidate.reasons[0] == "metadata_relink")
+        && !(candidate.current_path == candidate.expected_path
+            && !candidate.reasons.is_empty()
+            && candidate
+                .reasons
+                .iter()
+                .all(|reason| reason == "metadata_relink" || reason == "metadata_path_drift"))
 }
 
 fn is_blocking_rfc_rename_candidate(candidate: &RfcRepairCandidate) -> bool {
@@ -3103,13 +3121,15 @@ fn parse_disk_rfc(root: &Path, path: &Path) -> Result<DiskRfcRecord> {
     Ok(parse_rfc_document(&relative_path, &content, None)?.disk)
 }
 
-pub(crate) fn workspace_rfc_record(root: &Path, id: &str) -> Result<RfcRecord> {
-    let file_path = find_rfc_file(&root.join(RFCS_DIR), id)?;
+pub(crate) fn workspace_rfc_record(root: &Path, id: &str) -> Result<Option<RfcRecord>> {
+    let Some(file_path) = find_optional_rfc_file(&root.join(RFCS_DIR), id)? else {
+        return Ok(None);
+    };
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
     let relative_path = relative_workspace_path(root, &file_path);
     let parsed = parse_rfc_document(&relative_path, &content, None)?;
-    Ok(canonical_rfc_record(&parsed, None))
+    Ok(Some(canonical_rfc_record(&parsed, None)))
 }
 
 fn parse_rfc_document(
@@ -3135,7 +3155,7 @@ fn parse_rfc_document(
         .with_context(|| format!("RFC file has invalid anchor number: {relative_path}"))?;
     let title = extract_h1_title(&content).unwrap_or_else(|| format!("RFC {rfc_number}"));
     let metadata = rfc_metadata_preamble(content);
-    let relationships = extract_rfc_relationships(&metadata);
+    let relationships = extract_rfc_relationships(content);
     let status = parse_status(path).to_string();
     let declared_status = declared_lifecycle_status(&metadata);
     let lifecycle_status_conflicts = declared_status.is_some_and(|declared| declared != status);
@@ -4302,6 +4322,63 @@ This RFC supersedes:
     }
 
     #[test]
+    fn once_reconciliation_resolves_canonical_ref_after_lock_acquisition() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-lock-ref.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01lockref -->\n\n# RFC 1: Before Lock\n\n## Summary\n\nBefore.\n",
+        )
+        .unwrap();
+        let before_oid = commit_all(root, "before lock");
+        publish_origin_main(root, &before_oid);
+
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01lockref -->\n\n# RFC 1: After Lock\n\n## Summary\n\nAfter.\n",
+        )
+        .unwrap();
+        let after_oid = commit_all(root, "after lock");
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = reconcile_rfcs_once_with_project(&thread_root, None)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            publish_origin_main(root, &after_oid);
+            Ok(())
+        })
+        .unwrap();
+
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        worker.unwrap().join().unwrap();
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(1).unwrap().unwrap();
+        assert_eq!(record.title, "After Lock");
+    }
+
+    #[test]
     fn canonical_oid_advance_updates_shared_state_from_a_stale_worktree() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -4536,6 +4613,19 @@ This RFC supersedes:
         assert_eq!(parsed.feature.value.as_deref(), Some("sidecar"));
         assert_eq!(parsed.disk.superseded_by, None);
         assert!(!parsed.disk.superseded_by_declared);
+    }
+
+    #[test]
+    fn canonical_parser_preserves_section_style_relationships() {
+        let parsed = parse_rfc_document(
+            "docs/rfcs/stage-2/10196-overlays.md",
+            "<!-- exo:10196 ulid:01overlay -->\n\n# RFC 10196: Overlays\n\n## Superseded Documents\n\nThis RFC supersedes:\n\n- RFC 10184\n\n```markdown\nThis RFC supersedes:\n\n- RFC 99999\n```\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.disk.supersedes.as_deref(), Some("10184"));
+        assert!(parsed.disk.supersedes_declared);
     }
 
     #[test]

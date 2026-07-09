@@ -1469,15 +1469,11 @@ impl Command for RfcPromote {
 impl MutableCommand for RfcPromote {
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput> {
         let rfc_path = rfc_root(ctx.root);
-        let loader = rfc_loader(ctx.root, ctx.project)?;
-        let rfc_number = parse_rfc_number(&self.id)?;
+        parse_rfc_number(&self.id)?;
 
         // Get current stage before promotion
-        let current = match loader.load_rfc_by_number(rfc_number)? {
-            Some(current) => current,
-            None => rfc::workspace_rfc_record(ctx.root, &self.id)
-                .map_err(|_| rfc_not_found_failure(&self.id))?,
-        };
+        let current = rfc::workspace_rfc_record(ctx.root, &self.id)?
+            .ok_or_else(|| rfc_not_found_failure(&self.id))?;
         let read_status = rfc_read_status(&current).to_string();
         let old_stage = current.stage;
         let title = current.title.clone();
