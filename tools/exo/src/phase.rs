@@ -2,7 +2,7 @@
 
 use crate::ExoResult;
 use crate::api::protocol::ErrorCode;
-use crate::context::{ExoState, SqliteLoader};
+use crate::context::ExoState;
 use crate::failure::ExoFailure;
 use crate::steering::{SuggestedAction, WorkIntent};
 use serde::Serialize;
@@ -274,7 +274,7 @@ pub(crate) fn finish_phase(
     }
 
     // 3. Collect RFC info for the completed phase before marking it done
-    let rfc_suggestions = collect_phase_rfc_info(db_path, plan, &active_phase_id);
+    let rfc_suggestions = collect_phase_rfc_info(root, plan, &active_phase_id);
 
     // 4. Update status to completed
     {
@@ -346,10 +346,9 @@ pub(crate) fn finish_phase(
 
 /// Collect RFC information for a phase's attached RFCs.
 ///
-/// Reads each attached RFC from disk to get its current stage and title,
-/// then generates a promotion suggestion based on whether the RFC is
-/// driving (has a target stage) or related.
-fn collect_phase_rfc_info(db_path: &Path, plan: &ExoState, phase_id: &str) -> Vec<RfcSuggestion> {
+/// Reads each attached RFC through the effective workspace view, then generates
+/// a promotion suggestion based on whether the RFC is driving or related.
+fn collect_phase_rfc_info(root: &Path, plan: &ExoState, phase_id: &str) -> Vec<RfcSuggestion> {
     // Find the phase's RFC attachments
     let phase_rfcs: Vec<_> = plan
         .epochs
@@ -363,14 +362,14 @@ fn collect_phase_rfc_info(db_path: &Path, plan: &ExoState, phase_id: &str) -> Ve
         return Vec::new();
     }
 
-    let loader = match SqliteLoader::open(db_path) {
-        Ok(loader) => loader,
-        Err(_) => return Vec::new(),
-    };
-    let rfc_index = match loader.load_rfcs() {
+    let project = crate::project::Project::resolve(root).ok();
+    let rfc_index = match crate::rfc::load_effective_rfcs(root, project.as_ref()) {
         Ok(rfcs) => rfcs
             .into_iter()
-            .map(|rfc| (format!("{:05}", rfc.rfc_number), (rfc.title, rfc.stage)))
+            .map(|effective| {
+                let rfc = effective.record;
+                (format!("{:05}", rfc.rfc_number), (rfc.title, rfc.stage))
+            })
             .collect::<std::collections::HashMap<_, _>>(),
         Err(_) => return Vec::new(),
     };

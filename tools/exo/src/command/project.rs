@@ -433,7 +433,14 @@ fn project_snapshot_output(
 
     let phase_details = loader.load_active_phase_details_for_workspace(workspace_key.as_deref())?;
     let state = loader.load_state()?;
-    let rfcs = loader.load_rfcs_for_display()?;
+    let rfcs = if workspace_available {
+        crate::rfc::load_effective_rfcs(project.workspace_root.as_deref().unwrap_or(root), None)?
+            .into_iter()
+            .map(|effective| effective.record)
+            .collect()
+    } else {
+        loader.load_rfcs_for_display()?
+    };
     let inbox = loader.load_inbox()?;
     let git_dirty = project
         .workspace_root

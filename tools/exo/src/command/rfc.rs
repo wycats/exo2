@@ -22,7 +22,6 @@ use crate::api::protocol::{Effect, ErrorCode};
 use crate::context::AgentContext;
 use crate::context::sqlite_loader::{RfcRecord, SqliteLoader};
 use crate::failure::ExoFailure;
-use crate::project::Project;
 use crate::rfc;
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::Result as ExoResult;
@@ -51,10 +50,6 @@ fn default_rfc_steering() -> Vec<SuggestedAction> {
 /// Helper to get RFC root path
 fn rfc_root(root: &Path) -> std::path::PathBuf {
     root.join("docs/rfcs")
-}
-
-fn rfc_loader(root: &Path, project: Option<&Project>) -> ExoResult<SqliteLoader> {
-    SqliteLoader::open(crate::context::db_path(root, project))
 }
 
 fn format_rfc_number(number: i64) -> String {
@@ -276,7 +271,20 @@ fn rfc_list_entry_from_record(record: &RfcRecord) -> RfcListEntry {
         status: rfc_read_status(record).to_string(),
         feature: display_feature(record.feature.as_deref()),
         filename: display_filename(&record.file_path),
+        document_source: "canonical".to_string(),
+        workspace_presence: "unknown".to_string(),
+        canonical_presence: "present".to_string(),
+        differs_from_canonical: false,
     }
+}
+
+fn rfc_list_entry_from_effective(record: &rfc::EffectiveRfcRecord) -> RfcListEntry {
+    let mut entry = rfc_list_entry_from_record(&record.record);
+    entry.document_source = record.provenance.document_source.clone();
+    entry.workspace_presence = record.provenance.workspace_presence.clone();
+    entry.canonical_presence = record.provenance.canonical_presence.clone();
+    entry.differs_from_canonical = record.provenance.differs_from_canonical;
+    entry
 }
 
 fn status_label(status: &str) -> String {
@@ -547,6 +555,10 @@ struct RfcListEntry {
     status: String,
     feature: String,
     filename: String,
+    document_source: String,
+    workspace_presence: String,
+    canonical_presence: String,
+    differs_from_canonical: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -579,18 +591,18 @@ impl Command for RfcList {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let loader = rfc_loader(ctx.root, ctx.project)?;
-        let all_rfcs = loader.load_rfcs_for_display()?;
+        let all_rfcs = rfc::load_effective_rfcs(ctx.root, ctx.project)?;
 
         let filtered: Vec<_> = match self.stage {
             Some(s) => all_rfcs
                 .into_iter()
-                .filter(|r| rfc_matches_stage_filter(r, Some(s)))
+                .filter(|r| rfc_matches_stage_filter(&r.record, Some(s)))
                 .collect(),
             None => all_rfcs,
         };
 
-        let entries: Vec<RfcListEntry> = filtered.iter().map(rfc_list_entry_from_record).collect();
+        let entries: Vec<RfcListEntry> =
+            filtered.iter().map(rfc_list_entry_from_effective).collect();
 
         let count = entries.len();
         let output = RfcListOutput {
@@ -667,6 +679,18 @@ struct RfcShowOutput {
     withdrawal_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_reason: Option<String>,
+    document_source: String,
+    workspace_presence: String,
+    canonical_presence: String,
+    differs_from_canonical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_head: Option<String>,
 }
 
 impl Command for RfcShow {
@@ -706,19 +730,20 @@ impl Command for RfcShow {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let loader = rfc_loader(ctx.root, ctx.project)?;
         let rfc_number = parse_rfc_number(&self.id)?;
-        let rfc_info = loader.load_rfc_by_number(rfc_number)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "RFC {} not found. Use `exo rfc list` to see available RFCs.",
-                self.id
-            )
-        })?;
+        let effective = rfc::load_effective_rfc_by_number(ctx.root, ctx.project, rfc_number)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RFC {} not found. Use `exo rfc list` to see available RFCs.",
+                    self.id
+                )
+            })?;
+        let rfc_info = &effective.record;
 
         let feature = display_feature(rfc_info.feature.as_deref());
         let filename = display_filename(&rfc_info.file_path);
         let formatted_id = format_rfc_number(rfc_info.rfc_number);
-        let read_status = rfc_read_status(&rfc_info).to_string();
+        let read_status = rfc_read_status(rfc_info).to_string();
 
         let output = RfcShowOutput {
             kind: "rfc.show",
@@ -733,6 +758,14 @@ impl Command for RfcShow {
             supersedes: rfc_info.supersedes.clone(),
             withdrawal_reason: rfc_info.withdrawal_reason.clone(),
             archived_reason: rfc_info.archived_reason.clone(),
+            document_source: effective.provenance.document_source.clone(),
+            workspace_presence: effective.provenance.workspace_presence.clone(),
+            canonical_presence: effective.provenance.canonical_presence.clone(),
+            differs_from_canonical: effective.provenance.differs_from_canonical,
+            workspace_branch: effective.provenance.workspace_branch.clone(),
+            workspace_head: effective.provenance.workspace_head.clone(),
+            canonical_ref: effective.provenance.canonical_ref.clone(),
+            canonical_head: effective.provenance.canonical_head.clone(),
         };
 
         match ctx.format {
@@ -761,9 +794,20 @@ impl Command for RfcShow {
                     }
                     lines.join("\n")
                 };
+                let view = match (
+                    effective.provenance.document_source.as_str(),
+                    effective.provenance.workspace_presence.as_str(),
+                ) {
+                    ("workspace", _) if effective.provenance.differs_from_canonical => {
+                        "Workspace overlay (differs from canonical)"
+                    }
+                    ("workspace", _) => "Workspace document",
+                    (_, "absent") => "Canonical document (absent from this workspace)",
+                    _ => "Canonical document",
+                };
                 let msg = format!(
-                    "# RFC {}: {}\n\n{}\n**Feature**: {}\n**File**: {}",
-                    formatted_id, rfc_info.title, lifecycle, feature_str, filename
+                    "# RFC {}: {}\n\n{}\n**Feature**: {}\n**File**: {}\n**View**: {}",
+                    formatted_id, rfc_info.title, lifecycle, feature_str, filename, view
                 );
                 Ok(CommandOutput::new(output, msg))
             }
@@ -806,6 +850,7 @@ struct RfcStatusOutput {
     stages: Vec<RfcStageGroup>,
     lifecycle: Vec<RfcLifecycleGroup>,
     repairs: Vec<rfc::RfcRepairCandidate>,
+    workspace_diagnostics: Vec<crate::context::sqlite_loader::RfcWorkspaceDiagnostic>,
     total: usize,
 }
 
@@ -867,8 +912,11 @@ impl Command for RfcStatus {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let loader = rfc_loader(ctx.root, ctx.project)?;
-        let all_rfcs = loader.load_rfcs_for_display()?;
+        let view = rfc::load_effective_rfc_view(ctx.root, ctx.project)?;
+        let repairs =
+            rfc::detect_rfc_repair_candidates_with_records(ctx.root, &view.repair_records)?;
+        let workspace_diagnostics = view.workspace_diagnostics;
+        let all_rfcs = view.records;
         let total = all_rfcs.len();
 
         // Group active RFCs by stage; archived and withdrawn RFCs are grouped
@@ -883,13 +931,13 @@ impl Command for RfcStatus {
         let mut lifecycle = Vec::<RfcLifecycleGroup>::new();
 
         for r in all_rfcs {
-            if is_active_stage_rfc(&r) && (r.stage as usize) < stages.len() {
-                stages[r.stage as usize]
+            if is_active_stage_rfc(&r.record) && (r.record.stage as usize) < stages.len() {
+                stages[r.record.stage as usize]
                     .rfcs
-                    .push(rfc_list_entry_from_record(&r));
+                    .push(rfc_list_entry_from_effective(&r));
             } else {
-                let entry = rfc_list_entry_from_record(&r);
-                let read_status = rfc_read_status(&r);
+                let entry = rfc_list_entry_from_effective(&r);
+                let read_status = rfc_read_status(&r.record);
                 if let Some(group) = lifecycle
                     .iter_mut()
                     .find(|group| group.status == read_status)
@@ -905,14 +953,13 @@ impl Command for RfcStatus {
             }
         }
         lifecycle.sort_by(|a, b| a.status.cmp(&b.status));
-        let repairs = rfc::detect_rfc_repair_candidates(ctx.root)?;
-
         let output = RfcStatusOutput {
             kind: "rfc.status",
             ok: true,
             stages: stages.clone(),
             lifecycle: lifecycle.clone(),
             repairs: repairs.clone(),
+            workspace_diagnostics: workspace_diagnostics.clone(),
             total,
         };
 
@@ -961,6 +1008,16 @@ impl Command for RfcStatus {
                             repair.expected_path,
                             repair.reasons.join(", "),
                             repair.id
+                        ));
+                    }
+                    msg.push('\n');
+                }
+                if !workspace_diagnostics.is_empty() {
+                    msg.push_str("## Workspace RFC Diagnostics\n\n");
+                    for diagnostic in &workspace_diagnostics {
+                        msg.push_str(&format!(
+                            "- {}: {} ({})\n",
+                            diagnostic.file_path, diagnostic.message, diagnostic.diagnostic_code
                         ));
                     }
                     msg.push('\n');
@@ -1885,10 +1942,9 @@ impl Command for RfcPipeline {
             };
         };
 
-        let rfc_index = loader
-            .load_rfcs()?
+        let rfc_index = rfc::load_effective_rfcs(ctx.root, ctx.project)?
             .into_iter()
-            .map(|record| (format_rfc_number(record.rfc_number), record))
+            .map(|record| (format_rfc_number(record.record.rfc_number), record.record))
             .collect::<std::collections::HashMap<_, _>>();
 
         // Load phase RFC attachments (with target/relation)

@@ -533,6 +533,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "strum",
  "tempfile",
  "test-case",
