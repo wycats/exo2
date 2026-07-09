@@ -5,7 +5,7 @@
 //! - Centralized error handling with steering suggestions
 //! - Capability tree generation for RFC 0125
 
-use crate::api::protocol::{Effect, ErrorCode, WorkflowConfirmationInput};
+use crate::api::protocol::{Effect, ErrorCode, RecoveryClass, WorkflowConfirmationInput};
 use crate::command::command_spec::CommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::Invocation;
@@ -176,6 +176,14 @@ impl CommandBox {
         match self {
             Self::Pure(cmd) => cmd.effect(),
             Self::Mutable(cmd) => cmd.effect(),
+        }
+    }
+
+    /// Returns the daemon recovery class of the underlying command.
+    pub fn recovery_class(&self) -> RecoveryClass {
+        match self {
+            Self::Pure(cmd) => cmd.recovery_class(),
+            Self::Mutable(cmd) => cmd.recovery_class(),
         }
     }
 
@@ -689,6 +697,11 @@ pub trait Command: Send + Sync {
         Effect::Pure
     }
 
+    /// The recovery boundary used when a daemon disappears mid-request.
+    fn recovery_class(&self) -> RecoveryClass {
+        recovery_class_for_command(self.namespace(), self.operation(), self.effect())
+    }
+
     /// Human-readable description for help and capability tree.
     fn description(&self) -> &'static str {
         ""
@@ -706,6 +719,61 @@ pub trait Command: Send + Sync {
 pub trait MutableCommand: Command {
     /// Execute with mutable access to context.
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput>;
+}
+
+/// Derive the recovery contract from the registered command surface.
+///
+/// The atomic class is deliberately narrow: these commands mutate canonical
+/// project SQLite state without owning Git, filesystem, process, or other
+/// external effects. The registry regression test keeps this list aligned
+/// with the 42-operation contract approved for RFC 10195.
+#[must_use]
+pub fn recovery_class_for_command(
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+) -> RecoveryClass {
+    if effect == Effect::Pure {
+        return RecoveryClass::ReplayableRead;
+    }
+
+    let atomic_project_state = matches!(
+        (namespace, operation),
+        ("axiom", "add" | "remove")
+            | (
+                "epoch",
+                "add"
+                    | "bankrupt"
+                    | "finish"
+                    | "remove"
+                    | "reorder"
+                    | "review"
+                    | "start"
+                    | "update"
+            )
+            | (
+                "goal",
+                "abandon" | "add" | "complete" | "move" | "remove" | "reorder" | "update"
+            )
+            | ("idea", "add" | "archive")
+            | ("inbox", "ack" | "add" | "archive" | "resolve")
+            | (
+                "phase",
+                "add" | "focus" | "move" | "release" | "remove" | "reorder" | "start" | "update"
+            )
+            | ("plan", "move-goals" | "update-status")
+            | (
+                "task",
+                "add" | "complete" | "log" | "remove" | "rename" | "reorder" | "start" | "update"
+            )
+            | ("gc", "inbox")
+    );
+
+    if atomic_project_state {
+        RecoveryClass::AtomicProjectState
+    } else {
+        RecoveryClass::ExternalAtMostOnce
+    }
 }
 
 #[cfg(test)]

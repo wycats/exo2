@@ -1537,6 +1537,49 @@ async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: 
         1,
         "first request should commit before outcome replay"
     );
+    let project_db = exosuit_storage::open_database(project.db_path())
+        .expect("open project database after atomic request");
+    let canonical_response: String = project_db
+        .connection()
+        .query_row(
+            "SELECT response_json FROM atomic_request_outcomes WHERE request_id = ?1",
+            ["lost-write-response"],
+            |row| row.get(0),
+        )
+        .expect("canonical response should commit with project state");
+    let canonical_response: serde_json::Value =
+        serde_json::from_str(&canonical_response).expect("canonical response json");
+    assert!(
+        canonical_response["result"].get("post_write").is_none(),
+        "canonical outcome stores the core response before idempotent finalization"
+    );
+    let command_events: i64 = project_db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'command' AND namespace = 'epoch' AND operation = 'add'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count command events");
+    assert_eq!(
+        command_events, 1,
+        "command event should commit with state and canonical response"
+    );
+
+    let runtime_ledger_path = exo::daemon::paths_for_workspace(&workspace)
+        .expect("daemon paths")
+        .outcome_ledger_path();
+    let runtime_ledger = exosuit_storage::Connection::open(&runtime_ledger_path)
+        .expect("open runtime outcome ledger");
+    runtime_ledger
+        .execute(
+            "UPDATE daemon_request_outcomes
+             SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+             WHERE request_id = 'lost-write-response'",
+            [],
+        )
+        .expect("simulate daemon loss after canonical commit");
 
     let replay_stream = exo::daemon::connect_to_daemon(&workspace)
         .await
@@ -1550,11 +1593,33 @@ async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: 
         1,
         "replayed request id must not execute the mutation twice"
     );
+    let command_events: i64 = project_db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'command' AND namespace = 'epoch' AND operation = 'add'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count command events after replay");
+    assert_eq!(
+        command_events, 1,
+        "canonical replay must not duplicate the command event"
+    );
+    let runtime_response_recorded: bool = runtime_ledger
+        .query_row(
+            "SELECT response_json IS NOT NULL FROM daemon_request_outcomes
+             WHERE request_id = 'lost-write-response'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired runtime outcome");
     assert!(
-        exo::daemon::paths_for_workspace(&workspace)
-            .expect("daemon paths")
-            .outcome_ledger_path()
-            .exists(),
+        runtime_response_recorded,
+        "canonical replay should repopulate the runtime outcome"
+    );
+    assert!(
+        runtime_ledger_path.exists(),
         "daemon should persist request outcomes in the project runtime"
     );
 }

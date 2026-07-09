@@ -10,6 +10,7 @@
           "name": "chat-history",
           "description": "Read recent chat history from VS Code sessions. Use this to recover context lost during conversation summarization—especially nuanced user feedback, decisions, and steering. Always provide match-text with a distinctive phrase from a recent user message to identify the correct session.",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -90,6 +91,7 @@
           "name": "context",
           "description": "Dump context for AI handoff",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -130,6 +132,7 @@
           "name": "prompt",
           "description": "Get a prompt template",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -153,6 +156,7 @@
           "name": "add",
           "description": "Add a new axiom",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -206,6 +210,7 @@
           "name": "list",
           "description": "List axioms",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -223,6 +228,7 @@
           "name": "remove",
           "description": "Remove an axiom",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -255,6 +261,7 @@
           "name": "create",
           "description": "Stage all changes and create a git commit",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -273,6 +280,7 @@
           "name": "status",
           "description": "Check git working directory status",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         }
@@ -286,6 +294,7 @@
           "name": "paths",
           "description": "Show context file paths",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -293,6 +302,7 @@
           "name": "restore",
           "description": "Restore context from a previous session",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -300,6 +310,7 @@
           "name": "snapshot",
           "description": "Return full workspace state snapshot (plan, inbox, ideas) as JSON",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -307,6 +318,7 @@
           "name": "validate-trace",
           "description": "Validate a cached reactive trace against current revisions",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -330,6 +342,7 @@
           "name": "links.check",
           "description": "Validate documentation links",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -356,6 +369,7 @@
           "name": "links.fix",
           "description": "Repair documentation links",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -388,6 +402,7 @@
           "name": "receipt",
           "description": "Save the dogfood activation baseline for this workspace",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -395,6 +410,7 @@
           "name": "repair",
           "description": "Preview guided repair for divergent dogfood sidecar state",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -413,6 +429,7 @@
           "name": "restart",
           "description": "Refresh Exo runtime health without terminating durable transports",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -420,6 +437,7 @@
           "name": "verify",
           "description": "Verify Exosuit dogfood activation identity and state paths",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -472,6 +490,7 @@
           "name": "add",
           "description": "Add a new epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -499,6 +518,7 @@
           "name": "bankrupt",
           "description": "Bankrupt an epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -516,6 +536,7 @@
           "name": "finish",
           "description": "Finish the current active epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [],
           "lm_tool": {
@@ -539,6 +560,7 @@
           "name": "list",
           "description": "List all epochs with status",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [],
           "lm_tool": {
@@ -561,6 +583,7 @@
           "name": "remove",
           "description": "Remove an epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -578,6 +601,7 @@
           "name": "reorder",
           "description": "Reorder an epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -604,6 +628,7 @@
           "name": "review",
           "description": "Mark an epoch as reviewed",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -621,6 +646,7 @@
           "name": "start",
           "description": "Start an epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -654,6 +680,7 @@
           "name": "status",
           "description": "Show status of an epoch",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -671,6 +698,7 @@
           "name": "update",
           "description": "Update epoch metadata",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -703,6 +731,7 @@
           "name": "inbox",
           "description": "Remove old archived inbox items",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -727,6 +756,7 @@
           "name": "abandon",
           "description": "Abandon a goal with a log message",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -753,6 +783,7 @@
           "name": "add",
           "description": "Add a new goal to a phase (defaults to active phase)",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -832,6 +863,7 @@
           "name": "complete",
           "description": "Record a goal's completed outcome",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -859,6 +891,7 @@
           "name": "list",
           "description": "List goals in the active phase",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [],
           "lm_tool": {
@@ -882,6 +915,7 @@
           "name": "move",
           "description": "Move a goal to another phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -917,6 +951,7 @@
           "name": "remove",
           "description": "Remove a goal from a phase (defaults to active phase)",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -943,6 +978,7 @@
           "name": "reorder",
           "description": "Reorder a goal within its phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -969,6 +1005,7 @@
           "name": "update",
           "description": "Update a goal's label",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1001,6 +1038,7 @@
           "name": "add",
           "description": "Add a new idea to the backlog",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1050,6 +1088,7 @@
           "name": "archive",
           "description": "Archive an idea",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1067,6 +1106,7 @@
           "name": "list",
           "description": "List all ideas in the backlog",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1093,6 +1133,7 @@
           "name": "show",
           "description": "Show details of a specific idea",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1110,6 +1151,7 @@
           "name": "to-rfc",
           "description": "Convert an idea to an RFC",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1142,6 +1184,7 @@
           "name": "ack",
           "description": "Acknowledge an inbox item",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1159,6 +1202,7 @@
           "name": "add",
           "description": "Add a new inbox item",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1253,6 +1297,7 @@
           "name": "archive",
           "description": "Archive an inbox item",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1270,6 +1315,7 @@
           "name": "list",
           "description": "List inbox items",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1336,6 +1382,7 @@
           "name": "resolve",
           "description": "Resolve an inbox item",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1377,6 +1424,7 @@
           "name": "artifact",
           "description": "Generate CommandSpec artifact for VS Code extension",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1394,6 +1442,7 @@
           "name": "lm-tools",
           "description": "Generate VS Code languageModelTools contribution format",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1412,6 +1461,7 @@
           "name": "package-tools",
           "description": "Generate package.json languageModelTools contribution format",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -1419,6 +1469,7 @@
           "name": "read",
           "description": "Read a value from a JSON file",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1445,6 +1496,7 @@
           "name": "schema",
           "description": "Generate JSON schema for exo commands",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1462,6 +1514,7 @@
           "name": "spec",
           "description": "Generate CommandSpec from registry (RFC 0132)",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -1469,6 +1522,7 @@
           "name": "write",
           "description": "Write a value to a JSON file",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1510,6 +1564,7 @@
           "name": "add",
           "description": "Add a new phase to an epoch (defaults to active epoch)",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -1584,6 +1639,7 @@
           "name": "execution.tasks",
           "description": "List phase execution tasks",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1610,6 +1666,7 @@
           "name": "finish",
           "description": "Finish the current phase",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -1645,6 +1702,7 @@
           "name": "focus",
           "description": "Focus a phase in this workspace without claiming ownership",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1662,6 +1720,7 @@
           "name": "history",
           "description": "Show history of completed phases",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1679,6 +1738,7 @@
           "name": "list",
           "description": "List phases in the active epoch",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1696,6 +1756,7 @@
           "name": "move",
           "description": "Move a phase to another epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1731,6 +1792,7 @@
           "name": "read-details",
           "description": "Read canonical details for a phase (defaults to active phase)",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1748,6 +1810,7 @@
           "name": "read-goals",
           "description": "Read goals for a phase (defaults to active phase)",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1765,6 +1828,7 @@
           "name": "read-tasks",
           "description": "Read tasks for a phase (defaults to active phase)",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1782,6 +1846,7 @@
           "name": "release",
           "description": "Release this workspace's or a stale phase owner",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1799,6 +1864,7 @@
           "name": "remove",
           "description": "Remove a phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -1816,6 +1882,7 @@
           "name": "reorder",
           "description": "Reorder a phase within its epoch",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1842,6 +1909,7 @@
           "name": "start",
           "description": "Start a pending phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -1886,6 +1954,7 @@
           "name": "status",
           "description": "Get the status of the current phase",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1916,6 +1985,7 @@
           "name": "update",
           "description": "Update phase metadata (title, RFCs)",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -1957,6 +2027,7 @@
           "name": "move-goals",
           "description": "Move goals to a different phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -1992,6 +2063,7 @@
           "name": "read",
           "description": "Read the full plan state as JSON",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -1999,6 +2071,7 @@
           "name": "review",
           "description": "Review the plan for health and progress",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2029,6 +2102,7 @@
           "name": "snapshot",
           "description": "Return the full plan state as JSON (for extension consumption)",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2036,6 +2110,7 @@
           "name": "update-status",
           "description": "Update the status of an item",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2068,6 +2143,7 @@
           "name": "list",
           "description": "List locally known Exo projects from project policy and sidecars",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2075,6 +2151,7 @@
           "name": "move-root",
           "description": "Retarget a sidecar-backed project to a new checkout root",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2111,6 +2188,7 @@
           "name": "repair",
           "description": "Preview project policy repairs",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2129,6 +2207,7 @@
           "name": "repair-apply",
           "description": "Apply project policy repairs after reviewing the preview",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2147,6 +2226,7 @@
           "name": "resolve",
           "description": "Resolve project identity and state/runtime paths",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2154,6 +2234,7 @@
           "name": "snapshot",
           "description": "Read project-scoped cockpit roots by project id",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2177,6 +2258,7 @@
           "name": "archive",
           "description": "Archive a shipped-then-superseded RFC",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2203,6 +2285,7 @@
           "name": "create",
           "description": "Create a new RFC",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2284,6 +2367,7 @@
           "name": "edit",
           "description": "Edit an existing RFC",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2355,6 +2439,7 @@
           "name": "list",
           "description": "List RFCs with optional stage filter",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2387,6 +2472,7 @@
           "name": "pipeline",
           "description": "Show RFC pipeline for the active phase",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2394,6 +2480,7 @@
           "name": "promote",
           "description": "Promote RFC to the specified next stage",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2436,6 +2523,7 @@
           "name": "rename",
           "description": "Rename RFC file to match title slug",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2453,6 +2541,7 @@
           "name": "repair",
           "description": "Repair RFC filename identity and metadata path drift",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2488,6 +2577,7 @@
           "name": "show",
           "description": "Show RFC details by ID",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2505,6 +2595,7 @@
           "name": "status",
           "description": "Show RFC status grouped by stage",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2512,6 +2603,7 @@
           "name": "supersede",
           "description": "Mark RFC as superseded by another",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2547,6 +2639,7 @@
           "name": "withdraw",
           "description": "Withdraw an RFC",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2579,6 +2672,7 @@
           "name": "task",
           "description": "Execute a task",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2596,6 +2690,7 @@
           "name": "tasks",
           "description": "List available tasks",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2628,6 +2723,7 @@
           "name": "bootstrap",
           "description": "Bootstrap sidecar-backed Exosuit state for this repo",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2693,6 +2789,7 @@
           "name": "checkpoint",
           "description": "Create a local checkpoint for sidecar-backed project state",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2720,6 +2817,7 @@
           "name": "discover",
           "description": "Discover sidecar configuration for this repo",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2737,6 +2835,7 @@
           "name": "init",
           "description": "Create or reuse sidecar state for this repo",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2773,6 +2872,7 @@
           "name": "link",
           "description": "Bind this repo to sidecar state",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2799,6 +2899,7 @@
           "name": "repo",
           "description": "Inspect or mutate the sidecar git repo. The status action is read-only at runtime, but this combined operation is classified as write for command-spec metadata.",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2863,6 +2964,7 @@
           "name": "setup",
           "description": "Create missing GitHub sidecar repo and profile registry setup",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2918,6 +3020,7 @@
           "name": "status",
           "description": "Show sidecar binding status",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -2935,6 +3038,7 @@
           "name": "unlink",
           "description": "Remove this repo's local sidecar binding",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         }
@@ -2948,6 +3052,7 @@
           "name": "maintain",
           "description": "Run bounded physical SQLite maintenance for the current project",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         }
@@ -2961,6 +3066,7 @@
           "name": "abort",
           "description": "Abort the current surgical strike",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2968,6 +3074,7 @@
           "name": "finish",
           "description": "Finish the current surgical strike",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -2975,6 +3082,7 @@
           "name": "start",
           "description": "Start a new surgical strike",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -3009,6 +3117,7 @@
           "name": "add",
           "description": "Add a new task to the active phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3070,6 +3179,7 @@
           "name": "complete",
           "description": "Mark a task as completed with a log message",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3114,6 +3224,7 @@
           "name": "list",
           "description": "List tasks in the active phase",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [],
           "lm_tool": {
@@ -3137,6 +3248,7 @@
           "name": "log",
           "description": "Append a progress log entry to a task",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3180,6 +3292,7 @@
           "name": "remove",
           "description": "Remove a task from the active phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3214,6 +3327,7 @@
           "name": "rename",
           "description": "Rename a task handle while preserving the old handle as an alias",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3240,6 +3354,7 @@
           "name": "reorder",
           "description": "Reorder a task within the active phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3283,6 +3398,7 @@
           "name": "start",
           "description": "Mark a task as in-progress",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3317,6 +3433,7 @@
           "name": "update",
           "description": "Update a task's title in the active phase",
           "effect": "write",
+          "recovery_class": "atomic_project_state",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3367,6 +3484,7 @@
           "name": "read",
           "description": "Read a value from a TOML file",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3393,6 +3511,7 @@
           "name": "write",
           "description": "Write a value to a TOML file",
           "effect": "write",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": [
             {
@@ -3434,6 +3553,7 @@
           "name": "dump",
           "description": "Verify SQL dump round-trip on live database",
           "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },
@@ -3441,6 +3561,7 @@
           "name": "run",
           "description": "Run phase verification",
           "effect": "exec",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": false,
           "args": []
         }
@@ -3452,6 +3573,7 @@
       "name": "map",
       "description": "Show the project map",
       "effect": "pure",
+      "recovery_class": "replayable_read",
       "needs_upgrade_gate": false,
       "args": [
         {
@@ -3492,6 +3614,7 @@
       "name": "status",
       "description": "Show project status",
       "effect": "pure",
+      "recovery_class": "replayable_read",
       "needs_upgrade_gate": false,
       "args": [],
       "lm_tool": {
@@ -3511,6 +3634,7 @@
       "name": "update",
       "description": "Apply all project upgrades",
       "effect": "write",
+      "recovery_class": "external_at_most_once",
       "needs_upgrade_gate": false,
       "args": []
     },
@@ -3518,6 +3642,7 @@
       "name": "write",
       "description": "Write content to an agent-context file",
       "effect": "write",
+      "recovery_class": "external_at_most_once",
       "needs_upgrade_gate": false,
       "args": [
         {

@@ -28,16 +28,21 @@
 //! 4. Wait for socket to become available
 //! 5. Connect and return stream
 
-use crate::api::handler::handle_request_with_project_and_diagnostics_as_writer;
+use crate::api::handler::{
+    finalize_atomic_response_after_commit,
+    handle_request_with_project_and_diagnostics_as_atomic_writer,
+    handle_request_with_project_and_diagnostics_as_writer,
+};
 use crate::api::protocol::{
-    Effect, ErrorBody, ErrorCode, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, Status,
+    Effect, ErrorBody, ErrorCode, PROTOCOL_VERSION, RecoveryClass, RequestEnvelope,
+    ResponseEnvelope, Status,
 };
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, DaemonDiagnosticsConfig, effect_name, elapsed_ms, request_op_path,
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, resolved_request_effect,
+    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, request_command_path, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -1908,40 +1913,88 @@ pub async fn run_daemon(
                 let instance_id = Arc::clone(&request_instance_id);
                 async move {
                     let request_id = req.id.clone();
+                    let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let effect = resolved_request_effect(&workspace, &req);
-                        let execute = |req: RequestEnvelope| {
-                            let request_id = req.id.clone();
-                            match daemon_request_project(project.as_ref()) {
-                                Ok(project) => {
-                                    handle_request_with_project_and_diagnostics_as_writer(
-                                        &workspace,
-                                        Some(&project),
-                                        req,
-                                        &diagnostics,
-                                    )
-                                }
-                                Err(error) => daemon_handler_error_response(
-                                    request_id,
+                        let recovery = resolved_request_recovery(&workspace, &req);
+                        let request_project = match daemon_request_project(project.as_ref()) {
+                            Ok(project) => project,
+                            Err(error) => {
+                                return daemon_handler_error_response(
+                                    handler_request_id,
                                     ErrorCode::PreconditionFailed,
                                     error.to_string(),
-                                ),
+                                );
                             }
                         };
 
-                        match effect {
-                            Some(effect @ (Effect::Write | Effect::Exec)) => {
+                        match recovery {
+                            Some(recovery)
+                                if recovery.recovery_class
+                                    == RecoveryClass::AtomicProjectState =>
+                            {
+                                let Some((namespace, operation)) = request_command_path(&req)
+                                else {
+                                    return daemon_handler_error_response(
+                                        handler_request_id,
+                                        ErrorCode::InvalidInput,
+                                        "atomic request is missing a command path".to_string(),
+                                    );
+                                };
                                 outcome_ledger
-                                    .execute(
+                                    .execute_atomic_project_state(
                                         req,
-                                        effect,
+                                        recovery.effect,
                                         &instance_id,
                                         Duration::from_secs(30),
-                                        execute,
+                                        &request_project.db_path(),
+                                        |req| {
+                                            handle_request_with_project_and_diagnostics_as_atomic_writer(
+                                                &workspace,
+                                                Some(&request_project),
+                                                req,
+                                                &diagnostics,
+                                            )
+                                        },
+                                        |response| {
+                                            finalize_atomic_response_after_commit(
+                                                &workspace,
+                                                Some(&request_project),
+                                                &namespace,
+                                                &operation,
+                                                recovery.effect,
+                                                response,
+                                                &diagnostics,
+                                            )
+                                        },
                                     )
                                     .response
                             }
-                            _ => execute(req),
+                            Some(recovery)
+                                if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
+                            {
+                                outcome_ledger
+                                    .execute(
+                                        req,
+                                        recovery.effect,
+                                        &instance_id,
+                                        Duration::from_secs(30),
+                                        |req| {
+                                            handle_request_with_project_and_diagnostics_as_writer(
+                                                &workspace,
+                                                Some(&request_project),
+                                                req,
+                                                &diagnostics,
+                                            )
+                                        },
+                                    )
+                                    .response
+                            }
+                            _ => handle_request_with_project_and_diagnostics_as_writer(
+                                &workspace,
+                                Some(&request_project),
+                                req,
+                                &diagnostics,
+                            ),
                         }
                     })
                     .await

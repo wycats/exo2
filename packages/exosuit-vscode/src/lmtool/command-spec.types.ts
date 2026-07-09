@@ -20,6 +20,12 @@ import commandSpecJson from "../command-spec.json";
  */
 export type Effect = "pure" | "write" | "exec";
 
+/** Recovery behavior when the daemon is replaced during a request. */
+export type RecoveryClass =
+  | "replayable_read"
+  | "atomic_project_state"
+  | "external_at_most_once";
+
 /**
  * The kind of argument a command accepts.
  *
@@ -105,6 +111,8 @@ export interface OperationSpec {
   description: string;
   /** Effect classification (pure, write, exec) */
   effect: Effect;
+  /** Recovery behavior after daemon replacement */
+  recovery_class: RecoveryClass;
   /** Whether this operation requires an upgrade gate check */
   needs_upgrade_gate: boolean;
   /** Arguments this operation accepts */

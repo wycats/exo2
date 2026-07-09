@@ -11,6 +11,7 @@ function operationSpec(): OperationSpec {
     name: "promote",
     description: "Promote RFC to the specified next stage",
     effect: "write",
+    recovery_class: "external_at_most_once",
     needs_upgrade_gate: false,
     args: [
       {

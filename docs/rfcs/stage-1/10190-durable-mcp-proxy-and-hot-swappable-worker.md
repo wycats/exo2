@@ -159,9 +159,17 @@ Pure reads may be retried automatically across a worker restart. Writes and exec
 
 The daemon reserves a write or exec request identity before command execution and records the complete response before socket delivery. Reusing the same identity and payload returns the recorded response. Reusing an identity with a different payload is rejected.
 
-If a daemon instance disappears after reserving an identity but before recording a response, its replacement does not execute that mutation again. It returns a structured `daemon.request_outcome_indeterminate` result identifying the request and effect. This preserves at-most-once mutation safety for the process-crash window that cannot yet be associated atomically with the canonical state transaction.
+If a daemon instance disappears after reserving an identity, recovery follows
+the built command's RFC 10195 recovery class. For `atomic_project_state`, the
+replacement daemon queries the canonical project outcome: it replays a
+committed response and resumes idempotent finalization, or executes when no
+outcome exists because the interrupted transaction did not commit. For
+`external_at_most_once`, the replacement returns a structured
+`daemon.request_outcome_indeterminate` result identifying the request and
+effect rather than replaying an external effect.
 
-If the proxy cannot retrieve a recorded outcome after automatic worker recovery, it returns an MCP transport error with:
+If an `external_at_most_once` request has no recorded outcome after automatic
+worker recovery, the proxy returns an MCP transport error with:
 
 - `code`: `exo.retry_required`;
 - `effect`: `write` or `exec`;

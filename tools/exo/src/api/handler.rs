@@ -31,18 +31,20 @@ const DEFAULT_PAGE_LIMIT: u32 = 20;
 enum HandlerRuntime {
     External,
     SidecarWriter,
+    AtomicStateWriter,
 }
 
 /// Log a command execution event to the `agent_events` table (RFC 10183).
 ///
-/// Best-effort: errors are silently ignored — event logging should never
-/// block command execution. Uses the shared event-DB connection cache
-/// (`crate::event_db`) so the daemon doesn't open a fresh connection per
-/// request.
+/// Atomic project-state requests write a deterministic event through their
+/// request transaction. Other paths retain best-effort event logging through
+/// the shared event-DB connection cache (`crate::event_db`).
 #[allow(clippy::too_many_arguments)]
 fn log_command_event(
     workspace_root: &Path,
     project: Option<&Project>,
+    request_id: &str,
+    runtime: HandlerRuntime,
     agent_id: Option<&str>,
     namespace: &str,
     operation: &str,
@@ -51,10 +53,14 @@ fn log_command_event(
     effect: Effect,
     duration_ms: u64,
     summary: &str,
-) -> bool {
+) -> anyhow::Result<bool> {
     let db_path = crate::context::db_path(workspace_root, project);
 
-    let text_id = ulid::Ulid::new().to_string().to_lowercase();
+    let text_id = if runtime == HandlerRuntime::AtomicStateWriter {
+        format!("request-{}", blake3::hash(request_id.as_bytes()).to_hex())
+    } else {
+        ulid::Ulid::new().to_string().to_lowercase()
+    };
     let timestamp = chrono::Utc::now().to_rfc3339();
     let effect_str = match effect {
         Effect::Pure => "read",
@@ -76,7 +82,7 @@ fn log_command_event(
         input.get("id").and_then(JsonValue::as_str)
     };
 
-    crate::event_db::with_event_db(&db_path, |conn| {
+    let insert = |conn: &exosuit_storage::Connection| {
         conn.execute(
             "INSERT INTO agent_events (text_id, timestamp, agent_id, event_type, namespace, operation, entity_type, entity_id, effect, duration_ms, summary)
              VALUES (?1, ?2, ?3, 'command', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -93,8 +99,16 @@ fn log_command_event(
                 summary,
             ],
         )
-    })
-    .is_some()
+    };
+
+    if runtime == HandlerRuntime::AtomicStateWriter {
+        let database = exosuit_storage::active_request_database(&db_path)?
+            .ok_or_else(|| anyhow::anyhow!("atomic request database is not active"))?;
+        insert(database.connection())?;
+        return Ok(true);
+    }
+
+    Ok(crate::event_db::with_event_db(&db_path, insert).is_some())
 }
 
 /// Generate display metadata from a command result.
@@ -1495,6 +1509,21 @@ pub fn handle_request_with_project_and_diagnostics_as_writer(
     )
 }
 
+pub fn handle_request_with_project_and_diagnostics_as_atomic_writer(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    request: RequestEnvelope,
+    diagnostics: &DaemonDiagnostics,
+) -> ResponseEnvelope {
+    handle_request_with_project_and_diagnostics_in_runtime(
+        workspace_root,
+        project,
+        request,
+        diagnostics,
+        HandlerRuntime::AtomicStateWriter,
+    )
+}
+
 fn handle_request_with_project_and_diagnostics_in_runtime(
     workspace_root: &Path,
     project: Option<&Project>,
@@ -1676,6 +1705,94 @@ fn should_use_daemon_writer_lane(
     runtime == HandlerRuntime::External
         && project.is_some()
         && matches!(effect, Effect::Write | Effect::Exec)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_after_success_with_diagnostics(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+    diagnostics: &DaemonDiagnostics,
+) -> anyhow::Result<Option<crate::post_write::PostWritePersistenceReport>> {
+    if !crate::post_write::should_persist_after_success(project, namespace, operation, effect) {
+        return Ok(None);
+    }
+
+    crate::post_write::with_sidecar_runtime_lock(project, || {
+        let persistence_start = Instant::now();
+        diagnostics.record(
+            "request.post_write_persistence_start",
+            json!({ "namespace": namespace, "operation": operation }),
+        );
+        let report = crate::post_write::persist_after_success(
+            workspace_root,
+            project,
+            namespace,
+            operation,
+            effect,
+        );
+        let report_json = match &report {
+            Ok(report) => json!(report),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        diagnostics.record(
+            "request.post_write_persistence_end",
+            json!({
+                "namespace": namespace,
+                "operation": operation,
+                "report": report_json,
+                "elapsed_ms": elapsed_ms(persistence_start.elapsed()),
+            }),
+        );
+        report
+    })
+}
+
+/// Complete idempotent projection/checkpoint work after an atomic project
+/// transaction has committed. A failure is returned as a structured response
+/// so the runtime ledger can leave the request recoverable.
+pub(crate) fn finalize_atomic_response_after_commit(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+    mut response: ResponseEnvelope,
+    diagnostics: &DaemonDiagnostics,
+) -> Result<ResponseEnvelope, ResponseEnvelope> {
+    let report = match persist_after_success_with_diagnostics(
+        workspace_root,
+        project,
+        namespace,
+        operation,
+        effect,
+        diagnostics,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            diagnostics.record(
+                "request.post_write_persistence_failed",
+                json!({
+                    "namespace": namespace,
+                    "operation": operation,
+                    "error": error.to_string(),
+                }),
+            );
+            let mut error_response = command_construction_error_to_response(response.id, error);
+            error_response.effect = Some(effect);
+            return Err(error_response);
+        }
+    };
+
+    if let Some(report) = report
+        && let Some(result_object) = response.result.as_mut().and_then(JsonValue::as_object_mut)
+        && let Ok(report_value) = serde_json::to_value(report)
+    {
+        result_object.insert("post_write".to_string(), report_value);
+    }
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1987,10 +2104,6 @@ fn handle_call_with_namespace_operation(
 
                     let display = make_display(namespace, operation, &params.input, &invoke_result);
                     let effect = invoke_result.effect;
-                    let mut should_auto_persist =
-                        crate::post_write::should_auto_persist_after_success(
-                            effect, namespace, operation, project,
-                        );
 
                     if crate::post_write::should_log_command_event(namespace, operation) {
                         // Log command event (RFC 10183)
@@ -2005,9 +2118,11 @@ fn handle_call_with_namespace_operation(
                             },
                             |d| d.summary.as_str(),
                         );
-                        let event_logged = log_command_event(
+                        let event_logged = match log_command_event(
                             workspace_root,
                             project,
+                            &id,
+                            runtime,
                             agent_id_for_log.as_deref(),
                             namespace,
                             operation,
@@ -2016,15 +2131,22 @@ fn handle_call_with_namespace_operation(
                             effect,
                             duration_ms,
                             summary,
-                        );
-                        should_auto_persist |=
-                            crate::post_write::should_auto_persist_after_command_event(
-                                event_logged,
-                                effect,
-                                namespace,
-                                operation,
-                                project,
-                            );
+                        ) {
+                            Ok(logged) => logged,
+                            Err(error) => {
+                                diagnostics.record(
+                                    "request.event_log_end",
+                                    json!({
+                                        "namespace": namespace,
+                                        "operation": operation,
+                                        "logged": false,
+                                        "error": error.to_string(),
+                                        "elapsed_ms": elapsed_ms(event_log_start.elapsed()),
+                                    }),
+                                );
+                                return command_construction_error_to_response(id, error);
+                            }
+                        };
                         diagnostics.record(
                             "request.event_log_end",
                             json!({
@@ -2036,56 +2158,31 @@ fn handle_call_with_namespace_operation(
                         );
                     }
 
-                    let post_write_report =
-                        if crate::post_write::should_write_sql_dump(namespace, operation, effect)
-                            || should_auto_persist
-                        {
-                            let report =
-                                crate::post_write::with_sidecar_runtime_lock(project, || {
-                                    let persistence_start = Instant::now();
-                                    diagnostics.record(
-                                        "request.post_write_persistence_start",
-                                        json!({ "namespace": namespace, "operation": operation }),
-                                    );
-                                    let report = crate::post_write::persist_after_success(
-                                        workspace_root,
-                                        project,
-                                        namespace,
-                                        operation,
-                                        effect,
-                                    );
-                                    let report_json = match &report {
-                                        Ok(report) => json!(report),
-                                        Err(error) => json!({ "error": error.to_string() }),
-                                    };
-                                    diagnostics.record(
-                                        "request.post_write_persistence_end",
-                                        json!({
-                                            "namespace": namespace,
-                                            "operation": operation,
-                                            "report": report_json,
-                                            "elapsed_ms": elapsed_ms(persistence_start.elapsed()),
-                                        }),
-                                    );
-                                    report
-                                });
-                            match report {
-                                Ok(report) => report,
-                                Err(error) => {
-                                    diagnostics.record(
-                                        "request.post_write_persistence_failed",
-                                        json!({
-                                            "namespace": namespace,
-                                            "operation": operation,
-                                            "error": error.to_string(),
-                                        }),
-                                    );
-                                    return command_construction_error_to_response(id, error);
-                                }
+                    let post_write_report = if runtime == HandlerRuntime::AtomicStateWriter {
+                        None
+                    } else {
+                        match persist_after_success_with_diagnostics(
+                            workspace_root,
+                            project,
+                            namespace,
+                            operation,
+                            effect,
+                            diagnostics,
+                        ) {
+                            Ok(report) => report,
+                            Err(error) => {
+                                diagnostics.record(
+                                    "request.post_write_persistence_failed",
+                                    json!({
+                                        "namespace": namespace,
+                                        "operation": operation,
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                                return command_construction_error_to_response(id, error);
                             }
-                        } else {
-                            None
-                        };
+                        }
+                    };
 
                     let trace = serde_json::to_value(&invoke_result.trace).ok();
                     let (mut result, steering) = split_command_envelope(invoke_result.data);

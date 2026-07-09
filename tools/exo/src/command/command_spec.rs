@@ -32,8 +32,9 @@
 //! let help = spec.namespace("phase").unwrap().to_help_text();
 //! ```
 
-use crate::api::protocol::Effect;
+use crate::api::protocol::{Effect, RecoveryClass};
 use crate::command::lm_tool_metadata;
+use crate::command::traits::recovery_class_for_command;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -160,6 +161,8 @@ pub struct OperationSpec {
     pub description: String,
     /// Effect classification (Pure, Write, Exec).
     pub effect: Effect,
+    /// Recovery behavior after daemon replacement.
+    pub recovery_class: RecoveryClass,
     /// Whether this operation requires an upgrade gate check.
     pub needs_upgrade_gate: bool,
     /// Arguments this operation accepts.
@@ -179,6 +182,11 @@ impl OperationSpec {
             name: name.into(),
             description: description.into(),
             effect,
+            recovery_class: if effect == Effect::Pure {
+                RecoveryClass::ReplayableRead
+            } else {
+                RecoveryClass::ExternalAtMostOnce
+            },
             needs_upgrade_gate: false,
             args: Vec::new(),
             example: None,
@@ -523,6 +531,22 @@ impl CommandSpec {
 
         // Override root operations with ExoSpec-generated definitions
         spec.merge_exospec_root::<super::root::RootCommands>();
+
+        // ExoSpec owns syntax while the registered command owns runtime
+        // recovery behavior. Reapply that metadata after ExoSpec replacement.
+        for cmd in registry.iter() {
+            let operation = if cmd.namespace().is_empty() {
+                spec.root_operations.get_mut(cmd.operation())
+            } else {
+                spec.namespaces
+                    .get_mut(cmd.namespace())
+                    .and_then(|namespace| namespace.operations.get_mut(cmd.operation()))
+            };
+            if let Some(operation) = operation {
+                operation.recovery_class =
+                    recovery_class_for_command(cmd.namespace(), cmd.operation(), operation.effect);
+            }
+        }
 
         // Calculate total operation count
         let namespace_ops: usize = spec.namespaces.values().map(|ns| ns.operations.len()).sum();

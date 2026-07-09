@@ -11,7 +11,7 @@
 
 use super::router::Invocation;
 use super::traits::{Command, CommandBox};
-use crate::api::protocol::Effect;
+use crate::api::protocol::{Effect, RecoveryClass};
 use crate::context::PhaseKind;
 use anyhow::Result as ExoResult;
 use std::collections::HashMap;
@@ -25,6 +25,7 @@ pub struct CommandMetadata {
     pub namespace: &'static str,
     pub operation: &'static str,
     pub effect: Effect,
+    pub recovery_class: RecoveryClass,
     pub description: &'static str,
     pub needs_upgrade_gate: bool,
 }
@@ -36,6 +37,7 @@ impl CommandMetadata {
             namespace: cmd.namespace(),
             operation: cmd.operation(),
             effect: cmd.effect(),
+            recovery_class: cmd.recovery_class(),
             description: cmd.description(),
             needs_upgrade_gate: false,
         }
@@ -880,5 +882,33 @@ mod tests {
 
         let strike_finish = registry.find_metadata("strike", "finish").unwrap();
         assert_eq!(strike_finish.effect, Effect::Exec);
+    }
+
+    #[test]
+    fn atomic_project_state_recovery_class_has_approved_42_operations() {
+        let registry = default_registry();
+        let atomic = registry
+            .metadata()
+            .into_iter()
+            .filter(|command| command.recovery_class == RecoveryClass::AtomicProjectState)
+            .collect::<Vec<_>>();
+
+        assert_eq!(atomic.len(), 42);
+        assert!(
+            atomic
+                .iter()
+                .any(|command| { command.namespace == "task" && command.operation == "complete" })
+        );
+        assert!(
+            atomic
+                .iter()
+                .any(|command| { command.namespace == "epoch" && command.operation == "finish" })
+        );
+        assert!(
+            !atomic
+                .iter()
+                .any(|command| { command.namespace == "phase" && command.operation == "finish" })
+        );
+        assert!(!atomic.iter().any(|command| command.namespace == "rfc"));
     }
 }
