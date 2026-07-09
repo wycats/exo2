@@ -1253,6 +1253,166 @@ mod tests {
     }
 
     #[test]
+    fn rfc_workspace_observation_storage_is_reactive_and_machine_local() {
+        let db = open_memory_database().expect("should create in-memory database");
+        let conn = db.connection();
+
+        let migration_applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 22",
+                [],
+                |row| row.get(0),
+            )
+            .expect("should query migration history");
+        assert_eq!(migration_applied, 1, "V022 should be applied");
+
+        conn.execute(
+            "INSERT INTO rfc_workspace_snapshots (
+                workspace_root, branch_name, head_oid, document_digest,
+                canonical_ref, canonical_oid, observed_at
+             ) VALUES (
+                '/tmp/exo-workspace', 'feature/rfc-overlays', 'workspace-head',
+                zeroblob(32), 'refs/remotes/origin/main', 'canonical-head',
+                '2026-07-09T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("should insert workspace snapshot through reactive table");
+
+        conn.execute(
+            "INSERT INTO rfc_workspace_observations (
+                workspace_root, text_id, rfc_number, title, stage, stage_source,
+                status, feature, feature_declared, slug, file_path,
+                superseded_by, superseded_by_declared, supersedes,
+                supersedes_declared, withdrawal_reason,
+                withdrawal_reason_declared, archived_reason,
+                archived_reason_declared, consolidated_into,
+                consolidated_into_declared, branch_name, head_oid, observed_at
+             ) VALUES (
+                '/tmp/exo-workspace', '01RFCOVERLAY', 10196,
+                'Worktree-Aware RFC Overlays', 2, 'path', 'active', 'sidecar', 1,
+                'worktree-aware-rfc-overlays',
+                'docs/rfcs/stage-2/10196-worktree-aware-rfc-overlays.md',
+                NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                'feature/rfc-overlays', 'workspace-head', '2026-07-09T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("should insert workspace observation through reactive table");
+
+        conn.execute(
+            "INSERT INTO rfc_workspace_diagnostics (
+                workspace_root, file_path, diagnostic_code, text_id,
+                rfc_number, message, observed_at
+             ) VALUES (
+                '/tmp/exo-workspace', 'docs/rfcs/stage-2/duplicate.md',
+                'duplicate_number', '01RFCOVERLAY', 10196,
+                'RFC number is duplicated in this workspace',
+                '2026-07-09T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("should insert workspace diagnostic through reactive table");
+
+        conn.execute(
+            "INSERT INTO rfc_canonical_baseline (
+                singleton, canonical_ref, canonical_oid, completed_at
+             ) VALUES (1, 'refs/remotes/origin/main', 'canonical-head',
+                       '2026-07-09T00:00:00Z')",
+            [],
+        )
+        .expect("should insert canonical baseline marker");
+        conn.execute(
+            "INSERT INTO rfc_canonical_quarantine (
+                text_id, rfc_number, serialized_row, quarantine_reason,
+                quarantined_at
+             ) VALUES (
+                '01BRANCHONLY', 10999, '{\"status\":\"active\"}',
+                'missing_canonical_anchor', '2026-07-09T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("should insert canonical quarantine record");
+
+        for table in [
+            "rfc_workspace_snapshots_data",
+            "rfc_workspace_observations_data",
+            "rfc_workspace_diagnostics_data",
+        ] {
+            let rev_table = table.replace("_data", "_rev");
+            let revision_count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {rev_table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("should count row revisions");
+            assert_eq!(revision_count, 1, "{rev_table} should contain a digest");
+
+            let rowset_counter: i64 = conn
+                .query_row(
+                    "SELECT counter FROM rowset_revisions WHERE table_name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("should read rowset counter");
+            assert_eq!(rowset_counter, 1, "{table} should record its insert");
+        }
+
+        let dumps = dump_tables(conn).expect("portable dump should succeed");
+        for (file_stem, local_table) in [
+            ("rfc_workspace_snapshots", "rfc_workspace_snapshots_data"),
+            (
+                "rfc_workspace_observations",
+                "rfc_workspace_observations_data",
+            ),
+            (
+                "rfc_workspace_diagnostics",
+                "rfc_workspace_diagnostics_data",
+            ),
+            ("rfc_canonical_baseline", "rfc_canonical_baseline"),
+            ("rfc_canonical_quarantine", "rfc_canonical_quarantine"),
+        ] {
+            assert!(
+                !TABLE_ORDER.iter().any(|(_, table)| *table == local_table),
+                "{local_table} should not be registered for portable dumps"
+            );
+            assert!(
+                dumps.iter().all(|(name, _)| name != file_stem),
+                "{local_table} should not appear in portable dumps"
+            );
+        }
+
+        conn.execute(
+            "DELETE FROM rfc_workspace_snapshots
+             WHERE workspace_root = '/tmp/exo-workspace'",
+            [],
+        )
+        .expect("should delete workspace snapshot through reactive table");
+
+        for table in [
+            "rfc_workspace_observations_data",
+            "rfc_workspace_diagnostics_data",
+        ] {
+            let row_count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("should count cascaded rows");
+            assert_eq!(row_count, 0, "{table} should cascade with its snapshot");
+
+            let rev_table = table.replace("_data", "_rev");
+            let revision_count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {rev_table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("should count cascaded revisions");
+            assert_eq!(
+                revision_count, 0,
+                "{rev_table} should remove cascaded row revisions"
+            );
+        }
+    }
+
+    #[test]
     fn reactive_vtab_writes_cover_representative_table_shapes() {
         let db = open_memory_database().expect("should create in-memory database");
         let conn = db.connection();

@@ -23,19 +23,6 @@ use crate::trace::{
 use crate::vtab::shadow::with_reactive_shadow_names;
 use crate::DatabaseError;
 
-const REACTIVE_SHADOW_TABLES: &[&str] = &[
-    "epochs_data",
-    "phases_data",
-    "goals_data",
-    "tasks_data",
-    "phase_rfcs_data",
-    "ideas_data",
-    "inbox_data",
-    "rfcs_data",
-    "workspace_active_phase_data",
-    "phase_ownership_data",
-];
-
 /// Auxiliary data passed to the virtual table module.
 ///
 /// Contains the raw sqlite3 handle and revision store needed for
@@ -276,7 +263,7 @@ impl ReactiveVTab {
     }
 
     fn refresh_cascaded_revision_metadata(&self, before: &[(String, i64)]) -> Result<()> {
-        for table in REACTIVE_SHADOW_TABLES {
+        for (_, table) in crate::schema::REACTIVE_TABLES {
             if *table == self.shadow_table {
                 continue;
             }
@@ -934,9 +921,9 @@ fn execute_raw(db: *mut ffi::sqlite3, sql: &str, params: &[Value]) -> Result<usi
 }
 
 fn row_counts(db: *mut ffi::sqlite3) -> Result<Vec<(String, i64)>> {
-    REACTIVE_SHADOW_TABLES
+    crate::schema::REACTIVE_TABLES
         .iter()
-        .map(|table| Ok(((*table).to_string(), table_row_count(db, table)?)))
+        .map(|(_, table)| Ok(((*table).to_string(), table_row_count(db, table)?)))
         .collect()
 }
 
