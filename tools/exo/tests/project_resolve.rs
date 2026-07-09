@@ -463,6 +463,36 @@ fn cli_project_snapshot_reads_sidecar_project_state_without_workspace_root() {
     writer
         .set_workspace_active_phase(&workspace_key, &phase_id)
         .expect("set sidecar workspace active phase");
+    let rfc_text_id = "01J00000000000000000000001";
+    let rfc_dir = workspace.join("docs/rfcs/stage-0");
+    std::fs::create_dir_all(&rfc_dir).expect("create RFC directory");
+    std::fs::write(
+        rfc_dir.join("00001-sidecar-snapshot-rfc.md"),
+        format!(
+            "<!-- exo:1 ulid:{rfc_text_id} -->\n\n# RFC 00001: Sidecar Snapshot RFC\n\n**Stage**: 0\n\n## Summary\n\nSidecar snapshot coverage.\n"
+        ),
+    )
+    .expect("write sidecar snapshot RFC");
+    writer
+        .upsert_rfc(
+            rfc_text_id,
+            1,
+            "Sidecar Snapshot RFC",
+            0,
+            "active",
+            Some("sidecar-snapshot"),
+            "sidecar-snapshot-rfc",
+            "docs/rfcs/stage-0/00001-sidecar-snapshot-rfc.md",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("seed sidecar RFC metadata");
+    writer
+        .replace_phase_rfcs(&phase_id, &["00001".to_string()])
+        .expect("attach sidecar RFC to phase");
 
     let policy_path = config_home.join("exo/projects.toml");
     std::fs::create_dir_all(policy_path.parent().expect("policy parent"))
@@ -495,6 +525,16 @@ fn cli_project_snapshot_reads_sidecar_project_state_without_workspace_root() {
         Some(project_dir.to_string_lossy().as_ref())
     );
     assert_eq!(result["roots"]["status"]["commands_available"], true);
+    let rfc_pipeline =
+        serde_json::to_string(&result["roots"]["rfc-pipeline"]).expect("serialize RFC pipeline");
+    assert!(
+        rfc_pipeline.contains("Sidecar Snapshot RFC"),
+        "snapshot should read RFCs from the resolved sidecar DB: {rfc_pipeline}"
+    );
+    assert!(
+        rfc_pipeline.contains("sidecar-snapshot"),
+        "workspace RFC should inherit undeclared metadata from the resolved sidecar DB: {rfc_pipeline}"
+    );
     let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
     assert!(
         diagnostics.iter().all(|diagnostic| diagnostic["message"]
