@@ -39,11 +39,7 @@ fn list_active_phase_tasks_from_context(
     Ok(if tasks.is_empty() { None } else { Some(tasks) })
 }
 
-fn load_active_phase_goal_statuses(root: &Path) -> HashMap<String, String> {
-    let Ok(ctx) = AgentContext::load(root.to_path_buf()) else {
-        return HashMap::new();
-    };
-
+fn active_phase_goal_statuses(ctx: &AgentContext) -> HashMap<String, String> {
     let Ok(Some(active_phase)) = ctx.find_workspace_active_phase() else {
         return HashMap::new();
     };
@@ -129,8 +125,7 @@ pub(crate) struct TaskListGroup {
     pub tasks: Vec<TaskListItem>,
 }
 
-pub(crate) fn list_task_groups(root: &Path) -> ExoResult<Vec<TaskListGroup>> {
-    let ctx = AgentContext::load(root.to_path_buf())?;
+pub(crate) fn list_task_groups_for_context(ctx: &AgentContext) -> ExoResult<Vec<TaskListGroup>> {
     let Some(active_phase) = ctx.find_workspace_active_phase()? else {
         return Err(anyhow!(
             "No active phase found. Use `exo phase start <id>` to start one."
@@ -138,14 +133,14 @@ pub(crate) fn list_task_groups(root: &Path) -> ExoResult<Vec<TaskListGroup>> {
     };
 
     let workspace_root = ctx.workspace_root_key();
-    let db_path = crate::context::db_path(root, ctx.project.as_ref());
+    let db_path = crate::context::db_path(&ctx.root, ctx.project.as_ref());
     if !db_path.exists() {
         return Ok(Vec::new());
     }
 
     let loader = SqliteLoader::open(&db_path)?;
     let task_rows = loader.list_active_phase_tasks_for_workspace(workspace_root.as_deref())?;
-    let goal_statuses = load_active_phase_goal_statuses(root);
+    let goal_statuses = active_phase_goal_statuses(ctx);
 
     let mut groups = Vec::new();
     let mut group_index: HashMap<String, usize> = HashMap::new();

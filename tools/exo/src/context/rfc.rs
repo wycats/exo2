@@ -25,19 +25,25 @@ pub fn index_rfcs_with_project(
     }
 
     let rfcs = crate::rfc::load_effective_rfcs(root, project)?;
+    Ok(index_effective_rfcs(&rfcs))
+}
+
+pub fn index_effective_rfcs(
+    rfcs: &[crate::rfc::EffectiveRfcRecord],
+) -> HashMap<String, RfcIndexEntry> {
     let mut entries = HashMap::new();
 
     for effective in rfcs {
-        let rfc = effective.record;
+        let rfc = &effective.record;
         entries.insert(
             format!("{:05}", rfc.rfc_number),
             RfcIndexEntry {
                 id: format!("{:05}", rfc.rfc_number),
                 stage: rfc.stage,
-                title: rfc.title,
+                title: rfc.title.clone(),
             },
         );
     }
 
-    Ok(entries)
+    entries
 }

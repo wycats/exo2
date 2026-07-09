@@ -803,7 +803,9 @@ impl Command for TaskList {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let tasks = task::list_tasks(ctx.root)?;
+        let agent_ctx =
+            AgentContext::load_with_project(ctx.root.to_path_buf(), ctx.project.cloned())?;
+        let tasks = task::list_tasks_for_context(&agent_ctx)?;
 
         let task_entries: Vec<TaskListEntry> = tasks
             .into_iter()
@@ -819,7 +821,7 @@ impl Command for TaskList {
         match ctx.format {
             OutputFormat::Json => Ok(CommandOutput::data(output)),
             OutputFormat::Human => {
-                let groups = task::list_task_groups(ctx.root)?;
+                let groups = task::list_task_groups_for_context(&agent_ctx)?;
                 if groups.is_empty() {
                     Ok(CommandOutput::new(
                         output,

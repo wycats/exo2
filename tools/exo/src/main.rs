@@ -1360,6 +1360,17 @@ fn is_update_command(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("update"))
 }
 
+fn command_loads_request_context(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("status"))
+        || matches!(
+            (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str)
+            ),
+            (Some("task"), Some("list"))
+        )
+}
+
 fn attach_post_write_report(
     value: &mut serde_json::Value,
     report: &exo::post_write::PostWritePersistenceReport,
@@ -1951,6 +1962,7 @@ fn main() {
     let context = if is_project_bootstrap_read(&args)
         || is_sidecar_bootstrap_context_command(&args)
         || is_update_command(&args)
+        || command_loads_request_context(&args)
     {
         let project = Project::resolve(&cwd).ok();
         AgentContext {
@@ -2989,5 +3001,18 @@ mod tests {
                 operation.to_string(),
             ]));
         }
+    }
+
+    #[test]
+    fn request_context_commands_own_their_single_state_load() {
+        assert!(command_loads_request_context(&["status".to_string()]));
+        assert!(command_loads_request_context(&[
+            "task".to_string(),
+            "list".to_string(),
+        ]));
+        assert!(!command_loads_request_context(&[
+            "task".to_string(),
+            "start".to_string(),
+        ]));
     }
 }
