@@ -35,6 +35,15 @@ pub(crate) const REACTIVE_TABLES: &[(&str, &str)] = &[
     ("ideas", "ideas_data"),
     ("inbox", "inbox_data"),
     ("rfcs", "rfcs_data"),
+    ("rfc_workspace_snapshots", "rfc_workspace_snapshots_data"),
+    (
+        "rfc_workspace_observations",
+        "rfc_workspace_observations_data",
+    ),
+    (
+        "rfc_workspace_diagnostics",
+        "rfc_workspace_diagnostics_data",
+    ),
     ("workspace_active_phase", "workspace_active_phase_data"),
     ("phase_ownership", "phase_ownership_data"),
 ];
