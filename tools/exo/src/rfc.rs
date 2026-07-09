@@ -936,6 +936,14 @@ pub fn observe_effective_rfc_view_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<(ReconcileResult, EffectiveRfcView)> {
+    observe_effective_rfc_view(root, project, true)
+}
+
+fn observe_effective_rfc_view(
+    root: &Path,
+    project: Option<&Project>,
+    reconcile_shared: bool,
+) -> Result<(ReconcileResult, EffectiveRfcView)> {
     with_reconcile_lock(root, project, || {
         let source = canonical_reconcile_source(root)?;
         let key = ReconcileKey::new(root, project, &source);
@@ -944,7 +952,7 @@ pub fn observe_effective_rfc_view_with_project(
             let reconciled_keys = reconciled_keys
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !reconciled_keys.contains(&key)
+            reconcile_shared && !reconciled_keys.contains(&key)
         };
         let result = if should_reconcile {
             reconcile_rfcs_from_source(root, project, &source)?
@@ -1734,7 +1742,7 @@ pub fn load_effective_rfcs(
 /// Load one complete effective RFC view for the issuing workspace.
 #[allow(clippy::missing_errors_doc)]
 pub fn load_effective_rfc_view(root: &Path, project: Option<&Project>) -> Result<EffectiveRfcView> {
-    observe_effective_rfc_view_with_project(root, project).map(|(_, view)| view)
+    observe_effective_rfc_view(root, project, false).map(|(_, view)| view)
 }
 
 fn compose_effective_rfc_view_locked(
