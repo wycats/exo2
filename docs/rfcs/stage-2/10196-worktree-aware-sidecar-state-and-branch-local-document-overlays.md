@@ -102,7 +102,11 @@ The overlay storage migration creates matching `*_rev` tables and `rowset_revisi
 
 Portable dumps and SQL projections serialize shared `rfcs` state. The workspace tables stay outside `dump::TABLE_ORDER`, imports, and portable backups because their absolute paths and Git observations belong to one machine.
 
-The document digest is a SHA-256 digest over the sorted tuples of repository-relative RFC path, file kind, and content digest for every managed RFC document visible in the checkout. It changes for committed, staged, unstaged, renamed, deleted, and untracked RFC document changes without depending on unrelated working-tree files.
+The document digest is a SHA-256 digest over sorted tuples of `(repository-relative path, collection kind, SHA-256(raw document bytes))`.
+
+The candidate set contains regular `.md` files directly inside `stage-0/` through `stage-4/`, `withdrawn/`, and `archive/`, excluding `README.md` and `0000-template.md`. It also contains legacy flat `.md` files directly under `docs/rfcs/` whose filename begins with a parseable RFC number. Nested support files, evidence directories, templates, README files, and non-Markdown files are outside the snapshot.
+
+Collection kind is one of `stage(0..4)`, `withdrawn`, `archive`, or `legacy-flat`. The digest changes for committed, staged, unstaged, renamed, deleted, and untracked candidate changes without depending on unrelated working-tree files.
 
 ## Canonical Git Ref Resolution
 
@@ -159,7 +163,11 @@ The pass proceeds as follows:
 3. Read blob bytes and parse all candidates in memory.
 4. Partition malformed paths, duplicate anchors, ambiguous numeric identities, and invalid lifecycle locations into repair diagnostics.
 5. In one SQLite transaction, upsert every non-conflicting canonical candidate through `rfcs`.
-6. Commit the ref name and OID to the workspace snapshot together with the workspace pass.
+6. Commit the shared canonical changes.
+
+Canonical reconciliation and workspace refresh use independent transactions. Canonical publication can succeed when workspace scanning fails, and workspace refresh can succeed while canonical publication is waiting for a usable ref.
+
+The workspace snapshot's `canonical_ref` and `canonical_oid` record the canonical comparison basis used by that successful workspace refresh. They are not a commit marker for the shared canonical transaction.
 
 A valid anchored canonical document creates or relinks its shared row automatically. Canonical stage, lifecycle, path, title, feature, declared reasons, consolidation, and declared relationships replace older shared values. An absent canonical document leaves its existing shared row intact. Managed withdrawal, archive, supersession, and consolidation express retirement explicitly.
 
@@ -265,7 +273,9 @@ Daemon boot identity, connection recovery, bounded health probing, and project-r
 
 Both workspace tables are reactive virtual tables. Snapshot replacement changes their row digests and rowset revisions through ordinary `xUpdate` mediation. Traces over RFC membership invalidate when a workspace document appears or disappears. Traces over RFC content invalidate when parsed metadata changes.
 
-Canonical writes use the existing `rfcs` virtual table and commit in the same SQLite transaction as snapshot bookkeeping. Sidecar checkpointing runs after the transaction and serializes shared `rfcs` only.
+Canonical writes use the existing `rfcs` virtual table and commit in the canonical transaction. Snapshot and observation replacement commit in a separate workspace transaction. Each pass is atomic within its own boundary, so a failed workspace refresh preserves its previous snapshot without rolling back canonical publication.
+
+Sidecar checkpointing runs after a successful canonical transaction and serializes shared `rfcs` only.
 
 Observation refresh is conservative: replacing a changed snapshot may update every observation row for that workspace. Unchanged snapshots perform no writes. A later optimization may diff rows while preserving the same revision contract.
 
@@ -289,14 +299,14 @@ The migration is idempotent. Opening the database from another worktree refreshe
 | Condition | Result |
 | --- | --- |
 | Canonical ref unavailable | Preserve shared rows, refresh workspace, report publication waiting |
-| Canonical Git object unavailable | Preserve shared rows and prior canonical snapshot, return Git diagnostic |
+| Canonical Git object unavailable | Preserve shared rows, allow workspace refresh, return Git diagnostic |
 | Valid canonical RFC missing from SQLite | Insert or relink automatically |
 | RFC absent from current workspace | Keep shared row, report workspace absence |
 | RFC absent from canonical tree | Keep shared row until explicit lifecycle action |
 | Malformed anchor or invalid path | Preserve affected prior row, report scoped repair debt |
 | Duplicate anchor or numeric identity | Exclude conflicting group, return ambiguity with paths |
-| Workspace scan fails | Preserve prior workspace snapshot and observations |
-| SQLite transaction fails | Roll back the complete pass |
+| Workspace scan fails | Preserve prior workspace snapshot and observations; retain any committed canonical result |
+| SQLite transaction fails | Roll back the affected canonical or workspace pass; retain the other pass if it committed |
 | Sidecar checkpoint fails after commit | Keep committed SQLite state and report retryable persistence debt |
 | Request workspace belongs to another project | Reject before document access |
 
