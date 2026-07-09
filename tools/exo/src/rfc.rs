@@ -122,7 +122,6 @@ impl DeclaredRfcValue {
 struct ParsedRfcDocument {
     disk: DiskRfcRecord,
     filename_number: i64,
-    stage_source: String,
     canonical_metadata_conflict: bool,
     feature: DeclaredRfcValue,
     withdrawal_reason: DeclaredRfcValue,
@@ -814,6 +813,36 @@ fn canonical_rfc_blobs(root: &Path, canonical: &CanonicalGitRef) -> Result<Vec<C
     Ok(blobs)
 }
 
+fn canonical_history_contains_anchor(
+    root: &Path,
+    canonical: &CanonicalGitRef,
+    text_id: &str,
+) -> Result<bool> {
+    let anchor = format!("ulid:{text_id}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "--format=%H",
+            "-S",
+            &anchor,
+            &canonical.oid,
+            "--",
+            RFCS_DIR,
+        ])
+        .output()
+        .with_context(|| format!("Failed to inspect RFC history from {}", canonical.ref_name))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to inspect RFC history from {} at {}",
+            canonical.ref_name,
+            canonical.oid
+        );
+    }
+    Ok(!output.stdout.is_empty())
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn reconcile_rfcs_once_with_project(
     root: &Path,
@@ -952,7 +981,6 @@ fn reconcile_canonical_rfcs(
                 if parsed.canonical_metadata_conflict
                     || existing.is_some_and(|existing| existing.text_id != parsed.disk.text_id)
                     || parsed.filename_number != parsed.disk.rfc_number
-                    || (parsed.stage_source == "legacy" && existing.is_none())
                 {
                     result.unchanged += 1;
                 } else {
@@ -964,21 +992,15 @@ fn reconcile_canonical_rfcs(
     }
 
     let mut text_id_counts = HashMap::new();
-    let mut number_counts = HashMap::new();
     for parsed in &parsed_documents {
         *text_id_counts
             .entry(parsed.disk.text_id.clone())
-            .or_insert(0_usize) += 1;
-        *number_counts
-            .entry(parsed.disk.rfc_number)
             .or_insert(0_usize) += 1;
     }
 
     let mut changed_records = Vec::new();
     for parsed in parsed_documents {
-        if text_id_counts.get(&parsed.disk.text_id) != Some(&1)
-            || number_counts.get(&parsed.disk.rfc_number) != Some(&1)
-        {
+        if text_id_counts.get(&parsed.disk.text_id) != Some(&1) {
             result.unchanged += 1;
             continue;
         }
@@ -998,15 +1020,17 @@ fn reconcile_canonical_rfcs(
     }
 
     let establish_baseline = !writer.has_rfc_canonical_baseline()?;
-    let quarantined = if establish_baseline {
-        existing_by_text_id
-            .values()
-            .filter(|record| !canonical_anchors.contains(&record.text_id))
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mut quarantined = Vec::new();
+    for record in existing_by_text_id
+        .values()
+        .filter(|record| !canonical_anchors.contains(&record.text_id))
+    {
+        let has_canonical_history = !establish_baseline
+            && canonical_history_contains_anchor(root, canonical, &record.text_id)?;
+        if establish_baseline || !has_canonical_history {
+            quarantined.push(record.clone());
+        }
+    }
     result.deleted += quarantined.len();
     writer.reconcile_canonical_rfcs(
         &changed_records,
@@ -1049,14 +1073,22 @@ fn canonical_rfc_record(parsed: &ParsedRfcDocument, existing: Option<&RfcRecord>
         } else {
             existing.and_then(|row| row.supersedes.clone())
         },
-        withdrawal_reason: compatibility_value(
-            &parsed.withdrawal_reason,
-            existing.and_then(|row| row.withdrawal_reason.as_ref()),
-        ),
-        archived_reason: compatibility_value(
-            &parsed.archived_reason,
-            existing.and_then(|row| row.archived_reason.as_ref()),
-        ),
+        withdrawal_reason: if parsed.disk.status == "withdrawn" {
+            compatibility_value(
+                &parsed.withdrawal_reason,
+                existing.and_then(|row| row.withdrawal_reason.as_ref()),
+            )
+        } else {
+            None
+        },
+        archived_reason: if parsed.disk.status == "archived" {
+            compatibility_value(
+                &parsed.archived_reason,
+                existing.and_then(|row| row.archived_reason.as_ref()),
+            )
+        } else {
+            None
+        },
         consolidated_into: compatibility_value(
             &parsed.consolidated_into,
             existing.and_then(|row| row.consolidated_into.as_ref()),
@@ -3092,14 +3124,14 @@ fn parse_rfc_document(
     let path_stage = parse_stage(path);
     let stage_marker_conflicts = status == "active"
         && declared_stage.is_some_and(|declared_stage| declared_stage != path_stage);
-    let (stage, stage_source) = if status == "active" {
-        (path_stage, "path")
+    let stage = if status == "active" {
+        path_stage
     } else if let Some(stage) = declared_stage {
-        (stage, "marker")
+        stage
     } else if let Some(existing) = existing {
-        (existing.stage, "legacy")
+        existing.stage
     } else {
-        (0, "legacy")
+        0
     };
 
     let feature = declared_metadata_value_with_yaml(&metadata, "Feature", "feature");
@@ -3137,7 +3169,6 @@ fn parse_rfc_document(
             supersedes_declared: relationships.supersedes_declared,
         },
         filename_number,
-        stage_source: stage_source.to_string(),
         canonical_metadata_conflict: lifecycle_status_conflicts
             || invalid_stage_marker
             || stage_marker_conflicts,
@@ -4364,6 +4395,38 @@ This RFC supersedes:
             .unwrap();
         assert_eq!(quarantined, 1);
 
+        writer
+            .upsert_rfc(
+                "01laterbranch",
+                10998,
+                "Later Branch Only",
+                1,
+                "active",
+                None,
+                "later-branch-only",
+                "docs/rfcs/stage-1/10998-later-branch-only.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert!(loader.load_rfc_by_number(10998).unwrap().is_none());
+        let quarantine_reason: String = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT quarantine_reason FROM rfc_canonical_quarantine
+                 WHERE text_id = '01laterbranch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_reason, "missing_from_canonical_history");
+
         fs::remove_file(&canonical_path).unwrap();
         let absent_oid = commit_all(root, "remove canonical document");
         publish_origin_main(root, &absent_oid);
@@ -4372,6 +4435,72 @@ This RFC supersedes:
             loader.load_rfc_by_number(10200).unwrap().is_some(),
             "canonical absence after baseline preserves shared identity"
         );
+    }
+
+    #[test]
+    fn canonical_reconciliation_relinks_legacy_lifecycle_rfc_without_stage_marker() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/withdrawn")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/withdrawn/00129-legacy.md"),
+            "<!-- exo:129 ulid:01legacy -->\n\n# RFC 129: Legacy\n\n**Reason**: Retired.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+        let oid = commit_all(root, "legacy withdrawn RFC");
+        publish_origin_main(root, &oid);
+
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let record = loader.load_rfc_by_number(129).unwrap().unwrap();
+        assert_eq!(record.status, "withdrawn");
+        assert_eq!(record.stage, 0);
+        assert_eq!(record.withdrawal_reason.as_deref(), Some("Retired."));
+    }
+
+    #[test]
+    fn canonical_reconciliation_preserves_distinct_anchors_with_the_same_number() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join("docs/rfcs/withdrawn")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/stage-1/00100-current.md"),
+            "<!-- exo:100 ulid:01current -->\n\n# RFC 100: Current\n\n## Summary\n\nCurrent.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/rfcs/withdrawn/00100-historical.md"),
+            "<!-- exo:100 ulid:01historical -->\n\n# RFC 100: Historical\n\n**Stage**: 1\n**Reason**: Replaced.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+        let oid = commit_all(root, "same-number RFCs");
+        publish_origin_main(root, &oid);
+
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 2);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let mut records = loader
+            .load_rfcs()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.rfc_number == 100)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.text_id.cmp(&right.text_id));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text_id, "01current");
+        assert_eq!(records[1].text_id, "01historical");
     }
 
     #[test]
@@ -4400,8 +4529,8 @@ This RFC supersedes:
             file_path: "docs/rfcs/stage-2/10196-overlays.md".to_string(),
             superseded_by: None,
             supersedes: Some("10184".to_string()),
-            withdrawal_reason: None,
-            archived_reason: None,
+            withdrawal_reason: Some("obsolete".to_string()),
+            archived_reason: Some("old archive reason".to_string()),
             consolidated_into: None,
         };
         let inherited = parse_rfc_document(
@@ -4413,6 +4542,8 @@ This RFC supersedes:
         let inherited = canonical_rfc_record(&inherited, Some(&existing));
         assert_eq!(inherited.feature.as_deref(), Some("sidecar"));
         assert_eq!(inherited.supersedes.as_deref(), Some("10184"));
+        assert_eq!(inherited.withdrawal_reason, None);
+        assert_eq!(inherited.archived_reason, None);
 
         let cleared = parse_rfc_document(
             "docs/rfcs/stage-2/10196-overlays.md",

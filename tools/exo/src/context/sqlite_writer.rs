@@ -1483,38 +1483,49 @@ impl SqliteWriter {
             .context("Failed to clear canonical RFC quarantine")?;
         }
 
-        if establish_baseline {
-            for record in quarantined_records {
-                let serialized = serde_json::to_string(record)
-                    .context("Failed to serialize quarantined RFC metadata")?;
-                tx.execute(
-                    "INSERT INTO rfc_canonical_quarantine (
-                        text_id, rfc_number, serialized_row, quarantine_reason, quarantined_at
-                     ) VALUES (?1, ?2, ?3, 'missing_from_initial_canonical_tree', ?4)
-                     ON CONFLICT(text_id) DO UPDATE SET
-                        rfc_number = excluded.rfc_number,
-                        serialized_row = excluded.serialized_row,
-                        quarantine_reason = excluded.quarantine_reason,
-                        quarantined_at = excluded.quarantined_at",
-                    (&record.text_id, record.rfc_number, &serialized, &now),
+        let quarantine_reason = if establish_baseline {
+            "missing_from_initial_canonical_tree"
+        } else {
+            "missing_from_canonical_history"
+        };
+        for record in quarantined_records {
+            let serialized = serde_json::to_string(record)
+                .context("Failed to serialize quarantined RFC metadata")?;
+            tx.execute(
+                "INSERT INTO rfc_canonical_quarantine (
+                    text_id, rfc_number, serialized_row, quarantine_reason, quarantined_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(text_id) DO UPDATE SET
+                    rfc_number = excluded.rfc_number,
+                    serialized_row = excluded.serialized_row,
+                    quarantine_reason = excluded.quarantine_reason,
+                    quarantined_at = excluded.quarantined_at",
+                (
+                    &record.text_id,
+                    record.rfc_number,
+                    &serialized,
+                    quarantine_reason,
+                    &now,
+                ),
+            )
+            .context("Failed to quarantine non-canonical RFC metadata")?;
+            if let Some(row_id) = tx
+                .query_row(
+                    "SELECT id FROM rfcs_data WHERE text_id = ?1",
+                    [&record.text_id],
+                    |row| row.get::<_, i64>(0),
                 )
-                .context("Failed to quarantine non-canonical RFC metadata")?;
-                if let Some(row_id) = tx
-                    .query_row(
-                        "SELECT id FROM rfcs_data WHERE text_id = ?1",
-                        [&record.text_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .context("Failed to resolve quarantined RFC row")?
-                {
-                    tx.execute("DELETE FROM rfc_relations WHERE rfc_id = ?1", [row_id])
-                        .context("Failed to remove quarantined RFC relationships")?;
-                }
-                tx.execute("DELETE FROM rfcs WHERE text_id = ?1", [&record.text_id])
-                    .context("Failed to remove quarantined RFC metadata")?;
+                .optional()
+                .context("Failed to resolve quarantined RFC row")?
+            {
+                tx.execute("DELETE FROM rfc_relations WHERE rfc_id = ?1", [row_id])
+                    .context("Failed to remove quarantined RFC relationships")?;
             }
+            tx.execute("DELETE FROM rfcs WHERE text_id = ?1", [&record.text_id])
+                .context("Failed to remove quarantined RFC metadata")?;
+        }
 
+        if establish_baseline {
             tx.execute(
                 "INSERT INTO rfc_canonical_baseline (
                     singleton, canonical_ref, canonical_oid, completed_at
