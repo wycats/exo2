@@ -922,7 +922,10 @@ pub fn reconcile_rfcs_once_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
-    observe_effective_rfc_view_with_project(root, project).map(|(result, _)| result)
+    with_reconcile_lock(root, project, || {
+        let source = canonical_reconcile_source(root)?;
+        reconcile_and_refresh_locked(root, project, &source, true)
+    })
 }
 
 /// Reconcile and observe one coherent RFC view for a command request.
@@ -946,30 +949,40 @@ fn observe_effective_rfc_view(
 ) -> Result<(ReconcileResult, EffectiveRfcView)> {
     with_reconcile_lock(root, project, || {
         let source = canonical_reconcile_source(root)?;
-        let key = ReconcileKey::new(root, project, &source);
-        let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-        let should_reconcile = {
-            let reconciled_keys = reconciled_keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reconcile_shared && !reconciled_keys.contains(&key)
-        };
-        let result = if should_reconcile {
-            reconcile_rfcs_from_source(root, project, &source)?
-        } else {
-            ReconcileResult::default()
-        };
-        refresh_workspace_rfc_snapshot(root, project, &source)?;
+        let result = reconcile_and_refresh_locked(root, project, &source, reconcile_shared)?;
         let view = compose_effective_rfc_view_locked(root, project, &source)?;
-        if should_reconcile && key.canonical_oid.is_some() {
-            let mut reconciled_keys = reconciled_keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reconciled_keys.insert(key);
-            drop(reconciled_keys);
-        }
         Ok((result, view))
     })
+}
+
+fn reconcile_and_refresh_locked(
+    root: &Path,
+    project: Option<&Project>,
+    source: &CanonicalReconcileSource,
+    reconcile_shared: bool,
+) -> Result<ReconcileResult> {
+    let key = ReconcileKey::new(root, project, source);
+    let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    let should_reconcile = {
+        let reconciled_keys = reconciled_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reconcile_shared && !reconciled_keys.contains(&key)
+    };
+    let result = if should_reconcile {
+        reconcile_rfcs_from_source(root, project, source)?
+    } else {
+        ReconcileResult::default()
+    };
+    refresh_workspace_rfc_snapshot(root, project, source)?;
+    if should_reconcile && key.canonical_oid.is_some() {
+        let mut reconciled_keys = reconciled_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reconciled_keys.insert(key);
+        drop(reconciled_keys);
+    }
+    Ok(result)
 }
 
 fn with_reconcile_lock<T>(

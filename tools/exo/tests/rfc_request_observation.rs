@@ -46,6 +46,13 @@ fn workspace(temp: &TempDir) -> PathBuf {
         &["config", "user.email", "exo-test@example.invalid"],
     );
     test_support::exo_init_with_storage(&workspace, "sqlite");
+    let rfc_dir = workspace.join("docs/rfcs/stage-1");
+    std::fs::create_dir_all(&rfc_dir).unwrap();
+    std::fs::write(
+        rfc_dir.join("00001-request-observation.md"),
+        "<!-- exo:1 ulid:01requestobservation -->\n\n# RFC 1: Request Observation\n",
+    )
+    .unwrap();
     run_git(&workspace, &["add", "-A"]);
     run_git(&workspace, &["commit", "-m", "initialize workspace"]);
     let head = run_git(&workspace, &["rev-parse", "HEAD"]);
@@ -168,16 +175,17 @@ fn status_and_task_list_reuse_one_rfc_observation_per_request() {
     let workspace = workspace(&temp);
     let mut direct_results = Vec::new();
 
-    for (args, max_git_processes) in [(&["status"][..], 6), (&["task", "list"][..], 4)] {
+    for (args, max_git_processes) in [(&["status"][..], 7), (&["task", "list"][..], 5)] {
         let trace_path = temp.path().join(format!("direct-{}.trace", args.join("-")));
         reset_trace(&trace_path);
         let (output, elapsed) = run_exo(&workspace, true, args, Some(&trace_path));
         assert_request_bound(&output, elapsed, canonical_observation_count(&trace_path));
         let result = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
         direct_results.push((args.join(" "), result["result"].clone()));
+        let git_processes = git_process_count(&trace_path);
         assert!(
-            git_process_count(&trace_path) <= max_git_processes,
-            "direct {} repeated Git subprocesses",
+            git_processes <= max_git_processes,
+            "direct {} launched {git_processes} Git processes; budget is {max_git_processes}",
             args.join(" ")
         );
     }

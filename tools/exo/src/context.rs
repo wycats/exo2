@@ -1146,7 +1146,12 @@ impl AgentContext {
     /// Git discovery process for every storage helper they call.
     #[allow(clippy::missing_errors_doc)]
     pub fn load_with_project(root: PathBuf, project: Option<Project>) -> ExoResult<Self> {
-        Self::load_with_project_and_rfc_view(root, project).map(|(context, _)| context)
+        let plan = Self::load_from_sqlite(&root, project.as_ref())?;
+        Ok(Self {
+            root,
+            project,
+            plan,
+        })
     }
 
     /// Load context and the coherent RFC view observed by the same request.
@@ -1170,6 +1175,25 @@ impl AgentContext {
         root: &Path,
         project: Option<&Project>,
     ) -> ExoResult<(ExoState, crate::rfc::EffectiveRfcView)> {
+        let loader = Self::open_sqlite_loader(root, project)?;
+        let (_, rfc_view) = crate::rfc::observe_effective_rfc_view_with_project(root, project)
+            .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        let plan = loader
+            .load_state()
+            .with_context(|| "Failed to load state from SQLite database")?;
+        Ok((plan, rfc_view))
+    }
+
+    fn load_from_sqlite(root: &Path, project: Option<&Project>) -> ExoResult<ExoState> {
+        let loader = Self::open_sqlite_loader(root, project)?;
+        crate::rfc::reconcile_rfcs_once_with_project(root, project)
+            .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        loader
+            .load_state()
+            .with_context(|| "Failed to load state from SQLite database")
+    }
+
+    fn open_sqlite_loader(root: &Path, project: Option<&Project>) -> ExoResult<SqliteLoader> {
         let db_path = db_path(root, project);
 
         if !db_path.exists() {
@@ -1200,16 +1224,8 @@ impl AgentContext {
             }
         }
 
-        let loader = SqliteLoader::open(&db_path)
-            .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
-
-        let (_, rfc_view) = crate::rfc::observe_effective_rfc_view_with_project(root, project)
-            .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
-
-        let plan = loader
-            .load_state()
-            .with_context(|| "Failed to load state from SQLite database")?;
-        Ok((plan, rfc_view))
+        SqliteLoader::open(&db_path)
+            .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))
     }
 
     #[allow(clippy::missing_errors_doc)]
