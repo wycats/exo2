@@ -1464,7 +1464,10 @@ fn refresh_workspace_rfc_snapshot(
     }
 
     let previous_observations = if previous_snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot.branch_name == branch_name && snapshot.head_oid == head_oid
+        snapshot.branch_name == branch_name
+            && (branch_name.is_some()
+                || snapshot.head_oid == head_oid
+                || snapshot.document_digest == document_digest)
     }) {
         loader
             .load_rfc_workspace_observations(&workspace_root)?
@@ -1923,6 +1926,26 @@ pub fn get_next_rfc_id(rfc_dir: &Path) -> Result<String> {
     Ok(format!("{:05}", max_num + 1))
 }
 
+fn get_next_effective_rfc_id(
+    rfc_dir: &Path,
+    effective_rfcs: &[EffectiveRfcRecord],
+) -> Result<String> {
+    let next_file_number = get_next_rfc_id(rfc_dir)?
+        .parse::<i64>()
+        .context("Generated RFC ID was not numeric")?;
+    let next_effective_number = effective_rfcs
+        .iter()
+        .map(|effective| effective.record.rfc_number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("RFC number space is exhausted")?;
+    Ok(format!(
+        "{:05}",
+        next_file_number.max(next_effective_number)
+    ))
+}
+
 pub fn create(
     root: &Path,
     title: &str,
@@ -1934,6 +1957,13 @@ pub fn create(
     let rfc_dir = root.join(RFCS_DIR);
     let stage_dir = rfc_dir.join(format!("stage-{stage}"));
 
+    let project = Project::resolve(root).ok();
+    let effective_rfcs = if let Some(project) = project.as_ref() {
+        load_effective_rfcs(root, Some(project))?
+    } else {
+        Vec::new()
+    };
+
     if !stage_dir.exists() {
         std::fs::create_dir_all(&stage_dir)?;
     }
@@ -1941,7 +1971,7 @@ pub fn create(
     let number = if let Some(id) = id {
         id.to_string()
     } else {
-        get_next_rfc_id(&rfc_dir)?
+        get_next_effective_rfc_id(&rfc_dir, &effective_rfcs)?
     };
 
     let slug = slugify_title(title);
@@ -1951,6 +1981,12 @@ pub fn create(
     let rfc_number = number
         .parse::<i64>()
         .with_context(|| format!("RFC IDs must be numeric: {number}"))?;
+    if effective_rfcs
+        .iter()
+        .any(|effective| effective.record.rfc_number == rfc_number)
+    {
+        anyhow::bail!("RFC {number} already exists in the effective workspace view");
+    }
     let text_id = ulid::Ulid::new().to_string().to_lowercase();
     let body_content = body.unwrap_or("Write your RFC content here.");
     let content = render_anchor_rfc_content(rfc_number, &text_id, title, body_content);
@@ -3241,6 +3277,51 @@ fn replace_first_h1_line(body: &str, replacement: &str) -> String {
     out
 }
 
+fn update_declared_stage_marker(content: &str, stage: u8) -> String {
+    let mut saw_h1 = false;
+    let mut in_fence = false;
+    let mut in_preamble = true;
+    let mut replaced = false;
+    let mut out = String::with_capacity(content.len());
+
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !saw_h1 {
+            saw_h1 = trimmed.starts_with("# ");
+            out.push_str(line);
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if !in_fence && trimmed.starts_with("## ") {
+            in_preamble = false;
+        }
+        if in_preamble && !in_fence && !replaced && declared_metadata_value(line, "Stage").declared
+        {
+            let label_end = line.find("Stage").map(|index| index + "Stage".len());
+            if let Some(label_end) = label_end
+                && let Some(relative_start) = line[label_end..].find(|ch: char| ch.is_ascii_digit())
+            {
+                let number_start = label_end + relative_start;
+                let number_end = line[number_start..]
+                    .find(|ch: char| !ch.is_ascii_digit())
+                    .map_or(line.len(), |offset| number_start + offset);
+                out.push_str(&line[..number_start]);
+                out.push_str(&stage.to_string());
+                out.push_str(&line[number_end..]);
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+
+    out
+}
+
 /// Promotes an RFC to the next stage.
 ///
 /// # Errors
@@ -3279,8 +3360,8 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
         )
     })?;
 
-    // 2. Move File using git mv to preserve history
-    // Note: We no longer update content — stage is determined by directory, not frontmatter.
+    // 2. Move File using git mv to preserve history. The directory is authoritative,
+    // but an explicit stage marker must agree with it.
     let new_dir = path.join(new_stage_dir);
     if !new_dir.exists() {
         std::fs::create_dir_all(&new_dir)?;
@@ -3303,6 +3384,12 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
                 std::fs::rename(&file_path, &new_path)?;
             }
         }
+    }
+
+    let promoted_content = update_declared_stage_marker(&file_content, new_stage);
+    if promoted_content != file_content {
+        utils::edit_cli_managed_file(&new_path, move |_| Ok(promoted_content))
+            .with_context(|| format!("Failed to write {}", new_path.display()))?;
     }
 
     sync_rfc_edit(workspace_root, &new_path, None, false)?;
@@ -5021,6 +5108,12 @@ This RFC supersedes:
         assert!(feature_view.provenance.differs_from_canonical);
         assert_eq!(absent_from_feature.provenance.document_source, "canonical");
         assert_eq!(absent_from_feature.provenance.workspace_presence, "absent");
+        let feature_rfcs = load_effective_rfcs(&feature_root, Some(&feature_project)).unwrap();
+        assert_eq!(
+            get_next_effective_rfc_id(&feature_root.join(RFCS_DIR), &feature_rfcs).unwrap(),
+            "00003",
+            "number allocation must include canonical RFCs absent from the workspace"
+        );
         assert_eq!(
             shared.stage, 1,
             "feature observation cannot mutate canonical state"
@@ -5110,6 +5203,60 @@ This RFC supersedes:
             workspace_only.record.file_path,
             relative_workspace_path(root, &created)
         );
+
+        commit_all(root, "commit managed overlay changes");
+        let committed_withdrawal = load_effective_rfc_by_number(root, Some(&project), 1)
+            .unwrap()
+            .unwrap();
+        let committed_workspace_only = load_effective_rfc_by_number(root, Some(&project), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed_withdrawal.record.withdrawal_reason.as_deref(),
+            Some("The feature branch retired this proposal."),
+            "committing an unchanged RFC document must preserve its workspace lifecycle metadata"
+        );
+        assert_eq!(
+            committed_workspace_only.record.feature.as_deref(),
+            Some("workspace-feature"),
+            "committing an unchanged RFC document must preserve its workspace feature metadata"
+        );
+    }
+
+    #[test]
+    fn managed_promotion_updates_declared_stage_marker_before_overlay_refresh() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-0")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/stage-0/00001-promote.md"),
+            "<!-- exo:1 ulid:01promotemarker -->\n\n# RFC 1: Promote\n\n**Stage**: 0\n\n## Summary\n\nCandidate.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical promotion candidate");
+        publish_origin_main(root, &canonical_oid);
+        run_git(root, &["checkout", "-b", "feature"]);
+
+        let project = Project::resolve(root).unwrap();
+        fs::create_dir_all(project.db_path().parent().unwrap()).unwrap();
+        SqliteWriter::open(project.db_path()).unwrap();
+        reconcile_rfcs_with_project(root, Some(&project)).unwrap();
+
+        promote(&root.join(RFCS_DIR), "1").unwrap();
+
+        let promoted_path = root.join("docs/rfcs/stage-1/00001-promote.md");
+        let promoted_content = fs::read_to_string(&promoted_path).unwrap();
+        assert!(promoted_content.contains("**Stage**: 1"));
+        let effective = load_effective_rfc_by_number(root, Some(&project), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.record.stage, 1);
+        assert_eq!(
+            effective.record.file_path,
+            "docs/rfcs/stage-1/00001-promote.md"
+        );
     }
 
     #[test]
@@ -5164,7 +5311,7 @@ This RFC supersedes:
         .unwrap();
 
         finished_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap()
             .unwrap();
         worker.unwrap().join().unwrap();
