@@ -48,6 +48,7 @@ static RECONCILED_RFC_KEYS: OnceLock<Mutex<HashSet<ReconcileKey>>> = OnceLock::n
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReconcileKey {
     root: PathBuf,
+    project_id: Option<String>,
     db_path: PathBuf,
     canonical_oid: Option<String>,
 }
@@ -56,6 +57,7 @@ impl ReconcileKey {
     fn new(root: &Path, project: Option<&Project>, source: &CanonicalReconcileSource) -> Self {
         Self {
             root: normalize_key_path(root),
+            project_id: project.map(|project| project.id.as_str().to_string()),
             db_path: normalize_key_path(&crate::context::db_path(root, project)),
             canonical_oid: canonical_reconcile_cache_oid(source),
         }
@@ -119,6 +121,16 @@ pub struct EffectiveRfcView {
     pub workspace_diagnostics: Vec<RfcWorkspaceDiagnostic>,
     #[serde(skip)]
     pub(crate) repair_records: Vec<RfcRecord>,
+    #[serde(skip)]
+    snapshot: RfcWorkspaceSnapshot,
+}
+
+impl EffectiveRfcView {
+    /// Return the persisted workspace/canonical identity for this coherent view.
+    #[must_use]
+    pub const fn workspace_snapshot(&self) -> &RfcWorkspaceSnapshot {
+        &self.snapshot
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -638,6 +650,9 @@ fn canonical_reconcile_cache_oid(source: &CanonicalReconcileSource) -> Option<St
 }
 
 fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
+    #[cfg(test)]
+    CANONICAL_SOURCE_OBSERVATIONS.with(|count| count.set(count.get() + 1));
+
     if let Some(canonical) = resolve_canonical_ref(root, "refs/remotes/origin/HEAD")? {
         return Ok(CanonicalReconcileSource::Canonical(canonical));
     }
@@ -692,6 +707,21 @@ fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
     }
 
     Ok(CanonicalReconcileSource::PreserveShared)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANONICAL_SOURCE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_canonical_source_observation_count() {
+    CANONICAL_SOURCE_OBSERVATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn canonical_source_observation_count() -> usize {
+    CANONICAL_SOURCE_OBSERVATIONS.with(std::cell::Cell::get)
 }
 
 fn resolve_canonical_ref(root: &Path, ref_name: &str) -> Result<Option<CanonicalGitRef>> {
@@ -892,37 +922,46 @@ pub fn reconcile_rfcs_once_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
-    let observed_source = canonical_reconcile_source(root)?;
-    let observed_key = ReconcileKey::new(root, project, &observed_source);
-    let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut reconciled_keys = reconciled_keys
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    observe_effective_rfc_view_with_project(root, project).map(|(result, _)| result)
+}
 
-    if reconciled_keys.contains(&observed_key) {
-        drop(reconciled_keys);
-        with_reconcile_lock(root, project, || {
-            let locked_source = canonical_reconcile_source(root)?;
-            refresh_workspace_rfc_snapshot(root, project, &locked_source)
-        })?;
-        return Ok(ReconcileResult::default());
-    }
-
-    let (result, locked_key, reconciled) = with_reconcile_lock(root, project, || {
-        let locked_source = canonical_reconcile_source(root)?;
-        let locked_key = ReconcileKey::new(root, project, &locked_source);
-        if reconciled_keys.contains(&locked_key) {
-            return Ok((ReconcileResult::default(), locked_key, false));
+/// Reconcile and observe one coherent RFC view for a command request.
+///
+/// Canonical identity is resolved after taking the cross-process lock and is
+/// reused for canonical reconciliation, workspace refresh, and effective-view
+/// composition. The next request repeats this observation so ref advancement
+/// remains visible without allowing one request to mix snapshot bases.
+#[allow(clippy::missing_errors_doc)]
+pub fn observe_effective_rfc_view_with_project(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<(ReconcileResult, EffectiveRfcView)> {
+    with_reconcile_lock(root, project, || {
+        let source = canonical_reconcile_source(root)?;
+        let key = ReconcileKey::new(root, project, &source);
+        let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+        let should_reconcile = {
+            let reconciled_keys = reconciled_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !reconciled_keys.contains(&key)
+        };
+        let result = if should_reconcile {
+            reconcile_rfcs_from_source(root, project, &source)?
+        } else {
+            ReconcileResult::default()
+        };
+        refresh_workspace_rfc_snapshot(root, project, &source)?;
+        let view = compose_effective_rfc_view_locked(root, project, &source)?;
+        if should_reconcile && key.canonical_oid.is_some() {
+            let mut reconciled_keys = reconciled_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reconciled_keys.insert(key);
+            drop(reconciled_keys);
         }
-        let result = reconcile_rfcs_from_source(root, project, &locked_source)?;
-        refresh_workspace_rfc_snapshot(root, project, &locked_source)?;
-        Ok((result, locked_key, true))
-    })?;
-    if reconciled && locked_key.canonical_oid.is_some() {
-        reconciled_keys.insert(locked_key);
-    }
-    drop(reconciled_keys);
-    Ok(result)
+        Ok((result, view))
+    })
 }
 
 fn with_reconcile_lock<T>(
@@ -1695,17 +1734,14 @@ pub fn load_effective_rfcs(
 /// Load one complete effective RFC view for the issuing workspace.
 #[allow(clippy::missing_errors_doc)]
 pub fn load_effective_rfc_view(root: &Path, project: Option<&Project>) -> Result<EffectiveRfcView> {
-    with_reconcile_lock(root, project, || {
-        load_effective_rfc_view_locked(root, project)
-    })
+    observe_effective_rfc_view_with_project(root, project).map(|(_, view)| view)
 }
 
-fn load_effective_rfc_view_locked(
+fn compose_effective_rfc_view_locked(
     root: &Path,
     project: Option<&Project>,
+    source: &CanonicalReconcileSource,
 ) -> Result<EffectiveRfcView> {
-    let source = canonical_reconcile_source(root)?;
-    refresh_workspace_rfc_snapshot(root, project, &source)?;
     let loader = SqliteLoader::open(crate::context::db_path(root, project))?;
     let workspace_root = slash_path_string(&normalize_key_path(root));
     let snapshot = loader
@@ -1781,6 +1817,7 @@ fn load_effective_rfc_view_locked(
         records: effective,
         workspace_diagnostics,
         repair_records,
+        snapshot,
     })
 }
 
@@ -4752,6 +4789,58 @@ mod tests {
     }
 
     #[test]
+    fn request_observation_resolves_canonical_source_once_and_refreshes_next_request() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-request-view.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01requestview -->\n\n# RFC 1: Request View One\n\n## Summary\n\nFirst.\n",
+        )
+        .unwrap();
+        let first_oid = commit_all(root, "first canonical view");
+        publish_origin_main(root, &first_oid);
+        let project = Project::resolve(root).unwrap();
+        fs::create_dir_all(project.db_path().parent().unwrap()).unwrap();
+        SqliteWriter::open(project.db_path()).unwrap();
+
+        reset_canonical_source_observation_count();
+        let (_, first_view) =
+            observe_effective_rfc_view_with_project(root, Some(&project)).unwrap();
+        assert_eq!(canonical_source_observation_count(), 1);
+        assert_eq!(
+            first_view.workspace_snapshot().canonical_oid.as_deref(),
+            Some(first_oid.as_str())
+        );
+        assert!(first_view.records.iter().all(|record| {
+            record.provenance.canonical_head.as_deref() == Some(first_oid.as_str())
+        }));
+
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01requestview -->\n\n# RFC 1: Request View Two\n\n## Summary\n\nSecond.\n",
+        )
+        .unwrap();
+        let second_oid = commit_all(root, "second canonical view");
+        publish_origin_main(root, &second_oid);
+
+        let (_, second_view) =
+            observe_effective_rfc_view_with_project(root, Some(&project)).unwrap();
+        assert_eq!(canonical_source_observation_count(), 2);
+        assert_eq!(
+            second_view.workspace_snapshot().canonical_oid.as_deref(),
+            Some(second_oid.as_str())
+        );
+        assert_eq!(second_view.records[0].record.title, "Request View Two");
+        assert!(second_view.records.iter().all(|record| {
+            record.provenance.canonical_head.as_deref() == Some(second_oid.as_str())
+        }));
+    }
+
+    #[test]
     fn test_parse_rfc_frontmatter() {
         let content = r"---
 title: My RFC
@@ -5166,6 +5255,19 @@ This RFC supersedes:
             Some("The feature branch retired this proposal."),
         )
         .unwrap();
+        let workspace_root = slash_path_string(&normalize_key_path(root));
+        let persisted_withdrawal = SqliteLoader::open(project.db_path())
+            .unwrap()
+            .load_rfc_workspace_observations(&workspace_root)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.rfc_number == 1)
+            .expect("withdraw should refresh the workspace observation before returning");
+        assert_eq!(persisted_withdrawal.status, "withdrawn");
+        assert_eq!(
+            persisted_withdrawal.withdrawal_reason.as_deref(),
+            Some("The feature branch retired this proposal.")
+        );
         let created = create(
             root,
             "Workspace Only",

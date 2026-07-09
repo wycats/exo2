@@ -110,15 +110,17 @@ impl Command for StatusCommand {
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
         let root = resolve_workspace_root(ctx.root);
-        let agent_ctx = AgentContext::load_with_project(root, ctx.project.cloned())?;
+        let (agent_ctx, rfc_view) =
+            AgentContext::load_with_project_and_rfc_view(root, ctx.project.cloned())?;
 
         match ctx.format {
             OutputFormat::Json => {
-                let json = status::build_status_json(&agent_ctx, ctx.agent_id.as_deref())?;
+                let json =
+                    status::build_status_json(&agent_ctx, &rfc_view, ctx.agent_id.as_deref())?;
                 Ok(CommandOutput::data(json))
             }
             OutputFormat::Human => {
-                status::show_status_human(&agent_ctx, ctx.agent_id.as_deref())?;
+                status::show_status_human(&agent_ctx, &rfc_view, ctx.agent_id.as_deref())?;
                 Ok(CommandOutput::message(""))
             }
         }

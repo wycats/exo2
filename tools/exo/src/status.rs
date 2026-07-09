@@ -175,6 +175,7 @@ fn compute_between_phases_context(context: &AgentContext) -> Option<BetweenPhase
 /// Build JSON output for `exo status`
 pub fn build_status_json(
     context: &AgentContext,
+    rfc_view: &crate::rfc::EffectiveRfcView,
     agent_id: Option<&str>,
 ) -> ExoResult<serde_json::Value> {
     let owner_context =
@@ -211,7 +212,7 @@ pub fn build_status_json(
         return Ok(serde_json::to_value(&output)?);
     }
 
-    let world = WorldState::probe(context)?;
+    let world = WorldState::probe_with_rfc_view(context, rfc_view)?;
     let steering = steering::derive_world_steering(&world, agent_id);
     let progress_mode = steering::derive_progress_mode(&world);
 
@@ -270,7 +271,11 @@ pub fn build_status_json(
 }
 
 /// Show human-readable status output
-pub fn show_status_human(context: &AgentContext, agent_id: Option<&str>) -> ExoResult<()> {
+pub fn show_status_human(
+    context: &AgentContext,
+    rfc_view: &crate::rfc::EffectiveRfcView,
+    agent_id: Option<&str>,
+) -> ExoResult<()> {
     let owner_context =
         phase_owner::PhaseOwnerViewContext::new(&context.root, context.project.as_ref());
     // Check for critical upgrades first
@@ -290,7 +295,7 @@ pub fn show_status_human(context: &AgentContext, agent_id: Option<&str>) -> ExoR
         return Ok(());
     }
 
-    let world = WorldState::probe(context)?;
+    let world = WorldState::probe_with_rfc_view(context, rfc_view)?;
     let steering = steering::derive_world_steering(&world, agent_id);
     let progress_mode = steering::derive_progress_mode(&world);
     let current_owner = owner_context.current_owner_view();

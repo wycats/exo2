@@ -129,6 +129,15 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn probe(context: &AgentContext) -> ExoResult<Self> {
+        let rfc_view =
+            crate::rfc::load_effective_rfc_view(&context.root, context.project.as_ref())?;
+        Self::probe_with_rfc_view(context, &rfc_view)
+    }
+
+    pub fn probe_with_rfc_view(
+        context: &AgentContext,
+        rfc_view: &crate::rfc::EffectiveRfcView,
+    ) -> ExoResult<Self> {
         let db_path = crate::context::db_path(&context.root, context.project.as_ref());
         let workspace_root_key = context.workspace_root_key();
         let active_phase = context
@@ -171,7 +180,7 @@ impl WorldState {
         let git_changes = git_porcelain.as_deref().map(summarize_git_porcelain);
         let current_snapshots = snapshot_statuses(&context.root);
 
-        let rfc_index = rfc::index_rfcs_with_project(&context.root, context.project.as_ref())?;
+        let rfc_index = rfc::index_effective_rfcs(&rfc_view.records);
         let rfc_pipeline = build_rfc_pipeline(active_phase.as_ref(), &rfc_index);
 
         // Find unreviewed completed epochs
