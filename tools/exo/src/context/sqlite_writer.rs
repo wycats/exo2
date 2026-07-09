@@ -1444,7 +1444,7 @@ impl SqliteWriter {
         &self,
         changed_records: &[RfcRecord],
         quarantined_records: &[RfcRecord],
-        canonical_text_ids: &BTreeSet<String>,
+        relinked_canonical_text_ids: &BTreeSet<String>,
         canonical_ref: &str,
         canonical_oid: &str,
         establish_baseline: bool,
@@ -1475,7 +1475,7 @@ impl SqliteWriter {
             )?;
         }
 
-        for text_id in canonical_text_ids {
+        for text_id in relinked_canonical_text_ids {
             tx.execute(
                 "DELETE FROM rfc_canonical_quarantine WHERE text_id = ?1",
                 [text_id],

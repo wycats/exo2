@@ -7,6 +7,7 @@
 mod test_support;
 
 use exo::context::{SQLITE_DB_PATH, SqliteLoader};
+use exo::project::Project;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value as JsonValue;
@@ -499,6 +500,18 @@ fn rfc_promote_uses_workspace_stage_when_canonical_metadata_is_older(backend: &s
         root.join("docs/rfcs/stage-3/0001-workspace-stage.md")
             .exists(),
         "promotion must advance the workspace file from stage 2 to stage 3"
+    );
+
+    let project = Project::resolve(root).expect("resolve project");
+    let loader = SqliteLoader::open(project.db_path()).expect("open SQLite loader");
+    let shared = loader
+        .load_rfc_by_number(1)
+        .expect("load shared RFC metadata")
+        .expect("shared RFC row remains canonical");
+    assert_eq!(shared.stage, 1);
+    assert_eq!(
+        shared.file_path,
+        "docs/rfcs/stage-1/0001-workspace-stage.md"
     );
 }
 

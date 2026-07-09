@@ -976,25 +976,21 @@ fn reconcile_canonical_rfcs(
         .collect::<HashMap<_, _>>();
     let mut result = ReconcileResult::default();
     let blobs = canonical_rfc_blobs(root, canonical)?;
-    let mut canonical_anchors = BTreeSet::new();
+    let mut canonical_presence_anchors = BTreeSet::new();
     let mut parsed_documents = Vec::new();
     for blob in blobs {
         let anchor = extract_anchor_ulid(&blob.content);
         let existing_at_path = existing_by_path.get(&blob.file_path).copied();
-        if let Some(existing) = existing_at_path {
-            canonical_anchors.insert(existing.text_id.clone());
-        }
         if let Some(text_id) = anchor.as_deref() {
-            canonical_anchors.insert(text_id.to_string());
+            canonical_presence_anchors.insert(text_id.to_string());
         }
         let existing = anchor
             .as_deref()
             .and_then(|text_id| existing_by_text_id.get(text_id))
-            .or(existing_at_path);
+            .or_else(|| anchor.is_none().then_some(existing_at_path).flatten());
         match parse_rfc_document(&blob.file_path, &blob.content, existing) {
             Ok(parsed) => {
                 if parsed.canonical_metadata_conflict
-                    || existing.is_some_and(|existing| existing.text_id != parsed.disk.text_id)
                     || parsed.filename_number != parsed.disk.rfc_number
                 {
                     result.unchanged += 1;
@@ -1014,11 +1010,13 @@ fn reconcile_canonical_rfcs(
     }
 
     let mut changed_records = Vec::new();
+    let mut relinked_canonical_anchors = BTreeSet::new();
     for parsed in parsed_documents {
         if text_id_counts.get(&parsed.disk.text_id) != Some(&1) {
             result.unchanged += 1;
             continue;
         }
+        relinked_canonical_anchors.insert(parsed.disk.text_id.clone());
         let existing = existing_by_text_id.get(&parsed.disk.text_id);
         let record = canonical_rfc_record(&parsed, existing);
         match existing {
@@ -1038,7 +1036,7 @@ fn reconcile_canonical_rfcs(
     let mut quarantined = Vec::new();
     for record in existing_by_text_id
         .values()
-        .filter(|record| !canonical_anchors.contains(&record.text_id))
+        .filter(|record| !canonical_presence_anchors.contains(&record.text_id))
     {
         let has_canonical_history = !establish_baseline
             && canonical_history_contains_anchor(root, canonical, &record.text_id)?;
@@ -1050,7 +1048,7 @@ fn reconcile_canonical_rfcs(
     writer.reconcile_canonical_rfcs(
         &changed_records,
         &quarantined,
-        &canonical_anchors,
+        &relinked_canonical_anchors,
         &canonical.ref_name,
         &canonical.oid,
         establish_baseline,
@@ -2757,7 +2755,10 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
         }
     }
 
-    if load_rfc_record_by_text_id(workspace_root, &text_id)?.is_some()
+    if matches!(
+        canonical_reconcile_source(workspace_root)?,
+        CanonicalReconcileSource::WorkspaceFallback
+    ) && load_rfc_record_by_text_id(workspace_root, &text_id)?.is_some()
         && let Some(writer) = maybe_open_rfc_writer(workspace_root)?
     {
         let relative_path = relative_workspace_path(workspace_root, &new_path);
@@ -4494,6 +4495,30 @@ This RFC supersedes:
             .unwrap();
         assert_eq!(quarantined, 1);
 
+        let invalid_relink_path = root.join("docs/rfcs/stage-1/10999-branch-only.md");
+        fs::write(
+            &invalid_relink_path,
+            "<!-- exo:10998 ulid:01branchonly -->\n\n# RFC 10998: Invalid Relink\n\n## Summary\n\nInvalid.\n",
+        )
+        .unwrap();
+        let invalid_oid = commit_all(root, "invalid canonical relink");
+        publish_origin_main(root, &invalid_oid);
+        reconcile_rfcs_with_project(root, None).unwrap();
+        assert!(loader.load_rfc_by_number(10999).unwrap().is_none());
+        let quarantined: i64 = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM rfc_canonical_quarantine WHERE text_id = '01branchonly'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined, 1,
+            "an invalid canonical document cannot clear quarantine"
+        );
+
         writer
             .upsert_rfc(
                 "01laterbranch",
@@ -4534,6 +4559,62 @@ This RFC supersedes:
             loader.load_rfc_by_number(10200).unwrap().is_some(),
             "canonical absence after baseline preserves shared identity"
         );
+    }
+
+    #[test]
+    fn canonical_reconciliation_replaces_stale_path_owner_with_valid_anchor() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let canonical_path = root.join("docs/rfcs/stage-1/00123-canonical.md");
+        fs::write(
+            &canonical_path,
+            "<!-- exo:123 ulid:01canonicalpath -->\n\n# RFC 123: Canonical\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical path owner");
+        publish_origin_main(root, &canonical_oid);
+
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01stalepath",
+                122,
+                "Stale Path Owner",
+                1,
+                "active",
+                None,
+                "stale-path-owner",
+                "docs/rfcs/stage-1/00123-canonical.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = reconcile_rfcs_with_project(root, None).unwrap();
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.deleted, 1);
+
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        let canonical = loader.load_rfc_by_number(123).unwrap().unwrap();
+        assert_eq!(canonical.text_id, "01canonicalpath");
+        assert!(loader.load_rfc_by_number(122).unwrap().is_none());
+        let quarantined: i64 = writer
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM rfc_canonical_quarantine WHERE text_id = '01stalepath'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
     }
 
     #[test]
