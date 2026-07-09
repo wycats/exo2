@@ -52,11 +52,13 @@ When a checkout lacks an RFC that exists canonically, Exo still returns the shar
 | Shared RFC metadata | Project | Stable anchor identity and the canonical RFC view | Included in sidecar SQL projection |
 | Workspace RFC snapshot | Machine-local workspace | Git identity and the document-set fingerprint for one checkout | Excluded from sidecar projection |
 | Workspace RFC observations | Machine-local workspace | Parsed RFC documents visible in that checkout | Excluded from sidecar projection |
+| Workspace RFC diagnostics | Machine-local workspace | Persistent parse, identity, and path diagnostics for the snapshot | Excluded from sidecar projection |
+| Canonical baseline quarantine | Machine-local project state | Pre-overlay shared rows that lack canonical Git evidence | Excluded from sidecar projection |
 | RFC Markdown | Git branch | Public design prose and portable lifecycle metadata | Transported by the project repository |
 
 The existing `rfcs` virtual table remains the shared project query and relationship surface. Canonical reconciliation writes it through the reactive virtual table so row digests and rowset revisions remain current.
 
-Workspace snapshots and observations use two new reactive virtual tables:
+Workspace snapshots, observations, and diagnostics use three new reactive virtual tables:
 
 ```sql
 CREATE TABLE rfc_workspace_snapshots_data (
@@ -77,16 +79,24 @@ CREATE TABLE rfc_workspace_observations_data (
     rfc_number          INTEGER NOT NULL,
     title               TEXT NOT NULL,
     stage               INTEGER NOT NULL CHECK(stage BETWEEN 0 AND 4),
+    stage_source        TEXT NOT NULL
+                            CHECK(stage_source IN ('path', 'marker', 'legacy')),
     status              TEXT NOT NULL
                             CHECK(status IN ('active', 'archived', 'withdrawn')),
     feature             TEXT,
+    feature_declared    INTEGER NOT NULL CHECK(feature_declared IN (0, 1)),
     slug                TEXT NOT NULL,
     file_path           TEXT NOT NULL,
     superseded_by       TEXT,
+    superseded_by_declared INTEGER NOT NULL CHECK(superseded_by_declared IN (0, 1)),
     supersedes          TEXT,
+    supersedes_declared INTEGER NOT NULL CHECK(supersedes_declared IN (0, 1)),
     withdrawal_reason   TEXT,
+    withdrawal_reason_declared INTEGER NOT NULL CHECK(withdrawal_reason_declared IN (0, 1)),
     archived_reason     TEXT,
+    archived_reason_declared INTEGER NOT NULL CHECK(archived_reason_declared IN (0, 1)),
     consolidated_into   TEXT,
+    consolidated_into_declared INTEGER NOT NULL CHECK(consolidated_into_declared IN (0, 1)),
     branch_name         TEXT,
     head_oid            TEXT NOT NULL,
     observed_at         TEXT NOT NULL,
@@ -96,9 +106,24 @@ CREATE TABLE rfc_workspace_observations_data (
         REFERENCES rfc_workspace_snapshots_data(workspace_root)
         ON DELETE CASCADE
 );
+
+CREATE TABLE rfc_workspace_diagnostics_data (
+    id                  INTEGER PRIMARY KEY,
+    workspace_root      TEXT NOT NULL,
+    file_path           TEXT NOT NULL,
+    diagnostic_code     TEXT NOT NULL,
+    text_id             TEXT,
+    rfc_number          INTEGER,
+    message             TEXT NOT NULL,
+    observed_at         TEXT NOT NULL,
+    UNIQUE(workspace_root, file_path, diagnostic_code),
+    FOREIGN KEY(workspace_root)
+        REFERENCES rfc_workspace_snapshots_data(workspace_root)
+        ON DELETE CASCADE
+);
 ```
 
-The overlay storage migration creates matching `*_rev` tables and `rowset_revisions` seed rows. The virtual table names are `rfc_workspace_snapshots` and `rfc_workspace_observations`. They participate in `REACTIVE_TABLES` and the reactive shadow-name boundary from RFC 10165.
+The overlay storage migration creates matching `*_rev` tables and `rowset_revisions` seed rows. The virtual table names are `rfc_workspace_snapshots`, `rfc_workspace_observations`, and `rfc_workspace_diagnostics`. They participate in `REACTIVE_TABLES` and the reactive shadow-name boundary from RFC 10165. Nullable optional values pair with explicit declaration flags so an overlay can distinguish inheritance from an intentional empty declaration.
 
 Portable dumps and SQL projections serialize shared `rfcs` state. The workspace tables stay outside `dump::TABLE_ORDER`, imports, and portable backups because their absolute paths and Git observations belong to one machine.
 
@@ -135,6 +160,7 @@ The parser recognizes these portable forms near the top of the document:
 
 ```markdown
 **Status**: Withdrawn
+**Stage**: 3
 **Feature**: sidecar
 **Reason**: The implemented design moved to RFC <replacement-id>.
 - **Superseded by**: RFC <replacement-id>
@@ -142,9 +168,11 @@ The parser recognizes these portable forms near the top of the document:
 **Consolidated into**: RFC <replacement-id>
 ```
 
-Existing list rows, metadata table rows, and sentence-style status, reason, or note markers remain supported. Managed edits preserve the source form when it can be updated without ambiguity. A compact metadata block immediately after the H1 is the canonical fallback.
+Metadata extraction reads the document preamble between the H1 and the first level-two heading and ignores fenced code blocks. Existing list rows, metadata table rows, and sentence-style status, reason, or note markers remain supported there. Managed edits preserve the source form when it can be updated without ambiguity. A compact metadata block immediately after the H1 is the canonical fallback.
 
-Stage comes from `docs/rfcs/stage-N/`. `withdrawn/` and `archive/` determine lifecycle status; their explicit status and reason markers make that lifecycle portable outside the original SQLite database. A superseded relationship derives the read status `superseded` while the stored lifecycle status remains `active`, `withdrawn`, or `archived`.
+Stage comes from `docs/rfcs/stage-N/` for active documents. Documents in `withdrawn/` and `archive/` carry `**Stage**` with their last active stage, plus explicit status and reason markers. A legacy retired document without a stage marker preserves an existing shared stage as compatibility state and produces repair debt; the implementation backfill materializes every missing retired-stage marker before Stage 3. A superseded relationship derives the read status `superseded` while the stored lifecycle status remains `active`, `withdrawn`, or `archived`.
+
+Stage 0 uses the local numeric IDs defined by the staged RFC process. The slug or filename handle does not replace `rfc_number`; promotion may replace the local number with a permanent global number through a managed identity operation.
 
 The parser reports whether each optional field was declared. Canonical reconciliation follows this merge rule:
 
@@ -182,15 +210,16 @@ Workspace refresh reads the issuing checkout, including working-tree files. It b
 In one transaction Exo:
 
 1. upserts the workspace snapshot;
-2. deletes the prior observation rows for that workspace;
+2. deletes the prior observation and diagnostic rows for that workspace;
 3. inserts every non-conflicting valid observation through the reactive virtual table;
-4. commits the snapshot and observations together.
+4. inserts parse, path, and identity diagnostics through the diagnostics virtual table;
+5. commits the snapshot, observations, and diagnostics together.
 
 The observation key is `(workspace_root, text_id)`. Repository-relative path is unique within the workspace snapshot. Branch name may be absent for detached HEAD; `head_oid` always records the resolved commit.
 
-A branch switch, commit, reset, rename, or working-tree edit changes the snapshot fingerprint and replaces only that workspace's observations. When the fingerprint and canonical OID match the stored snapshot, Exo reuses the current observation set.
+A branch switch, commit, reset, rename, or working-tree edit refreshes only that workspace. Exo reuses a snapshot only when `branch_name`, `head_oid`, `document_digest`, `canonical_ref`, and `canonical_oid` all match. A branch or HEAD change with identical RFC bytes updates snapshot and observation provenance.
 
-A workspace scan failure retains the previous snapshot and returns a scoped error. Malformed and conflicting documents remain visible as workspace repair diagnostics while independent valid observations are committed.
+A workspace scan failure retains the previous snapshot and returns a scoped error. Malformed and conflicting documents remain visible through persisted workspace diagnostics while independent valid observations are committed. Reused snapshots return those persisted diagnostics without reparsing.
 
 ## Effective RFC View
 
@@ -199,7 +228,7 @@ Every RFC read receives a validated workspace root and constructs the effective 
 For each anchor:
 
 1. a current workspace observation supplies document-derived values;
-2. the shared row supplies canonical comparison values and compatibility fields the document has not declared;
+2. the shared row supplies canonical comparison values and optional compatibility fields whose workspace declaration flag is false;
 3. a shared row with no workspace observation remains in the result as `workspace_presence = "absent"`;
 4. a workspace observation with no shared row remains in the result as `canonical_presence = "unpublished"`.
 
@@ -216,7 +245,7 @@ Human output identifies an overlay when workspace path, stage, lifecycle, title,
 - `canonical_ref` and `canonical_head`;
 - `differs_from_canonical`.
 
-The fields are additive. Existing consumers can continue reading the current RFC shape.
+The fields are additive. Existing consumers can continue reading the current RFC shape. Local CLI, MCP, and JSON responses may include local branch names, ref names, and commit OIDs for provenance; they omit the absolute workspace root.
 
 ## Managed RFC Mutations
 
@@ -235,8 +264,8 @@ Repair remains path- and anchor-aware. A valid canonical document missing from S
 Lifecycle commands update path and Markdown together:
 
 - promote moves the file to `stage-N`;
-- withdraw moves the file to `withdrawn/`, writes `**Status**: Withdrawn`, and writes `**Reason**`;
-- archive moves the file to `archive/`, writes `**Status**: Archived`, and writes `**Reason**`;
+- withdraw records the current stage, moves the file to `withdrawn/`, writes `**Status**: Withdrawn`, writes `**Stage**`, and writes `**Reason**`;
+- archive records the current stage, moves the file to `archive/`, writes `**Status**: Archived`, writes `**Stage**`, and writes `**Reason**`;
 - supersede writes reciprocal `Superseded by` and `Supersedes` markers;
 - consolidation writes `**Consolidated into**`;
 - feature changes write `**Feature**`.
@@ -271,7 +300,7 @@ Daemon boot identity, connection recovery, bounded health probing, and project-r
 
 ## Reactive and Transaction Semantics
 
-Both workspace tables are reactive virtual tables. Snapshot replacement changes their row digests and rowset revisions through ordinary `xUpdate` mediation. Traces over RFC membership invalidate when a workspace document appears or disappears. Traces over RFC content invalidate when parsed metadata changes.
+All three workspace tables are reactive virtual tables. Snapshot replacement changes their row digests and rowset revisions through ordinary `xUpdate` mediation. Traces over RFC membership invalidate when a workspace document appears or disappears. Traces over RFC content invalidate when parsed metadata changes.
 
 Canonical writes use the existing `rfcs` virtual table and commit in the canonical transaction. Snapshot and observation replacement commit in a separate workspace transaction. Each pass is atomic within its own boundary, so a failed workspace refresh preserves its previous snapshot without rolling back canonical publication.
 
@@ -281,18 +310,21 @@ Observation refresh is conservative: replacing a changed snapshot may update eve
 
 ## Migration and Backfill
 
-The overlay storage migration creates the machine-local tables, revision tables, indexes, and rowset seeds. It preserves every existing `rfcs` row.
+The overlay storage migration creates the machine-local workspace tables, revision tables, indexes, and rowset seeds. It also creates two non-projected machine-local tables: a singleton canonical-baseline marker and an RFC quarantine keyed by stable anchor with the serialized pre-migration row and quarantine reason.
 
-The first context load after migration runs:
+Existing shared RFC rows remain readable until the first successful canonical baseline. That baseline runs in one transaction:
 
-1. canonical ref resolution;
-2. canonical reconciliation into shared `rfcs`;
-3. current workspace snapshot refresh;
-4. ordinary sidecar checkpointing when shared canonical rows changed.
+1. parse the canonical ref and collect its stable anchors;
+2. upsert every valid canonical document into shared `rfcs`;
+3. copy each pre-migration shared row whose anchor has no canonical document into quarantine;
+4. remove quarantined rows and their dependent shared relations from the canonical tables;
+5. record the baseline ref, commit OID, and completion time.
 
-This backfill automatically restores a valid canonical RFC missing from SQLite and restores canonical lifecycle state previously overwritten by an older worktree. Workspace observations are rebuilt locally and never imported from SQL projection.
+After the baseline transaction commits, Exo refreshes the current workspace in its independent workspace transaction and checkpoints the corrected shared projection. A missing or ambiguous canonical ref postpones baseline completion and leaves existing rows intact. Once the baseline completes, ordinary canonical absence follows the normal preservation rule for previously confirmed shared rows. If a quarantined anchor later appears canonically, reconciliation restores it from Markdown and clears its quarantine record.
 
-The migration is idempotent. Opening the database from another worktree refreshes that workspace only. Opening without a canonical ref preserves shared state and still establishes the workspace overlay.
+This backfill restores valid canonical RFCs missing from SQLite, restores lifecycle state overwritten by older worktrees, and removes branch-only publication leaks from shared state without discarding their recovery evidence. It also materializes missing `**Stage**` markers for retired RFCs from compatible shared metadata; unresolved legacy stages remain explicit repair debt. Workspace observations and quarantine records are rebuilt or retained locally and never imported from SQL projection.
+
+The migration and baseline are idempotent. Opening the database from another worktree refreshes that workspace only.
 
 ## Repair and Failure Semantics
 
@@ -316,7 +348,7 @@ Repair reminders name whether evidence came from the canonical tree or current w
 
 The daemon validates request workspaces against project identity and state root before accessing documents.
 
-Machine-local snapshots stay within the local database because they may contain absolute paths, branch names, and commit identities. Local human diagnostics may display that context; portable projections, dumps, sidecar commits, shared logs, and machine responses omit it.
+Machine-local snapshots stay within the local database because they contain absolute paths and local Git observations. Local CLI, MCP, and JSON responses may expose local branch names, ref names, and commit OIDs as request-scoped provenance, while omitting absolute workspace paths. Portable projections, dumps, sidecar commits, and shared logs contain no workspace observations or diagnostics.
 
 Canonical reconciliation reads Git tree entries and blobs only. It executes no repository code, follows no worktree symlink outside the project, and accepts only managed repository-relative RFC paths.
 
@@ -334,7 +366,7 @@ Existing RFC anchors and numeric IDs keep their meaning. This RFC changes proven
 
 ## Drawbacks
 
-The model introduces two machine-local tables and requires read surfaces to explain provenance.
+The model introduces three reactive workspace tables plus machine-local baseline and quarantine storage, and it requires read surfaces to explain provenance.
 
 A locally stale remote-default ref delays shared publication until local Git refs advance. This property makes accepted Git history the boundary and prevents a stale checkout from becoming project authority.
 
@@ -362,7 +394,7 @@ Direct parsing avoids duplicated metadata but gives up reactive traces, shared q
 
 ## Implementation Sequence
 
-1. Add the overlay storage migration, reactive workspace tables, revision coverage, and dump-exclusion tests.
+1. Add the overlay storage migration, reactive workspace and diagnostics tables, canonical baseline quarantine, revision coverage, and dump-exclusion tests.
 2. Extract one path-and-bytes RFC parser for filesystem documents and Git blobs.
 3. Add canonical-ref resolution and canonical Git-tree reconciliation.
 4. Add atomic workspace snapshot refresh and effective-view composition.
@@ -376,11 +408,13 @@ Direct parsing avoids duplicated metadata but gives up reactive traces, shared q
 
 ### Storage
 
-- Migration creates both data tables, revision tables, virtual tables, indexes, and rowset seeds.
-- Workspace tables are absent from `dump::TABLE_ORDER`, sidecar projection, imports, and portable dumps.
+- Migration creates snapshot, observation, diagnostics, baseline, and quarantine tables with the required revision coverage.
+- Machine-local RFC tables are absent from `dump::TABLE_ORDER`, sidecar projection, imports, and portable dumps.
 - Snapshot insert, replacement, and delete maintain row digests and rowset counters.
-- Observation content and membership traces invalidate after RFC document changes.
+- Observation and diagnostics content and membership traces invalidate after RFC document changes.
+- Reused snapshots preserve diagnostics and refresh branch/HEAD provenance when Git identity changes.
 - Failed replacement transactions retain the previous complete snapshot.
+- Initial canonical baseline quarantines pre-migration rows without canonical anchors and removes them from shared projection.
 
 ### Canonical Git Reconciliation
 
@@ -407,7 +441,7 @@ Direct parsing avoids duplicated metadata but gives up reactive traces, shared q
 ### Lifecycle Portability
 
 - Promote, withdraw, archive, supersede, consolidate, feature edit, rename, and repair update Markdown and workspace observations together.
-- Withdrawal and archive reasons survive restart, another worktree, merge, canonical reconciliation, and sidecar regeneration.
+- Withdrawal and archive stage plus reason survive restart, another worktree, merge, canonical reconciliation, and sidecar regeneration.
 - Status/reason prose and metadata tables retain unrelated content.
 - Linked relationship markers keep labels, URLs, and titles consistent.
 - File-path and status-marker disagreements remain scoped repair debt.
@@ -419,7 +453,7 @@ Direct parsing avoids duplicated metadata but gives up reactive traces, shared q
 - MCP supplies the same workspace identity as CLI.
 - A daemon rejects a workspace from another project or state root.
 - Legacy envelopes use the daemon startup workspace.
-- Existing JSON consumers accept additive provenance fields.
+- Existing JSON consumers accept additive provenance fields, and local JSON provenance omits absolute workspace roots.
 
 ### Regression
 
