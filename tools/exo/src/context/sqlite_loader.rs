@@ -200,6 +200,60 @@ pub struct RfcRecord {
     pub consolidated_into: Option<String>,
 }
 
+/// Machine-local identity for one workspace RFC document snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfcWorkspaceSnapshot {
+    pub workspace_root: String,
+    pub branch_name: Option<String>,
+    pub head_oid: String,
+    pub document_digest: Vec<u8>,
+    pub canonical_ref: Option<String>,
+    pub canonical_oid: Option<String>,
+    pub observed_at: String,
+}
+
+/// Parsed RFC document observed in one workspace snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RfcWorkspaceObservation {
+    pub workspace_root: String,
+    pub text_id: String,
+    pub rfc_number: i64,
+    pub title: String,
+    pub stage: u8,
+    pub stage_source: String,
+    pub status: String,
+    pub feature: Option<String>,
+    pub feature_declared: bool,
+    pub slug: String,
+    pub file_path: String,
+    pub superseded_by: Option<String>,
+    pub superseded_by_declared: bool,
+    pub supersedes: Option<String>,
+    pub supersedes_declared: bool,
+    pub withdrawal_reason: Option<String>,
+    pub withdrawal_reason_declared: bool,
+    pub archived_reason: Option<String>,
+    pub archived_reason_declared: bool,
+    pub consolidated_into: Option<String>,
+    pub consolidated_into_declared: bool,
+    pub branch_name: Option<String>,
+    pub head_oid: String,
+    pub observed_at: String,
+}
+
+/// Parse or identity diagnostic retained with one workspace RFC snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RfcWorkspaceDiagnostic {
+    pub workspace_root: String,
+    pub file_path: String,
+    pub diagnostic_code: String,
+    pub text_id: Option<String>,
+    pub rfc_number: Option<i64>,
+    pub message: String,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseProgress {
@@ -2049,6 +2103,123 @@ impl SqliteLoader {
             .context("Failed to query rfc by number")?;
 
         Ok(result)
+    }
+
+    /// Load the latest RFC document snapshot for one workspace.
+    pub fn load_rfc_workspace_snapshot(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Option<RfcWorkspaceSnapshot>> {
+        self.db
+            .connection()
+            .query_row(
+                "SELECT workspace_root, branch_name, head_oid, document_digest,
+                        canonical_ref, canonical_oid, observed_at
+                 FROM rfc_workspace_snapshots
+                 WHERE workspace_root = ?1",
+                [workspace_root],
+                |row| {
+                    Ok(RfcWorkspaceSnapshot {
+                        workspace_root: row.get(0)?,
+                        branch_name: row.get(1)?,
+                        head_oid: row.get(2)?,
+                        document_digest: row.get(3)?,
+                        canonical_ref: row.get(4)?,
+                        canonical_oid: row.get(5)?,
+                        observed_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to load RFC workspace snapshot")
+    }
+
+    /// Load parsed RFC observations for one workspace snapshot.
+    pub fn load_rfc_workspace_observations(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<RfcWorkspaceObservation>> {
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare(
+                "SELECT workspace_root, text_id, rfc_number, title, stage, stage_source,
+                        status, feature, feature_declared, slug, file_path,
+                        superseded_by, superseded_by_declared, supersedes,
+                        supersedes_declared, withdrawal_reason,
+                        withdrawal_reason_declared, archived_reason,
+                        archived_reason_declared, consolidated_into,
+                        consolidated_into_declared, branch_name, head_oid, observed_at
+                 FROM rfc_workspace_observations
+                 WHERE workspace_root = ?1
+                 ORDER BY rfc_number ASC, file_path ASC",
+            )
+            .context("Failed to prepare RFC workspace observations query")?;
+
+        stmt.query_map([workspace_root], |row| {
+            Ok(RfcWorkspaceObservation {
+                workspace_root: row.get(0)?,
+                text_id: row.get(1)?,
+                rfc_number: row.get(2)?,
+                title: row.get(3)?,
+                stage: row.get(4)?,
+                stage_source: row.get(5)?,
+                status: row.get(6)?,
+                feature: row.get(7)?,
+                feature_declared: row.get(8)?,
+                slug: row.get(9)?,
+                file_path: row.get(10)?,
+                superseded_by: row.get(11)?,
+                superseded_by_declared: row.get(12)?,
+                supersedes: row.get(13)?,
+                supersedes_declared: row.get(14)?,
+                withdrawal_reason: row.get(15)?,
+                withdrawal_reason_declared: row.get(16)?,
+                archived_reason: row.get(17)?,
+                archived_reason_declared: row.get(18)?,
+                consolidated_into: row.get(19)?,
+                consolidated_into_declared: row.get(20)?,
+                branch_name: row.get(21)?,
+                head_oid: row.get(22)?,
+                observed_at: row.get(23)?,
+            })
+        })
+        .context("Failed to query RFC workspace observations")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to read RFC workspace observations")
+    }
+
+    /// Load persisted RFC diagnostics for one workspace snapshot.
+    pub fn load_rfc_workspace_diagnostics(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<RfcWorkspaceDiagnostic>> {
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare(
+                "SELECT workspace_root, file_path, diagnostic_code, text_id,
+                        rfc_number, message, observed_at
+                 FROM rfc_workspace_diagnostics
+                 WHERE workspace_root = ?1
+                 ORDER BY file_path ASC, diagnostic_code ASC",
+            )
+            .context("Failed to prepare RFC workspace diagnostics query")?;
+
+        stmt.query_map([workspace_root], |row| {
+            Ok(RfcWorkspaceDiagnostic {
+                workspace_root: row.get(0)?,
+                file_path: row.get(1)?,
+                diagnostic_code: row.get(2)?,
+                text_id: row.get(3)?,
+                rfc_number: row.get(4)?,
+                message: row.get(5)?,
+                observed_at: row.get(6)?,
+            })
+        })
+        .context("Failed to query RFC workspace diagnostics")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to read RFC workspace diagnostics")
     }
 
     // ═══════════════════════════════════════════════════════════════════════

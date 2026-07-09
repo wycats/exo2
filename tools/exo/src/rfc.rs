@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,7 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use walkdir::WalkDir;
 
-use crate::context::sqlite_loader::RfcRecord;
+use crate::context::sqlite_loader::{
+    RfcRecord, RfcWorkspaceDiagnostic, RfcWorkspaceObservation, RfcWorkspaceSnapshot,
+};
 use crate::context::{SqliteLoader, SqliteWriter};
 use crate::project::Project;
 use crate::utils;
@@ -87,6 +90,37 @@ pub struct ReconcileResult {
     pub unchanged: usize,
 }
 
+/// Provenance for an RFC record in the issuing workspace's effective view.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RfcViewProvenance {
+    pub document_source: String,
+    pub workspace_presence: String,
+    pub canonical_presence: String,
+    pub workspace_branch: Option<String>,
+    pub workspace_head: Option<String>,
+    pub canonical_ref: Option<String>,
+    pub canonical_head: Option<String>,
+    pub differs_from_canonical: bool,
+}
+
+/// RFC metadata composed from the issuing workspace and shared canonical state.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveRfcRecord {
+    #[serde(flatten)]
+    pub record: RfcRecord,
+    #[serde(flatten)]
+    pub provenance: RfcViewProvenance,
+}
+
+/// Effective RFC records and diagnostics from one atomic workspace refresh.
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveRfcView {
+    pub records: Vec<EffectiveRfcRecord>,
+    pub workspace_diagnostics: Vec<RfcWorkspaceDiagnostic>,
+    #[serde(skip)]
+    pub(crate) repair_records: Vec<RfcRecord>,
+}
+
 #[derive(Debug, Clone)]
 struct DiskRfcRecord {
     text_id: String,
@@ -122,6 +156,7 @@ impl DeclaredRfcValue {
 struct ParsedRfcDocument {
     disk: DiskRfcRecord,
     filename_number: i64,
+    stage_source: String,
     canonical_metadata_conflict: bool,
     feature: DeclaredRfcValue,
     withdrawal_reason: DeclaredRfcValue,
@@ -865,6 +900,11 @@ pub fn reconcile_rfcs_once_with_project(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     if reconciled_keys.contains(&observed_key) {
+        drop(reconciled_keys);
+        with_reconcile_lock(root, project, || {
+            let locked_source = canonical_reconcile_source(root)?;
+            refresh_workspace_rfc_snapshot(root, project, &locked_source)
+        })?;
         return Ok(ReconcileResult::default());
     }
 
@@ -874,7 +914,8 @@ pub fn reconcile_rfcs_once_with_project(
         if reconciled_keys.contains(&locked_key) {
             return Ok((ReconcileResult::default(), locked_key, false));
         }
-        let result = reconcile_rfcs_from_source(root, project, locked_source)?;
+        let result = reconcile_rfcs_from_source(root, project, &locked_source)?;
+        refresh_workspace_rfc_snapshot(root, project, &locked_source)?;
         Ok((result, locked_key, true))
     })?;
     if reconciled && locked_key.canonical_oid.is_some() {
@@ -936,14 +977,16 @@ pub fn reconcile_rfcs_with_project(
 ) -> Result<ReconcileResult> {
     with_reconcile_lock(root, project, || {
         let source = canonical_reconcile_source(root)?;
-        reconcile_rfcs_from_source(root, project, source)
+        let result = reconcile_rfcs_from_source(root, project, &source)?;
+        refresh_workspace_rfc_snapshot(root, project, &source)?;
+        Ok(result)
     })
 }
 
 fn reconcile_rfcs_from_source(
     root: &Path,
     project: Option<&Project>,
-    source: CanonicalReconcileSource,
+    source: &CanonicalReconcileSource,
 ) -> Result<ReconcileResult> {
     match source {
         CanonicalReconcileSource::Canonical(canonical) => {
@@ -1270,6 +1313,508 @@ fn reconcile_workspace_rfcs(root: &Path, project: Option<&Project>) -> Result<Re
     Ok(result)
 }
 
+fn workspace_git_identity(root: &Path) -> Result<(Option<String>, String)> {
+    let branch_name = git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
+        .filter(|branch| !branch.is_empty());
+    let head_oid = git_stdout(root, &["rev-parse", "--verify", "HEAD^{commit}"])?
+        .filter(|oid| !oid.is_empty())
+        .unwrap_or_else(|| "unborn".to_string());
+    Ok((branch_name, head_oid))
+}
+
+fn canonical_source_identity(
+    source: &CanonicalReconcileSource,
+) -> (Option<String>, Option<String>) {
+    match source {
+        CanonicalReconcileSource::Canonical(canonical) => (
+            Some(canonical.ref_name.clone()),
+            Some(canonical.oid.clone()),
+        ),
+        CanonicalReconcileSource::PreserveShared | CanonicalReconcileSource::WorkspaceFallback => {
+            (None, None)
+        }
+    }
+}
+
+fn workspace_collection_kind(relative_path: &str) -> String {
+    let path = Path::new(relative_path);
+    let collection = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    match collection {
+        Some("withdrawn") => "withdrawn".to_string(),
+        Some("archive") => "archive".to_string(),
+        Some(stage) if stage.starts_with("stage-") => stage.to_string(),
+        _ => "legacy-flat".to_string(),
+    }
+}
+
+fn update_digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn workspace_document_digest(documents: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    for (path, bytes) in documents {
+        update_digest_field(&mut hasher, path.as_bytes());
+        update_digest_field(&mut hasher, workspace_collection_kind(path).as_bytes());
+        let document_hash = Sha256::digest(bytes);
+        update_digest_field(&mut hasher, &document_hash);
+    }
+    hasher.finalize().to_vec()
+}
+
+fn workspace_observation_from_parsed(
+    workspace_root: &str,
+    branch_name: Option<&str>,
+    head_oid: &str,
+    observed_at: &str,
+    parsed: &ParsedRfcDocument,
+) -> RfcWorkspaceObservation {
+    RfcWorkspaceObservation {
+        workspace_root: workspace_root.to_string(),
+        text_id: parsed.disk.text_id.clone(),
+        rfc_number: parsed.disk.rfc_number,
+        title: parsed.disk.title.clone(),
+        stage: parsed.disk.stage,
+        stage_source: parsed.stage_source.clone(),
+        status: parsed.disk.status.clone(),
+        feature: parsed.feature.value.clone(),
+        feature_declared: parsed.feature.declared,
+        slug: parsed.disk.slug.clone(),
+        file_path: parsed.disk.file_path.clone(),
+        superseded_by: parsed.disk.superseded_by.clone(),
+        superseded_by_declared: parsed.disk.superseded_by_declared,
+        supersedes: parsed.disk.supersedes.clone(),
+        supersedes_declared: parsed.disk.supersedes_declared,
+        withdrawal_reason: parsed.withdrawal_reason.value.clone(),
+        withdrawal_reason_declared: parsed.withdrawal_reason.declared,
+        archived_reason: parsed.archived_reason.value.clone(),
+        archived_reason_declared: parsed.archived_reason.declared,
+        consolidated_into: parsed.consolidated_into.value.clone(),
+        consolidated_into_declared: parsed.consolidated_into.declared,
+        branch_name: branch_name.map(str::to_string),
+        head_oid: head_oid.to_string(),
+        observed_at: observed_at.to_string(),
+    }
+}
+
+fn workspace_diagnostic(
+    workspace_root: &str,
+    file_path: &str,
+    code: &str,
+    content: &str,
+    message: impl Into<String>,
+    observed_at: &str,
+) -> RfcWorkspaceDiagnostic {
+    RfcWorkspaceDiagnostic {
+        workspace_root: workspace_root.to_string(),
+        file_path: file_path.to_string(),
+        diagnostic_code: code.to_string(),
+        text_id: extract_anchor_ulid(content),
+        rfc_number: extract_anchor_rfc_number(content),
+        message: message.into(),
+        observed_at: observed_at.to_string(),
+    }
+}
+
+fn refresh_workspace_rfc_snapshot(
+    root: &Path,
+    project: Option<&Project>,
+    source: &CanonicalReconcileSource,
+) -> Result<()> {
+    let db_path = crate::context::db_path(root, project);
+    let loader = SqliteLoader::open(&db_path)
+        .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
+    let writer = SqliteWriter::open(&db_path)
+        .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
+    let workspace_root = slash_path_string(&normalize_key_path(root));
+    let (branch_name, head_oid) = workspace_git_identity(root)?;
+    let (canonical_ref, canonical_oid) = canonical_source_identity(source);
+    let observed_at = chrono::Utc::now().to_rfc3339();
+
+    let shared_by_text_id = loader
+        .load_rfcs()?
+        .into_iter()
+        .map(|record| (record.text_id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
+        .into_iter()
+        .map(|path| {
+            let relative_path = relative_workspace_path(root, &path);
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok((relative_path, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    documents.sort_by(|left, right| left.0.cmp(&right.0));
+    let document_digest = workspace_document_digest(&documents);
+
+    let previous_snapshot = loader.load_rfc_workspace_snapshot(&workspace_root)?;
+    if previous_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.branch_name == branch_name
+            && snapshot.head_oid == head_oid
+            && snapshot.document_digest == document_digest
+            && snapshot.canonical_ref == canonical_ref
+            && snapshot.canonical_oid == canonical_oid
+    }) {
+        return Ok(());
+    }
+
+    let previous_observations = if previous_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.branch_name == branch_name
+            && (branch_name.is_some()
+                || snapshot.head_oid == head_oid
+                || snapshot.document_digest == document_digest)
+    }) {
+        loader
+            .load_rfc_workspace_observations(&workspace_root)?
+            .into_iter()
+            .map(|observation| (observation.text_id.clone(), observation))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let mut diagnostics = Vec::new();
+    let mut parsed_documents = Vec::new();
+    for (relative_path, bytes) in &documents {
+        let Ok(content) = String::from_utf8(bytes.clone()) else {
+            diagnostics.push(RfcWorkspaceDiagnostic {
+                workspace_root: workspace_root.clone(),
+                file_path: relative_path.clone(),
+                diagnostic_code: "invalid_utf8".to_string(),
+                text_id: None,
+                rfc_number: None,
+                message: format!("RFC document contains non-UTF-8 bytes: {relative_path}"),
+                observed_at: observed_at.clone(),
+            });
+            continue;
+        };
+        let existing = extract_anchor_ulid(&content)
+            .as_deref()
+            .and_then(|text_id| shared_by_text_id.get(text_id));
+        match parse_rfc_document(relative_path, &content, existing) {
+            Ok(parsed)
+                if !parsed.canonical_metadata_conflict
+                    && parsed.filename_number == parsed.disk.rfc_number =>
+            {
+                parsed_documents.push((parsed, content));
+            }
+            Ok(_parsed) => diagnostics.push(workspace_diagnostic(
+                &workspace_root,
+                relative_path,
+                "metadata_conflict",
+                &content,
+                format!(
+                    "RFC document metadata conflicts with its path or lifecycle at {relative_path}"
+                ),
+                &observed_at,
+            )),
+            Err(error) => diagnostics.push(workspace_diagnostic(
+                &workspace_root,
+                relative_path,
+                "parse_error",
+                &content,
+                format!("{error:#}"),
+                &observed_at,
+            )),
+        }
+    }
+
+    let mut anchor_counts = HashMap::new();
+    for (parsed, _) in &parsed_documents {
+        *anchor_counts
+            .entry(parsed.disk.text_id.clone())
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut observations = Vec::new();
+    for (parsed, content) in parsed_documents {
+        if anchor_counts.get(&parsed.disk.text_id) != Some(&1) {
+            diagnostics.push(workspace_diagnostic(
+                &workspace_root,
+                &parsed.disk.file_path,
+                "duplicate_anchor",
+                &content,
+                format!(
+                    "RFC anchor {} appears in multiple workspace documents",
+                    parsed.disk.text_id
+                ),
+                &observed_at,
+            ));
+            continue;
+        }
+        let mut observation = workspace_observation_from_parsed(
+            &workspace_root,
+            branch_name.as_deref(),
+            &head_oid,
+            &observed_at,
+            &parsed,
+        );
+        if let Some(previous) = previous_observations.get(&observation.text_id) {
+            let canonical = shared_by_text_id.get(&observation.text_id);
+            preserve_workspace_optional_override(
+                &mut observation.feature,
+                &mut observation.feature_declared,
+                &previous.feature,
+                previous.feature_declared,
+                canonical.and_then(|record| record.feature.as_ref()),
+            );
+            preserve_workspace_optional_override(
+                &mut observation.superseded_by,
+                &mut observation.superseded_by_declared,
+                &previous.superseded_by,
+                previous.superseded_by_declared,
+                canonical.and_then(|record| record.superseded_by.as_ref()),
+            );
+            preserve_workspace_optional_override(
+                &mut observation.supersedes,
+                &mut observation.supersedes_declared,
+                &previous.supersedes,
+                previous.supersedes_declared,
+                canonical.and_then(|record| record.supersedes.as_ref()),
+            );
+            preserve_workspace_optional_override(
+                &mut observation.withdrawal_reason,
+                &mut observation.withdrawal_reason_declared,
+                &previous.withdrawal_reason,
+                previous.withdrawal_reason_declared,
+                canonical.and_then(|record| record.withdrawal_reason.as_ref()),
+            );
+            preserve_workspace_optional_override(
+                &mut observation.archived_reason,
+                &mut observation.archived_reason_declared,
+                &previous.archived_reason,
+                previous.archived_reason_declared,
+                canonical.and_then(|record| record.archived_reason.as_ref()),
+            );
+            preserve_workspace_optional_override(
+                &mut observation.consolidated_into,
+                &mut observation.consolidated_into_declared,
+                &previous.consolidated_into,
+                previous.consolidated_into_declared,
+                canonical.and_then(|record| record.consolidated_into.as_ref()),
+            );
+        }
+        observations.push(observation);
+    }
+
+    let snapshot = RfcWorkspaceSnapshot {
+        workspace_root,
+        branch_name,
+        head_oid,
+        document_digest,
+        canonical_ref,
+        canonical_oid,
+        observed_at,
+    };
+    writer.replace_rfc_workspace_snapshot(&snapshot, &observations, &diagnostics)
+}
+
+fn preserve_workspace_optional_override(
+    observed: &mut Option<String>,
+    declared: &mut bool,
+    previous: &Option<String>,
+    previous_declared: bool,
+    canonical: Option<&String>,
+) {
+    if !*declared && previous_declared && previous.as_ref() != canonical {
+        observed.clone_from(previous);
+        *declared = true;
+    }
+}
+
+fn composed_optional_value(
+    observed: &Option<String>,
+    declared: bool,
+    canonical: Option<&String>,
+) -> Option<String> {
+    if declared {
+        observed.clone()
+    } else {
+        canonical.cloned()
+    }
+}
+
+fn effective_record_from_observation(
+    observation: RfcWorkspaceObservation,
+    canonical: Option<&RfcRecord>,
+) -> RfcRecord {
+    RfcRecord {
+        text_id: observation.text_id,
+        rfc_number: observation.rfc_number,
+        title: observation.title,
+        stage: observation.stage,
+        status: observation.status,
+        feature: composed_optional_value(
+            &observation.feature,
+            observation.feature_declared,
+            canonical.and_then(|record| record.feature.as_ref()),
+        ),
+        slug: observation.slug,
+        file_path: observation.file_path,
+        superseded_by: composed_optional_value(
+            &observation.superseded_by,
+            observation.superseded_by_declared,
+            canonical.and_then(|record| record.superseded_by.as_ref()),
+        ),
+        supersedes: composed_optional_value(
+            &observation.supersedes,
+            observation.supersedes_declared,
+            canonical.and_then(|record| record.supersedes.as_ref()),
+        ),
+        withdrawal_reason: composed_optional_value(
+            &observation.withdrawal_reason,
+            observation.withdrawal_reason_declared,
+            canonical.and_then(|record| record.withdrawal_reason.as_ref()),
+        ),
+        archived_reason: composed_optional_value(
+            &observation.archived_reason,
+            observation.archived_reason_declared,
+            canonical.and_then(|record| record.archived_reason.as_ref()),
+        ),
+        consolidated_into: composed_optional_value(
+            &observation.consolidated_into,
+            observation.consolidated_into_declared,
+            canonical.and_then(|record| record.consolidated_into.as_ref()),
+        ),
+    }
+}
+
+/// Load RFC metadata as observed by the issuing workspace.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_effective_rfcs(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<Vec<EffectiveRfcRecord>> {
+    Ok(load_effective_rfc_view(root, project)?.records)
+}
+
+/// Load one complete effective RFC view for the issuing workspace.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_effective_rfc_view(root: &Path, project: Option<&Project>) -> Result<EffectiveRfcView> {
+    with_reconcile_lock(root, project, || {
+        load_effective_rfc_view_locked(root, project)
+    })
+}
+
+fn load_effective_rfc_view_locked(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<EffectiveRfcView> {
+    let source = canonical_reconcile_source(root)?;
+    refresh_workspace_rfc_snapshot(root, project, &source)?;
+    let loader = SqliteLoader::open(crate::context::db_path(root, project))?;
+    let workspace_root = slash_path_string(&normalize_key_path(root));
+    let snapshot = loader
+        .load_rfc_workspace_snapshot(&workspace_root)?
+        .with_context(|| format!("RFC workspace snapshot missing for {workspace_root}"))?;
+    let canonical_records = loader.load_rfcs()?;
+    let mut shared = canonical_records
+        .iter()
+        .cloned()
+        .map(|record| (record.text_id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut effective = Vec::new();
+
+    for observation in loader.load_rfc_workspace_observations(&workspace_root)? {
+        let canonical = shared.remove(&observation.text_id);
+        let workspace_branch = observation.branch_name.clone();
+        let workspace_head = Some(observation.head_oid.clone());
+        let record = effective_record_from_observation(observation, canonical.as_ref());
+        let differs_from_canonical = canonical
+            .as_ref()
+            .is_none_or(|canonical| !rfc_records_equal(canonical, &record));
+        effective.push(EffectiveRfcRecord {
+            record,
+            provenance: RfcViewProvenance {
+                document_source: "workspace".to_string(),
+                workspace_presence: "present".to_string(),
+                canonical_presence: if canonical.is_some() {
+                    "present".to_string()
+                } else {
+                    "unpublished".to_string()
+                },
+                workspace_branch,
+                workspace_head,
+                canonical_ref: snapshot.canonical_ref.clone(),
+                canonical_head: snapshot.canonical_oid.clone(),
+                differs_from_canonical,
+            },
+        });
+    }
+
+    for record in shared.into_values() {
+        effective.push(EffectiveRfcRecord {
+            record,
+            provenance: RfcViewProvenance {
+                document_source: "canonical".to_string(),
+                workspace_presence: "absent".to_string(),
+                canonical_presence: "present".to_string(),
+                workspace_branch: snapshot.branch_name.clone(),
+                workspace_head: Some(snapshot.head_oid.clone()),
+                canonical_ref: snapshot.canonical_ref.clone(),
+                canonical_head: snapshot.canonical_oid.clone(),
+                differs_from_canonical: false,
+            },
+        });
+    }
+
+    effective.sort_by(|left, right| {
+        left.record
+            .rfc_number
+            .cmp(&right.record.rfc_number)
+            .then(left.record.file_path.cmp(&right.record.file_path))
+    });
+    let workspace_diagnostics = loader.load_rfc_workspace_diagnostics(&workspace_root)?;
+    let repair_records = if matches!(source, CanonicalReconcileSource::WorkspaceFallback) {
+        canonical_records
+    } else {
+        effective
+            .iter()
+            .map(|record| record.record.clone())
+            .collect()
+    };
+    Ok(EffectiveRfcView {
+        records: effective,
+        workspace_diagnostics,
+        repair_records,
+    })
+}
+
+/// Load parse and identity diagnostics for the issuing workspace's RFC snapshot.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_effective_rfc_diagnostics(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<Vec<RfcWorkspaceDiagnostic>> {
+    Ok(load_effective_rfc_view(root, project)?.workspace_diagnostics)
+}
+
+/// Resolve one RFC number in the issuing workspace's effective view.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_effective_rfc_by_number(
+    root: &Path,
+    project: Option<&Project>,
+    rfc_number: i64,
+) -> Result<Option<EffectiveRfcRecord>> {
+    let mut matches = load_effective_rfcs(root, project)?
+        .into_iter()
+        .filter(|record| record.record.rfc_number == rfc_number)
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        let identities = matches
+            .iter()
+            .map(|record| format!("{} ({})", record.record.file_path, record.record.text_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("RFC {rfc_number} is ambiguous in this workspace: {identities}");
+    }
+    Ok(matches.pop())
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn get_rfcs(path: &Path, verify: bool) -> Result<(Vec<Rfc>, bool)> {
     let mut rfcs = Vec::new();
@@ -1381,6 +1926,26 @@ pub fn get_next_rfc_id(rfc_dir: &Path) -> Result<String> {
     Ok(format!("{:05}", max_num + 1))
 }
 
+fn get_next_effective_rfc_id(
+    rfc_dir: &Path,
+    effective_rfcs: &[EffectiveRfcRecord],
+) -> Result<String> {
+    let next_file_number = get_next_rfc_id(rfc_dir)?
+        .parse::<i64>()
+        .context("Generated RFC ID was not numeric")?;
+    let next_effective_number = effective_rfcs
+        .iter()
+        .map(|effective| effective.record.rfc_number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("RFC number space is exhausted")?;
+    Ok(format!(
+        "{:05}",
+        next_file_number.max(next_effective_number)
+    ))
+}
+
 pub fn create(
     root: &Path,
     title: &str,
@@ -1392,6 +1957,13 @@ pub fn create(
     let rfc_dir = root.join(RFCS_DIR);
     let stage_dir = rfc_dir.join(format!("stage-{stage}"));
 
+    let project = Project::resolve(root).ok();
+    let effective_rfcs = if let Some(project) = project.as_ref() {
+        load_effective_rfcs(root, Some(project))?
+    } else {
+        Vec::new()
+    };
+
     if !stage_dir.exists() {
         std::fs::create_dir_all(&stage_dir)?;
     }
@@ -1399,7 +1971,7 @@ pub fn create(
     let number = if let Some(id) = id {
         id.to_string()
     } else {
-        get_next_rfc_id(&rfc_dir)?
+        get_next_effective_rfc_id(&rfc_dir, &effective_rfcs)?
     };
 
     let slug = slugify_title(title);
@@ -1409,30 +1981,35 @@ pub fn create(
     let rfc_number = number
         .parse::<i64>()
         .with_context(|| format!("RFC IDs must be numeric: {number}"))?;
+    if effective_rfcs
+        .iter()
+        .any(|effective| effective.record.rfc_number == rfc_number)
+    {
+        anyhow::bail!("RFC {number} already exists in the effective workspace view");
+    }
     let text_id = ulid::Ulid::new().to_string().to_lowercase();
     let body_content = body.unwrap_or("Write your RFC content here.");
     let content = render_anchor_rfc_content(rfc_number, &text_id, title, body_content);
 
     std::fs::write(&file_path, content)?;
 
-    if let Some(writer) = maybe_open_rfc_writer(root)? {
-        let relative_path = relative_workspace_path(root, &file_path);
-        writer.upsert_rfc(
-            &text_id,
-            rfc_number,
-            title,
-            stage,
-            "active",
-            Some(feature),
-            &slug,
-            &relative_path,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
-    }
+    let relative_path = relative_workspace_path(root, &file_path);
+    let record = RfcRecord {
+        text_id,
+        rfc_number,
+        title: title.to_string(),
+        stage,
+        status: "active".to_string(),
+        feature: Some(feature.to_string()),
+        slug,
+        file_path: relative_path,
+        superseded_by: None,
+        supersedes: None,
+        withdrawal_reason: None,
+        archived_reason: None,
+        consolidated_into: None,
+    };
+    persist_rfc_record(root, &record)?;
 
     Ok(file_path)
 }
@@ -1580,13 +2157,31 @@ pub fn detect_rfc_repair_candidates(root: &Path) -> Result<Vec<RfcRepairCandidat
         return Ok(Vec::new());
     }
 
-    let records_by_text_id: HashMap<String, RfcRecord> = maybe_open_rfc_loader(root)?
-        .map(|loader| loader.load_rfcs())
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
+    let records = load_effective_rfc_records_if_available(root)?;
+    detect_rfc_repair_candidates_with_records_inner(root, &records)
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub(crate) fn detect_rfc_repair_candidates_with_records(
+    root: &Path,
+    records: &[RfcRecord],
+) -> Result<Vec<RfcRepairCandidate>> {
+    detect_rfc_repair_candidates_with_records_inner(root, records)
+}
+
+fn detect_rfc_repair_candidates_with_records_inner(
+    root: &Path,
+    records: &[RfcRecord],
+) -> Result<Vec<RfcRepairCandidate>> {
+    let rfc_root = root.join(RFCS_DIR);
+    if !rfc_root.exists() {
+        return Ok(Vec::new());
+    }
+    let records_by_text_id = records
+        .iter()
+        .cloned()
         .map(|record| (record.text_id.clone(), record))
-        .collect();
+        .collect::<HashMap<_, _>>();
 
     let mut candidates = Vec::new();
     for path in walk_rfc_markdown_files(&rfc_root) {
@@ -1626,13 +2221,11 @@ pub fn detect_rfc_repair_candidate_for_text_id(
         return Ok(None);
     }
 
-    let records_by_text_id: HashMap<String, RfcRecord> = maybe_open_rfc_loader(root)?
-        .map(|loader| loader.load_rfcs())
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|record| (record.text_id.clone(), record))
-        .collect();
+    let records_by_text_id: HashMap<String, RfcRecord> =
+        load_effective_rfc_records_if_available(root)?
+            .into_iter()
+            .map(|record| (record.text_id.clone(), record))
+            .collect();
 
     for path in walk_rfc_markdown_files(&rfc_root) {
         let Ok(parsed) = parse_disk_rfc(root, &path) else {
@@ -1865,16 +2458,14 @@ fn ensure_rfc_number_available_for_renumber(
     }
 
     let current_rel = relative_workspace_path(root, current_path);
-    if let Some(loader) = maybe_open_rfc_loader(root)? {
-        for record in loader.load_rfcs()? {
-            if record.rfc_number == target_number && record.file_path != current_rel {
-                anyhow::bail!(
-                    "Refusing to renumber RFC to {}: metadata already exists for {} at {}",
-                    format_rfc_number(target_number),
-                    record.title,
-                    record.file_path
-                );
-            }
+    for record in load_effective_rfc_records_if_available(root)? {
+        if record.rfc_number == target_number && record.file_path != current_rel {
+            anyhow::bail!(
+                "Refusing to renumber RFC to {}: metadata already exists for {} at {}",
+                format_rfc_number(target_number),
+                record.title,
+                record.file_path
+            );
         }
     }
 
@@ -1929,13 +2520,11 @@ fn find_rfc_file_for_repair(root: &Path, rfc_root: &Path, id: &str) -> Result<Pa
         anyhow::bail!("Invalid RFC ID: {id}");
     }
     let requested_number = parse_rfc_number(id).with_context(|| format!("Invalid RFC ID: {id}"))?;
-    let records_by_text_id: HashMap<String, RfcRecord> = maybe_open_rfc_loader(root)?
-        .map(|loader| loader.load_rfcs())
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|record| (record.text_id.clone(), record))
-        .collect();
+    let records_by_text_id: HashMap<String, RfcRecord> =
+        load_effective_rfc_records_if_available(root)?
+            .into_iter()
+            .map(|record| (record.text_id.clone(), record))
+            .collect();
 
     let mut matches = Vec::new();
     for path in walk_rfc_markdown_files(rfc_root) {
@@ -2243,10 +2832,7 @@ fn matching_rfc_record_for_repair_debt(
         ));
     }
 
-    let Some(loader) = maybe_open_rfc_loader(root)? else {
-        return Ok(None);
-    };
-    let records = loader.load_rfcs()?;
+    let records = load_effective_rfc_records_if_available(root)?;
     Ok(select_rfc_record_for_repair_debt(
         records.iter(),
         text_id,
@@ -2691,6 +3277,51 @@ fn replace_first_h1_line(body: &str, replacement: &str) -> String {
     out
 }
 
+fn update_declared_stage_marker(content: &str, stage: u8) -> String {
+    let mut saw_h1 = false;
+    let mut in_fence = false;
+    let mut in_preamble = true;
+    let mut replaced = false;
+    let mut out = String::with_capacity(content.len());
+
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !saw_h1 {
+            saw_h1 = trimmed.starts_with("# ");
+            out.push_str(line);
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if !in_fence && trimmed.starts_with("## ") {
+            in_preamble = false;
+        }
+        if in_preamble && !in_fence && !replaced && declared_metadata_value(line, "Stage").declared
+        {
+            let label_end = line.find("Stage").map(|index| index + "Stage".len());
+            if let Some(label_end) = label_end
+                && let Some(relative_start) = line[label_end..].find(|ch: char| ch.is_ascii_digit())
+            {
+                let number_start = label_end + relative_start;
+                let number_end = line[number_start..]
+                    .find(|ch: char| !ch.is_ascii_digit())
+                    .map_or(line.len(), |offset| number_start + offset);
+                out.push_str(&line[..number_start]);
+                out.push_str(&stage.to_string());
+                out.push_str(&line[number_end..]);
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+
+    out
+}
+
 /// Promotes an RFC to the next stage.
 ///
 /// # Errors
@@ -2722,15 +3353,15 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
     let new_stage = rfc.stage + 1;
     let new_stage_dir = format!("stage-{new_stage}");
 
-    let text_id = extract_anchor_ulid(&file_content).with_context(|| {
+    extract_anchor_ulid(&file_content).with_context(|| {
         format!(
             "RFC {id} is missing an anchor ULID in {}",
             file_path.display()
         )
     })?;
 
-    // 2. Move File using git mv to preserve history
-    // Note: We no longer update content — stage is determined by directory, not frontmatter.
+    // 2. Move File using git mv to preserve history. The directory is authoritative,
+    // but an explicit stage marker must agree with it.
     let new_dir = path.join(new_stage_dir);
     if !new_dir.exists() {
         std::fs::create_dir_all(&new_dir)?;
@@ -2755,15 +3386,13 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
         }
     }
 
-    if matches!(
-        canonical_reconcile_source(workspace_root)?,
-        CanonicalReconcileSource::WorkspaceFallback
-    ) && load_rfc_record_by_text_id(workspace_root, &text_id)?.is_some()
-        && let Some(writer) = maybe_open_rfc_writer(workspace_root)?
-    {
-        let relative_path = relative_workspace_path(workspace_root, &new_path);
-        writer.update_rfc_stage(&text_id, new_stage, &relative_path)?;
+    let promoted_content = update_declared_stage_marker(&file_content, new_stage);
+    if promoted_content != file_content {
+        utils::edit_cli_managed_file(&new_path, move |_| Ok(promoted_content))
+            .with_context(|| format!("Failed to write {}", new_path.display()))?;
     }
+
+    sync_rfc_edit(workspace_root, &new_path, None, false)?;
 
     Ok(())
 }
@@ -3176,6 +3805,13 @@ fn parse_rfc_document(
     } else {
         0
     };
+    let stage_source = if status == "active" {
+        "path"
+    } else if declared_stage.is_some() {
+        "marker"
+    } else {
+        "legacy"
+    };
 
     let feature = declared_metadata_value_with_yaml(&metadata, "Feature", "feature");
     let reason = declared_metadata_value(&metadata, "Reason");
@@ -3212,6 +3848,7 @@ fn parse_rfc_document(
             supersedes_declared: relationships.supersedes_declared,
         },
         filename_number,
+        stage_source: stage_source.to_string(),
         canonical_metadata_conflict: lifecycle_status_conflicts
             || invalid_stage_marker
             || stage_marker_conflicts,
@@ -3360,12 +3997,14 @@ fn open_rfc_in_editor(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn maybe_open_rfc_writer(root: &Path) -> Result<Option<SqliteWriter>> {
-    let project = Project::resolve(root).ok();
-    let db_path = crate::context::db_path(root, project.as_ref());
+fn resolve_rfc_storage(root: &Path) -> Result<Option<(Option<Project>, PathBuf)>> {
+    let mut project = Project::resolve(root).ok();
+    let mut db_path = crate::context::db_path(root, project.as_ref());
     if !db_path.exists() {
         if root.join("exosuit.toml").exists() {
             let _ = crate::context::AgentContext::load(root.to_path_buf())?;
+            project = Project::resolve(root).ok();
+            db_path = crate::context::db_path(root, project.as_ref());
         } else {
             return Ok(None);
         }
@@ -3375,41 +4014,54 @@ fn maybe_open_rfc_writer(root: &Path) -> Result<Option<SqliteWriter>> {
         return Ok(None);
     }
 
-    Ok(Some(SqliteWriter::open(&db_path)?))
-}
-
-fn maybe_open_rfc_loader(root: &Path) -> Result<Option<SqliteLoader>> {
-    let project = Project::resolve(root).ok();
-    let db_path = crate::context::db_path(root, project.as_ref());
-    if !db_path.exists() {
-        if root.join("exosuit.toml").exists() {
-            let _ = crate::context::AgentContext::load(root.to_path_buf())?;
-        } else {
-            return Ok(None);
-        }
-    }
-
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    Ok(Some(SqliteLoader::open(&db_path)?))
+    Ok(Some((project, db_path)))
 }
 
 fn load_rfc_record(root: &Path, rfc_number: i64) -> Result<Option<RfcRecord>> {
-    let Some(loader) = maybe_open_rfc_loader(root)? else {
+    let Some((project, db_path)) = resolve_rfc_storage(root)? else {
         return Ok(None);
     };
-    loader.load_rfc_by_number(rfc_number)
+    if matches!(
+        canonical_reconcile_source(root)?,
+        CanonicalReconcileSource::WorkspaceFallback
+    ) {
+        return SqliteLoader::open(&db_path)?.load_rfc_by_number(rfc_number);
+    }
+    Ok(load_effective_rfc_by_number(root, project.as_ref(), rfc_number)?.map(|rfc| rfc.record))
+}
+
+fn load_effective_rfc_records_if_available(root: &Path) -> Result<Vec<RfcRecord>> {
+    let Some((project, db_path)) = resolve_rfc_storage(root)? else {
+        return Ok(Vec::new());
+    };
+    if matches!(
+        canonical_reconcile_source(root)?,
+        CanonicalReconcileSource::WorkspaceFallback
+    ) {
+        return SqliteLoader::open(&db_path)?.load_rfcs();
+    }
+    Ok(load_effective_rfcs(root, project.as_ref())?
+        .into_iter()
+        .map(|effective| effective.record)
+        .collect())
 }
 
 fn load_rfc_record_by_text_id(root: &Path, text_id: &str) -> Result<Option<RfcRecord>> {
-    let Some(loader) = maybe_open_rfc_loader(root)? else {
+    let Some((project, db_path)) = resolve_rfc_storage(root)? else {
         return Ok(None);
     };
-    Ok(loader
-        .load_rfcs()?
+    if matches!(
+        canonical_reconcile_source(root)?,
+        CanonicalReconcileSource::WorkspaceFallback
+    ) {
+        return Ok(SqliteLoader::open(&db_path)?
+            .load_rfcs()?
+            .into_iter()
+            .find(|record| record.text_id == text_id));
+    }
+    Ok(load_effective_rfcs(root, project.as_ref())?
         .into_iter()
+        .map(|effective| effective.record)
         .find(|record| record.text_id == text_id))
 }
 
@@ -3424,25 +4076,126 @@ fn load_rfc_record_by_text_or_number(
 }
 
 fn persist_rfc_record(root: &Path, record: &RfcRecord) -> Result<()> {
-    let Some(writer) = maybe_open_rfc_writer(root)? else {
+    let Some((project, db_path)) = resolve_rfc_storage(root)? else {
         return Ok(());
     };
 
-    writer.upsert_rfc(
-        &record.text_id,
-        record.rfc_number,
-        &record.title,
-        record.stage,
-        &record.status,
-        record.feature.as_deref(),
-        &record.slug,
-        &record.file_path,
-        record.superseded_by.as_deref(),
-        record.supersedes.as_deref(),
-        record.withdrawal_reason.as_deref(),
-        record.archived_reason.as_deref(),
-        record.consolidated_into.as_deref(),
-    )
+    with_reconcile_lock(root, project.as_ref(), || {
+        let source = canonical_reconcile_source(root)?;
+        if matches!(source, CanonicalReconcileSource::WorkspaceFallback) {
+            let writer = SqliteWriter::open(&db_path)?;
+            writer.upsert_rfc(
+                &record.text_id,
+                record.rfc_number,
+                &record.title,
+                record.stage,
+                &record.status,
+                record.feature.as_deref(),
+                &record.slug,
+                &record.file_path,
+                record.superseded_by.as_deref(),
+                record.supersedes.as_deref(),
+                record.withdrawal_reason.as_deref(),
+                record.archived_reason.as_deref(),
+                record.consolidated_into.as_deref(),
+            )?;
+            refresh_workspace_rfc_snapshot(root, project.as_ref(), &source)?;
+            return Ok(());
+        }
+
+        refresh_workspace_rfc_snapshot(root, project.as_ref(), &source)?;
+        let loader = SqliteLoader::open(&db_path)?;
+        let writer = SqliteWriter::open(&db_path)?;
+        let workspace_root = slash_path_string(&normalize_key_path(root));
+        let snapshot = loader
+            .load_rfc_workspace_snapshot(&workspace_root)?
+            .with_context(|| format!("RFC workspace snapshot missing for {workspace_root}"))?;
+        let diagnostics = loader.load_rfc_workspace_diagnostics(&workspace_root)?;
+        let canonical = loader
+            .load_rfcs()?
+            .into_iter()
+            .find(|candidate| candidate.text_id == record.text_id);
+        let mut observations = loader.load_rfc_workspace_observations(&workspace_root)?;
+        let observation = observations
+            .iter_mut()
+            .find(|candidate| candidate.text_id == record.text_id)
+            .with_context(|| {
+                format!(
+                    "RFC {} ({}) is not a valid document in the current workspace snapshot",
+                    record.rfc_number, record.text_id
+                )
+            })?;
+
+        observation.rfc_number = record.rfc_number;
+        observation.title.clone_from(&record.title);
+        observation.stage = record.stage;
+        observation.status.clone_from(&record.status);
+        observation.slug.clone_from(&record.slug);
+        observation.file_path.clone_from(&record.file_path);
+        apply_workspace_optional_override(
+            &mut observation.feature,
+            &mut observation.feature_declared,
+            &record.feature,
+            canonical
+                .as_ref()
+                .and_then(|record| record.feature.as_ref()),
+        );
+        apply_workspace_optional_override(
+            &mut observation.superseded_by,
+            &mut observation.superseded_by_declared,
+            &record.superseded_by,
+            canonical
+                .as_ref()
+                .and_then(|record| record.superseded_by.as_ref()),
+        );
+        apply_workspace_optional_override(
+            &mut observation.supersedes,
+            &mut observation.supersedes_declared,
+            &record.supersedes,
+            canonical
+                .as_ref()
+                .and_then(|record| record.supersedes.as_ref()),
+        );
+        apply_workspace_optional_override(
+            &mut observation.withdrawal_reason,
+            &mut observation.withdrawal_reason_declared,
+            &record.withdrawal_reason,
+            canonical
+                .as_ref()
+                .and_then(|record| record.withdrawal_reason.as_ref()),
+        );
+        apply_workspace_optional_override(
+            &mut observation.archived_reason,
+            &mut observation.archived_reason_declared,
+            &record.archived_reason,
+            canonical
+                .as_ref()
+                .and_then(|record| record.archived_reason.as_ref()),
+        );
+        apply_workspace_optional_override(
+            &mut observation.consolidated_into,
+            &mut observation.consolidated_into_declared,
+            &record.consolidated_into,
+            canonical
+                .as_ref()
+                .and_then(|record| record.consolidated_into.as_ref()),
+        );
+
+        writer.replace_rfc_workspace_snapshot(&snapshot, &observations, &diagnostics)
+    })
+}
+
+fn apply_workspace_optional_override(
+    observed: &mut Option<String>,
+    declared: &mut bool,
+    desired: &Option<String>,
+    canonical: Option<&String>,
+) {
+    let differs_from_canonical = desired.as_ref() != canonical;
+    if *declared || differs_from_canonical {
+        observed.clone_from(desired);
+        *declared = true;
+    }
 }
 
 fn relative_workspace_path(root: &Path, path: &Path) -> String {
@@ -3983,6 +4736,21 @@ mod tests {
         );
     }
 
+    fn shared_sidecar_project(root: &Path, git_common_dir: &Path, state_root: &Path) -> Project {
+        Project {
+            id: crate::project::ProjectId::from_git_common_dir(git_common_dir),
+            git_common_dir: git_common_dir.to_path_buf(),
+            workspace_root: Some(root.to_path_buf()),
+            policy: crate::project::StatePolicy::Sidecar,
+            projects_config_path: None,
+            state_root: state_root.to_path_buf(),
+            sidecar_key: Some("rfc-overlay-test".to_string()),
+            sidecar_root: state_root.parent().map(Path::to_path_buf),
+            sidecar_auto_commit: false,
+            sidecar_auto_push: crate::project::SidecarAutoPushPolicy::Never,
+        }
+    }
+
     #[test]
     fn test_parse_rfc_frontmatter() {
         let content = r"---
@@ -4265,6 +5033,233 @@ This RFC supersedes:
     }
 
     #[test]
+    fn linked_worktrees_compose_distinct_rfc_views_over_shared_canonical_state() {
+        let temp = TempDir::new().unwrap();
+        let main_root = temp.path().join("main");
+        let feature_root = temp.path().join("feature");
+        let state_root = temp.path().join("sidecar-state");
+        fs::create_dir_all(main_root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(state_root.join("cache")).unwrap();
+        init_git_repository(&main_root);
+
+        let canonical_path = main_root.join("docs/rfcs/stage-1/00001-overlay.md");
+        fs::write(
+            &canonical_path,
+            "<!-- exo:1 ulid:01overlay -->\n\n# RFC 1: Canonical Overlay\n\n**Feature**: core\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        fs::write(
+            main_root.join("docs/rfcs/stage-1/00002-canonical-only.md"),
+            "<!-- exo:2 ulid:01canonicalonly -->\n\n# RFC 2: Canonical Only\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(&main_root, "canonical RFC");
+        publish_origin_main(&main_root, &canonical_oid);
+        run_git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature_root.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        fs::create_dir_all(feature_root.join("docs/rfcs/stage-2")).unwrap();
+        fs::rename(
+            feature_root.join("docs/rfcs/stage-1/00001-overlay.md"),
+            feature_root.join("docs/rfcs/stage-2/00001-overlay.md"),
+        )
+        .unwrap();
+        fs::remove_file(feature_root.join("docs/rfcs/stage-1/00002-canonical-only.md")).unwrap();
+
+        let git_common_dir = main_root.join(".git");
+        let main_project = shared_sidecar_project(&main_root, &git_common_dir, &state_root);
+        let feature_project = shared_sidecar_project(&feature_root, &git_common_dir, &state_root);
+        SqliteWriter::open(main_project.db_path()).unwrap();
+        reconcile_rfcs_with_project(&main_root, Some(&main_project)).unwrap();
+
+        let main_view = load_effective_rfc_by_number(&main_root, Some(&main_project), 1)
+            .unwrap()
+            .unwrap();
+        let feature_view = load_effective_rfc_by_number(&feature_root, Some(&feature_project), 1)
+            .unwrap()
+            .unwrap();
+        let shared = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        let absent_from_feature =
+            load_effective_rfc_by_number(&feature_root, Some(&feature_project), 2)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(main_view.record.stage, 1);
+        assert!(!main_view.provenance.differs_from_canonical);
+        assert_eq!(feature_view.record.stage, 2);
+        assert_eq!(feature_view.provenance.document_source, "workspace");
+        assert_eq!(
+            feature_view.provenance.workspace_branch.as_deref(),
+            Some("feature")
+        );
+        assert!(feature_view.provenance.differs_from_canonical);
+        assert_eq!(absent_from_feature.provenance.document_source, "canonical");
+        assert_eq!(absent_from_feature.provenance.workspace_presence, "absent");
+        let feature_rfcs = load_effective_rfcs(&feature_root, Some(&feature_project)).unwrap();
+        assert_eq!(
+            get_next_effective_rfc_id(&feature_root.join(RFCS_DIR), &feature_rfcs).unwrap(),
+            "00003",
+            "number allocation must include canonical RFCs absent from the workspace"
+        );
+        assert_eq!(
+            shared.stage, 1,
+            "feature observation cannot mutate canonical state"
+        );
+
+        let loader = SqliteLoader::open(main_project.db_path()).unwrap();
+        assert!(
+            loader
+                .load_rfc_workspace_snapshot(&slash_path_string(&normalize_key_path(&main_root)))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            loader
+                .load_rfc_workspace_snapshot(&slash_path_string(&normalize_key_path(&feature_root)))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn managed_branch_mutations_update_overlay_without_advancing_canonical_state() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+
+        let text_id = ulid::Ulid::new().to_string().to_lowercase();
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-managed.md"),
+            format!(
+                "<!-- exo:1 ulid:{text_id} -->\n\n# RFC 1: Managed\n\n**Feature**: core\n\n## Summary\n\nCanonical.\n"
+            ),
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical RFC");
+        publish_origin_main(root, &canonical_oid);
+        run_git(root, &["checkout", "-b", "feature"]);
+
+        let project = Project::resolve(root).unwrap();
+        fs::create_dir_all(project.db_path().parent().unwrap()).unwrap();
+        SqliteWriter::open(project.db_path()).unwrap();
+        reconcile_rfcs_with_project(root, Some(&project)).unwrap();
+        let repairs = detect_rfc_repair_candidates(root).unwrap();
+        assert!(repairs.is_empty(), "unexpected repair debt: {repairs:#?}");
+        withdraw(
+            &root.join(RFCS_DIR),
+            "1",
+            Some("The feature branch retired this proposal."),
+        )
+        .unwrap();
+        let created = create(
+            root,
+            "Workspace Only",
+            Some("00002"),
+            "workspace-feature",
+            0,
+            Some("This proposal is still local to the feature branch."),
+        )
+        .unwrap();
+
+        let shared_loader = SqliteLoader::open(project.db_path()).unwrap();
+        let shared = shared_loader.load_rfc_by_number(1).unwrap().unwrap();
+        assert_eq!(shared.status, "active");
+        assert!(shared_loader.load_rfc_by_number(2).unwrap().is_none());
+
+        let withdrawn = load_effective_rfc_by_number(root, Some(&project), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(withdrawn.record.status, "withdrawn");
+        assert_eq!(
+            withdrawn.record.withdrawal_reason.as_deref(),
+            Some("The feature branch retired this proposal.")
+        );
+        assert!(withdrawn.provenance.differs_from_canonical);
+
+        let workspace_only = load_effective_rfc_by_number(root, Some(&project), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            workspace_only.record.feature.as_deref(),
+            Some("workspace-feature")
+        );
+        assert_eq!(workspace_only.provenance.canonical_presence, "unpublished");
+        assert_eq!(
+            workspace_only.record.file_path,
+            relative_workspace_path(root, &created)
+        );
+
+        commit_all(root, "commit managed overlay changes");
+        let committed_withdrawal = load_effective_rfc_by_number(root, Some(&project), 1)
+            .unwrap()
+            .unwrap();
+        let committed_workspace_only = load_effective_rfc_by_number(root, Some(&project), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed_withdrawal.record.withdrawal_reason.as_deref(),
+            Some("The feature branch retired this proposal."),
+            "committing an unchanged RFC document must preserve its workspace lifecycle metadata"
+        );
+        assert_eq!(
+            committed_workspace_only.record.feature.as_deref(),
+            Some("workspace-feature"),
+            "committing an unchanged RFC document must preserve its workspace feature metadata"
+        );
+    }
+
+    #[test]
+    fn managed_promotion_updates_declared_stage_marker_before_overlay_refresh() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-0")).unwrap();
+        init_git_repository(root);
+
+        fs::write(
+            root.join("docs/rfcs/stage-0/00001-promote.md"),
+            "<!-- exo:1 ulid:01promotemarker -->\n\n# RFC 1: Promote\n\n**Stage**: 0\n\n## Summary\n\nCandidate.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical promotion candidate");
+        publish_origin_main(root, &canonical_oid);
+        run_git(root, &["checkout", "-b", "feature"]);
+
+        let project = Project::resolve(root).unwrap();
+        fs::create_dir_all(project.db_path().parent().unwrap()).unwrap();
+        SqliteWriter::open(project.db_path()).unwrap();
+        reconcile_rfcs_with_project(root, Some(&project)).unwrap();
+
+        promote(&root.join(RFCS_DIR), "1").unwrap();
+
+        let promoted_path = root.join("docs/rfcs/stage-1/00001-promote.md");
+        let promoted_content = fs::read_to_string(&promoted_path).unwrap();
+        assert!(promoted_content.contains("**Stage**: 1"));
+        let effective = load_effective_rfc_by_number(root, Some(&project), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.record.stage, 1);
+        assert_eq!(
+            effective.record.file_path,
+            "docs/rfcs/stage-1/00001-promote.md"
+        );
+    }
+
+    #[test]
     fn unborn_single_worktree_uses_workspace_reconciliation() {
         let temp = TempDir::new().unwrap();
         init_git_repository(temp.path());
@@ -4316,7 +5311,7 @@ This RFC supersedes:
         .unwrap();
 
         finished_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap()
             .unwrap();
         worker.unwrap().join().unwrap();
@@ -4681,6 +5676,21 @@ This RFC supersedes:
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].text_id, "01current");
         assert_eq!(records[1].text_id, "01historical");
+
+        let effective = load_effective_rfcs(root, None).unwrap();
+        assert_eq!(
+            effective
+                .iter()
+                .filter(|record| record.record.rfc_number == 100)
+                .count(),
+            2
+        );
+        let error = load_effective_rfc_by_number(root, None, 100).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("00100-current.md"));
+        assert!(message.contains("01current"));
+        assert!(message.contains("00100-historical.md"));
+        assert!(message.contains("01historical"));
     }
 
     #[test]

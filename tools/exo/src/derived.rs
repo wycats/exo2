@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::Path};
 
+use crate::context::SqliteLoader;
 #[cfg(test)]
-use crate::context::SqliteWriter;
-use crate::context::{SQLITE_DB_PATH, SqliteLoader};
+use crate::context::{SQLITE_DB_PATH, SqliteWriter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedGoalStatus {
@@ -22,12 +22,20 @@ impl<'a> DeriveContext<'a> {
     pub fn load(root: &'a Path) -> Self {
         let mut rfc_stages = HashMap::new();
 
-        let db_path = root.join(SQLITE_DB_PATH);
-        if let Ok(loader) = SqliteLoader::open(&db_path)
-            && let Ok(rfcs) = loader.load_rfcs()
-        {
-            for r in rfcs {
+        let project = crate::project::Project::resolve(root).ok();
+        if let Ok(rfcs) = crate::rfc::load_effective_rfcs(root, project.as_ref()) {
+            for effective in rfcs {
+                let r = effective.record;
                 rfc_stages.insert(format!("{:05}", r.rfc_number), r.stage);
+            }
+        } else {
+            let db_path = crate::context::db_path(root, project.as_ref());
+            if let Ok(loader) = SqliteLoader::open(&db_path)
+                && let Ok(rfcs) = loader.load_rfcs()
+            {
+                for r in rfcs {
+                    rfc_stages.insert(format!("{:05}", r.rfc_number), r.stage);
+                }
             }
         }
 

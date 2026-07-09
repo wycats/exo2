@@ -5,12 +5,14 @@
 //! maintenance paths may still address shadow tables directly.
 
 use crate::api::protocol::ErrorCode;
-use crate::context::sqlite_loader::RfcRecord;
+use crate::context::sqlite_loader::{
+    RfcRecord, RfcWorkspaceDiagnostic, RfcWorkspaceObservation, RfcWorkspaceSnapshot,
+};
 use crate::failure::ExoFailure;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use exosuit_storage::{
-    Connection, Database, OptionalExtension, open_database, open_memory_database,
+    Connection, Database, OptionalExtension, open_database, open_memory_database, params,
 };
 use fractional_index::FractionalIndex;
 use std::collections::BTreeSet;
@@ -1537,6 +1539,137 @@ impl SqliteWriter {
 
         tx.commit()
             .context("Failed to commit canonical RFC reconciliation")
+    }
+
+    /// Atomically replace one workspace's RFC snapshot, observations, and diagnostics.
+    pub fn replace_rfc_workspace_snapshot(
+        &self,
+        snapshot: &RfcWorkspaceSnapshot,
+        observations: &[RfcWorkspaceObservation],
+        diagnostics: &[RfcWorkspaceDiagnostic],
+    ) -> Result<()> {
+        let tx = self
+            .db
+            .connection()
+            .unchecked_transaction()
+            .context("Failed to start RFC workspace snapshot transaction")?;
+
+        let updated = tx
+            .execute(
+                "UPDATE rfc_workspace_snapshots
+                 SET branch_name = ?2,
+                     head_oid = ?3,
+                     document_digest = ?4,
+                     canonical_ref = ?5,
+                     canonical_oid = ?6,
+                     observed_at = ?7
+                 WHERE workspace_root = ?1",
+                params![
+                    snapshot.workspace_root,
+                    snapshot.branch_name,
+                    snapshot.head_oid,
+                    snapshot.document_digest,
+                    snapshot.canonical_ref,
+                    snapshot.canonical_oid,
+                    snapshot.observed_at,
+                ],
+            )
+            .context("Failed to update RFC workspace snapshot")?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO rfc_workspace_snapshots (
+                workspace_root, branch_name, head_oid, document_digest,
+                canonical_ref, canonical_oid, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    snapshot.workspace_root,
+                    snapshot.branch_name,
+                    snapshot.head_oid,
+                    snapshot.document_digest,
+                    snapshot.canonical_ref,
+                    snapshot.canonical_oid,
+                    snapshot.observed_at,
+                ],
+            )
+            .context("Failed to insert RFC workspace snapshot")?;
+        }
+
+        tx.execute(
+            "DELETE FROM rfc_workspace_diagnostics WHERE workspace_root = ?1",
+            [&snapshot.workspace_root],
+        )
+        .context("Failed to clear RFC workspace diagnostics")?;
+        tx.execute(
+            "DELETE FROM rfc_workspace_observations WHERE workspace_root = ?1",
+            [&snapshot.workspace_root],
+        )
+        .context("Failed to clear RFC workspace observations")?;
+
+        for observation in observations {
+            tx.execute(
+                "INSERT INTO rfc_workspace_observations (
+                    workspace_root, text_id, rfc_number, title, stage, stage_source,
+                    status, feature, feature_declared, slug, file_path,
+                    superseded_by, superseded_by_declared, supersedes,
+                    supersedes_declared, withdrawal_reason,
+                    withdrawal_reason_declared, archived_reason,
+                    archived_reason_declared, consolidated_into,
+                    consolidated_into_declared, branch_name, head_oid, observed_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                 )",
+                params![
+                    observation.workspace_root,
+                    observation.text_id,
+                    observation.rfc_number,
+                    observation.title,
+                    observation.stage,
+                    observation.stage_source,
+                    observation.status,
+                    observation.feature,
+                    observation.feature_declared,
+                    observation.slug,
+                    observation.file_path,
+                    observation.superseded_by,
+                    observation.superseded_by_declared,
+                    observation.supersedes,
+                    observation.supersedes_declared,
+                    observation.withdrawal_reason,
+                    observation.withdrawal_reason_declared,
+                    observation.archived_reason,
+                    observation.archived_reason_declared,
+                    observation.consolidated_into,
+                    observation.consolidated_into_declared,
+                    observation.branch_name,
+                    observation.head_oid,
+                    observation.observed_at,
+                ],
+            )
+            .context("Failed to insert RFC workspace observation")?;
+        }
+
+        for diagnostic in diagnostics {
+            tx.execute(
+                "INSERT INTO rfc_workspace_diagnostics (
+                    workspace_root, file_path, diagnostic_code, text_id,
+                    rfc_number, message, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    diagnostic.workspace_root,
+                    diagnostic.file_path,
+                    diagnostic.diagnostic_code,
+                    diagnostic.text_id,
+                    diagnostic.rfc_number,
+                    diagnostic.message,
+                    diagnostic.observed_at,
+                ],
+            )
+            .context("Failed to insert RFC workspace diagnostic")?;
+        }
+
+        tx.commit()
+            .context("Failed to commit RFC workspace snapshot transaction")
     }
 
     /// Update just the stage and `file_path` for an RFC (used by rfc promote).

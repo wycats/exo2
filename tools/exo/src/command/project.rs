@@ -422,18 +422,42 @@ fn project_snapshot_output(
     project.commands_available = workspace_available;
     project.write_available = workspace_available;
 
-    if workspace_available
-        && let Some(workspace_root) = project.workspace_root.as_deref()
-        && let Ok(resolved_project) = resolver.resolve(workspace_root)
-        && resolved_project.id.as_str() == project.id
-    {
+    let resolved_workspace_project = if workspace_available {
+        let workspace_root = project.workspace_root.as_deref().unwrap_or(root);
+        let resolved_project = resolver.resolve(workspace_root).with_context(|| {
+            format!(
+                "Failed to resolve workspace {} for project snapshot",
+                workspace_root.display()
+            )
+        })?;
+        if resolved_project.id.as_str() != project.id {
+            anyhow::bail!(
+                "Workspace {} resolved to project {}, not selected project {}",
+                workspace_root.display(),
+                resolved_project.id.as_str(),
+                project.id
+            );
+        }
         crate::rfc::reconcile_rfcs_once_with_project(workspace_root, Some(&resolved_project))
             .with_context(|| "Failed to reconcile RFC metadata for project snapshot")?;
-    }
+        Some(resolved_project)
+    } else {
+        None
+    };
 
     let phase_details = loader.load_active_phase_details_for_workspace(workspace_key.as_deref())?;
     let state = loader.load_state()?;
-    let rfcs = loader.load_rfcs_for_display()?;
+    let rfcs = if workspace_available {
+        crate::rfc::load_effective_rfcs(
+            project.workspace_root.as_deref().unwrap_or(root),
+            resolved_workspace_project.as_ref(),
+        )?
+        .into_iter()
+        .map(|effective| effective.record)
+        .collect()
+    } else {
+        loader.load_rfcs_for_display()?
+    };
     let inbox = loader.load_inbox()?;
     let git_dirty = project
         .workspace_root

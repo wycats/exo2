@@ -1,5 +1,4 @@
 use crate::ExoResult;
-use crate::context::SqliteLoader;
 use crate::project::Project;
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,11 +24,11 @@ pub fn index_rfcs_with_project(
         return Ok(HashMap::new());
     }
 
-    let loader = SqliteLoader::open(&db_path)?;
-    let rfcs = loader.load_rfcs()?;
+    let rfcs = crate::rfc::load_effective_rfcs(root, project)?;
     let mut entries = HashMap::new();
 
-    for rfc in rfcs {
+    for effective in rfcs {
+        let rfc = effective.record;
         entries.insert(
             format!("{:05}", rfc.rfc_number),
             RfcIndexEntry {
