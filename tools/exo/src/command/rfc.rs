@@ -1473,16 +1473,18 @@ impl MutableCommand for RfcPromote {
         let rfc_number = parse_rfc_number(&self.id)?;
 
         // Get current stage before promotion
-        let current = loader
-            .load_rfc_by_number(rfc_number)?
-            .ok_or_else(|| rfc_not_found_failure(&self.id))?;
+        let current = match loader.load_rfc_by_number(rfc_number)? {
+            Some(current) => current,
+            None => rfc::workspace_rfc_record(ctx.root, &self.id)
+                .map_err(|_| rfc_not_found_failure(&self.id))?,
+        };
         let read_status = rfc_read_status(&current).to_string();
         let old_stage = current.stage;
         let title = current.title.clone();
 
         if let Some(candidate) =
             rfc::detect_rfc_repair_candidate_for_text_id(ctx.root, &current.text_id)?
-            && rfc::is_blocking_rfc_repair_candidate(&candidate)
+            && rfc::is_blocking_rfc_promote_candidate(&candidate)
         {
             return Err(rfc_promote_repair_required_failure(&self.id, &candidate));
         }

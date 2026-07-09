@@ -7,6 +7,9 @@ use std::path::Path;
 use std::process::Command;
 use test_support::{exo_cmd, exo_init, exo_rfc_create};
 
+use exo::context::SqliteLoader;
+use exo::project::Project;
+
 fn git_init(root: &Path) {
     let output = Command::new("git")
         .args(["init"])
@@ -89,6 +92,16 @@ fn verifier_preserves_untracked_anchored_rfc_after_promote() {
         .args(["rfc", "promote", "10185", "--stage", "1"])
         .assert()
         .success();
+
+    let project = Project::resolve(root).expect("resolve project");
+    let loader = SqliteLoader::open(project.db_path()).expect("open RFC metadata");
+    assert!(
+        loader
+            .load_rfc_by_number(10185)
+            .expect("load RFC metadata")
+            .is_none(),
+        "promoting an unmerged RFC must not republish it into shared canonical metadata"
+    );
 
     let promoted = root.join("docs/rfcs/stage-1/10185-identity-preserving-verifier.md");
     assert!(promoted.exists(), "promoted RFC must exist");

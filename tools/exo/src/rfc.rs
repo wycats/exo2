@@ -2689,7 +2689,11 @@ fn replace_first_h1_line(body: &str, replacement: &str) -> String {
 pub fn promote(path: &Path, id: &str) -> Result<()> {
     let file_path = find_rfc_file(path, id)?;
     let workspace_root = workspace_root_from_rfc_root(path)?;
-    ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
+    ensure_no_rfc_repair_debt_matching(
+        workspace_root,
+        &file_path,
+        is_blocking_rfc_promote_candidate,
+    )?;
     let file_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
     let filename = file_path
@@ -2738,7 +2742,9 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
         }
     }
 
-    if let Some(writer) = maybe_open_rfc_writer(workspace_root)? {
+    if load_rfc_record_by_text_id(workspace_root, &text_id)?.is_some()
+        && let Some(writer) = maybe_open_rfc_writer(workspace_root)?
+    {
         let relative_path = relative_workspace_path(workspace_root, &new_path);
         writer.update_rfc_stage(&text_id, new_stage, &relative_path)?;
     }
@@ -3020,6 +3026,13 @@ pub(crate) fn is_blocking_rfc_repair_candidate(candidate: &RfcRepairCandidate) -
         .any(|reason| reason != "filename_slug_drift" && reason != "metadata_path_drift")
 }
 
+pub(crate) fn is_blocking_rfc_promote_candidate(candidate: &RfcRepairCandidate) -> bool {
+    is_blocking_rfc_repair_candidate(candidate)
+        && !(candidate.stored_metadata.is_none()
+            && candidate.reasons.len() == 1
+            && candidate.reasons[0] == "metadata_relink")
+}
+
 fn is_blocking_rfc_rename_candidate(candidate: &RfcRepairCandidate) -> bool {
     !candidate
         .reasons
@@ -3088,6 +3101,15 @@ fn parse_disk_rfc(root: &Path, path: &Path) -> Result<DiskRfcRecord> {
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let relative_path = relative_workspace_path(root, path);
     Ok(parse_rfc_document(&relative_path, &content, None)?.disk)
+}
+
+pub(crate) fn workspace_rfc_record(root: &Path, id: &str) -> Result<RfcRecord> {
+    let file_path = find_rfc_file(&root.join(RFCS_DIR), id)?;
+    let content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    let relative_path = relative_workspace_path(root, &file_path);
+    let parsed = parse_rfc_document(&relative_path, &content, None)?;
+    Ok(canonical_rfc_record(&parsed, None))
 }
 
 fn parse_rfc_document(
