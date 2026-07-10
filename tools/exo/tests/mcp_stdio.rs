@@ -467,8 +467,7 @@ fn exo_mcp_proxy_health_fails_when_source_build_missing() {
     let health: JsonValue = serde_json::from_slice(&output.stdout).expect("proxy health JSON");
     assert_eq!(health["ok"], false, "{health}");
     assert_eq!(
-        health["status"]["activation"]["state"],
-        "source_build_missing",
+        health["status"]["activation"]["state"], "source_build_missing",
         "{health}"
     );
     assert!(health["status"]["worker"].is_null(), "{health}");
@@ -509,8 +508,7 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
     // source_worker, so after reload file_blake3(alt_source) ≠ worker.stable_hash, which
     // makes the activation check produce worker_source_mismatch on the next spawn.
     let alt_source = temp.path().join("alt-source-exo");
-    std::fs::write(&alt_source, b"alternate-source-activation-identity")
-        .expect("write alt source");
+    std::fs::write(&alt_source, b"alternate-source-activation-identity").expect("write alt source");
     write_dogfood_activation(&activation, &alt_source, &exo_mcp, &exo, &exo_mcp);
 
     // Atomically replace source_worker to trigger identity-change detection.
@@ -522,9 +520,8 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
     std::fs::rename(&source_worker_v2, &source_worker)
         .expect("atomically replace source worker to trigger identity change");
 
-    // The proxy detects source_worker's inode changed → restarts the worker.
-    // validate_running_worker_activation checks the reloaded activation (alt_source)
-    // against the new worker's identity → worker_source_mismatch → error.
+    // The proxy reloads the activation before using the replacement worker and
+    // rejects the newly configured non-executable source.
     let restarted = call_exo_run(&mut stdin, &mut stdout, 2, "status");
     assert_eq!(restarted["error"]["code"], -32000, "{restarted}");
     let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-failure");
@@ -532,7 +529,7 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
     assert!(
         status["result"]["last_error"]
             .as_str()
-            .is_some_and(|error| error.contains("does not match the current source build")),
+            .is_some_and(|error| error.contains("source worker is not executable")),
         "{status}"
     );
 
@@ -575,31 +572,37 @@ fn exo_mcp_proxy_reloads_replaced_activation_record() {
     let initial = call_exo_run(&mut stdin, &mut stdout, 1, "status");
     assert_eq!(initial["result"]["isError"], false, "{initial}");
 
-    // Point activation at a sentinel file with a distinct hash.  The running worker's
-    // stable_hash was computed from first_source (H1), so file_blake3(stale_source) ≠ H1
-    // → the proxy reports worker_source_mismatch after reload.
-    // (We cannot write directly to first_source because Linux returns ETXTBSY when
-    // attempting to open an executing ELF for writing.)
-    let stale_source = temp.path().join("stale-source-exo");
-    std::fs::write(&stale_source, b"stale-source-identity").expect("write stale source");
-    write_dogfood_activation(&activation, &stale_source, &exo_mcp, &exo, &exo_mcp);
-
-    let stale_status = call_proxy_status(&mut stdin, &mut stdout, "proxy-stale-activation");
-    assert_eq!(
-        stale_status["result"]["activation"]["state"],
-        "worker_source_mismatch",
-        "{stale_status}"
-    );
-
-    // Now reload with second_source (also hash H1 = worker.stable_hash) → "current".
+    // A repeated dogfood activation can point the durable proxy at a new source path.
+    // The proxy reloads the same activation record, replaces its running worker, and
+    // reports the exact newly activated executable without restarting the proxy.
     write_dogfood_activation(&activation, &second_source, &exo_mcp, &exo, &exo_mcp);
 
+    let refreshed = call_exo_run(&mut stdin, &mut stdout, 2, "status");
+    assert_eq!(refreshed["result"]["isError"], false, "{refreshed}");
     let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-refresh");
     assert_eq!(
         status["result"]["activation"]["state"], "current",
         "{status}"
     );
     assert_eq!(status["result"]["activation"]["ok"], true, "{status}");
+    assert_eq!(
+        std::path::Path::new(
+            status["result"]["worker"]["identity"]["executable_path"]
+                .as_str()
+                .expect("worker executable path")
+        )
+        .canonicalize()
+        .expect("canonical worker executable"),
+        second_source
+            .canonicalize()
+            .expect("canonical second source"),
+        "{status}"
+    );
+    assert_eq!(
+        status["result"]["last_restart_reason"], "dogfood_activation_changed",
+        "{status}"
+    );
+    assert_eq!(status["result"]["restart_count"], 1, "{status}");
 
     drop(stdin);
     let status = child.wait().expect("wait for exo-mcp");

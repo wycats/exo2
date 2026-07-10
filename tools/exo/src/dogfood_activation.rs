@@ -26,6 +26,12 @@ pub struct DogfoodActivationStatus {
     pub issue: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DogfoodActivationBinding {
+    pub activation_path: PathBuf,
+    pub pinned_mcp_config: PathBuf,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct DogfoodActivationRecord {
     version: u32,
@@ -103,10 +109,7 @@ impl DogfoodActivation {
             );
         }
         if let Some(worker_identity) = worker_identity
-            && file_blake3(&record.source.exo.path).ok().as_deref()
-                != worker_identity
-                    .pointer("/executable_identity/stable_hash")
-                    .and_then(JsonValue::as_str)
+            && !worker_matches_source(&record.source.exo, worker_identity)
         {
             return self.failure(
                 "worker_source_mismatch",
@@ -152,10 +155,24 @@ impl DogfoodActivation {
     }
 
     pub fn pinned_mcp_config_from_environment() -> Result<Option<PathBuf>, String> {
+        Ok(Self::binding_from_environment()?.map(|binding| binding.pinned_mcp_config))
+    }
+
+    pub fn binding_from_environment() -> Result<Option<DogfoodActivationBinding>, String> {
         let Some(path) = std::env::var_os(DOGFOOD_ACTIVATION_ENV).map(PathBuf::from) else {
             return Ok(None);
         };
-        Self::pinned_mcp_config_from_path(&path).map(Some)
+        let activation_path = path.canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve dogfood activation {}: {error}",
+                path.display()
+            )
+        })?;
+        let pinned_mcp_config = Self::pinned_mcp_config_from_path(&activation_path)?;
+        Ok(Some(DogfoodActivationBinding {
+            activation_path,
+            pinned_mcp_config,
+        }))
     }
 
     fn pinned_mcp_config_from_path(path: &Path) -> Result<PathBuf, String> {
@@ -211,6 +228,23 @@ impl DogfoodActivation {
 
 fn fingerprint_matches_path_for(expected: &DogfoodActivationBinary, path: &Path) -> bool {
     file_blake3(path).is_ok_and(|hash| hash == expected.blake3)
+}
+
+fn worker_matches_source(expected: &DogfoodActivationBinary, worker_identity: &JsonValue) -> bool {
+    let expected_path = expected
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| expected.path.clone());
+    let worker_path = worker_identity
+        .get("executable_path")
+        .and_then(JsonValue::as_str)
+        .map(PathBuf::from)
+        .map(|path| path.canonicalize().unwrap_or(path));
+    let worker_hash = worker_identity
+        .pointer("/executable_identity/stable_hash")
+        .and_then(JsonValue::as_str);
+    worker_path.as_deref() == Some(expected_path.as_path())
+        && file_blake3(&expected.path).ok().as_deref() == worker_hash
 }
 
 fn path_matches(expected: &Path, actual: &Path) -> bool {
@@ -287,7 +321,10 @@ mod tests {
             fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
         }
         let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
-        let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") } });
+        let worker = json!({
+            "executable_path": source_exo,
+            "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") }
+        });
 
         let status = activation.status(&installed_mcp, Some(&worker));
         assert!(status.ok);
@@ -307,7 +344,10 @@ mod tests {
         let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         fs::write(&source_exo, "new source build").expect("update source build");
 
-        let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&installed_exo).expect("hash") } });
+        let worker = json!({
+            "executable_path": installed_exo,
+            "executable_identity": { "stable_hash": file_blake3(&installed_exo).expect("hash") }
+        });
         let status = activation.status(&installed_mcp, Some(&worker));
         assert!(!status.ok);
         assert_eq!(status.state, "worker_source_mismatch");
@@ -326,7 +366,10 @@ mod tests {
         }
         let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         fs::write(&source_mcp, "rebuilt source proxy").expect("rebuild source proxy");
-        let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") } });
+        let worker = json!({
+            "executable_path": source_exo,
+            "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") }
+        });
 
         let status = activation.status(&source_mcp, Some(&worker));
         assert!(status.ok);

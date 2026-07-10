@@ -437,18 +437,62 @@ impl ProxyWorker {
         self.dogfood_activation
             .ensure_before_worker(&self.proxy_identity.executable_path)
             .map_err(HostError::Protocol)?;
-        if self.running.is_some() {
-            return Ok(None);
+        if let Some(identity) = self
+            .running
+            .as_ref()
+            .map(|running| running.identity.clone())
+        {
+            if self
+                .dogfood_activation
+                .ensure_worker(&self.proxy_identity.executable_path, &identity)
+                .is_ok()
+            {
+                return Ok(None);
+            }
+            self.running = None;
+            let reason = "dogfood_activation_changed";
+            self.pending_restart_reason = Some(reason.to_string());
+            if let Err(error) = self.refresh_worker_spec_from_activation() {
+                self.record_restart_error(reason, &error);
+                return Err(error);
+            }
+            self.spawn_worker_recording(reason, true)?;
+            self.validate_running_worker_activation(reason)?;
+            return Ok(Some(reason.to_string()));
         }
 
         let reason = self
             .pending_restart_reason
             .clone()
             .unwrap_or_else(|| "initial_start".to_string());
+        if reason == "dogfood_activation_changed"
+            && let Err(error) = self.refresh_worker_spec_from_activation()
+        {
+            self.record_restart_error(&reason, &error);
+            return Err(error);
+        }
         let record_restart = reason != "initial_start";
         self.spawn_worker_recording(&reason, record_restart)?;
         self.validate_running_worker_activation(&reason)?;
         Ok(Some(reason))
+    }
+
+    fn refresh_worker_spec_from_activation(&mut self) -> Result<(), HostError> {
+        let source_worker =
+            DogfoodActivation::source_worker_path_from_environment().ok_or_else(|| {
+                HostError::Protocol(
+                    "dogfood activation changed but its source worker could not be resolved"
+                        .to_string(),
+                )
+            })?;
+        if !is_executable_file(&source_worker) {
+            return Err(HostError::Protocol(format!(
+                "dogfood activation source worker is not executable: {}",
+                source_worker.display()
+            )));
+        }
+        self.spec = exo_worker_spec(source_worker).current_dir(std::env::current_dir()?);
+        Ok(())
     }
 
     fn validate_running_worker_activation(&mut self, reason: &str) -> Result<(), HostError> {
@@ -893,6 +937,24 @@ fn worker_spec_for(
 
 fn exo_worker_spec(program: PathBuf) -> WorkerSpec {
     WorkerSpec::new(program).arg("mcp").arg("worker")
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn exo_manifest_path() -> PathBuf {
