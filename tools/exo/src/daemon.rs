@@ -1016,6 +1016,25 @@ fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
     Ok(current)
 }
 
+fn atomic_request_project(
+    workspace: &Path,
+    startup_project: &Project,
+    outcome_ledger: &RequestOutcomeLedger,
+    request: &RequestEnvelope,
+) -> io::Result<Project> {
+    if outcome_ledger
+        .has_recorded_atomic_outcome(request, &startup_project.db_path())
+        .map_err(to_io_error)?
+    {
+        return Ok(startup_project.clone());
+    }
+
+    let request_project = daemon_request_project(startup_project)?;
+    AgentContext::prepare_request_transaction(workspace, Some(&request_project))
+        .map_err(to_io_error)?;
+    Ok(request_project)
+}
+
 fn spawn_daemon_after_lock(
     paths: &LocalRuntimePaths,
     socket_path: &Path,
@@ -1917,32 +1936,11 @@ pub async fn run_daemon(
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
                         let recovery = resolved_request_recovery(&workspace, &req);
-                        let request_project = match daemon_request_project(project.as_ref()) {
-                            Ok(project) => project,
-                            Err(error) => {
-                                return daemon_handler_error_response(
-                                    handler_request_id,
-                                    ErrorCode::PreconditionFailed,
-                                    error.to_string(),
-                                );
-                            }
-                        };
-
                         match recovery {
                             Some(recovery)
                                 if recovery.recovery_class
                                     == RecoveryClass::AtomicProjectState =>
                             {
-                                if let Err(error) = AgentContext::prepare_request_transaction(
-                                    &workspace,
-                                    Some(&request_project),
-                                ) {
-                                    return daemon_handler_error_response(
-                                        handler_request_id,
-                                        ErrorCode::PreconditionFailed,
-                                        error.to_string(),
-                                    );
-                                }
                                 let Some((namespace, operation)) = request_command_path(&req)
                                 else {
                                     return daemon_handler_error_response(
@@ -1950,6 +1948,21 @@ pub async fn run_daemon(
                                         ErrorCode::InvalidInput,
                                         "atomic request is missing a command path".to_string(),
                                     );
+                                };
+                                let request_project = match atomic_request_project(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &outcome_ledger,
+                                    &req,
+                                ) {
+                                    Ok(project) => project,
+                                    Err(error) => {
+                                        return daemon_handler_error_response(
+                                            handler_request_id,
+                                            ErrorCode::PreconditionFailed,
+                                            error.to_string(),
+                                        );
+                                    }
                                 };
                                 outcome_ledger
                                     .execute_atomic_project_state(
@@ -1983,6 +1996,16 @@ pub async fn run_daemon(
                             Some(recovery)
                                 if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
                             {
+                                let request_project = match daemon_request_project(project.as_ref()) {
+                                    Ok(project) => project,
+                                    Err(error) => {
+                                        return daemon_handler_error_response(
+                                            handler_request_id,
+                                            ErrorCode::PreconditionFailed,
+                                            error.to_string(),
+                                        );
+                                    }
+                                };
                                 outcome_ledger
                                     .execute(
                                         req,
@@ -2000,12 +2023,24 @@ pub async fn run_daemon(
                                     )
                                     .response
                             }
-                            _ => handle_request_with_project_and_diagnostics_as_writer(
-                                &workspace,
-                                Some(&request_project),
-                                req,
-                                &diagnostics,
-                            ),
+                            _ => {
+                                let request_project = match daemon_request_project(project.as_ref()) {
+                                    Ok(project) => project,
+                                    Err(error) => {
+                                        return daemon_handler_error_response(
+                                            handler_request_id,
+                                            ErrorCode::PreconditionFailed,
+                                            error.to_string(),
+                                        );
+                                    }
+                                };
+                                handle_request_with_project_and_diagnostics_as_writer(
+                                    &workspace,
+                                    Some(&request_project),
+                                    req,
+                                    &diagnostics,
+                                )
+                            }
                         }
                     })
                     .await
@@ -2448,6 +2483,94 @@ mod tests {
         assert_eq!(
             refreshed.sidecar_auto_push,
             crate::project::SidecarAutoPushPolicy::Always
+        );
+    }
+
+    fn recorded_atomic_request(
+        temp: &tempfile::TempDir,
+        request_id: &str,
+    ) -> (RequestOutcomeLedger, RequestEnvelope) {
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "id": request_id,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": {
+                        "kind": "operation",
+                        "path": ["epoch", "add"]
+                    },
+                    "input": {"title": "Recorded epoch"}
+                }
+            }
+        }))
+        .expect("parse request");
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let execution = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                daemon_handler_error_response(
+                    request.id,
+                    ErrorCode::Internal,
+                    "recorded response".to_string(),
+                )
+            },
+        );
+        assert!(!execution.replayed);
+        (ledger, request)
+    }
+
+    #[test]
+    fn recorded_atomic_replay_skips_project_policy_refresh() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&config_path, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        let mut project = test_project(&workspace, workspace.join(".exo"));
+        project.projects_config_path = Some(config_path);
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-before-policy-drift");
+
+        assert!(
+            daemon_request_project(&project).is_err(),
+            "fixture must fail mutable policy refresh"
+        );
+        let replay_project = atomic_request_project(&workspace, &project, &ledger, &request)
+            .expect("recorded response should bypass policy refresh");
+        assert_eq!(replay_project, project);
+    }
+
+    #[test]
+    fn recorded_atomic_replay_skips_projection_hydration() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(workspace.join("docs/agent-context"))
+            .expect("create projection directory");
+        std::fs::write(
+            workspace.join("docs/agent-context/epochs.sql"),
+            "not valid SQL projection",
+        )
+        .expect("write invalid projection");
+        let project = test_project(&workspace, workspace.clone());
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-before-hydration-drift");
+
+        assert!(
+            AgentContext::prepare_request_transaction(&workspace, Some(&project)).is_err(),
+            "fixture must fail projection hydration"
+        );
+        let _ = std::fs::remove_dir_all(project.db_path().parent().expect("database parent"));
+        let replay_project = atomic_request_project(&workspace, &project, &ledger, &request)
+            .expect("recorded response should bypass projection hydration");
+        assert_eq!(replay_project, project);
+        assert!(
+            !project.db_path().exists(),
+            "replay preparation must not recreate the project database"
         );
     }
 

@@ -13,7 +13,7 @@ use crate::command::command_spec::CommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::Invocation;
 use anyhow::{Context, Result, anyhow};
-use exosuit_storage::rusqlite::TransactionBehavior;
+use exosuit_storage::rusqlite::{OpenFlags, TransactionBehavior};
 use exosuit_storage::{Connection, OptionalExtension, RequestTransaction, params};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -86,6 +86,28 @@ impl RequestOutcomeLedger {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return whether this request already has a terminal runtime or canonical
+    /// record. Callers use this before project refresh so completed retries can
+    /// replay even when current workspace preparation is unavailable.
+    pub(crate) fn has_recorded_atomic_outcome(
+        &self,
+        request: &RequestEnvelope,
+        project_db_path: &Path,
+    ) -> Result<bool> {
+        let request_hash = request_hash(request)?;
+        let runtime_outcome = self.runtime_outcome_is_terminal(&request.id, &request_hash);
+        if matches!(runtime_outcome, Ok(true)) {
+            return Ok(true);
+        }
+        let canonical_outcome = canonical_atomic_outcome_exists(project_db_path, &request.id);
+        match (runtime_outcome, canonical_outcome) {
+            (_, Ok(true)) => Ok(true),
+            (Ok(false), Ok(false)) => Ok(false),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(true), _) => Ok(true),
+        }
     }
 
     pub fn execute<F>(
@@ -318,6 +340,22 @@ impl RequestOutcomeLedger {
         Ok(connection)
     }
 
+    fn runtime_outcome_is_terminal(&self, request_id: &str, request_hash: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let existing = connection
+            .query_row(
+                "SELECT request_hash, response_json
+                 FROM daemon_request_outcomes
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(existing.is_some_and(|(stored_hash, response)| {
+            stored_hash != request_hash || response.is_some()
+        }))
+    }
+
     fn reserve(
         &self,
         request_id: &str,
@@ -451,6 +489,38 @@ impl RequestOutcomeLedger {
         )?;
         Ok(())
     }
+}
+
+fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> Result<bool> {
+    if !project_db_path.exists() {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(project_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "open canonical atomic outcome database {}",
+                project_db_path.display()
+            )
+        })?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'atomic_request_outcomes'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM atomic_request_outcomes WHERE request_id = ?1",
+            [request_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub fn resolved_request_recovery(
@@ -947,6 +1017,66 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(epoch_count(&db_path), 0);
         assert_eq!(atomic_outcome_count(&db_path), 0);
+    }
+
+    #[test]
+    fn recorded_atomic_probe_distinguishes_terminal_and_incomplete_requests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+
+        let runtime_request = request("request-runtime-terminal", "task-a");
+        let runtime_outcome = ledger.execute(
+            runtime_request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        assert_eq!(runtime_outcome.response.status, Status::Ok);
+        assert!(
+            ledger
+                .has_recorded_atomic_outcome(&runtime_request, &db_path)
+                .expect("probe runtime outcome")
+        );
+
+        let incomplete_request = request("request-runtime-incomplete", "task-a");
+        let incomplete_hash = request_hash(&incomplete_request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &incomplete_request.id,
+                    &incomplete_hash,
+                    Effect::Write,
+                    "instance-a",
+                )
+                .expect("reserve incomplete request"),
+            Reservation::Execute
+        ));
+        assert!(
+            !ledger
+                .has_recorded_atomic_outcome(&incomplete_request, &db_path)
+                .expect("probe incomplete outcome")
+        );
+
+        let canonical_request = request("request-canonical-terminal", "task-a");
+        let canonical_hash = request_hash(&canonical_request).expect("request hash");
+        execute_atomic_core(
+            &db_path,
+            &canonical_hash,
+            Effect::Write,
+            canonical_request.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit canonical outcome");
+        assert!(
+            ledger
+                .has_recorded_atomic_outcome(&canonical_request, &db_path)
+                .expect("probe canonical outcome")
+        );
     }
 
     #[test]
