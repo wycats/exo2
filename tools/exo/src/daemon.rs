@@ -44,7 +44,7 @@ use crate::daemon_diagnostics::{
 };
 use crate::daemon_outcomes::{
     DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
-    request_declared_recovery, request_may_have_recorded_outcome, resolved_request_recovery,
+    request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -1077,6 +1077,15 @@ fn validated_request_workspace(
     Ok(workspace_root)
 }
 
+fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
+    let code = if error.kind() == io::ErrorKind::InvalidInput {
+        ErrorCode::InvalidInput
+    } else {
+        ErrorCode::PreconditionFailed
+    };
+    daemon_handler_error_response(id, code, error.to_string())
+}
+
 fn replay_request_context(
     startup_workspace: &Path,
     startup_project: &Project,
@@ -1139,11 +1148,7 @@ fn execute_ledgered_daemon_request(
             {
                 Ok(context) => context,
                 Err(error) => {
-                    return daemon_handler_error_response(
-                        request_id,
-                        ErrorCode::PreconditionFailed,
-                        error.to_string(),
-                    );
+                    return daemon_workspace_error_response(request_id, &error);
                 }
             };
             handle_request_with_project_and_diagnostics_as_writer(
@@ -2065,9 +2070,8 @@ pub async fn run_daemon(
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        if request_may_have_recorded_outcome(&workspace, &req)
-                            && let Ok(Some(outcome)) = outcome_ledger
-                                .terminal_outcome_before_preparation(&req)
+                        if let Ok(Some(outcome)) =
+                            outcome_ledger.terminal_outcome_before_preparation(&req)
                         {
                             return outcome.response;
                         }
@@ -2092,10 +2096,9 @@ pub async fn run_daemon(
                             ) {
                                 Ok(workspace) => workspace,
                                 Err(error) => {
-                                    return daemon_handler_error_response(
+                                    return daemon_workspace_error_response(
                                         handler_request_id,
-                                        ErrorCode::PreconditionFailed,
-                                        error.to_string(),
+                                        &error,
                                     );
                                 }
                             };
@@ -2123,10 +2126,9 @@ pub async fn run_daemon(
                                 ) {
                                     Ok(project) => project,
                                     Err(error) => {
-                                        return daemon_handler_error_response(
+                                        return daemon_workspace_error_response(
                                             handler_request_id,
-                                            ErrorCode::PreconditionFailed,
-                                            error.to_string(),
+                                            &error,
                                         );
                                     }
                                 };
@@ -2183,10 +2185,9 @@ pub async fn run_daemon(
                                 ) {
                                     Ok(context) => context,
                                     Err(error) => {
-                                        return daemon_handler_error_response(
+                                        return daemon_workspace_error_response(
                                             handler_request_id,
-                                            ErrorCode::PreconditionFailed,
-                                            error.to_string(),
+                                            &error,
                                         );
                                     }
                                 };
@@ -2740,6 +2741,11 @@ mod tests {
             error.to_string(),
             "request workspace does not belong to this daemon's project and state root"
         );
+        let response = daemon_workspace_error_response("foreign-workspace".to_string(), &error);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::PreconditionFailed)
+        );
     }
 
     #[test]
@@ -2759,6 +2765,11 @@ mod tests {
             "daemon request workspace path could not be canonicalized"
         );
         assert!(!error.to_string().contains(&missing.to_string_lossy()[..]));
+        let response = daemon_workspace_error_response("missing-workspace".to_string(), &error);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::InvalidInput)
+        );
     }
 
     #[test]

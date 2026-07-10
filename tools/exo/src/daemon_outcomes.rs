@@ -126,24 +126,28 @@ impl RequestOutcomeLedger {
         request: &RequestEnvelope,
     ) -> Result<Option<OutcomeExecution>> {
         let request_hash = request_hash(request)?;
-        let runtime_outcome = self.connection().and_then(|connection| {
-            connection
-                .query_row(
-                    "SELECT request_hash, effect, response_json
+        let runtime_outcome =
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))
+                .and_then(|connection| {
+                    connection.pragma_update(None, "busy_timeout", 5_000)?;
+                    connection
+                        .query_row(
+                            "SELECT request_hash, effect, response_json
              FROM daemon_request_outcomes
              WHERE request_id = ?1",
-                    [&request.id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-        });
+                            [&request.id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(Into::into)
+                });
 
         if let Ok(Some((stored_hash, effect, response_json))) = &runtime_outcome {
             let effect = effect_from_name(&effect)?;
@@ -812,12 +816,6 @@ pub fn resolved_request_recovery(
         })
 }
 
-pub fn request_may_have_recorded_outcome(workspace_root: &Path, request: &RequestEnvelope) -> bool {
-    resolved_request_recovery(workspace_root, request)
-        .or_else(|| request_declared_recovery(request))
-        .is_some_and(|recovery| recovery.effect != Effect::Pure)
-}
-
 pub fn request_declared_recovery(request: &RequestEnvelope) -> Option<ResolvedRequestRecovery> {
     let Some((namespace, operation)) = request_command_path(request) else {
         return None;
@@ -1330,11 +1328,41 @@ mod tests {
         );
         std::fs::remove_dir(&workspace).expect("remove issuing workspace");
 
-        assert!(request_may_have_recorded_outcome(temp.path(), &request));
         let replay = ledger
             .terminal_outcome_before_preparation(&request)
             .expect("probe dynamic terminal runtime outcome")
             .expect("completed dynamic runtime outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn terminal_runtime_outcome_replay_does_not_require_registered_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let mut request = request("request-retired-command", "task-a");
+        let Op::Call(params) = &mut request.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["retired".to_string(), "command".to_string()],
+        };
+        request.workspace_root = Some(temp.path().join("removed-worktree"));
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+
+        assert!(resolved_request_recovery(temp.path(), &request).is_none());
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request)
+            .expect("probe retired command outcome")
+            .expect("completed retired command outcome");
 
         assert!(replay.replayed);
         assert_eq!(replay.response.result, first.response.result);
@@ -2127,11 +2155,6 @@ mod tests {
         };
         params.input = serde_json::json!({});
 
-        assert!(!request_may_have_recorded_outcome(Path::new("."), &status));
-        assert!(request_may_have_recorded_outcome(
-            Path::new("."),
-            &request("request-1", "task-a")
-        ));
         assert_eq!(
             resolved_request_effect(Path::new("."), &request("request-1", "task-a")),
             Some(Effect::Write)
@@ -2155,7 +2178,6 @@ mod tests {
             resolved_request_effect(Path::new("."), &apply),
             Some(Effect::Exec)
         );
-        assert!(request_may_have_recorded_outcome(Path::new("."), &apply));
 
         let Op::Call(params) = &mut apply.op else {
             unreachable!("test request is a call");
@@ -2165,7 +2187,6 @@ mod tests {
             resolved_request_effect(Path::new("."), &apply),
             Some(Effect::Pure)
         );
-        assert!(!request_may_have_recorded_outcome(Path::new("."), &apply));
     }
 
     #[test]
