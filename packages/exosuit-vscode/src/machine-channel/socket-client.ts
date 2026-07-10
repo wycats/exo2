@@ -36,6 +36,7 @@ export interface DaemonRuntimePaths {
 }
 
 export interface DaemonEnsureResult extends DaemonRuntimePaths {
+  workspaceRoot?: string;
   pid?: number | null;
   instanceId?: string | null;
   probeOk?: boolean | null;
@@ -101,6 +102,7 @@ interface ProjectResolveJson {
 interface DaemonEnsureJson {
   status?: string;
   result?: {
+    workspace_root?: unknown;
     runtime_dir?: unknown;
     socket_path?: unknown;
     endpoint?: unknown;
@@ -204,6 +206,7 @@ function parseDaemonEnsureResult(stdout: string): DaemonEnsureResult {
   }
 
   return {
+    workspaceRoot: optionalString(paths.workspace_root) ?? undefined,
     runtimeDir: paths.runtime_dir,
     socketPath: paths.socket_path,
     endpoint: optionalString(paths.endpoint) ?? paths.socket_path,

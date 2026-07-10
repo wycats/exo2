@@ -1707,6 +1707,13 @@ fn should_use_daemon_writer_lane(
         && matches!(effect, Effect::Write | Effect::Exec)
 }
 
+fn daemon_writer_request_workspace<'a>(
+    handler_workspace: &'a Path,
+    project_workspace: Option<&'a Path>,
+) -> &'a Path {
+    project_workspace.unwrap_or(handler_workspace)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_after_success_with_diagnostics(
     workspace_root: &Path,
@@ -1811,9 +1818,10 @@ fn call_ensured_daemon_writer(
         json!({ "request_id": id }),
     );
 
-    let request_workspace_root = project
-        .and_then(|project| project.workspace_root.as_deref())
-        .unwrap_or(workspace_root);
+    let request_workspace_root = daemon_writer_request_workspace(
+        workspace_root,
+        project.and_then(|project| project.workspace_root.as_deref()),
+    );
     let writer_request = RequestEnvelope {
         protocol_version: protocol::PROTOCOL_VERSION,
         id: id.clone(),
@@ -2840,6 +2848,21 @@ mod tests {
     use crate::api::protocol::{HelpParams, Op, RequestEnvelope};
     use crate::command_reference::ExoCommandReference;
     use crate::steering::{SuggestedAction, WorkIntent};
+
+    #[test]
+    fn daemon_writer_request_uses_resolved_worktree_root() {
+        let handler_workspace = Path::new("/workspace/packages/tool");
+        let project_workspace = Path::new("/workspace");
+
+        assert_eq!(
+            daemon_writer_request_workspace(handler_workspace, Some(project_workspace)),
+            project_workspace
+        );
+        assert_eq!(
+            daemon_writer_request_workspace(handler_workspace, None),
+            handler_workspace
+        );
+    }
 
     #[test]
     fn help_root_includes_phase_namespace_and_next_call() {

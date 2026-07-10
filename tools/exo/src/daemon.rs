@@ -1028,11 +1028,22 @@ fn daemon_request_context(
     startup_project: &Project,
     request: &RequestEnvelope,
 ) -> io::Result<DaemonRequestContext> {
+    let workspace_root = validated_request_workspace(startup_workspace, startup_project, request)?;
+    let mut request_project = daemon_request_project(startup_project)?;
+    request_project.workspace_root = Some(workspace_root.clone());
+    Ok(DaemonRequestContext {
+        workspace_root,
+        project: request_project,
+    })
+}
+
+fn validated_request_workspace(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> io::Result<PathBuf> {
     let Some(requested_workspace) = request.workspace_root.as_deref() else {
-        return Ok(DaemonRequestContext {
-            workspace_root: startup_workspace.to_path_buf(),
-            project: daemon_request_project(startup_project)?,
-        });
+        return Ok(startup_workspace.to_path_buf());
     };
 
     if !requested_workspace.is_absolute() {
@@ -1042,7 +1053,6 @@ fn daemon_request_context(
         ));
     }
 
-    let startup_project = daemon_request_project(startup_project)?;
     let workspace_root = requested_workspace.canonicalize().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1050,10 +1060,7 @@ fn daemon_request_context(
         )
     })?;
     if workspace_root == startup_workspace {
-        return Ok(DaemonRequestContext {
-            workspace_root,
-            project: startup_project,
-        });
+        return Ok(workspace_root);
     }
 
     let belongs_to_project = startup_project
@@ -1067,12 +1074,7 @@ fn daemon_request_context(
         ));
     }
 
-    let mut request_project = startup_project;
-    request_project.workspace_root = Some(workspace_root.clone());
-    Ok(DaemonRequestContext {
-        workspace_root,
-        project: request_project,
-    })
+    Ok(workspace_root)
 }
 
 fn replay_request_context(
@@ -2063,7 +2065,21 @@ pub async fn run_daemon(
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let recovery = resolved_request_recovery(&workspace, &req);
+                        let request_workspace = match validated_request_workspace(
+                            &workspace,
+                            project.as_ref(),
+                            &req,
+                        ) {
+                            Ok(workspace) => workspace,
+                            Err(error) => {
+                                return daemon_handler_error_response(
+                                    handler_request_id,
+                                    ErrorCode::PreconditionFailed,
+                                    error.to_string(),
+                                );
+                            }
+                        };
+                        let recovery = resolved_request_recovery(&request_workspace, &req);
                         match recovery {
                             Some(recovery)
                                 if recovery.recovery_class
@@ -2706,6 +2722,25 @@ mod tests {
     }
 
     #[test]
+    fn daemon_request_context_reports_unavailable_workspace_without_leaking_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let missing = temp.path().join("missing-worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&missing));
+
+        let error = daemon_request_context(&primary, &startup, &request)
+            .expect_err("missing workspace must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "daemon request workspace path could not be canonicalized"
+        );
+        assert!(!error.to_string().contains(&missing.to_string_lossy()[..]));
+    }
+
+    #[test]
     fn daemon_request_context_uses_startup_workspace_for_legacy_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let primary = create_test_git_repo(&temp, "primary");
@@ -2732,6 +2767,55 @@ mod tests {
 
         assert_eq!(context.workspace_root, primary);
         assert_eq!(context.project, startup);
+    }
+
+    #[test]
+    fn linked_worktree_local_arguments_drive_recovery_classification() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-recovery-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        std::fs::write(linked.join("replacement.md"), "Replacement body.\n")
+            .expect("write linked-worktree body file");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "linked-recovery-classification",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["rfc", "edit"] },
+                    "input": {
+                        "id": "0001",
+                        "body-file": "replacement.md"
+                    }
+                }
+            }
+        }))
+        .expect("linked RFC edit request");
+
+        assert!(
+            resolved_request_recovery(&primary, &request).is_none(),
+            "the body file is intentionally absent from the daemon startup workspace"
+        );
+        let request_workspace = validated_request_workspace(&primary, &startup, &request)
+            .expect("validate linked request workspace");
+        let recovery = resolved_request_recovery(&request_workspace, &request)
+            .expect("classify linked-worktree RFC edit");
+
+        assert_eq!(recovery.effect, Effect::Write);
+        assert_eq!(recovery.recovery_class, RecoveryClass::ExternalAtMostOnce);
     }
 
     fn recorded_atomic_request(
