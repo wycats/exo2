@@ -78,11 +78,15 @@ ID: a committed V021 outcome is replayed, while absence of an outcome proves
 that the interrupted SQLite transaction did not commit and may be executed
 again safely.
 
-Ordinary command failures roll back the request transaction. A structured
-outcome-review precondition is an explicit stateful response and may commit
+Ordinary command failures roll back the request transaction. An outcome-review
+prompt without approval evidence also rolls back. When a matching approval has
+been supplied, the structured outcome-review precondition commits the recorded
 approval evidence with its replayable response. SQL projection and sidecar
 checkpoint work run after the canonical commit as an idempotent finalization
 stage; replacement daemons resume that stage from the canonical response.
+Runtime reservations record the recovery class that created them. An in-flight
+reservation without that marker predates this atomic contract and remains
+indeterminate after daemon replacement rather than authorizing execution.
 Completed runtime and canonical outcomes are retained for at least seven days
 and pruned during outcome-ledger activity. Canonical proof remains retained
 while an unresolved runtime reservation references the request ID.

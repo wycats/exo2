@@ -33,14 +33,20 @@ pub struct RequestOutcomeLedger {
 enum Reservation {
     Execute,
     Replay(Box<ResponseEnvelope>),
-    InFlight { instance_id: String },
+    InFlight {
+        instance_id: String,
+        recovery_class: Option<RecoveryClass>,
+    },
     Conflict,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum RuntimeOutcomeState {
     Missing,
-    InFlight { instance_id: String },
+    InFlight {
+        instance_id: String,
+        recovery_class: Option<RecoveryClass>,
+    },
     Terminal,
 }
 
@@ -82,6 +88,7 @@ impl RequestOutcomeLedger {
                  request_hash TEXT NOT NULL,
                  effect TEXT NOT NULL,
                  instance_id TEXT NOT NULL,
+                 recovery_class TEXT,
                  response_json TEXT,
                  started_at INTEGER NOT NULL,
                  completed_at INTEGER
@@ -89,6 +96,20 @@ impl RequestOutcomeLedger {
              CREATE INDEX IF NOT EXISTS daemon_request_outcomes_completed_at
                  ON daemon_request_outcomes(completed_at);",
         )?;
+        let has_recovery_class: bool = connection.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pragma_table_info('daemon_request_outcomes')
+                 WHERE name = 'recovery_class'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_recovery_class {
+            connection.execute(
+                "ALTER TABLE daemon_request_outcomes ADD COLUMN recovery_class TEXT",
+                [],
+            )?;
+        }
         ledger.prune_completed(&connection)?;
         Ok(ledger)
     }
@@ -112,8 +133,23 @@ impl RequestOutcomeLedger {
             || matches!(
                 &runtime_outcome,
                 Ok(RuntimeOutcomeState::InFlight {
-                    instance_id: owner
+                    instance_id: owner,
+                    ..
                 }) if owner == instance_id
+            )
+            || matches!(
+                &runtime_outcome,
+                Ok(RuntimeOutcomeState::InFlight {
+                    recovery_class: Some(recovery_class),
+                    ..
+                }) if *recovery_class != RecoveryClass::AtomicProjectState
+            )
+            || matches!(
+                &runtime_outcome,
+                Ok(RuntimeOutcomeState::InFlight {
+                    recovery_class: None,
+                    ..
+                })
             )
         {
             return Ok(false);
@@ -159,7 +195,13 @@ impl RequestOutcomeLedger {
             }
         };
 
-        match self.reserve(&request_id, &request_hash, effect, instance_id) {
+        match self.reserve(
+            &request_id,
+            &request_hash,
+            effect,
+            RecoveryClass::ExternalAtMostOnce,
+            instance_id,
+        ) {
             Ok(Reservation::Replay(response)) => OutcomeExecution {
                 response: *response,
                 replayed: true,
@@ -168,7 +210,9 @@ impl RequestOutcomeLedger {
                 response: request_id_conflict_response(request_id, effect),
                 replayed: false,
             },
-            Ok(Reservation::InFlight { instance_id: owner }) if owner == instance_id => {
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) if owner == instance_id => {
                 match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
                     Ok(Some(response)) => OutcomeExecution {
                         response,
@@ -190,7 +234,9 @@ impl RequestOutcomeLedger {
                     },
                 }
             }
-            Ok(Reservation::InFlight { instance_id: owner }) => OutcomeExecution {
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) => OutcomeExecution {
                 response: in_flight_response(request_id, effect, &owner, true),
                 replayed: false,
             },
@@ -264,75 +310,91 @@ impl RequestOutcomeLedger {
             }
         };
 
-        let owns_runtime_reservation =
-            match self.reserve(&request_id, &request_hash, effect, instance_id) {
-                Ok(Reservation::Replay(response)) => {
-                    return OutcomeExecution {
-                        response: *response,
-                        replayed: true,
-                    };
-                }
-                Ok(Reservation::Conflict) => {
-                    return OutcomeExecution {
-                        response: without_committed_effect(request_id_conflict_response(
-                            request_id, effect,
-                        )),
-                        replayed: false,
-                    };
-                }
-                Ok(Reservation::InFlight { instance_id: owner }) if owner == instance_id => {
-                    match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
-                        Ok(Some(response)) => {
-                            return OutcomeExecution {
-                                response,
-                                replayed: true,
-                            };
-                        }
-                        Ok(None) => {
-                            match canonical_atomic_outcome_exists(project_db_path, &request_id) {
-                                Ok(true) => false,
-                                Ok(false) => {
-                                    return OutcomeExecution {
-                                        response: in_flight_response(
-                                            request_id, effect, &owner, false,
-                                        ),
-                                        replayed: false,
-                                    };
-                                }
-                                Err(error) => {
-                                    return OutcomeExecution {
-                                        response: without_committed_effect(ledger_error_response(
-                                            request_id,
-                                            effect,
-                                            "daemon.request_outcome_lookup_failed",
-                                            error,
-                                            false,
-                                        )),
-                                        replayed: false,
-                                    };
-                                }
+        let owns_runtime_reservation = match self.reserve(
+            &request_id,
+            &request_hash,
+            effect,
+            RecoveryClass::AtomicProjectState,
+            instance_id,
+        ) {
+            Ok(Reservation::Replay(response)) => {
+                return OutcomeExecution {
+                    response: *response,
+                    replayed: true,
+                };
+            }
+            Ok(Reservation::Conflict) => {
+                return OutcomeExecution {
+                    response: without_committed_effect(request_id_conflict_response(
+                        request_id, effect,
+                    )),
+                    replayed: false,
+                };
+            }
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) if owner == instance_id => {
+                match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
+                    Ok(Some(response)) => {
+                        return OutcomeExecution {
+                            response,
+                            replayed: true,
+                        };
+                    }
+                    Ok(None) => {
+                        match canonical_atomic_outcome_exists(project_db_path, &request_id) {
+                            Ok(true) => false,
+                            Ok(false) => {
+                                return OutcomeExecution {
+                                    response: in_flight_response(request_id, effect, &owner, false),
+                                    replayed: false,
+                                };
+                            }
+                            Err(error) => {
+                                return OutcomeExecution {
+                                    response: without_committed_effect(ledger_error_response(
+                                        request_id,
+                                        effect,
+                                        "daemon.request_outcome_lookup_failed",
+                                        error,
+                                        false,
+                                    )),
+                                    replayed: false,
+                                };
                             }
                         }
-                        Err(error) => {
-                            return OutcomeExecution {
-                                response: without_committed_effect(ledger_error_response(
-                                    request_id,
-                                    effect,
-                                    "daemon.request_outcome_lookup_failed",
-                                    error,
-                                    false,
-                                )),
-                                replayed: false,
-                            };
-                        }
+                    }
+                    Err(error) => {
+                        return OutcomeExecution {
+                            response: without_committed_effect(ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_lookup_failed",
+                                error,
+                                false,
+                            )),
+                            replayed: false,
+                        };
                     }
                 }
-                Ok(Reservation::Execute) => true,
-                Ok(Reservation::InFlight { .. }) => false,
-                // V021 remains sufficient when the runtime-only ledger is
-                // temporarily unavailable. Completion below is best-effort.
-                Err(_) => false,
-            };
+            }
+            Ok(Reservation::Execute) => true,
+            Ok(Reservation::InFlight {
+                recovery_class: Some(RecoveryClass::AtomicProjectState),
+                ..
+            }) => false,
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) => {
+                return OutcomeExecution {
+                    response: in_flight_response(request_id, effect, &owner, true),
+                    replayed: false,
+                };
+            }
+            // V021 remains sufficient when the runtime-only ledger is
+            // temporarily unavailable. Completion below is best-effort.
+            Err(_) => false,
+        };
 
         let atomic = match execute_atomic_core(
             project_db_path,
@@ -421,7 +483,7 @@ impl RequestOutcomeLedger {
         let connection = self.connection()?;
         let existing = connection
             .query_row(
-                "SELECT request_hash, instance_id, response_json
+                "SELECT request_hash, instance_id, recovery_class, response_json
                  FROM daemon_request_outcomes
                  WHERE request_id = ?1",
                 [request_id],
@@ -430,17 +492,21 @@ impl RequestOutcomeLedger {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
         Ok(match existing {
             None => RuntimeOutcomeState::Missing,
-            Some((stored_hash, _, _)) if stored_hash != request_hash => {
+            Some((stored_hash, _, _, _)) if stored_hash != request_hash => {
                 RuntimeOutcomeState::Terminal
             }
-            Some((_, _, Some(_))) => RuntimeOutcomeState::Terminal,
-            Some((_, instance_id, None)) => RuntimeOutcomeState::InFlight { instance_id },
+            Some((_, _, _, Some(_))) => RuntimeOutcomeState::Terminal,
+            Some((_, instance_id, recovery_class, None)) => RuntimeOutcomeState::InFlight {
+                instance_id,
+                recovery_class: recovery_class.as_deref().and_then(recovery_class_from_name),
+            },
         })
     }
 
@@ -449,13 +515,14 @@ impl RequestOutcomeLedger {
         request_id: &str,
         request_hash: &str,
         effect: Effect,
+        recovery_class: RecoveryClass,
         instance_id: &str,
     ) -> Result<Reservation> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
-                "SELECT request_hash, instance_id, response_json
+                "SELECT request_hash, instance_id, recovery_class, response_json
                  FROM daemon_request_outcomes
                  WHERE request_id = ?1",
                 [request_id],
@@ -464,30 +531,35 @@ impl RequestOutcomeLedger {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
 
         let reservation = match existing {
-            Some((stored_hash, _, _)) if stored_hash != request_hash => Reservation::Conflict,
-            Some((_, _, Some(response_json))) => Reservation::Replay(Box::new(
+            Some((stored_hash, _, _, _)) if stored_hash != request_hash => Reservation::Conflict,
+            Some((_, _, _, Some(response_json))) => Reservation::Replay(Box::new(
                 serde_json::from_str(&response_json)
                     .context("deserialize recorded daemon response")?,
             )),
-            Some((_, owner_instance_id, None)) => Reservation::InFlight {
+            Some((_, owner_instance_id, stored_recovery_class, None)) => Reservation::InFlight {
                 instance_id: owner_instance_id,
+                recovery_class: stored_recovery_class
+                    .as_deref()
+                    .and_then(recovery_class_from_name),
             },
             None => {
                 transaction.execute(
                     "INSERT INTO daemon_request_outcomes (
-                         request_id, request_hash, effect, instance_id, started_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                         request_id, request_hash, effect, instance_id, recovery_class, started_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         request_id,
                         request_hash,
                         effect_name(effect),
                         instance_id,
+                        recovery_class_name(recovery_class),
                         now_timestamp(),
                     ],
                 )?;
@@ -811,7 +883,7 @@ fn atomic_response_commits(response: &ResponseEnvelope) -> bool {
                 error
                     .details
                     .as_ref()
-                    .is_some_and(contains_workflow_confirmation)
+                    .is_some_and(contains_recorded_workflow_confirmation)
             })
 }
 
@@ -820,13 +892,20 @@ fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope 
     response
 }
 
-fn contains_workflow_confirmation(value: &serde_json::Value) -> bool {
+fn contains_recorded_workflow_confirmation(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => {
-            object.contains_key("workflow_confirmation")
-                || object.values().any(contains_workflow_confirmation)
+            object
+                .get("workflow_confirmation")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|workflow| workflow.get("evidence_recorded"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || object.values().any(contains_recorded_workflow_confirmation)
         }
-        serde_json::Value::Array(values) => values.iter().any(contains_workflow_confirmation),
+        serde_json::Value::Array(values) => {
+            values.iter().any(contains_recorded_workflow_confirmation)
+        }
         _ => false,
     }
 }
@@ -848,6 +927,23 @@ const fn effect_name(effect: Effect) -> &'static str {
         Effect::Pure => "pure",
         Effect::Write => "write",
         Effect::Exec => "exec",
+    }
+}
+
+const fn recovery_class_name(recovery_class: RecoveryClass) -> &'static str {
+    match recovery_class {
+        RecoveryClass::ReplayableRead => "replayable_read",
+        RecoveryClass::AtomicProjectState => "atomic_project_state",
+        RecoveryClass::ExternalAtMostOnce => "external_at_most_once",
+    }
+}
+
+fn recovery_class_from_name(name: &str) -> Option<RecoveryClass> {
+    match name {
+        "replayable_read" => Some(RecoveryClass::ReplayableRead),
+        "atomic_project_state" => Some(RecoveryClass::AtomicProjectState),
+        "external_at_most_once" => Some(RecoveryClass::ExternalAtMostOnce),
+        _ => None,
     }
 }
 
@@ -1206,7 +1302,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Exec, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Exec,
+                    RecoveryClass::ExternalAtMostOnce,
+                    "instance-a",
+                )
                 .expect("reserve"),
             Reservation::Execute
         ));
@@ -1231,6 +1333,73 @@ mod tests {
     }
 
     #[test]
+    fn legacy_in_flight_atomic_request_remains_indeterminate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger_path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let request = request("request-legacy-in-flight", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        let legacy = Connection::open(&ledger_path).expect("open legacy runtime ledger");
+        legacy
+            .execute_batch(
+                "CREATE TABLE daemon_request_outcomes (
+                     request_id TEXT PRIMARY KEY,
+                     request_hash TEXT NOT NULL,
+                     effect TEXT NOT NULL,
+                     instance_id TEXT NOT NULL,
+                     response_json TEXT,
+                     started_at INTEGER NOT NULL,
+                     completed_at INTEGER
+                 );",
+            )
+            .expect("create legacy runtime schema");
+        legacy
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, started_at
+                 ) VALUES (?1, ?2, 'write', 'instance-old', ?3)",
+                params![request.id, hash, now_timestamp()],
+            )
+            .expect("insert legacy in-flight reservation");
+        drop(legacy);
+
+        let ledger = RequestOutcomeLedger::open(&ledger_path).expect("upgrade runtime ledger");
+        assert!(
+            !ledger
+                .atomic_request_needs_preparation(&request, &db_path, "instance-new")
+                .expect("probe legacy reservation"),
+            "legacy in-flight reservations must return indeterminate before preparation"
+        );
+        let executions = Cell::new(0);
+        let result = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-new",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            Ok,
+        );
+
+        assert_eq!(executions.get(), 0);
+        assert_eq!(result.response.status, Status::Error);
+        assert_eq!(
+            result.response.error.as_ref().and_then(|error| {
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["kind"].as_str())
+            }),
+            Some("daemon.request_outcome_indeterminate")
+        );
+        assert_eq!(atomic_outcome_count(&db_path), 0);
+    }
+
+    #[test]
     fn same_instance_atomic_retry_remains_pending_without_db_contention() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("exo.db");
@@ -1241,7 +1410,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Write, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
                 .expect("reserve active request"),
             Reservation::Execute
         ));
@@ -1288,7 +1463,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Write, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
                 .expect("reserve active request"),
             Reservation::Execute
         ));
@@ -1332,7 +1513,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Write, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
                 .expect("reserve previous request"),
             Reservation::Execute
         ));
@@ -1421,6 +1608,7 @@ mod tests {
                     &incomplete_request.id,
                     &incomplete_hash,
                     Effect::Write,
+                    RecoveryClass::AtomicProjectState,
                     "instance-a",
                 )
                 .expect("reserve incomplete request"),
@@ -1491,6 +1679,7 @@ mod tests {
                     &protected.id,
                     &protected_hash,
                     Effect::Write,
+                    RecoveryClass::AtomicProjectState,
                     "instance-old",
                 )
                 .expect("reserve unresolved runtime reference"),
@@ -1546,7 +1735,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Write, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
                 .expect("reserve runtime request"),
             Reservation::Execute
         ));
@@ -1700,7 +1895,8 @@ mod tests {
                     Some(serde_json::json!({
                         "details": {
                             "workflow_confirmation": {
-                                "kind": "workflow_completion_confirmation"
+                                "kind": "workflow_completion_confirmation",
+                                "evidence_recorded": true
                             }
                         }
                     })),
@@ -1713,6 +1909,44 @@ mod tests {
         assert!(execution.committed);
         assert_eq!(epoch_count(&db_path), 1);
         assert_eq!(atomic_outcome_count(&db_path), 1);
+    }
+
+    #[test]
+    fn completion_review_prompt_without_evidence_rolls_back() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let request = request("request-review-prompt", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+
+        let execution = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request,
+            |request| {
+                insert_epoch(&db_path, "epoch-review-prompt");
+                error_response(
+                    &request.id,
+                    ErrorCode::PreconditionFailed,
+                    Some(serde_json::json!({
+                        "details": {
+                            "workflow_confirmation": {
+                                "kind": "workflow_completion_confirmation",
+                                "evidence_recorded": false
+                            }
+                        }
+                    })),
+                )
+            },
+            || Ok(()),
+        )
+        .expect("return approval prompt without committing state");
+
+        assert!(!execution.committed);
+        assert_eq!(execution.response.effect, None);
+        assert_eq!(epoch_count(&db_path), 0);
+        assert_eq!(atomic_outcome_count(&db_path), 0);
     }
 
     #[test]
