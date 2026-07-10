@@ -433,8 +433,10 @@ pub fn default_registry() -> CommandRegistry {
     registry.register(Box::new(SidecarInit::new(None, None, false)));
     registry.register(Box::new(SidecarLink::new("placeholder", PathBuf::new())));
     registry.register(Box::new(SidecarStatus::new(None)));
+    // `sidecar repo` is argument-dependent; use a mutating representative so
+    // static metadata remains conservative while built status commands stay pure.
     registry.register(Box::new(SidecarRepo::new(
-        "status", None, None, None, None, false,
+        "commit", None, None, None, None, false,
     )));
     registry.register(Box::new(SidecarUnlink::new()));
 

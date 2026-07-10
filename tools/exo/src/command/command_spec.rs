@@ -34,7 +34,6 @@
 
 use crate::api::protocol::{Effect, RecoveryClass};
 use crate::command::lm_tool_metadata;
-use crate::command::traits::recovery_class_for_command;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -533,7 +532,7 @@ impl CommandSpec {
         spec.merge_exospec_root::<super::root::RootCommands>();
 
         // ExoSpec owns syntax while the registered command owns runtime
-        // recovery behavior. Reapply that metadata after ExoSpec replacement.
+        // behavior. Reapply effect and recovery after ExoSpec replacement.
         for cmd in registry.iter() {
             let operation = if cmd.namespace().is_empty() {
                 spec.root_operations.get_mut(cmd.operation())
@@ -543,8 +542,8 @@ impl CommandSpec {
                     .and_then(|namespace| namespace.operations.get_mut(cmd.operation()))
             };
             if let Some(operation) = operation {
-                operation.recovery_class =
-                    recovery_class_for_command(cmd.namespace(), cmd.operation(), operation.effect);
+                operation.effect = cmd.effect();
+                operation.recovery_class = cmd.recovery_class();
             }
         }
 
@@ -954,6 +953,47 @@ mod tests {
             .expect("epoch namespace should exist");
         assert!(epoch.operation("list").is_some());
         assert!(epoch.operation("review").is_some());
+    }
+
+    #[test]
+    fn command_spec_recovery_classes_match_registered_commands() {
+        let registry = default_registry();
+        let spec = CommandSpec::from_registry(&registry);
+
+        for command in registry.metadata() {
+            let operation = if command.namespace.is_empty() {
+                spec.root_operations.get(command.operation)
+            } else {
+                spec.namespaces
+                    .get(command.namespace)
+                    .and_then(|namespace| namespace.operations.get(command.operation))
+            }
+            .expect("registered command should be present in the command spec");
+
+            assert_eq!(
+                operation.recovery_class, command.recovery_class,
+                "recovery class drift for {} {}",
+                command.namespace, command.operation
+            );
+            assert_eq!(
+                operation.effect, command.effect,
+                "effect drift for {} {}",
+                command.namespace, command.operation
+            );
+        }
+
+        assert_eq!(
+            spec.namespace("context")
+                .and_then(|namespace| namespace.operation("restore"))
+                .map(|operation| operation.recovery_class),
+            Some(RecoveryClass::ReplayableRead)
+        );
+        assert_eq!(
+            spec.namespace("sidecar")
+                .and_then(|namespace| namespace.operation("repo"))
+                .map(|operation| operation.recovery_class),
+            Some(RecoveryClass::ExternalAtMostOnce)
+        );
     }
 
     #[test]

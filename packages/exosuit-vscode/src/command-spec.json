@@ -301,8 +301,8 @@
         "restore": {
           "name": "restore",
           "description": "Restore context from a previous session",
-          "effect": "write",
-          "recovery_class": "external_at_most_once",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
         },

@@ -209,13 +209,13 @@ impl RequestOutcomeLedger {
             Ok(hash) => hash,
             Err(error) => {
                 return OutcomeExecution {
-                    response: ledger_error_response(
+                    response: without_committed_effect(ledger_error_response(
                         request_id,
                         effect,
                         "daemon.request_outcome_fingerprint_failed",
                         error,
                         false,
-                    ),
+                    )),
                     replayed: false,
                 };
             }
@@ -230,7 +230,9 @@ impl RequestOutcomeLedger {
             }
             Ok(Reservation::Conflict) => {
                 return OutcomeExecution {
-                    response: request_id_conflict_response(request_id, effect),
+                    response: without_committed_effect(request_id_conflict_response(
+                        request_id, effect,
+                    )),
                     replayed: false,
                 };
             }
@@ -265,13 +267,13 @@ impl RequestOutcomeLedger {
             Err(error) => {
                 let _ = self.abandon(&request_id, &request_hash);
                 return OutcomeExecution {
-                    response: ledger_error_response(
+                    response: without_committed_effect(ledger_error_response(
                         request_id,
                         effect,
                         "daemon.atomic_request_commit_failed",
                         error,
                         false,
-                    ),
+                    )),
                     replayed: false,
                 };
             }
@@ -521,7 +523,7 @@ where
     {
         transaction.rollback()?;
         return Ok(AtomicCoreExecution {
-            response: request_id_conflict_response(request_id, effect),
+            response: without_committed_effect(request_id_conflict_response(request_id, effect)),
             committed: false,
             replayed: false,
         });
@@ -539,8 +541,8 @@ where
     }
 
     let mut response = execute(request);
-    response.effect.get_or_insert(effect);
     if !atomic_response_commits(&response) {
+        response.effect = None;
         transaction.rollback()?;
         return Ok(AtomicCoreExecution {
             response,
@@ -548,6 +550,7 @@ where
             replayed: false,
         });
     }
+    response.effect.get_or_insert(effect);
 
     let response_json =
         serde_json::to_string(&response).context("serialize canonical atomic request outcome")?;
@@ -591,6 +594,11 @@ fn atomic_response_commits(response: &ResponseEnvelope) -> bool {
                     .as_ref()
                     .is_some_and(contains_workflow_confirmation)
             })
+}
+
+fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
+    response.effect = None;
+    response
 }
 
 fn contains_workflow_confirmation(value: &serde_json::Value) -> bool {
@@ -1136,6 +1144,7 @@ mod tests {
         .expect("return ordinary command error");
 
         assert!(!execution.committed);
+        assert_eq!(execution.response.effect, None);
         assert_eq!(epoch_count(&db_path), 0);
         assert_eq!(atomic_outcome_count(&db_path), 0);
     }

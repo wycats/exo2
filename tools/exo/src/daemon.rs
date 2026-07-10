@@ -37,6 +37,7 @@ use crate::api::protocol::{
     Effect, ErrorBody, ErrorCode, PROTOCOL_VERSION, RecoveryClass, RequestEnvelope,
     ResponseEnvelope, Status,
 };
+use crate::context::AgentContext;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, DaemonDiagnosticsConfig, effect_name, elapsed_ms, request_op_path,
     response_status,
@@ -1932,6 +1933,16 @@ pub async fn run_daemon(
                                 if recovery.recovery_class
                                     == RecoveryClass::AtomicProjectState =>
                             {
+                                if let Err(error) = AgentContext::prepare_request_transaction(
+                                    &workspace,
+                                    Some(&request_project),
+                                ) {
+                                    return daemon_handler_error_response(
+                                        handler_request_id,
+                                        ErrorCode::PreconditionFailed,
+                                        error.to_string(),
+                                    );
+                                }
                                 let Some((namespace, operation)) = request_command_path(&req)
                                 else {
                                     return daemon_handler_error_response(
