@@ -1060,6 +1060,7 @@ mod tests {
                 },
                 input: serde_json::json!({ "id": task_id, "log": "Done" }),
             }),
+            workspace_root: None,
             auth: None,
             workflow_confirmation: None,
             agent_id: None,

@@ -62,6 +62,7 @@ pub fn req_call_op(id: &str, op_path: &[&str], input: serde_json::Value) -> Requ
             },
             input,
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,

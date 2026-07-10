@@ -1017,28 +1017,108 @@ fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
     Ok(current)
 }
 
-fn atomic_request_project(
-    workspace: &Path,
+#[derive(Debug)]
+struct DaemonRequestContext {
+    workspace_root: PathBuf,
+    project: Project,
+}
+
+fn daemon_request_context(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> io::Result<DaemonRequestContext> {
+    let Some(requested_workspace) = request.workspace_root.as_deref() else {
+        return Ok(DaemonRequestContext {
+            workspace_root: startup_workspace.to_path_buf(),
+            project: daemon_request_project(startup_project)?,
+        });
+    };
+
+    if !requested_workspace.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon request workspace must be an absolute path",
+        ));
+    }
+
+    let startup_project = daemon_request_project(startup_project)?;
+    let workspace_root = requested_workspace.canonicalize().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon request workspace could not be resolved as a Git worktree",
+        )
+    })?;
+    if workspace_root == startup_workspace {
+        return Ok(DaemonRequestContext {
+            workspace_root,
+            project: startup_project,
+        });
+    }
+
+    let belongs_to_project = startup_project
+        .worktree_index()
+        .and_then(|worktrees| worktrees.get(&workspace_root).copied())
+        .is_some_and(|prunable| !prunable);
+    if !belongs_to_project {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        ));
+    }
+
+    let mut request_project = startup_project;
+    request_project.workspace_root = Some(workspace_root.clone());
+    Ok(DaemonRequestContext {
+        workspace_root,
+        project: request_project,
+    })
+}
+
+fn replay_request_context(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> DaemonRequestContext {
+    let workspace_root = request
+        .workspace_root
+        .as_deref()
+        .and_then(|workspace| workspace.canonicalize().ok())
+        .unwrap_or_else(|| startup_workspace.to_path_buf());
+    let mut project = startup_project.clone();
+    project.workspace_root = Some(workspace_root.clone());
+    DaemonRequestContext {
+        workspace_root,
+        project,
+    }
+}
+
+fn atomic_request_context(
+    startup_workspace: &Path,
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
     request: &RequestEnvelope,
     instance_id: &str,
-) -> io::Result<Project> {
+) -> io::Result<DaemonRequestContext> {
     if !outcome_ledger
         .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
         .map_err(to_io_error)?
     {
-        return Ok(startup_project.clone());
+        return Ok(replay_request_context(
+            startup_workspace,
+            startup_project,
+            request,
+        ));
     }
 
-    let request_project = daemon_request_project(startup_project)?;
-    AgentContext::prepare_request_transaction(workspace, Some(&request_project))
+    let context = daemon_request_context(startup_workspace, startup_project, request)?;
+    AgentContext::prepare_request_transaction(&context.workspace_root, Some(&context.project))
         .map_err(to_io_error)?;
-    Ok(request_project)
+    Ok(context)
 }
 
 fn execute_ledgered_daemon_request(
-    workspace: &Path,
+    startup_workspace: &Path,
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
     request: RequestEnvelope,
@@ -1053,8 +1133,9 @@ fn execute_ledgered_daemon_request(
         Duration::from_secs(30),
         |request| {
             let request_id = request.id.clone();
-            let request_project = match daemon_request_project(startup_project) {
-                Ok(project) => project,
+            let context = match daemon_request_context(startup_workspace, startup_project, &request)
+            {
+                Ok(context) => context,
                 Err(error) => {
                     return daemon_handler_error_response(
                         request_id,
@@ -1064,8 +1145,8 @@ fn execute_ledgered_daemon_request(
                 }
             };
             handle_request_with_project_and_diagnostics_as_writer(
-                workspace,
-                Some(&request_project),
+                &context.workspace_root,
+                Some(&context.project),
                 request,
                 diagnostics,
             )
@@ -1996,7 +2077,7 @@ pub async fn run_daemon(
                                         "atomic request is missing a command path".to_string(),
                                     );
                                 };
-                                let request_project = match atomic_request_project(
+                                let request_context = match atomic_request_context(
                                     &workspace,
                                     project.as_ref(),
                                     &outcome_ledger,
@@ -2012,6 +2093,8 @@ pub async fn run_daemon(
                                         );
                                     }
                                 };
+                                let request_workspace = request_context.workspace_root;
+                                let request_project = request_context.project;
                                 outcome_ledger
                                     .execute_atomic_project_state(
                                         req,
@@ -2021,7 +2104,7 @@ pub async fn run_daemon(
                                         &request_project.db_path(),
                                         |req| {
                                             handle_request_with_project_and_diagnostics_as_atomic_writer(
-                                                &workspace,
+                                                &request_workspace,
                                                 Some(&request_project),
                                                 req,
                                                 &diagnostics,
@@ -2029,7 +2112,7 @@ pub async fn run_daemon(
                                         },
                                         |response| {
                                             finalize_atomic_response_after_commit(
-                                                &workspace,
+                                                &request_workspace,
                                                 Some(&request_project),
                                                 &namespace,
                                                 &operation,
@@ -2056,8 +2139,12 @@ pub async fn run_daemon(
                                     .response
                             }
                             _ => {
-                                let request_project = match daemon_request_project(project.as_ref()) {
-                                    Ok(project) => project,
+                                let request_context = match daemon_request_context(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &req,
+                                ) {
+                                    Ok(context) => context,
                                     Err(error) => {
                                         return daemon_handler_error_response(
                                             handler_request_id,
@@ -2067,8 +2154,8 @@ pub async fn run_daemon(
                                     }
                                 };
                                 handle_request_with_project_and_diagnostics_as_writer(
-                                    &workspace,
-                                    Some(&request_project),
+                                    &request_context.workspace_root,
+                                    Some(&request_context.project),
                                     req,
                                     &diagnostics,
                                 )
@@ -2414,6 +2501,59 @@ mod tests {
         MAX_PORTABLE_UNIX_SOCKET_PATH_LEN, ProjectId, SidecarAutoPushPolicy, StatePolicy,
     };
     use std::path::PathBuf;
+    use std::process::Command;
+
+    fn run_test_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn create_test_git_repo(temp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let workspace = temp.path().join(name);
+        std::fs::create_dir(&workspace).expect("create git workspace");
+        run_test_git(&workspace, &["init"]);
+        std::fs::write(workspace.join("README.md"), name).expect("write test file");
+        run_test_git(&workspace, &["add", "."]);
+        run_test_git(
+            &workspace,
+            &[
+                "-c",
+                "user.name=Exo Test",
+                "-c",
+                "user.email=exo@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        workspace.canonicalize().expect("canonical git workspace")
+    }
+
+    fn request_for_workspace(workspace_root: Option<&Path>) -> RequestEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "workspace-context-test",
+            "workspace_root": workspace_root,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["project", "resolve"] },
+                    "input": {}
+                }
+            }
+        }))
+        .expect("workspace request")
+    }
 
     #[tokio::test]
     async fn daemon_probe_requires_matching_instance_response() {
@@ -2516,6 +2656,82 @@ mod tests {
             refreshed.sidecar_auto_push,
             crate::project::SidecarAutoPushPolicy::Always
         );
+    }
+
+    #[test]
+    fn daemon_request_context_accepts_linked_worktree_for_same_project_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&linked));
+
+        let context = daemon_request_context(&primary, &startup, &request)
+            .expect("linked worktree request context");
+
+        assert_eq!(context.workspace_root, linked);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_rejects_workspace_from_another_project() {
+        let primary_temp = tempfile::tempdir().expect("primary tempdir");
+        let primary = create_test_git_repo(&primary_temp, "primary");
+        let foreign_temp = tempfile::tempdir().expect("foreign tempdir");
+        let foreign = create_test_git_repo(&foreign_temp, "foreign");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&foreign));
+
+        let error = daemon_request_context(&primary, &startup, &request)
+            .expect_err("foreign workspace must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+    }
+
+    #[test]
+    fn daemon_request_context_uses_startup_workspace_for_legacy_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(None);
+
+        let context =
+            daemon_request_context(&primary, &startup, &request).expect("legacy request context");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn daemon_request_context_reuses_startup_project_for_explicit_startup_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&primary));
+
+        let context = daemon_request_context(&primary, &startup, &request)
+            .expect("explicit startup workspace context");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project, startup);
     }
 
     fn recorded_atomic_request(
@@ -2652,10 +2868,10 @@ mod tests {
             daemon_request_project(&project).is_err(),
             "fixture must fail mutable policy refresh"
         );
-        let replay_project =
-            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+        let replay_context =
+            atomic_request_context(&workspace, &project, &ledger, &request, "instance-a")
                 .expect("recorded response should bypass policy refresh");
-        assert_eq!(replay_project, project);
+        assert_eq!(replay_context.project, project);
     }
 
     #[test]
@@ -2677,10 +2893,10 @@ mod tests {
             "fixture must fail projection hydration"
         );
         let _ = std::fs::remove_dir_all(project.db_path().parent().expect("database parent"));
-        let replay_project =
-            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+        let replay_context =
+            atomic_request_context(&workspace, &project, &ledger, &request, "instance-a")
                 .expect("recorded response should bypass projection hydration");
-        assert_eq!(replay_project, project);
+        assert_eq!(replay_context.project, project);
         assert!(
             !project.db_path().exists(),
             "replay preparation must not recreate the project database"

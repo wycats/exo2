@@ -27,6 +27,7 @@ fn json_channel_call_context_paths_returns_ok() {
             },
             input: json!({}),
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,

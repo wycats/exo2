@@ -1572,11 +1572,19 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
     let linked_stream = exo::daemon::ensure_daemon(&linked)
         .await
         .expect("linked worktree should connect to shared daemon socket");
-    let response = send_machine_request(
-        linked_stream,
-        r#"{"protocol_version":1,"id":"linked-epoch-add","op":{"kind":"call","params":{"address":{"kind":"operation","path":["epoch","add"]},"input":{"title":"Linked Daemon Epoch"}}}}"#,
-    )
-    .await;
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "linked-epoch-add",
+        "workspace_root": linked.canonicalize().expect("canonical linked worktree"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["epoch", "add"] },
+                "input": { "title": "Linked Daemon Epoch" }
+            }
+        }
+    });
+    let response = send_machine_request(linked_stream, &request.to_string()).await;
 
     assert_eq!(response.get("status").and_then(|v| v.as_str()), Some("ok"));
 
@@ -1601,6 +1609,89 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
     assert!(
         !linked.join(".cache/exo.db").exists(),
         "linked legacy root DB should not exist"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_request_uses_the_issuing_linked_worktree(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let (primary, linked) = create_primary_and_linked_worktree(&dir);
+    let _guard = DaemonGuard::new(&primary);
+
+    let primary_stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("primary should spawn daemon");
+    drop(primary_stream);
+
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "linked-project-resolve",
+        "workspace_root": linked.canonicalize().expect("canonical linked worktree"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["project", "resolve"] },
+                "input": {}
+            }
+        }
+    });
+    let stream = exo::daemon::connect_to_daemon(&linked)
+        .await
+        .expect("linked worktree should connect to shared daemon");
+    let response = send_machine_request(stream, &request.to_string()).await;
+
+    assert_eq!(response["status"], "ok", "{response}");
+    assert_eq!(
+        response["result"]["project"]["workspace_root"],
+        linked
+            .canonicalize()
+            .expect("canonical linked worktree")
+            .to_string_lossy()
+            .as_ref(),
+        "daemon command context should use the issuing worktree"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_rejects_request_workspace_from_another_project(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let primary_dir = TempDir::new().unwrap();
+    let primary = create_test_workspace(&primary_dir, backend);
+    let _guard = DaemonGuard::new(&primary);
+    let other_dir = TempDir::new().unwrap();
+    let other = create_test_workspace(&other_dir, backend);
+
+    let stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("primary should spawn daemon");
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "foreign-project-resolve",
+        "workspace_root": other.canonicalize().expect("canonical foreign workspace"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["project", "resolve"] },
+                "input": {}
+            }
+        }
+    });
+    let response = send_machine_request(stream, &request.to_string()).await;
+
+    assert_eq!(response["status"], "error", "{response}");
+    assert_eq!(
+        response["error"]["code"], "precondition_failed",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message
+                == "request workspace does not belong to this daemon's project and state root"),
+        "foreign workspace rejection should identify the project boundary: {response}"
     );
 }
 

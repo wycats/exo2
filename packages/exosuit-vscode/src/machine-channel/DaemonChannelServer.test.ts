@@ -207,6 +207,9 @@ describe("DaemonChannelServer", () => {
     expect(response.status).toBe("ok");
     expect(connect).toHaveBeenCalledTimes(1);
     expect(connection.request).toHaveBeenCalledTimes(1);
+    expect(connection.request.mock.calls[0]?.[0]).toMatchObject({
+      workspace_root: "/tmp/exo2-daemon-1",
+    });
     expect(traceCache.notifyWrite).not.toHaveBeenCalled();
   });
 

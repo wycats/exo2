@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -150,6 +152,9 @@ pub struct RequestEnvelope {
     pub protocol_version: u32,
     pub id: String,
     pub op: Op,
+    /// Canonical workspace root for the caller issuing this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -834,7 +834,8 @@ fn prepare_exo_run_tool_call(
     request_id: String,
 ) -> Result<PreparedExoRunCall, ResponseEnvelope> {
     let include_structured = explicit_json_output_requested(&input);
-    let compiled = compile_exo_run_input(input, request_id)?;
+    let mut compiled = compile_exo_run_input(input, request_id)?;
+    compiled.request.workspace_root = Some(canonical_request_workspace_root(workspace_root));
     let preload_required = compiled.requires_workspace_preload();
     if preload_required {
         ensure_workspace_context_loaded(
@@ -993,10 +994,11 @@ fn call_exo_run_tool_with_request_id(
     request_id: String,
 ) -> McpToolResult {
     let include_structured = explicit_json_output_requested(&input);
-    let compiled = match compile_exo_run_input(input, request_id) {
+    let mut compiled = match compile_exo_run_input(input, request_id) {
         Ok(compiled) => compiled,
         Err(response) => return machine_response_to_tool_result(&response),
     };
+    compiled.request.workspace_root = Some(canonical_request_workspace_root(workspace_root));
     if compiled.requires_workspace_preload()
         && let Err(response) = ensure_workspace_context_loaded(
             workspace_root,
@@ -1047,6 +1049,12 @@ pub fn build_exo_run_request(
     request_id: String,
 ) -> Result<RequestEnvelope, ResponseEnvelope> {
     Ok(compile_exo_run_input(input, request_id)?.request)
+}
+
+fn canonical_request_workspace_root(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf())
 }
 
 #[derive(Debug, Clone)]
@@ -1145,6 +1153,7 @@ fn compile_exo_run_input(
                         address,
                         input: call_input,
                     }),
+                    workspace_root: None,
                     auth: input.auth,
                     workflow_confirmation: input.workflow_confirmation.map(Into::into),
                     agent_id: None,
@@ -1160,6 +1169,7 @@ fn compile_exo_run_input(
             protocol_version: PROTOCOL_VERSION,
             id: request_id,
             op,
+            workspace_root: None,
             auth: input.auth,
             workflow_confirmation: input.workflow_confirmation.map(Into::into),
             agent_id: None,
@@ -2347,6 +2357,22 @@ mod tests {
             }
             other => panic!("expected call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepared_mcp_request_carries_canonical_workspace_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prepared = prepare_exo_run_tool_call(
+            temp.path(),
+            input("help task"),
+            "workspace-request".to_string(),
+        )
+        .expect("prepare MCP request");
+
+        assert_eq!(
+            prepared.request.workspace_root,
+            Some(temp.path().canonicalize().expect("canonical tempdir"))
+        );
     }
 
     #[test]

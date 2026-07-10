@@ -33,6 +33,7 @@ fn json_channel_list_phase_execution_tasks_returns_ok_with_items() {
                 limit: 2,
             },
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,

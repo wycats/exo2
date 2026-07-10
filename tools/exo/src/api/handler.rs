@@ -1815,6 +1815,7 @@ fn call_ensured_daemon_writer(
         protocol_version: protocol::PROTOCOL_VERSION,
         id: id.clone(),
         op: Op::Call(params.clone()),
+        workspace_root: Some(workspace_root.to_path_buf()),
         auth: auth.cloned(),
         workflow_confirmation: workflow_confirmation.cloned(),
         agent_id: agent_id.cloned(),
@@ -2845,6 +2846,7 @@ mod tests {
             op: Op::Help(HelpParams {
                 address: Address::Root,
             }),
+            workspace_root: None,
             auth: None,
             workflow_confirmation: None,
             agent_id: None,
@@ -2897,6 +2899,7 @@ mod tests {
             op: Op::Help(HelpParams {
                 address: Address::Root,
             }),
+            workspace_root: None,
             auth: None,
             workflow_confirmation: None,
             agent_id: None,

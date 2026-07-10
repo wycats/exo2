@@ -451,6 +451,7 @@ export class DaemonChannelServer {
     envelope = {
       ...envelope,
       id: `${envelope.id}.${randomUUID()}`,
+      workspace_root: this.workspaceRoot,
     };
 
     // No extension-local request handling remains here.

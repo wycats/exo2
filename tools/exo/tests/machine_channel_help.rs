@@ -23,6 +23,7 @@ fn json_channel_help_root_returns_ok() {
         op: Op::Help(HelpParams {
             address: Address::Root,
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,
@@ -54,6 +55,7 @@ fn json_channel_help_docs_namespace_lists_operations() {
                 path: vec!["docs".to_string()],
             },
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,
@@ -77,6 +79,7 @@ fn json_channel_rejects_bad_version_with_nonzero_exit() {
         op: Op::Help(HelpParams {
             address: Address::Root,
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,
