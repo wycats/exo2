@@ -44,7 +44,7 @@ use crate::daemon_diagnostics::{
 };
 use crate::daemon_outcomes::{
     DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
-    request_may_have_recorded_outcome, resolved_request_recovery,
+    request_declared_recovery, request_may_have_recorded_outcome, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -2065,27 +2065,42 @@ pub async fn run_daemon(
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        if request_may_have_recorded_outcome(&req)
+                        if request_may_have_recorded_outcome(&workspace, &req)
                             && let Ok(Some(outcome)) = outcome_ledger
-                                .terminal_outcome_before_preparation(&req, &project.db_path())
+                                .terminal_outcome_before_preparation(&req)
                         {
                             return outcome.response;
                         }
-                        let request_workspace = match validated_request_workspace(
-                            &workspace,
-                            project.as_ref(),
-                            &req,
-                        ) {
-                            Ok(workspace) => workspace,
-                            Err(error) => {
-                                return daemon_handler_error_response(
-                                    handler_request_id,
-                                    ErrorCode::PreconditionFailed,
-                                    error.to_string(),
-                                );
-                            }
+                        let declared_recovery = request_declared_recovery(&req);
+                        let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
+                            recovery.recovery_class == RecoveryClass::AtomicProjectState
+                                && outcome_ledger
+                                    .atomic_request_needs_preparation(
+                                        &req,
+                                        &project.db_path(),
+                                        &instance_id,
+                                    )
+                                    .is_ok_and(|needs_preparation| !needs_preparation)
+                        });
+                        let recovery = if canonical_atomic_replay {
+                            declared_recovery
+                        } else {
+                            let request_workspace = match validated_request_workspace(
+                                &workspace,
+                                project.as_ref(),
+                                &req,
+                            ) {
+                                Ok(workspace) => workspace,
+                                Err(error) => {
+                                    return daemon_handler_error_response(
+                                        handler_request_id,
+                                        ErrorCode::PreconditionFailed,
+                                        error.to_string(),
+                                    );
+                                }
+                            };
+                            resolved_request_recovery(&request_workspace, &req)
                         };
-                        let recovery = resolved_request_recovery(&request_workspace, &req);
                         match recovery {
                             Some(recovery)
                                 if recovery.recovery_class
