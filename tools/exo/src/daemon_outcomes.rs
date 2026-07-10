@@ -118,6 +118,60 @@ impl RequestOutcomeLedger {
         &self.path
     }
 
+    /// Return a completed response or request-ID conflict before request
+    /// preparation. Replays remain available when the workspace that issued
+    /// the original request has since been removed.
+    pub(crate) fn terminal_outcome_before_preparation(
+        &self,
+        request: &RequestEnvelope,
+        project_db_path: &Path,
+    ) -> Result<Option<OutcomeExecution>> {
+        let request_hash = request_hash(request)?;
+        let runtime_outcome = self.connection().and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT request_hash, effect, response_json
+             FROM daemon_request_outcomes
+             WHERE request_id = ?1",
+                    [&request.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
+        });
+
+        if let Ok(Some((stored_hash, effect, response_json))) = &runtime_outcome {
+            let effect = effect_from_name(&effect)?;
+            if stored_hash != &request_hash {
+                return Ok(Some(OutcomeExecution {
+                    response: request_id_conflict_response(request.id.clone(), effect),
+                    replayed: false,
+                }));
+            }
+            if let Some(response_json) = response_json {
+                return Ok(Some(OutcomeExecution {
+                    response: serde_json::from_str(response_json)
+                        .context("deserialize recorded daemon response")?,
+                    replayed: true,
+                }));
+            }
+        }
+
+        let canonical_outcome =
+            canonical_atomic_terminal_outcome(project_db_path, request, &request_hash)?;
+        if canonical_outcome.is_some() {
+            return Ok(canonical_outcome);
+        }
+        runtime_outcome?;
+        Ok(None)
+    }
+
     /// Return whether an atomic request may execute and therefore needs current
     /// project preparation. Completed, conflicting, and same-instance in-flight
     /// requests are resolved by the outcome ledger before mutable preparation.
@@ -745,6 +799,67 @@ fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> 
         .is_some())
 }
 
+fn canonical_atomic_terminal_outcome(
+    project_db_path: &Path,
+    request: &RequestEnvelope,
+    request_hash: &str,
+) -> Result<Option<OutcomeExecution>> {
+    if !project_db_path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(project_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "open canonical atomic outcome database {}",
+                project_db_path.display()
+            )
+        })?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'atomic_request_outcomes'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(None);
+    }
+    let existing = connection
+        .query_row(
+            "SELECT request_hash, effect, response_json
+             FROM atomic_request_outcomes
+             WHERE request_id = ?1",
+            [&request.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_hash, effect, response_json)) = existing else {
+        return Ok(None);
+    };
+    let effect = effect_from_name(&effect)?;
+    if stored_hash != request_hash {
+        return Ok(Some(OutcomeExecution {
+            response: without_committed_effect(request_id_conflict_response(
+                request.id.clone(),
+                effect,
+            )),
+            replayed: false,
+        }));
+    }
+    Ok(Some(OutcomeExecution {
+        response: serde_json::from_str(&response_json)
+            .context("deserialize canonical atomic request outcome")?,
+        replayed: true,
+    }))
+}
+
 pub fn resolved_request_recovery(
     workspace_root: &Path,
     request: &RequestEnvelope,
@@ -762,6 +877,17 @@ pub fn resolved_request_recovery(
             effect: command.effect(),
             recovery_class: command.recovery_class(),
         })
+}
+
+pub fn request_may_have_recorded_outcome(request: &RequestEnvelope) -> bool {
+    let Some((namespace, operation)) = request_command_path(request) else {
+        return false;
+    };
+    static COMMAND_SPEC: OnceLock<CommandSpec> = OnceLock::new();
+    COMMAND_SPEC
+        .get_or_init(|| CommandSpec::from_registry(&default_registry()))
+        .operation(&namespace, &operation)
+        .is_some_and(|operation| operation.effect != Effect::Pure)
 }
 
 pub fn request_command_path(request: &RequestEnvelope) -> Option<(String, String)> {
@@ -927,6 +1053,15 @@ const fn effect_name(effect: Effect) -> &'static str {
         Effect::Pure => "pure",
         Effect::Write => "write",
         Effect::Exec => "exec",
+    }
+}
+
+fn effect_from_name(name: &str) -> Result<Effect> {
+    match name {
+        "pure" => Ok(Effect::Pure),
+        "write" => Ok(Effect::Write),
+        "exec" => Ok(Effect::Exec),
+        _ => Err(anyhow!("unknown recorded daemon effect {name}")),
     }
 }
 
@@ -1199,6 +1334,65 @@ mod tests {
         assert_eq!(replay.response.status, Status::Ok);
         assert_eq!(replay.response.result, first.response.result);
         assert_eq!(executions.get(), 1);
+    }
+
+    #[test]
+    fn terminal_runtime_outcome_replays_after_issuing_workspace_is_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let workspace = temp.path().join("linked-worktree");
+        std::fs::create_dir(&workspace).expect("create issuing workspace");
+        let mut request = request("request-removed-runtime-workspace", "task-a");
+        request.workspace_root = Some(workspace.clone());
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        std::fs::remove_dir(&workspace).expect("remove issuing workspace");
+
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request, &temp.path().join("missing.db"))
+            .expect("probe terminal runtime outcome")
+            .expect("completed runtime outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn terminal_canonical_outcome_replays_after_issuing_workspace_is_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let workspace = temp.path().join("linked-worktree");
+        std::fs::create_dir(&workspace).expect("create issuing workspace");
+        let mut request = request("request-removed-canonical-workspace", "task-a");
+        request.workspace_root = Some(workspace.clone());
+        let hash = request_hash(&request).expect("request hash");
+        let first = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit canonical outcome");
+        std::fs::remove_dir(&workspace).expect("remove issuing workspace");
+
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request, &db_path)
+            .expect("probe terminal canonical outcome")
+            .expect("completed canonical outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
     }
 
     #[test]
@@ -1858,7 +2052,7 @@ mod tests {
         );
 
         let execution = ledger.execute_atomic_project_state(
-            request,
+            request.clone(),
             Effect::Write,
             "instance-a",
             Duration::ZERO,
@@ -1873,6 +2067,12 @@ mod tests {
         assert_eq!(execution.response.status, Status::Ok);
         assert_eq!(epoch_count(&db_path), 1);
         assert_eq!(atomic_outcome_count(&db_path), 1);
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request, &db_path)
+            .expect("canonical replay should tolerate unavailable runtime ledger")
+            .expect("canonical replay outcome");
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, execution.response.result);
     }
 
     #[test]
@@ -1979,6 +2179,20 @@ mod tests {
 
     #[test]
     fn resolved_effect_comes_from_built_command() {
+        let mut status = request("request-status", "task-a");
+        let Op::Call(params) = &mut status.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["status".to_string()],
+        };
+        params.input = serde_json::json!({});
+
+        assert!(!request_may_have_recorded_outcome(&status));
+        assert!(request_may_have_recorded_outcome(&request(
+            "request-1",
+            "task-a"
+        )));
         assert_eq!(
             resolved_request_effect(Path::new("."), &request("request-1", "task-a")),
             Some(Effect::Write)

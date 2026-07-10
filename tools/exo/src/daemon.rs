@@ -44,7 +44,7 @@ use crate::daemon_diagnostics::{
 };
 use crate::daemon_outcomes::{
     DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
-    resolved_request_recovery,
+    request_may_have_recorded_outcome, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -2065,6 +2065,12 @@ pub async fn run_daemon(
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
+                        if request_may_have_recorded_outcome(&req)
+                            && let Ok(Some(outcome)) = outcome_ledger
+                                .terminal_outcome_before_preparation(&req, &project.db_path())
+                        {
+                            return outcome.response;
+                        }
                         let request_workspace = match validated_request_workspace(
                             &workspace,
                             project.as_ref(),
