@@ -1,6 +1,7 @@
 //! Source-build activation checks for the local dogfood MCP proxy.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -189,7 +190,17 @@ fn path_matches(expected: &Path, actual: &Path) -> bool {
 }
 
 fn file_blake3(path: &Path) -> Result<String, std::io::Error> {
-    Ok(blake3::hash(&fs::read(path)?).to_hex().to_string())
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn status_value(status: DogfoodActivationStatus) -> JsonValue {
@@ -291,5 +302,20 @@ mod tests {
         let status = activation.status(&source_mcp, Some(&worker));
         assert!(status.ok);
         assert_eq!(status.state, "current");
+    }
+
+    #[test]
+    fn file_blake3_matches_the_in_memory_digest_for_large_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("large-fixture");
+        let bytes = (0..(64 * 1024 * 3 + 37))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).expect("write fixture");
+
+        assert_eq!(
+            file_blake3(&path).expect("stream fixture"),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
     }
 }

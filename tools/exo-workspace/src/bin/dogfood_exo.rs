@@ -517,14 +517,17 @@ fn plugin_cache_mcp_paths(cache_root: &Path, name: &str, version: &str) -> Resul
 }
 
 fn write_pinned_mcp_config(path: &Path, proxy: &Path, activation: &Path) -> Result<()> {
+    let mut env = serde_json::Map::new();
+    env.insert(
+        DOGFOOD_ACTIVATION_ENV.to_string(),
+        serde_json::Value::String(activation.display().to_string()),
+    );
     let value = serde_json::json!({
         "mcpServers": {
             "exo": {
                 "command": proxy.display().to_string(),
                 "args": [],
-                "env": {
-                    DOGFOOD_ACTIVATION_ENV: activation.display().to_string()
-                }
+                "env": env
             }
         }
     });
@@ -757,6 +760,13 @@ mod tests {
         assert_eq!(
             value["mcpServers"]["exo"]["env"][DOGFOOD_ACTIVATION_ENV],
             activation.display().to_string()
+        );
+        assert_eq!(
+            value["mcpServers"]["exo"]["env"]
+                .as_object()
+                .expect("MCP environment object")
+                .len(),
+            1
         );
         fs::remove_dir_all(root).ok();
     }
