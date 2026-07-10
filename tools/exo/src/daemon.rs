@@ -1078,7 +1078,12 @@ fn validated_request_workspace(
         ));
     }
 
-    Ok(workspace_root)
+    resolved.workspace_root.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        )
+    })
 }
 
 fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
@@ -2775,6 +2780,43 @@ mod tests {
         assert_eq!(context.workspace_root, child);
         assert_eq!(context.project.id, startup.id);
         assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn daemon_request_context_normalizes_nested_directory_to_worktree_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "nested-project");
+        let nested = workspace.join("nested/directory");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        let startup = Project::resolve(&workspace).expect("resolve project");
+        let request = request_for_workspace(Some(&nested));
+
+        let context = daemon_request_context(&workspace, &startup, &request)
+            .expect("nested directory should resolve to its worktree root");
+
+        assert_eq!(
+            context.workspace_root,
+            workspace.canonicalize().expect("canonical worktree root")
+        );
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_normalizes_file_path_to_worktree_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "file-project");
+        let file = workspace.join("README.md");
+        let startup = Project::resolve(&workspace).expect("resolve project");
+        let request = request_for_workspace(Some(&file));
+
+        let context = daemon_request_context(&workspace, &startup, &request)
+            .expect("file path should resolve to its worktree root");
+
+        assert_eq!(
+            context.workspace_root,
+            workspace.canonicalize().expect("canonical worktree root")
+        );
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
     }
 
     #[test]
