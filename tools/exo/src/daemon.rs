@@ -47,7 +47,7 @@ use crate::daemon_outcomes::{
     request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
-use crate::project::Project;
+use crate::project::{Project, ProjectResolver};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, Metadata};
@@ -1074,6 +1074,25 @@ fn validated_request_workspace(
         ));
     }
 
+    let resolver = startup_project
+        .projects_config_path
+        .as_deref()
+        .map_or_else(ProjectResolver::default, |path| {
+            ProjectResolver::default().with_projects_config_path(path)
+        });
+    let resolved = resolver.resolve(&workspace_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        )
+    })?;
+    if resolved.id != startup_project.id || resolved.state_root != startup_project.state_root {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        ));
+    }
+
     Ok(workspace_root)
 }
 
@@ -1090,18 +1109,34 @@ fn replay_request_context(
     startup_workspace: &Path,
     startup_project: &Project,
     request: &RequestEnvelope,
-) -> DaemonRequestContext {
-    let workspace_root = request
-        .workspace_root
-        .as_deref()
-        .and_then(|workspace| workspace.canonicalize().ok())
-        .unwrap_or_else(|| startup_workspace.to_path_buf());
+) -> io::Result<DaemonRequestContext> {
+    let workspace_root = match request.workspace_root.as_deref() {
+        None => startup_workspace.to_path_buf(),
+        Some(workspace) if !workspace.is_absolute() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon request workspace must be an absolute path",
+            ));
+        }
+        Some(workspace) => match workspace.canonicalize() {
+            Ok(_) => validated_request_workspace(startup_workspace, startup_project, request)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                startup_workspace.to_path_buf()
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "daemon request workspace path could not be canonicalized",
+                ));
+            }
+        },
+    };
     let mut project = startup_project.clone();
     project.workspace_root = Some(workspace_root.clone());
-    DaemonRequestContext {
+    Ok(DaemonRequestContext {
         workspace_root,
         project,
-    }
+    })
 }
 
 fn atomic_request_context(
@@ -1115,11 +1150,7 @@ fn atomic_request_context(
         .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
         .map_err(to_io_error)?
     {
-        return Ok(replay_request_context(
-            startup_workspace,
-            startup_project,
-            request,
-        ));
+        return replay_request_context(startup_workspace, startup_project, request);
     }
 
     let context = daemon_request_context(startup_workspace, startup_project, request)?;
@@ -2770,6 +2801,118 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::InvalidInput)
         );
+    }
+
+    #[test]
+    fn canonical_replay_rejects_workspace_path_reused_by_another_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-replay-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let mut request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "canonical-replay-reused-workspace",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["epoch", "add"] },
+                    "input": { "title": "Recorded epoch" }
+                }
+            }
+        }))
+        .expect("parse atomic request");
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        std::fs::create_dir_all(startup.db_path().parent().expect("database parent"))
+            .expect("create project state directory");
+        drop(
+            exosuit_storage::open_database(&startup.db_path())
+                .expect("initialize project database"),
+        );
+        let execution = ledger.execute_atomic_project_state(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &startup.db_path(),
+            |request| ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Write),
+                trace: None,
+            },
+            Ok,
+        );
+        assert_eq!(execution.response.status, Status::Ok);
+        exosuit_storage::Connection::open(ledger.path())
+            .expect("open runtime outcome database")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+                 WHERE request_id = ?1",
+                [&request.id],
+            )
+            .expect("simulate runtime outcome loss after canonical commit");
+
+        std::fs::remove_dir_all(&linked).expect("remove original linked worktree");
+        let foreign = create_test_git_repo(&temp, "linked");
+        assert_eq!(
+            foreign.canonicalize().expect("canonical foreign repo"),
+            linked.canonicalize().expect("canonical reused path")
+        );
+        assert_eq!(
+            startup
+                .worktree_index()
+                .expect("read retained worktree index")
+                .get(&linked.canonicalize().expect("canonical foreign path")),
+            Some(&false),
+            "the retained Git index alone still accepts the reused path"
+        );
+
+        request.workspace_root = Some(linked);
+        let error = atomic_request_context(&primary, &startup, &ledger, &request, "instance-b")
+            .expect_err("replay must reject a workspace path reused by another project");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+    }
+
+    #[test]
+    fn replay_request_context_uses_startup_workspace_when_issuing_worktree_is_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let missing = temp.path().join("removed-linked-worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&missing));
+
+        let context = replay_request_context(&primary, &startup, &request)
+            .expect("removed issuing worktree should use the retained daemon workspace");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
     }
 
     #[test]

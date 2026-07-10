@@ -133,7 +133,7 @@ impl RequestOutcomeLedger {
                     connection.pragma_update(None, "busy_timeout", 5_000)?;
                     connection
                         .query_row(
-                            "SELECT request_hash, effect, response_json
+                            "SELECT request_hash, effect, recovery_class, response_json
              FROM daemon_request_outcomes
              WHERE request_id = ?1",
                             [&request.id],
@@ -142,6 +142,7 @@ impl RequestOutcomeLedger {
                                     row.get::<_, String>(0)?,
                                     row.get::<_, String>(1)?,
                                     row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
                                 ))
                             },
                         )
@@ -149,11 +150,18 @@ impl RequestOutcomeLedger {
                         .map_err(Into::into)
                 });
 
-        if let Ok(Some((stored_hash, effect, response_json))) = &runtime_outcome {
+        if let Ok(Some((stored_hash, effect, recovery_class, response_json))) = &runtime_outcome {
             let effect = effect_from_name(&effect)?;
             if stored_hash != &request_hash {
+                let response = request_id_conflict_response(request.id.clone(), effect);
                 return Ok(Some(OutcomeExecution {
-                    response: request_id_conflict_response(request.id.clone(), effect),
+                    response: if recovery_class.as_deref().and_then(recovery_class_from_name)
+                        == Some(RecoveryClass::AtomicProjectState)
+                    {
+                        without_committed_effect(response)
+                    } else {
+                        response
+                    },
                     replayed: false,
                 }));
             }
@@ -1366,6 +1374,47 @@ mod tests {
 
         assert!(replay.replayed);
         assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn terminal_atomic_request_id_conflict_has_no_committed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = request("request-terminal-atomic-conflict", "task-a");
+        let first = ledger.execute_atomic_project_state(
+            original,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(first.response.status, Status::Ok);
+
+        let conflict = ledger
+            .terminal_outcome_before_preparation(&request(
+                "request-terminal-atomic-conflict",
+                "task-b",
+            ))
+            .expect("probe terminal atomic conflict")
+            .expect("terminal conflict response");
+
+        assert!(!conflict.replayed);
+        assert_eq!(conflict.response.status, Status::Error);
+        assert_eq!(conflict.response.effect, None);
+        assert_eq!(
+            conflict
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("mutation_performed")),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]
