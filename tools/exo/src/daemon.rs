@@ -1059,10 +1059,6 @@ fn validated_request_workspace(
             "daemon request workspace path could not be canonicalized",
         )
     })?;
-    if workspace_root == startup_workspace {
-        return Ok(workspace_root);
-    }
-
     let belongs_to_project = startup_project
         .worktree_index()
         .and_then(|worktrees| worktrees.get(&workspace_root).copied())
@@ -2891,6 +2887,42 @@ mod tests {
         request.workspace_root = Some(linked);
         let error = atomic_request_context(&primary, &startup, &ledger, &request, "instance-b")
             .expect_err("replay must reject a workspace path reused by another project");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+    }
+
+    #[test]
+    fn explicit_startup_workspace_rejects_path_reused_by_another_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked-startup");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-startup-reuse-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        let startup = Project::resolve(&linked).expect("resolve linked startup project");
+        let request = request_for_workspace(Some(&linked));
+
+        std::fs::remove_dir_all(&linked).expect("remove startup worktree");
+        let foreign = create_test_git_repo(&temp, "linked-startup");
+        assert_eq!(
+            foreign.canonicalize().expect("canonical foreign repo"),
+            linked
+        );
+
+        let error = daemon_request_context(&linked, &startup, &request)
+            .expect_err("explicit reused startup path must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(

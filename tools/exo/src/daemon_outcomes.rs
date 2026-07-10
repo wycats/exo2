@@ -155,9 +155,10 @@ impl RequestOutcomeLedger {
             if stored_hash != &request_hash {
                 let response = request_id_conflict_response(request.id.clone(), effect);
                 return Ok(Some(OutcomeExecution {
-                    response: if recovery_class.as_deref().and_then(recovery_class_from_name)
-                        == Some(RecoveryClass::AtomicProjectState)
-                    {
+                    response: if matches!(
+                        recovery_class.as_deref().and_then(recovery_class_from_name),
+                        None | Some(RecoveryClass::AtomicProjectState)
+                    ) {
                         without_committed_effect(response)
                     } else {
                         response
@@ -1402,6 +1403,56 @@ mod tests {
             ))
             .expect("probe terminal atomic conflict")
             .expect("terminal conflict response");
+
+        assert!(!conflict.replayed);
+        assert_eq!(conflict.response.status, Status::Error);
+        assert_eq!(conflict.response.effect, None);
+        assert_eq!(
+            conflict
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("mutation_performed")),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
+    fn terminal_legacy_atomic_request_id_conflict_has_no_committed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = request("request-terminal-legacy-atomic-conflict", "task-a");
+        let first = ledger.execute_atomic_project_state(
+            original,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        Connection::open(ledger.path())
+            .expect("open runtime outcome ledger")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET recovery_class = NULL
+                 WHERE request_id = 'request-terminal-legacy-atomic-conflict'",
+                [],
+            )
+            .expect("simulate a migrated completed atomic outcome");
+
+        let conflict = ledger
+            .terminal_outcome_before_preparation(&request(
+                "request-terminal-legacy-atomic-conflict",
+                "task-b",
+            ))
+            .expect("probe legacy terminal atomic conflict")
+            .expect("legacy terminal conflict response");
 
         assert!(!conflict.replayed);
         assert_eq!(conflict.response.status, Status::Error);
