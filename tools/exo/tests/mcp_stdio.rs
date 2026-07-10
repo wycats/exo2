@@ -397,6 +397,32 @@ fn spawn_exo_mcp_proxy_with_env<const N: usize>(
     command.spawn().expect("spawn exo-mcp")
 }
 
+#[test]
+fn exo_mcp_proxy_health_reports_invalid_dogfood_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let activation = temp.path().join("activation.json");
+    std::fs::write(&activation, "not json").expect("write invalid activation");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("exo-mcp"))
+        .arg("--proxy-health")
+        .current_dir(temp.path())
+        .env(exo::dogfood_activation::DOGFOOD_ACTIVATION_ENV, &activation)
+        .output()
+        .expect("run proxy health");
+    assert!(output.status.success());
+
+    let health: JsonValue = serde_json::from_slice(&output.stdout).expect("proxy health JSON");
+    assert_eq!(health["kind"], "exo-mcp.proxy-health");
+    assert_eq!(health["ok"], false);
+    assert_eq!(health["status"]["activation"]["configured"], true);
+    assert_eq!(health["status"]["activation"]["ok"], false);
+    assert_eq!(
+        health["status"]["activation"]["state"],
+        "invalid_activation"
+    );
+    assert!(health["status"]["activation"].get("path").is_none());
+}
+
 #[cfg(unix)]
 fn install_exo_worker_binary(path: &std::path::Path) {
     let source = assert_cmd::cargo::cargo_bin!("exo");

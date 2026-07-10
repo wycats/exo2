@@ -5,8 +5,10 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 const USAGE: &str = "\
 cargo dogfood-exo
@@ -21,6 +23,8 @@ Runs the full Exosuit dogfood refresh lifecycle:
 - verify and refresh the dogfood receipt
 ";
 const EXO_PACKAGE_PATH: &str = "tools/exo";
+const DOGFOOD_ACTIVATION_ENV: &str = "EXO_DOGFOOD_ACTIVATION";
+const DOGFOOD_ACTIVATION_VERSION: u32 = 1;
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -60,9 +64,10 @@ fn main() -> Result<()> {
     step("Installing exo binaries into Cargo install root");
     install_exo_binaries(&root, &install_root)?;
     let installed_exo_bin = installed_exo_path(&install_root)?;
+    let activation = write_dogfood_activation(&root, &install_root)?;
 
     step("Pinning local Codex Exo plugin MCP command");
-    pin_local_codex_exo_plugin_mcp(&root, &install_root)?;
+    pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
 
     step("Building WASM bindings");
     run_workspace_helper(&root, "build_wasm")?;
@@ -107,26 +112,29 @@ fn main() -> Result<()> {
     )?;
 
     step("Verifying activation before receipt");
-    run_installed_exo_command(
+    run_installed_exo_command_with_activation(
         &root,
         &install_root,
         &installed_exo_bin,
+        &activation,
         &["--direct", "dogfood", "verify", "--skip-receipt"],
     )?;
 
     step("Writing dogfood receipt");
-    run_installed_exo_command(
+    run_installed_exo_command_with_activation(
         &root,
         &install_root,
         &installed_exo_bin,
+        &activation,
         &["--direct", "dogfood", "receipt"],
     )?;
 
     step("Verifying receipt");
-    run_installed_exo_command(
+    run_installed_exo_command_with_activation(
         &root,
         &install_root,
         &installed_exo_bin,
+        &activation,
         &["--direct", "dogfood", "verify"],
     )?;
 
@@ -174,6 +182,21 @@ fn run_installed_exo_command(
     exo_workspace::run_command_env_os(exo_bin, args, root, &envs)
 }
 
+fn run_installed_exo_command_with_activation(
+    root: &Path,
+    install_root: &Path,
+    exo_bin: &Path,
+    activation: &Path,
+    args: &[&str],
+) -> Result<()> {
+    let mut envs = installed_exo_command_env(install_root)?;
+    envs.push((
+        DOGFOOD_ACTIVATION_ENV.into(),
+        activation.as_os_str().to_os_string(),
+    ));
+    exo_workspace::run_command_env_os(exo_bin, args, root, &envs)
+}
+
 fn installed_exo_command_env(install_root: &Path) -> Result<Vec<(OsString, OsString)>> {
     Ok(vec![(
         "PATH".into(),
@@ -196,7 +219,11 @@ fn path_env_with_install_bin_from(
     std::env::join_paths(paths).context("failed to prepend Cargo install bin directory to PATH")
 }
 
-fn pin_local_codex_exo_plugin_mcp(root: &Path, install_root: &Path) -> Result<()> {
+fn pin_local_codex_exo_plugin_mcp(
+    root: &Path,
+    install_root: &Path,
+    activation: &Path,
+) -> Result<()> {
     let proxy = installed_exo_mcp_path(install_root)?;
     let paths = installed_codex_exo_plugin_mcp_paths(root)?;
     if paths.is_empty() {
@@ -207,9 +234,9 @@ fn pin_local_codex_exo_plugin_mcp(root: &Path, install_root: &Path) -> Result<()
     }
 
     for path in paths {
-        write_pinned_mcp_config(&path, &proxy)?;
+        write_pinned_mcp_config(&path, &proxy, activation)?;
         println!(
-            "Pinned Codex Exo plugin MCP command at {} -> {}",
+            "Pinned Codex Exo plugin MCP command at {} -> {} with dogfood build activation",
             path.display(),
             proxy.display()
         );
@@ -489,17 +516,90 @@ fn plugin_cache_mcp_paths(cache_root: &Path, name: &str, version: &str) -> Resul
     Ok(paths)
 }
 
-fn write_pinned_mcp_config(path: &Path, proxy: &Path) -> Result<()> {
+fn write_pinned_mcp_config(path: &Path, proxy: &Path, activation: &Path) -> Result<()> {
     let value = serde_json::json!({
         "mcpServers": {
             "exo": {
                 "command": proxy.display().to_string(),
-                "args": []
+                "args": [],
+                "env": {
+                    DOGFOOD_ACTIVATION_ENV: activation.display().to_string()
+                }
             }
         }
     });
     let content = format!("{}\n", serde_json::to_string_pretty(&value)?);
     fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[derive(Debug, Serialize)]
+struct DogfoodActivation {
+    version: u32,
+    source: DogfoodActivationBinaries,
+    installed: DogfoodActivationBinaries,
+}
+
+#[derive(Debug, Serialize)]
+struct DogfoodActivationBinaries {
+    exo: DogfoodActivationBinary,
+    exo_mcp: DogfoodActivationBinary,
+}
+
+#[derive(Debug, Serialize)]
+struct DogfoodActivationBinary {
+    path: PathBuf,
+    blake3: String,
+    size_bytes: u64,
+    modified_unix_ms: Option<u128>,
+}
+
+fn write_dogfood_activation(root: &Path, install_root: &Path) -> Result<PathBuf> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let activation_dir = install_root.join("exo-dogfood");
+    fs::create_dir_all(&activation_dir)
+        .with_context(|| format!("failed to create {}", activation_dir.display()))?;
+    let root_hash = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
+    let path = activation_dir.join(format!("{}.json", &root_hash[..16]));
+    let activation = DogfoodActivation {
+        version: DOGFOOD_ACTIVATION_VERSION,
+        source: DogfoodActivationBinaries {
+            exo: dogfood_activation_binary(&exo_debug_binary(&root))?,
+            exo_mcp: dogfood_activation_binary(&debug_binary(&root, "exo-mcp"))?,
+        },
+        installed: DogfoodActivationBinaries {
+            exo: dogfood_activation_binary(&installed_exo_path(install_root)?)?,
+            exo_mcp: dogfood_activation_binary(&installed_exo_mcp_path(install_root)?)?,
+        },
+    };
+    let serialized = serde_json::to_vec_pretty(&activation)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serialized)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(path)
+}
+
+fn dogfood_activation_binary(path: &Path) -> Result<DogfoodActivationBinary> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    let metadata =
+        fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+    Ok(DogfoodActivationBinary {
+        blake3: blake3::hash(
+            &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
+        )
+        .to_hex()
+        .to_string(),
+        size_bytes: metadata.len(),
+        modified_unix_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis()),
+        path,
+    })
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -639,12 +739,13 @@ mod tests {
     }
 
     #[test]
-    fn write_pinned_mcp_config_uses_absolute_proxy_command() {
+    fn write_pinned_mcp_config_uses_absolute_proxy_command_and_activation() {
         let root = temp_dir("pinned-mcp");
         let mcp = root.join(".mcp.json");
         let proxy = root.join(format!("exo-mcp{}", std::env::consts::EXE_SUFFIX));
+        let activation = root.join("activation.json");
 
-        write_pinned_mcp_config(&mcp, &proxy).expect("write pinned config");
+        write_pinned_mcp_config(&mcp, &proxy, &activation).expect("write pinned config");
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&mcp).expect("read mcp")).expect("valid json");
 
@@ -653,6 +754,10 @@ mod tests {
             proxy.display().to_string()
         );
         assert_eq!(value["mcpServers"]["exo"]["args"], serde_json::json!([]));
+        assert_eq!(
+            value["mcpServers"]["exo"]["env"][DOGFOOD_ACTIVATION_ENV],
+            activation.display().to_string()
+        );
         fs::remove_dir_all(root).ok();
     }
 

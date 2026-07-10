@@ -7,6 +7,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use exo::api::protocol::Effect;
+use exo::dogfood_activation::{DogfoodActivation, status_value as dogfood_activation_status_value};
 use exo::mcp::{
     ExecutableIdentity, MCP_WORKER_PROTOCOL_VERSION, executable_identity_for_path,
     executable_identity_matches_path,
@@ -30,13 +31,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if std::env::args().nth(1).as_deref() == Some("--proxy-health") {
         let mut proxy_worker = ProxyWorker::new(worker_spec)?;
-        proxy_worker.ensure_worker()?;
+        let health_error = proxy_worker
+            .ensure_worker()
+            .err()
+            .map(|error| error.to_string());
         let mut stdout = std::io::stdout().lock();
         serde_json::to_writer(
             &mut stdout,
             &json!({
                 "kind": "exo-mcp.proxy-health",
                 "worker_protocol_version": MCP_WORKER_PROTOCOL_VERSION,
+                "ok": health_error.is_none(),
+                "issue": health_error,
                 "status": proxy_worker.status_value(),
             }),
         )?;
@@ -72,6 +78,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct ProxyWorker {
     spec: WorkerSpec,
     proxy_identity: ProxyExecutableIdentity,
+    dogfood_activation: DogfoodActivation,
     running: Option<RunningWorker>,
     restart_count: u64,
     last_restart_reason: Option<String>,
@@ -85,6 +92,7 @@ impl ProxyWorker {
         Ok(Self {
             spec,
             proxy_identity: ProxyExecutableIdentity::capture()?,
+            dogfood_activation: DogfoodActivation::from_environment(),
             running: None,
             restart_count: 0,
             last_restart_reason: None,
@@ -405,6 +413,10 @@ impl ProxyWorker {
 
         json!({
             "proxy": self.proxy_identity.status_value(),
+            "activation": dogfood_activation_status_value(self.dogfood_activation.status(
+                &self.proxy_identity.executable_path,
+                self.running.as_ref().map(|running| &running.identity),
+            )),
             "restart_count": self.restart_count,
             "last_restart_reason": self.last_restart_reason,
             "last_error": self.last_error,
@@ -418,6 +430,9 @@ impl ProxyWorker {
     }
 
     fn ensure_worker_with_restart_reason(&mut self) -> Result<Option<String>, HostError> {
+        self.dogfood_activation
+            .ensure_before_worker(&self.proxy_identity.executable_path)
+            .map_err(HostError::Protocol)?;
         if self.running.is_some() {
             return Ok(None);
         }
@@ -428,6 +443,12 @@ impl ProxyWorker {
             .unwrap_or_else(|| "initial_start".to_string());
         let record_restart = reason != "initial_start";
         self.spawn_worker_recording(&reason, record_restart)?;
+        let Some(running) = self.running.as_ref() else {
+            return Err(HostError::Protocol("worker did not start".to_string()));
+        };
+        self.dogfood_activation
+            .ensure_worker(&self.proxy_identity.executable_path, &running.identity)
+            .map_err(HostError::Protocol)?;
         Ok(Some(reason))
     }
 
@@ -805,12 +826,26 @@ fn worker_spec() -> Result<WorkerSpec, std::io::Error> {
     }
 
     let current = std::env::current_exe()?;
-    Ok(worker_spec_for(
+    Ok(worker_spec_for_activation(
+        DogfoodActivation::source_worker_path_from_environment(),
         &current,
         current.with_file_name(worker_binary_name()).is_file(),
         std::env::var_os("CARGO").map(PathBuf::from),
         &exo_manifest_path(),
     ))
+}
+
+fn worker_spec_for_activation(
+    source_worker: Option<PathBuf>,
+    current_exe: &Path,
+    sibling_exists: bool,
+    cargo: Option<PathBuf>,
+    manifest_path: &Path,
+) -> WorkerSpec {
+    if let Some(path) = source_worker {
+        return exo_worker_spec(path);
+    }
+    worker_spec_for(current_exe, sibling_exists, cargo, manifest_path)
 }
 
 fn worker_spec_for(
@@ -877,7 +912,7 @@ mod tests {
 
     use super::{
         bind_outcome_request_id, exo_worker_spec, worker_binary_name, worker_identity_check_path,
-        worker_spec_for,
+        worker_spec_for, worker_spec_for_activation,
     };
 
     #[test]
@@ -980,5 +1015,20 @@ mod tests {
         let path = worker_identity_check_path(&spec, Path::new("/tmp/target/debug/exo"));
 
         assert_eq!(path, Path::new("/tmp/target/debug/exo"));
+    }
+
+    #[test]
+    fn dogfood_activation_prefers_the_source_worker_over_the_installed_sibling() {
+        let source_worker = PathBuf::from("/workspace/target/debug/exo");
+        let spec = worker_spec_for_activation(
+            Some(source_worker.clone()),
+            Path::new("/install/bin/exo-mcp"),
+            true,
+            None,
+            Path::new("/workspace/tools/exo/Cargo.toml"),
+        );
+
+        assert_eq!(spec.program(), source_worker);
+        assert_eq!(spec.args(), ["mcp", "worker"]);
     }
 }

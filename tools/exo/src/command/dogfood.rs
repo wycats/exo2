@@ -853,6 +853,15 @@ struct PluginProxyBinaryIdentity {
     blake3: Option<String>,
     size_bytes: Option<u64>,
     modified_unix_ms: Option<u128>,
+    activation: Option<DogfoodActivationProbe>,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DogfoodActivationProbe {
+    configured: bool,
+    ok: bool,
+    state: String,
     issue: Option<String>,
 }
 
@@ -976,6 +985,7 @@ fn plugin_proxy_binary_identity(
         blake3: None,
         size_bytes: None,
         modified_unix_ms: None,
+        activation: None,
         issue: Some(format!(
             "plugin MCP server command `{command}` was not found on PATH{workspace_note}; run `cargo install --path tools/exo --locked`"
         )),
@@ -1008,6 +1018,15 @@ fn plugin_proxy_binary_for_path(
         health = Some(proxy_health_probe(command, &path));
         if let Some(issue) = health.as_ref().and_then(|health| health.issue.clone()) {
             Some(issue)
+        } else if let Some(activation) = health
+            .as_ref()
+            .and_then(|health| health.activation.as_ref())
+            && activation.configured
+            && !activation.ok
+        {
+            Some(activation.issue.clone().unwrap_or_else(|| {
+                "the Exo MCP proxy dogfood activation is not current; run `cargo dogfood-exo` from the source checkout".to_string()
+            }))
         } else if health
             .as_ref()
             .and_then(|health| health.worker.as_ref())
@@ -1062,6 +1081,7 @@ fn plugin_proxy_binary_for_path(
                     .and_then(|metadata| metadata.modified().ok())
                     .and_then(system_time_ms)
             }),
+        activation: health.and_then(|health| health.activation),
         issue,
     }
 }
@@ -1071,6 +1091,7 @@ struct ProxyHealthProbe {
     issue: Option<String>,
     proxy: Option<ProbeExecutableIdentity>,
     worker: Option<ProbeExecutableIdentity>,
+    activation: Option<DogfoodActivationProbe>,
 }
 
 #[derive(Debug)]
@@ -1216,9 +1237,16 @@ fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
         };
     }
     ProxyHealthProbe {
-        issue: None,
+        issue: value
+            .get("issue")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
         proxy: probe_executable_identity(&value, "/status/proxy"),
         worker: probe_executable_identity(&value, "/status/worker/identity"),
+        activation: value
+            .pointer("/status/activation")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     }
 }
 

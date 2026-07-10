@@ -1114,6 +1114,55 @@ fn dogfood_rejects_proxy_health_with_stale_worker_identity() {
 
 #[cfg(unix)]
 #[test]
+fn dogfood_verify_reports_stale_dogfood_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut payload = healthy_proxy_payload();
+    payload["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "the source Exo build recorded by dogfood activation is unavailable; run `cargo dogfood-exo` from the source checkout"
+    });
+    fs::write(&fake_proxy, proxy_health_script_with_payload(payload, ""))
+        .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let output = dogfood_exo_cmd(temp.path())
+        .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+        .env(
+            "PATH",
+            std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                .expect("join fake PATH"),
+        )
+        .output()
+        .expect("run dogfood verify");
+    assert_eq!(output.status.code(), Some(2));
+
+    let dogfood = json_result(output.stdout);
+    assert_eq!(dogfood["ok"], false);
+    assert_eq!(dogfood["plugin"]["ok"], false);
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "source_build_missing"
+    );
+    assert!(
+        dogfood["plugin"]["issue"]
+            .as_str()
+            .expect("plugin issue")
+            .contains("cargo dogfood-exo"),
+        "{dogfood}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dogfood_proxy_health_probe_does_not_wait_for_background_stdout() {
     let temp = tempfile::tempdir().expect("tempdir");
     git_init(temp.path());
