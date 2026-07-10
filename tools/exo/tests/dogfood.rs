@@ -240,6 +240,10 @@ fn path_with_git_only() -> std::ffi::OsString {
 }
 
 fn write_plugin_mcp(root: &Path, command: &str, args: &[&str]) {
+    write_plugin_mcp_with_env(root, command, args, serde_json::json!({}));
+}
+
+fn write_plugin_mcp_with_env(root: &Path, command: &str, args: &[&str], env: JsonValue) {
     let plugin_dir = root.join("plugins/exo");
     std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
     std::fs::write(
@@ -248,7 +252,8 @@ fn write_plugin_mcp(root: &Path, command: &str, args: &[&str]) {
             "mcpServers": {
                 "exo": {
                     "command": command,
-                    "args": args
+                    "args": args,
+                    "env": env
                 }
             }
         }))
@@ -1204,6 +1209,53 @@ fn dogfood_verify_reports_stale_dogfood_activation() {
             .expect("plugin issue")
             .contains("cargo dogfood-exo"),
         "{dogfood}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_proxy_health_uses_the_pinned_activation_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut stale = healthy_proxy_payload();
+    stale["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "the source Exo build recorded by dogfood activation is unavailable; run `cargo dogfood-exo` from the source checkout"
+    });
+    let current = healthy_proxy_payload();
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--proxy-health\" ]; then\n  if [ -n \"${{EXO_DOGFOOD_ACTIVATION:-}}\" ]; then\n    printf '%s\\n' '{}'\n  else\n    printf '%s\\n' '{}'\n  fi\n  exit 0\nfi\nexit 0\n",
+            stale, current
+        ),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+    write_plugin_mcp_with_env(
+        temp.path(),
+        fake_proxy.to_str().expect("proxy path"),
+        &[],
+        serde_json::json!({ "EXO_DOGFOOD_ACTIVATION": temp.path().join("activation.json") }),
+    );
+
+    let output = dogfood_exo_cmd(temp.path())
+        .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+        .output()
+        .expect("run dogfood verify");
+    assert_eq!(output.status.code(), Some(2));
+
+    let dogfood = json_result(output.stdout);
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "source_build_missing"
     );
 }
 

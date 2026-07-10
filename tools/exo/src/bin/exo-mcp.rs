@@ -443,6 +443,11 @@ impl ProxyWorker {
             .unwrap_or_else(|| "initial_start".to_string());
         let record_restart = reason != "initial_start";
         self.spawn_worker_recording(&reason, record_restart)?;
+        self.validate_running_worker_activation(&reason)?;
+        Ok(Some(reason))
+    }
+
+    fn validate_running_worker_activation(&mut self, reason: &str) -> Result<(), HostError> {
         let Some(running) = self.running.as_ref() else {
             return Err(HostError::Protocol("worker did not start".to_string()));
         };
@@ -458,7 +463,7 @@ impl ProxyWorker {
             self.record_restart_error(&reason, &error);
             return Err(error);
         }
-        Ok(Some(reason))
+        Ok(())
     }
 
     fn ensure_worker_identity_is_current(&mut self) -> Result<(), HostError> {
@@ -484,6 +489,7 @@ impl ProxyWorker {
         self.running = None;
         self.pending_restart_reason = Some("worker_binary_changed".to_string());
         self.spawn_worker_recording("worker_binary_changed", true)?;
+        self.validate_running_worker_activation("worker_binary_changed")?;
         Ok(Some("worker_binary_changed".to_string()))
     }
 

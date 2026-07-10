@@ -876,6 +876,8 @@ struct PluginMcpServerConfig {
     command: String,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 fn plugin_mcp_server_identity(
@@ -939,7 +941,8 @@ fn plugin_mcp_server_identity(
         );
     }
 
-    let proxy_binary = plugin_proxy_binary_identity(root, &server.command, current_binary);
+    let proxy_binary =
+        plugin_proxy_binary_identity(root, &server.command, current_binary, &server.env);
     let issue = proxy_binary.issue.clone();
     (Some(identity), Some(proxy_binary), issue)
 }
@@ -948,6 +951,7 @@ fn plugin_proxy_binary_identity(
     root: &Path,
     command: &str,
     current_binary: &BinaryIdentity,
+    env: &BTreeMap<String, String>,
 ) -> PluginProxyBinaryIdentity {
     let command_path = Path::new(command);
     if command_path.is_absolute() {
@@ -956,6 +960,7 @@ fn plugin_proxy_binary_identity(
             command_path.to_path_buf(),
             "plugin-command",
             current_binary,
+            env,
         );
     }
 
@@ -965,7 +970,7 @@ fn plugin_proxy_binary_identity(
         .then(|| target.canonicalize().unwrap_or(target));
 
     if let Some(path) = find_command_in_path(command) {
-        return plugin_proxy_binary_for_path(command, path, "path", current_binary);
+        return plugin_proxy_binary_for_path(command, path, "path", current_binary, env);
     }
 
     let workspace_note = if let Some(workspace_target) = workspace_target {
@@ -997,6 +1002,7 @@ fn plugin_proxy_binary_for_path(
     path: PathBuf,
     source: &'static str,
     current_binary: &BinaryIdentity,
+    env: &BTreeMap<String, String>,
 ) -> PluginProxyBinaryIdentity {
     let mut path = path.canonicalize().unwrap_or(path);
     let mut source = source;
@@ -1015,7 +1021,7 @@ fn plugin_proxy_binary_for_path(
             path.display()
         ))
     } else {
-        health = Some(proxy_health_probe(command, &path));
+        health = Some(proxy_health_probe(command, &path, env));
         if let Some(issue) = health.as_ref().and_then(|health| health.issue.clone()) {
             Some(issue)
         } else if let Some(activation) = health
@@ -1106,7 +1112,11 @@ struct ProbeExecutableIdentity {
     modified_unix_ms: Option<u128>,
 }
 
-fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
+fn proxy_health_probe(
+    command: &str,
+    path: &Path,
+    env: &BTreeMap<String, String>,
+) -> ProxyHealthProbe {
     let output_path = std::env::temp_dir().join(format!(
         "exo-proxy-health-{}-{}-{}.json",
         std::process::id(),
@@ -1137,6 +1147,7 @@ fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
     child_command
         .arg("--proxy-health")
         .env_remove("EXO_NO_REEXEC")
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::null());
@@ -3089,7 +3100,7 @@ mod tests {
         fs::set_permissions(&proxy, permissions).expect("chmod fake proxy");
 
         let started = Instant::now();
-        let probe = proxy_health_probe("exo-mcp", &proxy);
+        let probe = proxy_health_probe("exo-mcp", &proxy, &BTreeMap::new());
 
         assert_eq!(probe.issue, None);
         assert!(

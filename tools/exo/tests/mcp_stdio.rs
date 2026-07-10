@@ -478,6 +478,98 @@ fn exo_mcp_proxy_health_reaps_worker_rejected_by_activation() {
 }
 
 #[cfg(unix)]
+#[test]
+fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init_with_storage(temp.path(), "sqlite");
+
+    let worker = temp.path().join("exo-worker");
+    let source_worker = temp.path().join("activation-source-exo");
+    install_exo_worker_binary(&worker);
+    std::fs::copy(&worker, &source_worker).expect("copy activation source worker");
+    let permissions = std::fs::metadata(&worker)
+        .expect("worker metadata")
+        .permissions();
+    std::fs::set_permissions(&source_worker, permissions).expect("set source worker permissions");
+
+    let exo = assert_cmd::cargo::cargo_bin!("exo");
+    let exo_mcp = assert_cmd::cargo::cargo_bin!("exo-mcp");
+    let activation = temp.path().join("activation.json");
+    write_dogfood_activation(&activation, &source_worker, &exo_mcp, &exo, &exo_mcp);
+
+    let mut child = spawn_exo_mcp_proxy_with_env(
+        temp.path(),
+        [
+            ("EXO_MCP_WORKER", worker.as_path()),
+            (
+                exo::dogfood_activation::DOGFOOD_ACTIVATION_ENV,
+                activation.as_path(),
+            ),
+        ],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    let initial = call_exo_run(&mut stdin, &mut stdout, 1, "status");
+    assert_eq!(initial["result"]["isError"], false, "{initial}");
+
+    std::fs::write(&source_worker, "updated source activation identity")
+        .expect("change source activation identity");
+    install_exo_worker_binary(&worker);
+
+    let restarted = call_exo_run(&mut stdin, &mut stdout, 2, "status");
+    assert_eq!(restarted["error"]["code"], -32000, "{restarted}");
+    let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-failure");
+    assert!(status["result"]["worker"].is_null(), "{status}");
+    assert!(
+        status["result"]["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not match the current source build")),
+        "{status}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for exo-mcp");
+    assert!(status.success(), "exo-mcp exited with {status}");
+}
+
+#[cfg(unix)]
+fn write_dogfood_activation(
+    path: &std::path::Path,
+    source_exo: &std::path::Path,
+    source_mcp: &std::path::Path,
+    installed_exo: &std::path::Path,
+    installed_mcp: &std::path::Path,
+) {
+    let binary = |path: &std::path::Path| {
+        serde_json::json!({
+            "path": path,
+            "blake3": "unused-by-this-fixture",
+            "size_bytes": 0,
+            "modified_unix_ms": null,
+        })
+    };
+    std::fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source": {
+                "exo": binary(source_exo),
+                "exo_mcp": binary(source_mcp),
+            },
+            "installed": {
+                "exo": binary(installed_exo),
+                "exo_mcp": binary(installed_mcp),
+            },
+        }))
+        .expect("serialize activation"),
+    )
+    .expect("write activation");
+}
+
+#[cfg(unix)]
 fn install_exo_worker_binary(path: &std::path::Path) {
     let source = assert_cmd::cargo::cargo_bin!("exo");
     if path.exists() {
