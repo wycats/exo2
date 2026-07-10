@@ -47,7 +47,7 @@ tokio = { version = "1", features = [
 fractional_index = "2.0.2"
 libc = "0.2"
 fs2 = "0.4.3"
-nix = { version = "0.31.1", features = ["signal"] }
+nix = { version = "0.31.1", features = ["process", "signal"] }
 tempfile = "3.10"
 [dev-dependencies]
 assert_cmd = "2.0"
