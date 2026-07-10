@@ -296,20 +296,11 @@ fn parse_cli_json(output: &std::process::Output) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-fn process_group_id(pid: u32) -> u32 {
-    let output = Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .output()
-        .expect("read process group with ps");
-    assert!(
-        output.status.success(),
-        "ps should read process group for {pid}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .expect("ps should report a numeric process group")
+fn process_group_id(pid: u32) -> i32 {
+    let pid = i32::try_from(pid).expect("process ID should fit in i32");
+    nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
+        .expect("read process group")
+        .as_raw()
 }
 
 fn read_ndjson(path: &Path) -> Vec<serde_json::Value> {
@@ -763,22 +754,22 @@ async fn daemon_ensure_cli_survives_short_lived_parent_exit(backend: &str) {
         "daemon ensure failed: {}",
         String::from_utf8_lossy(&ensure.stderr)
     );
-    let ensure = parse_cli_json(&ensure);
-    let pid = ensure
-        .get("result")
-        .and_then(|result| result.get("pid"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|pid| u32::try_from(pid).ok())
-        .expect("daemon ensure should report a daemon PID");
-
     #[cfg(unix)]
-    assert_ne!(
-        process_group_id(pid),
-        process_group_id(std::process::id()),
-        "spawned daemon must not inherit the short-lived parent's process group"
-    );
+    {
+        let pid = parse_cli_json(&ensure)
+            .get("result")
+            .and_then(|result| result.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .expect("daemon ensure should report a daemon PID");
+        assert_ne!(
+            process_group_id(pid),
+            process_group_id(std::process::id()),
+            "spawned daemon must not inherit the short-lived parent's process group"
+        );
+    }
 
-    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let status = run_exo_daemon_status(&workspace);
     assert!(
         status.status.success(),
