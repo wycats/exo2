@@ -14,6 +14,7 @@ const DOGFOOD_ACTIVATION_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct DogfoodActivation {
     configured: bool,
+    activation_path: Option<PathBuf>,
     record: Result<DogfoodActivationRecord, String>,
 }
 
@@ -52,26 +53,23 @@ impl DogfoodActivation {
         let Some(path) = std::env::var_os(DOGFOOD_ACTIVATION_ENV).map(PathBuf::from) else {
             return Self {
                 configured: false,
+                activation_path: None,
                 record: Err("dogfood activation is not configured".to_string()),
             };
         };
-        let record = fs::read(&path)
-            .map_err(|error| format!("failed to read dogfood activation: {error}"))
-            .and_then(|content| {
-                serde_json::from_slice(&content)
-                    .map_err(|error| format!("failed to parse dogfood activation: {error}"))
-            });
         Self {
             configured: true,
-            record,
+            activation_path: Some(path.clone()),
+            record: Self::read_record(&path),
         }
     }
 
     pub fn status(
-        &self,
+        &mut self,
         proxy_path: &Path,
         worker_identity: Option<&JsonValue>,
     ) -> DogfoodActivationStatus {
+        self.reload();
         if !self.configured {
             return DogfoodActivationStatus {
                 configured: false,
@@ -125,7 +123,7 @@ impl DogfoodActivation {
         }
     }
 
-    pub fn ensure_before_worker(&self, proxy_path: &Path) -> Result<(), String> {
+    pub fn ensure_before_worker(&mut self, proxy_path: &Path) -> Result<(), String> {
         let status = self.status(proxy_path, None);
         status.ok.then_some(()).ok_or_else(|| {
             status
@@ -135,7 +133,7 @@ impl DogfoodActivation {
     }
 
     pub fn ensure_worker(
-        &self,
+        &mut self,
         proxy_path: &Path,
         worker_identity: &JsonValue,
     ) -> Result<(), String> {
@@ -152,6 +150,21 @@ impl DogfoodActivation {
         let content = fs::read(path).ok()?;
         let record = serde_json::from_slice::<DogfoodActivationRecord>(&content).ok()?;
         (record.version == DOGFOOD_ACTIVATION_VERSION).then_some(record.source.exo.path)
+    }
+
+    fn reload(&mut self) {
+        if let Some(path) = &self.activation_path {
+            self.record = Self::read_record(path);
+        }
+    }
+
+    fn read_record(path: &Path) -> Result<DogfoodActivationRecord, String> {
+        fs::read(path)
+            .map_err(|error| format!("failed to read dogfood activation: {error}"))
+            .and_then(|content| {
+                serde_json::from_slice(&content)
+                    .map_err(|error| format!("failed to parse dogfood activation: {error}"))
+            })
     }
 
     fn failure(&self, state: &'static str, issue: impl Into<String>) -> DogfoodActivationStatus {
@@ -233,6 +246,7 @@ mod tests {
     ) -> DogfoodActivation {
         DogfoodActivation {
             configured: true,
+            activation_path: None,
             record: Ok(DogfoodActivationRecord {
                 version: DOGFOOD_ACTIVATION_VERSION,
                 source: DogfoodActivationBinaries {
@@ -257,7 +271,7 @@ mod tests {
         for path in [&source_exo, &source_mcp, &installed_exo, &installed_mcp] {
             fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
         }
-        let activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
+        let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") } });
 
         let status = activation.status(&installed_mcp, Some(&worker));
@@ -275,7 +289,7 @@ mod tests {
         for path in [&source_exo, &source_mcp, &installed_exo, &installed_mcp] {
             fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
         }
-        let activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
+        let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         fs::write(&source_exo, "new source build").expect("update source build");
 
         let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&installed_exo).expect("hash") } });
@@ -295,7 +309,7 @@ mod tests {
         for path in [&source_exo, &source_mcp, &installed_exo, &installed_mcp] {
             fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
         }
-        let activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
+        let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         fs::write(&source_mcp, "rebuilt source proxy").expect("rebuild source proxy");
         let worker = json!({ "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") } });
 

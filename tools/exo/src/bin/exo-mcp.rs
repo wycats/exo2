@@ -403,7 +403,11 @@ impl ProxyWorker {
         }))
     }
 
-    fn status_value(&self) -> JsonValue {
+    fn status_value(&mut self) -> JsonValue {
+        let worker_identity = self
+            .running
+            .as_ref()
+            .map(|running| running.identity.clone());
         let worker = self.running.as_ref().map(|running| {
             json!({
                 "pid": running.process_id,
@@ -415,7 +419,7 @@ impl ProxyWorker {
             "proxy": self.proxy_identity.status_value(),
             "activation": dogfood_activation_status_value(self.dogfood_activation.status(
                 &self.proxy_identity.executable_path,
-                self.running.as_ref().map(|running| &running.identity),
+                worker_identity.as_ref(),
             )),
             "restart_count": self.restart_count,
             "last_restart_reason": self.last_restart_reason,

@@ -536,6 +536,63 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
 }
 
 #[cfg(unix)]
+#[test]
+fn exo_mcp_proxy_reloads_replaced_activation_record() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init_with_storage(temp.path(), "sqlite");
+
+    let worker = temp.path().join("exo-worker");
+    let first_source = temp.path().join("first-source-exo");
+    let second_source = temp.path().join("second-source-exo");
+    install_exo_worker_binary(&worker);
+    for source in [&first_source, &second_source] {
+        std::fs::copy(&worker, source).expect("copy source worker");
+        let permissions = std::fs::metadata(&worker)
+            .expect("worker metadata")
+            .permissions();
+        std::fs::set_permissions(source, permissions).expect("set source worker permissions");
+    }
+
+    let exo = assert_cmd::cargo::cargo_bin!("exo");
+    let exo_mcp = assert_cmd::cargo::cargo_bin!("exo-mcp");
+    let activation = temp.path().join("activation.json");
+    write_dogfood_activation(&activation, &first_source, &exo_mcp, &exo, &exo_mcp);
+
+    let mut child = spawn_exo_mcp_proxy_with_env(
+        temp.path(),
+        [
+            ("EXO_MCP_WORKER", worker.as_path()),
+            (
+                exo::dogfood_activation::DOGFOOD_ACTIVATION_ENV,
+                activation.as_path(),
+            ),
+        ],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    let initial = call_exo_run(&mut stdin, &mut stdout, 1, "status");
+    assert_eq!(initial["result"]["isError"], false, "{initial}");
+
+    std::fs::write(&first_source, "stale source activation identity")
+        .expect("change first source identity");
+    write_dogfood_activation(&activation, &second_source, &exo_mcp, &exo, &exo_mcp);
+
+    let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-refresh");
+    assert_eq!(
+        status["result"]["activation"]["state"], "current",
+        "{status}"
+    );
+    assert_eq!(status["result"]["activation"]["ok"], true, "{status}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait for exo-mcp");
+    assert!(status.success(), "exo-mcp exited with {status}");
+}
+
+#[cfg(unix)]
 fn write_dogfood_activation(
     path: &std::path::Path,
     source_exo: &std::path::Path,
