@@ -1350,6 +1350,15 @@ fn spawn_daemon_process(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    // Null stdio does not detach the child from the caller's process group.
+    // Put the daemon in its own group so terminal and runner cleanup for the
+    // short-lived `daemon ensure` command cannot terminate a live daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     command.spawn()?;
 
     Ok(())
