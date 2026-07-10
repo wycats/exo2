@@ -1059,17 +1059,6 @@ fn validated_request_workspace(
             "daemon request workspace path could not be canonicalized",
         )
     })?;
-    let belongs_to_project = startup_project
-        .worktree_index()
-        .and_then(|worktrees| worktrees.get(&workspace_root).copied())
-        .is_some_and(|prunable| !prunable);
-    if !belongs_to_project {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "request workspace does not belong to this daemon's project and state root",
-        ));
-    }
-
     let resolver = startup_project
         .projects_config_path
         .as_deref()
@@ -2749,6 +2738,43 @@ mod tests {
         assert_eq!(context.project.id, startup.id);
         assert_eq!(context.project.state_root, startup.state_root);
         assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_accepts_git_submodule_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = create_test_git_repo(&temp, "submodule-source");
+        let parent = create_test_git_repo(&temp, "parent");
+        run_test_git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().expect("source path"),
+                "modules/child",
+            ],
+        );
+        let child = parent
+            .join("modules/child")
+            .canonicalize()
+            .expect("canonical submodule workspace");
+        let startup = Project::resolve(&child).expect("resolve submodule project");
+        assert!(
+            !startup
+                .worktree_index()
+                .is_some_and(|worktrees| worktrees.contains_key(&child)),
+            "the submodule workspace is not represented by the worktree index"
+        );
+        let request = request_for_workspace(Some(&child));
+
+        let context = daemon_request_context(&child, &startup, &request)
+            .expect("submodule workspace should resolve through project identity");
+
+        assert_eq!(context.workspace_root, child);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
     }
 
     #[test]
