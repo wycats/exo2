@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 pub const DOGFOOD_ACTIVATION_ENV: &str = "EXO_DOGFOOD_ACTIVATION";
-const DOGFOOD_ACTIVATION_VERSION: u32 = 1;
+const DOGFOOD_ACTIVATION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct DogfoodActivation {
@@ -29,6 +29,8 @@ pub struct DogfoodActivationStatus {
 #[derive(Debug, Clone, Deserialize)]
 struct DogfoodActivationRecord {
     version: u32,
+    #[serde(default)]
+    pinned_mcp_config: Option<PathBuf>,
     source: DogfoodActivationBinaries,
     installed: DogfoodActivationBinaries,
 }
@@ -76,7 +78,7 @@ impl DogfoodActivation {
             };
         }
         let record = match &self.record {
-            Ok(record) if record.version == DOGFOOD_ACTIVATION_VERSION => record,
+            Ok(record) if matches!(record.version, 1 | DOGFOOD_ACTIVATION_VERSION) => record,
             Ok(_) => {
                 return self.failure(
                     "unsupported_activation",
@@ -146,7 +148,40 @@ impl DogfoodActivation {
         let path = std::env::var_os(DOGFOOD_ACTIVATION_ENV).map(PathBuf::from)?;
         let content = fs::read(path).ok()?;
         let record = serde_json::from_slice::<DogfoodActivationRecord>(&content).ok()?;
-        (record.version == DOGFOOD_ACTIVATION_VERSION).then_some(record.source.exo.path)
+        matches!(record.version, 1 | DOGFOOD_ACTIVATION_VERSION).then_some(record.source.exo.path)
+    }
+
+    pub fn pinned_mcp_config_from_environment() -> Result<Option<PathBuf>, String> {
+        let Some(path) = std::env::var_os(DOGFOOD_ACTIVATION_ENV).map(PathBuf::from) else {
+            return Ok(None);
+        };
+        Self::pinned_mcp_config_from_path(&path).map(Some)
+    }
+
+    fn pinned_mcp_config_from_path(path: &Path) -> Result<PathBuf, String> {
+        let record = Self::read_record(path)?;
+        if record.version != DOGFOOD_ACTIVATION_VERSION {
+            return Err(format!(
+                "dogfood activation version {} does not identify the pinned Codex plugin config; run `cargo dogfood-exo` from the configured source checkout",
+                record.version
+            ));
+        }
+        let configured = record.pinned_mcp_config.ok_or_else(|| {
+            "dogfood activation does not identify the pinned Codex plugin config; run `cargo dogfood-exo` from the configured source checkout"
+                .to_string()
+        })?;
+        if !configured.is_file() {
+            return Err(format!(
+                "the pinned Codex plugin config is unavailable at {}; run `cargo dogfood-exo` from the configured source checkout",
+                configured.display()
+            ));
+        }
+        configured.canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve pinned Codex plugin config {}: {error}",
+                configured.display()
+            )
+        })
     }
 
     fn reload(&mut self) {
@@ -228,6 +263,7 @@ mod tests {
             activation_path: None,
             record: Ok(DogfoodActivationRecord {
                 version: DOGFOOD_ACTIVATION_VERSION,
+                pinned_mcp_config: Some(source_mcp.to_path_buf()),
                 source: DogfoodActivationBinaries {
                     exo: fingerprint(source_exo),
                     exo_mcp: fingerprint(source_mcp),
@@ -333,5 +369,69 @@ mod tests {
         assert!(status.success());
 
         assert!(!fingerprint_matches_path_for(&expected, &path));
+    }
+
+    #[test]
+    fn pinned_mcp_config_resolves_the_recorded_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let activation_path = temp.path().join("activation.json");
+        let pinned_config = temp.path().join("cache/exo/.mcp.json");
+        fs::create_dir_all(pinned_config.parent().expect("config parent"))
+            .expect("create plugin cache");
+        fs::write(&pinned_config, "{}").expect("write pinned config");
+        fs::write(
+            &activation_path,
+            serde_json::to_vec(&json!({
+                "version": DOGFOOD_ACTIVATION_VERSION,
+                "pinned_mcp_config": pinned_config,
+                "source": {
+                    "exo": { "path": "source-exo", "blake3": "source-exo" },
+                    "exo_mcp": { "path": "source-mcp", "blake3": "source-mcp" }
+                },
+                "installed": {
+                    "exo": { "path": "installed-exo", "blake3": "installed-exo" },
+                    "exo_mcp": { "path": "installed-mcp", "blake3": "installed-mcp" }
+                }
+            }))
+            .expect("serialize activation"),
+        )
+        .expect("write activation");
+
+        assert_eq!(
+            DogfoodActivation::pinned_mcp_config_from_path(&activation_path)
+                .expect("resolve pinned config"),
+            pinned_config
+                .canonicalize()
+                .expect("canonical pinned config")
+        );
+    }
+
+    #[test]
+    fn pinned_mcp_config_reports_missing_recorded_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let activation_path = temp.path().join("activation.json");
+        let missing = temp.path().join("missing/.mcp.json");
+        fs::write(
+            &activation_path,
+            serde_json::to_vec(&json!({
+                "version": DOGFOOD_ACTIVATION_VERSION,
+                "pinned_mcp_config": missing,
+                "source": {
+                    "exo": { "path": "source-exo", "blake3": "source-exo" },
+                    "exo_mcp": { "path": "source-mcp", "blake3": "source-mcp" }
+                },
+                "installed": {
+                    "exo": { "path": "installed-exo", "blake3": "installed-exo" },
+                    "exo_mcp": { "path": "installed-mcp", "blake3": "installed-mcp" }
+                }
+            }))
+            .expect("serialize activation"),
+        )
+        .expect("write activation");
+
+        let error = DogfoodActivation::pinned_mcp_config_from_path(&activation_path)
+            .expect_err("missing pinned config must fail");
+        assert!(error.contains("pinned Codex plugin config is unavailable"));
+        assert!(error.contains("cargo dogfood-exo"));
     }
 }

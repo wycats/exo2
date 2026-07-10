@@ -24,7 +24,8 @@ Runs the full Exosuit dogfood refresh lifecycle:
 ";
 const EXO_PACKAGE_PATH: &str = "tools/exo";
 const DOGFOOD_ACTIVATION_ENV: &str = "EXO_DOGFOOD_ACTIVATION";
-const DOGFOOD_ACTIVATION_VERSION: u32 = 1;
+const DOGFOOD_ACTIVATION_VERSION: u32 = 2;
+const DOGFOOD_MARKETPLACE: &str = "exo2";
 
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -64,11 +65,11 @@ fn main() -> Result<()> {
     step("Installing exo binaries into Cargo install root");
     install_exo_binaries(&root, &install_root)?;
     let installed_exo_bin = installed_exo_path(&install_root)?;
-    let activation = write_dogfood_activation(&root, &install_root)?;
+    let activation = dogfood_activation_path(&root, &install_root)?;
 
     step("Pinning local Codex Exo plugin MCP command");
-    let pinned_configs = pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
-    require_pinned_configs(&pinned_configs)?;
+    let pinned_config = pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
+    write_dogfood_activation(&root, &install_root, &pinned_config)?;
 
     step("Building WASM bindings");
     run_workspace_helper(&root, "build_wasm")?;
@@ -224,34 +225,16 @@ fn pin_local_codex_exo_plugin_mcp(
     root: &Path,
     install_root: &Path,
     activation: &Path,
-) -> Result<Vec<PathBuf>> {
+) -> Result<PathBuf> {
     let proxy = installed_exo_mcp_path(install_root)?;
-    let paths = installed_codex_exo_plugin_mcp_paths(root)?;
-    if paths.is_empty() {
-        println!(
-            "No installed Codex Exo plugin cache found; source plugin MCP config remains portable."
-        );
-        return Ok(paths);
-    }
-
-    for path in &paths {
-        write_pinned_mcp_config(&path, &proxy, activation)?;
-        println!(
-            "Pinned Codex Exo plugin MCP command at {} -> {} with dogfood build activation",
-            path.display(),
-            proxy.display()
-        );
-    }
-    Ok(paths)
-}
-
-fn require_pinned_configs(paths: &[PathBuf]) -> Result<()> {
-    if paths.is_empty() {
-        bail!(
-            "No installed Codex Exo plugin cache was pinned with the dogfood activation; install the Exo plugin cache before running `cargo dogfood-exo`"
-        );
-    }
-    Ok(())
+    let path = installed_codex_exo_plugin_mcp_path(root)?;
+    write_pinned_mcp_config(&path, &proxy, activation)?;
+    println!(
+        "Pinned Codex Exo plugin MCP command at {} -> {} with dogfood build activation",
+        path.display(),
+        proxy.display()
+    );
+    Ok(path)
 }
 
 fn installed_exo_path(install_root: &Path) -> Result<PathBuf> {
@@ -472,15 +455,14 @@ fn cargo_config_relative_base(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn installed_codex_exo_plugin_mcp_paths(root: &Path) -> Result<Vec<PathBuf>> {
+fn installed_codex_exo_plugin_mcp_path(root: &Path) -> Result<PathBuf> {
     let Some((name, version)) = source_plugin_identity(root)? else {
-        return Ok(Vec::new());
+        bail!("source Exo plugin manifest is missing; cannot identify the Codex cache to pin");
     };
     let Some(codex_home) = codex_home() else {
-        return Ok(Vec::new());
+        bail!("Codex home is unavailable; cannot identify the Exo plugin cache to pin");
     };
-    let cache_root = codex_home.join("plugins").join("cache");
-    plugin_cache_mcp_paths(&cache_root, &name, &version)
+    configured_plugin_cache_mcp_path(root, &codex_home, &name, &version)
 }
 
 fn source_plugin_identity(root: &Path) -> Result<Option<(String, String)>> {
@@ -503,27 +485,66 @@ fn source_plugin_identity(root: &Path) -> Result<Option<(String, String)>> {
     Ok(Some((name.to_string(), version.to_string())))
 }
 
-fn plugin_cache_mcp_paths(cache_root: &Path, name: &str, version: &str) -> Result<Vec<PathBuf>> {
-    if !cache_root.is_dir() {
-        return Ok(Vec::new());
+fn configured_plugin_cache_mcp_path(
+    root: &Path,
+    codex_home: &Path,
+    name: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    let config_path = codex_home.join("config.toml");
+    let config_text = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: toml::Value = toml::from_str(&config_text)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let plugins = config
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .context("Codex config is missing the plugins table")?;
+    let enabled = plugins
+        .iter()
+        .filter(|(key, value)| {
+            key.starts_with(&format!("{name}@"))
+                && value.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+        })
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>();
+    let expected = format!("{name}@{DOGFOOD_MARKETPLACE}");
+    if enabled != [expected.as_str()] {
+        bail!(
+            "Codex Exo plugin selection is ambiguous or inactive ({enabled:?}); enable only `{expected}` before running `cargo dogfood-exo`"
+        );
     }
-
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(cache_root)
-        .with_context(|| format!("failed to read {}", cache_root.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("failed to read entry in {}", cache_root.display()))?;
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-            continue;
-        }
-        let path = entry.path().join(name).join(version).join(".mcp.json");
-        if path.is_file() {
-            paths.push(path);
-        }
+    let source = config
+        .get("marketplaces")
+        .and_then(|value| value.get(DOGFOOD_MARKETPLACE))
+        .and_then(|value| value.get("source"))
+        .and_then(toml::Value::as_str)
+        .context("Codex marketplace `exo2` is missing its source path")?;
+    let configured_root = PathBuf::from(source).canonicalize().with_context(|| {
+        format!("failed to resolve configured exo2 marketplace source `{source}`")
+    })?;
+    let current_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if configured_root != current_root {
+        bail!(
+            "Codex `exo@exo2` is configured from {}, not this checkout {}; update the marketplace source before running `cargo dogfood-exo`",
+            configured_root.display(),
+            current_root.display()
+        );
     }
-    paths.sort();
-    Ok(paths)
+    let path = codex_home
+        .join("plugins/cache")
+        .join(DOGFOOD_MARKETPLACE)
+        .join(name)
+        .join(version)
+        .join(".mcp.json");
+    if !path.is_file() {
+        bail!(
+            "configured Codex plugin cache is missing {}; reinstall `{expected}`",
+            path.display()
+        );
+    }
+    path.canonicalize()
+        .with_context(|| format!("failed to resolve configured cache {}", path.display()))
 }
 
 fn write_pinned_mcp_config(path: &Path, proxy: &Path, activation: &Path) -> Result<()> {
@@ -548,6 +569,7 @@ fn write_pinned_mcp_config(path: &Path, proxy: &Path, activation: &Path) -> Resu
 #[derive(Debug, Serialize)]
 struct DogfoodActivation {
     version: u32,
+    pinned_mcp_config: PathBuf,
     source: DogfoodActivationBinaries,
     installed: DogfoodActivationBinaries,
 }
@@ -566,15 +588,27 @@ struct DogfoodActivationBinary {
     modified_unix_ms: Option<u128>,
 }
 
-fn write_dogfood_activation(root: &Path, install_root: &Path) -> Result<PathBuf> {
+fn dogfood_activation_path(root: &Path, install_root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let activation_dir = install_root.join("exo-dogfood");
     fs::create_dir_all(&activation_dir)
         .with_context(|| format!("failed to create {}", activation_dir.display()))?;
     let root_hash = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex();
-    let path = activation_dir.join(format!("{}.json", &root_hash[..16]));
+    Ok(activation_dir.join(format!("{}.json", &root_hash[..16])))
+}
+
+fn write_dogfood_activation(
+    root: &Path,
+    install_root: &Path,
+    pinned_mcp_config: &Path,
+) -> Result<PathBuf> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = dogfood_activation_path(&root, install_root)?;
     let activation = DogfoodActivation {
         version: DOGFOOD_ACTIVATION_VERSION,
+        pinned_mcp_config: pinned_mcp_config
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", pinned_mcp_config.display()))?,
         source: DogfoodActivationBinaries {
             exo: dogfood_activation_binary(&exo_debug_binary(&root))?,
             exo_mcp: dogfood_activation_binary(&debug_binary(&root, "exo-mcp"))?,
@@ -738,25 +772,56 @@ mod tests {
     }
 
     #[test]
-    fn plugin_cache_mcp_paths_find_matching_installed_plugin_caches() {
-        let root = temp_dir("plugin-cache-paths");
-        let cache = root.join("cache");
-        let first = cache.join("exo2").join("exo").join("0.1.0");
-        let second = cache.join("local").join("exo").join("0.1.0");
-        let ignored = cache.join("exo2").join("other").join("0.1.0");
-        fs::create_dir_all(&first).expect("create first cache");
-        fs::create_dir_all(&second).expect("create second cache");
-        fs::create_dir_all(&ignored).expect("create ignored cache");
-        fs::write(first.join(".mcp.json"), "{}").expect("write first mcp");
-        fs::write(second.join(".mcp.json"), "{}").expect("write second mcp");
-        fs::write(ignored.join(".mcp.json"), "{}").expect("write ignored mcp");
+    fn configured_plugin_cache_selects_only_the_active_marketplace() {
+        let root = temp_dir("configured-plugin-cache");
+        let codex_home = root.join("codex-home");
+        let selected = codex_home.join("plugins/cache/exo2/exo/0.1.0");
+        let other = codex_home.join("plugins/cache/local/exo/0.1.0");
+        fs::create_dir_all(&selected).expect("create selected cache");
+        fs::create_dir_all(&other).expect("create other cache");
+        fs::write(selected.join(".mcp.json"), "{}").expect("write selected mcp");
+        fs::write(other.join(".mcp.json"), "{}").expect("write other mcp");
+        fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[marketplaces.exo2]\nsource_type = \"local\"\nsource = {:?}\n\n[plugins.\"exo@exo2\"]\nenabled = true\n",
+                root.display().to_string()
+            ),
+        )
+        .expect("write Codex config");
 
-        let paths = plugin_cache_mcp_paths(&cache, "exo", "0.1.0").expect("scan plugin cache");
+        let path = configured_plugin_cache_mcp_path(&root, &codex_home, "exo", "0.1.0")
+            .expect("resolve configured plugin cache");
 
         assert_eq!(
-            paths,
-            vec![first.join(".mcp.json"), second.join(".mcp.json")]
+            path,
+            selected
+                .join(".mcp.json")
+                .canonicalize()
+                .expect("canonical selected config")
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn configured_plugin_cache_rejects_ambiguous_plugin_selection() {
+        let root = temp_dir("ambiguous-plugin-cache");
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).expect("create Codex home");
+        fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[marketplaces.exo2]\nsource_type = \"local\"\nsource = {:?}\n\n[plugins.\"exo@exo2\"]\nenabled = true\n\n[plugins.\"exo@local\"]\nenabled = true\n",
+                root.display().to_string()
+            ),
+        )
+        .expect("write Codex config");
+
+        let error = configured_plugin_cache_mcp_path(&root, &codex_home, "exo", "0.1.0")
+            .expect_err("ambiguous selection must fail");
+
+        assert!(error.to_string().contains("ambiguous or inactive"));
+        assert!(error.to_string().contains("exo@exo2"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -794,6 +859,10 @@ mod tests {
     fn repeated_activation_replaces_the_existing_record() {
         let root = temp_dir("repeated-activation");
         let install_root = root.join("install-root");
+        let pinned_config = root.join("plugin-cache/.mcp.json");
+        fs::create_dir_all(pinned_config.parent().expect("config parent"))
+            .expect("create plugin cache");
+        fs::write(&pinned_config, "{}").expect("write pinned config");
         for path in [
             exo_debug_binary(&root),
             debug_binary(&root, "exo-mcp"),
@@ -808,29 +877,29 @@ mod tests {
             fs::write(path, "first build").expect("write binary");
         }
 
-        let activation_path =
-            write_dogfood_activation(&root, &install_root).expect("write first activation");
+        let activation_path = write_dogfood_activation(&root, &install_root, &pinned_config)
+            .expect("write first activation");
         let first = fs::read_to_string(&activation_path).expect("read first activation");
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("parse activation");
+        assert_eq!(first_json["version"], DOGFOOD_ACTIVATION_VERSION);
+        assert_eq!(
+            first_json["pinned_mcp_config"],
+            pinned_config
+                .canonicalize()
+                .expect("canonical pinned config")
+                .display()
+                .to_string()
+        );
         fs::write(exo_debug_binary(&root), "second build").expect("update source exo");
 
-        let repeated_path =
-            write_dogfood_activation(&root, &install_root).expect("replace activation");
+        let repeated_path = write_dogfood_activation(&root, &install_root, &pinned_config)
+            .expect("replace activation");
         let second = fs::read_to_string(&repeated_path).expect("read second activation");
 
         assert_eq!(activation_path, repeated_path);
         assert_ne!(first, second);
         assert!(second.contains(&blake3::hash(b"second build").to_hex().to_string()));
         fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn dogfood_refuses_to_verify_without_a_pinned_plugin_config() {
-        let error = require_pinned_configs(&[]).expect_err("empty pin set should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("No installed Codex Exo plugin cache")
-        );
     }
 
     #[test]

@@ -131,6 +131,35 @@ fn dogfood_exo_cmd(root: &Path) -> assert_cmd::Command {
     exo_cmd_with_home(root, &home, &config_home)
 }
 
+fn write_dogfood_activation_record(path: &Path, pinned_mcp_config: &Path) {
+    let unused = path
+        .parent()
+        .expect("activation parent")
+        .join("unused-binary");
+    fs::write(&unused, "unused").expect("write unused activation binary");
+    let binary = serde_json::json!({
+        "path": unused,
+        "blake3": "unused"
+    });
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "pinned_mcp_config": pinned_mcp_config,
+            "source": {
+                "exo": binary,
+                "exo_mcp": binary
+            },
+            "installed": {
+                "exo": binary,
+                "exo_mcp": binary
+            }
+        }))
+        .expect("serialize activation"),
+    )
+    .expect("write activation");
+}
+
 fn json_result(output: Vec<u8>) -> JsonValue {
     let envelope: JsonValue = serde_json::from_slice(&output).expect("valid json envelope");
     assert_eq!(envelope["status"], "ok");
@@ -1287,14 +1316,13 @@ fn dogfood_proxy_health_does_not_inherit_parent_activation_environment() {
     )
     .expect("write fake proxy");
     make_executable(&fake_proxy);
+    let activation = temp.path().join("parent-activation.json");
+    write_dogfood_activation_record(&activation, &temp.path().join("plugins/exo/.mcp.json"));
 
     let dogfood = json_result(
         dogfood_exo_cmd(temp.path())
             .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
-            .env(
-                "EXO_DOGFOOD_ACTIVATION",
-                temp.path().join("parent-activation.json"),
-            )
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
             .env(
                 "PATH",
                 std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
@@ -1311,6 +1339,87 @@ fn dogfood_proxy_health_does_not_inherit_parent_activation_environment() {
     assert_eq!(
         dogfood["plugin"]["proxy_binary"]["activation"],
         JsonValue::Null
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_verify_uses_the_exact_activation_pinned_plugin_config() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "missing-source-proxy", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    fs::write(
+        &fake_proxy,
+        proxy_health_script_with_payload(healthy_proxy_payload(), ""),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let pinned_plugin = temp.path().join("pinned-cache/exo/0.1.0");
+    fs::create_dir_all(&pinned_plugin).expect("create pinned plugin cache");
+    write_plugin_mcp_with_env(
+        &pinned_plugin,
+        fake_proxy.to_str().expect("proxy path"),
+        &[],
+        serde_json::json!({}),
+    );
+    let pinned_config = pinned_plugin.join("plugins/exo/.mcp.json");
+    let activation = temp.path().join("activation.json");
+    write_dogfood_activation_record(&activation, &pinned_config);
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["path"],
+        pinned_plugin
+            .join("plugins/exo")
+            .canonicalize()
+            .expect("canonical pinned plugin")
+            .display()
+            .to_string()
+    );
+
+    let receipt = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "receipt"])
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+    let receipt_path = PathBuf::from(
+        receipt["receipt_path"]
+            .as_str()
+            .expect("receipt path is string"),
+    );
+    let receipt_json: JsonValue =
+        serde_json::from_str(&fs::read_to_string(receipt_path).expect("read dogfood receipt"))
+            .expect("parse dogfood receipt");
+    assert_eq!(
+        receipt_json["plugin"]["path"],
+        pinned_plugin
+            .join("plugins/exo")
+            .canonicalize()
+            .expect("canonical pinned plugin")
+            .display()
+            .to_string()
     );
 }
 

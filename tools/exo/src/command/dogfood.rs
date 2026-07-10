@@ -13,7 +13,7 @@ use crate::daemon::{
     DaemonEnsureOutcome, DaemonEnsureState, DaemonStatusState, daemon_status_for_project,
     ensure_daemon_with_report,
 };
-use crate::dogfood_activation::DOGFOOD_ACTIVATION_ENV;
+use crate::dogfood_activation::{DOGFOOD_ACTIVATION_ENV, DogfoodActivation};
 use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
@@ -2520,6 +2520,17 @@ fn default_plugin_identity(
     root: &Path,
     current_binary: &BinaryIdentity,
 ) -> ExoResult<Option<PluginIdentity>> {
+    if let Some(pinned_config) =
+        DogfoodActivation::pinned_mcp_config_from_environment().map_err(|error| anyhow!(error))?
+    {
+        let plugin_dir = pinned_config.parent().ok_or_else(|| {
+            anyhow!(
+                "Pinned Codex plugin config has no plugin directory: {}",
+                pinned_config.display()
+            )
+        })?;
+        return PluginIdentity::from_dir(root, plugin_dir, current_binary).map(Some);
+    }
     let plugin_dir = root.join("plugins/exo");
     if plugin_dir.is_dir() {
         return PluginIdentity::from_dir(root, &plugin_dir, current_binary).map(Some);
