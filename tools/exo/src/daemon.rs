@@ -43,7 +43,8 @@ use crate::daemon_diagnostics::{
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, request_command_path, resolved_request_recovery,
+    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
+    resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -1036,6 +1037,42 @@ fn atomic_request_project(
     Ok(request_project)
 }
 
+fn execute_ledgered_daemon_request(
+    workspace: &Path,
+    startup_project: &Project,
+    outcome_ledger: &RequestOutcomeLedger,
+    request: RequestEnvelope,
+    effect: Effect,
+    instance_id: &str,
+    diagnostics: &DaemonDiagnostics,
+) -> OutcomeExecution {
+    outcome_ledger.execute(
+        request,
+        effect,
+        instance_id,
+        Duration::from_secs(30),
+        |request| {
+            let request_id = request.id.clone();
+            let request_project = match daemon_request_project(startup_project) {
+                Ok(project) => project,
+                Err(error) => {
+                    return daemon_handler_error_response(
+                        request_id,
+                        ErrorCode::PreconditionFailed,
+                        error.to_string(),
+                    );
+                }
+            };
+            handle_request_with_project_and_diagnostics_as_writer(
+                workspace,
+                Some(&request_project),
+                request,
+                diagnostics,
+            )
+        },
+    )
+}
+
 fn spawn_daemon_after_lock(
     paths: &LocalRuntimePaths,
     socket_path: &Path,
@@ -1998,31 +2035,15 @@ pub async fn run_daemon(
                             Some(recovery)
                                 if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
                             {
-                                let request_project = match daemon_request_project(project.as_ref()) {
-                                    Ok(project) => project,
-                                    Err(error) => {
-                                        return daemon_handler_error_response(
-                                            handler_request_id,
-                                            ErrorCode::PreconditionFailed,
-                                            error.to_string(),
-                                        );
-                                    }
-                                };
-                                outcome_ledger
-                                    .execute(
-                                        req,
-                                        recovery.effect,
-                                        &instance_id,
-                                        Duration::from_secs(30),
-                                        |req| {
-                                            handle_request_with_project_and_diagnostics_as_writer(
-                                                &workspace,
-                                                Some(&request_project),
-                                                req,
-                                                &diagnostics,
-                                            )
-                                        },
-                                    )
+                                execute_ledgered_daemon_request(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &outcome_ledger,
+                                    req,
+                                    recovery.effect,
+                                    &instance_id,
+                                    &diagnostics,
+                                )
                                     .response
                             }
                             _ => {
@@ -2524,6 +2545,85 @@ mod tests {
         );
         assert!(!execution.replayed);
         (ledger, request)
+    }
+
+    #[test]
+    fn recorded_non_atomic_replay_skips_project_policy_refresh() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&config_path, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        let mut project = test_project(&workspace, workspace.join(".exo"));
+        project.projects_config_path = Some(config_path);
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-write-policy-drift");
+
+        assert!(
+            daemon_request_project(&project).is_err(),
+            "fixture must fail mutable policy refresh"
+        );
+        let execution = execute_ledgered_daemon_request(
+            &workspace,
+            &project,
+            &ledger,
+            request,
+            Effect::Write,
+            "instance-a",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(execution.replayed);
+        assert_eq!(
+            execution.response.error.expect("recorded error").message,
+            "recorded response"
+        );
+    }
+
+    #[test]
+    fn recorded_non_atomic_conflict_skips_projection_hydration() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let projection_dir = workspace.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "not valid SQL projection",
+        )
+        .expect("write invalid projection");
+        let project = test_project(&workspace, workspace.clone());
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-write-conflict");
+        let mut conflicting_request =
+            serde_json::to_value(request).expect("serialize recorded request");
+        conflicting_request["op"]["params"]["input"]["title"] =
+            serde_json::json!("Conflicting epoch");
+        let conflicting_request =
+            serde_json::from_value(conflicting_request).expect("parse conflicting request");
+
+        let execution = execute_ledgered_daemon_request(
+            &workspace,
+            &project,
+            &ledger,
+            conflicting_request,
+            Effect::Write,
+            "instance-a",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(!execution.replayed);
+        assert_eq!(
+            execution.response.error.expect("conflict error").details,
+            Some(serde_json::json!({
+                "kind": "daemon.request_id_conflict",
+                "request_id": "recorded-write-conflict",
+                "mutation_performed": false,
+            }))
+        );
+        assert!(
+            !project.db_path().exists(),
+            "request-id conflict must not hydrate the broken projection"
+        );
     }
 
     #[test]
