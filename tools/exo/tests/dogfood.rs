@@ -1261,6 +1261,61 @@ fn dogfood_proxy_health_uses_the_pinned_activation_environment() {
 
 #[cfg(unix)]
 #[test]
+fn dogfood_proxy_health_does_not_inherit_parent_activation_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut inherited = healthy_proxy_payload();
+    inherited["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "inherited activation should not reach the probe"
+    });
+    let current = healthy_proxy_payload();
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--proxy-health\" ]; then\n  if [ -n \"${{EXO_DOGFOOD_ACTIVATION:-}}\" ]; then\n    printf '%s\\n' '{}'\n  else\n    printf '%s\\n' '{}'\n  fi\n  exit 0\nfi\nexit 0\n",
+            inherited, current
+        ),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env(
+                "EXO_DOGFOOD_ACTIVATION",
+                temp.path().join("parent-activation.json"),
+            )
+            .env(
+                "PATH",
+                std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                    .expect("join fake PATH"),
+            )
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"],
+        JsonValue::Null
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dogfood_proxy_health_probe_does_not_wait_for_background_stdout() {
     let temp = tempfile::tempdir().expect("tempdir");
     git_init(temp.path());

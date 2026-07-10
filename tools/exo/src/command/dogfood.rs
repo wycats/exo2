@@ -13,6 +13,7 @@ use crate::daemon::{
     DaemonEnsureOutcome, DaemonEnsureState, DaemonStatusState, daemon_status_for_project,
     ensure_daemon_with_report,
 };
+use crate::dogfood_activation::DOGFOOD_ACTIVATION_ENV;
 use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
@@ -1147,6 +1148,7 @@ fn proxy_health_probe(
     child_command
         .arg("--proxy-health")
         .env_remove("EXO_NO_REEXEC")
+        .env_remove(DOGFOOD_ACTIVATION_ENV)
         .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
