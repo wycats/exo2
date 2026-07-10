@@ -1811,11 +1811,14 @@ fn call_ensured_daemon_writer(
         json!({ "request_id": id }),
     );
 
+    let request_workspace_root = project
+        .and_then(|project| project.workspace_root.as_deref())
+        .unwrap_or(workspace_root);
     let writer_request = RequestEnvelope {
         protocol_version: protocol::PROTOCOL_VERSION,
         id: id.clone(),
         op: Op::Call(params.clone()),
-        workspace_root: Some(workspace_root.to_path_buf()),
+        workspace_root: Some(request_workspace_root.to_path_buf()),
         auth: auth.cloned(),
         workflow_confirmation: workflow_confirmation.cloned(),
         agent_id: agent_id.cloned(),

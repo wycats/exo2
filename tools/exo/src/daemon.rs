@@ -1046,7 +1046,7 @@ fn daemon_request_context(
     let workspace_root = requested_workspace.canonicalize().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "daemon request workspace could not be resolved as a Git worktree",
+            "daemon request workspace path could not be canonicalized",
         )
     })?;
     if workspace_root == startup_workspace {
