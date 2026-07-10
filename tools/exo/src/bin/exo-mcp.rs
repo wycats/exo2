@@ -840,13 +840,16 @@ fn is_direct_exo_worker_spec(spec: &WorkerSpec) -> bool {
 }
 
 fn worker_spec() -> Result<WorkerSpec, std::io::Error> {
+    if let Some(path) = DogfoodActivation::source_worker_path_from_environment() {
+        return Ok(exo_worker_spec(path));
+    }
     if let Some(path) = std::env::var_os("EXO_MCP_WORKER") {
         return Ok(exo_worker_spec(PathBuf::from(path)));
     }
 
     let current = std::env::current_exe()?;
     Ok(worker_spec_for_activation(
-        DogfoodActivation::source_worker_path_from_environment(),
+        None,
         &current,
         current.with_file_name(worker_binary_name()).is_file(),
         std::env::var_os("CARGO").map(PathBuf::from),

@@ -67,7 +67,12 @@ fn main() -> Result<()> {
     let activation = write_dogfood_activation(&root, &install_root)?;
 
     step("Pinning local Codex Exo plugin MCP command");
-    pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
+    let pinned_configs = pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
+    if pinned_configs.is_empty() {
+        bail!(
+            "No installed Codex Exo plugin cache was pinned with the dogfood activation; install the Exo plugin cache before running `cargo dogfood-exo`"
+        );
+    }
 
     step("Building WASM bindings");
     run_workspace_helper(&root, "build_wasm")?;
@@ -223,17 +228,17 @@ fn pin_local_codex_exo_plugin_mcp(
     root: &Path,
     install_root: &Path,
     activation: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let proxy = installed_exo_mcp_path(install_root)?;
     let paths = installed_codex_exo_plugin_mcp_paths(root)?;
     if paths.is_empty() {
         println!(
             "No installed Codex Exo plugin cache found; source plugin MCP config remains portable."
         );
-        return Ok(());
+        return Ok(paths);
     }
 
-    for path in paths {
+    for path in &paths {
         write_pinned_mcp_config(&path, &proxy, activation)?;
         println!(
             "Pinned Codex Exo plugin MCP command at {} -> {} with dogfood build activation",
@@ -241,7 +246,7 @@ fn pin_local_codex_exo_plugin_mcp(
             proxy.display()
         );
     }
-    Ok(())
+    Ok(paths)
 }
 
 fn installed_exo_path(install_root: &Path) -> Result<PathBuf> {

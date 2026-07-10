@@ -3,7 +3,6 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -44,8 +43,6 @@ struct DogfoodActivationBinaries {
 struct DogfoodActivationBinary {
     path: PathBuf,
     blake3: String,
-    size_bytes: u64,
-    modified_unix_ms: Option<u128>,
 }
 
 impl DogfoodActivation {
@@ -178,17 +175,6 @@ impl DogfoodActivation {
 }
 
 fn fingerprint_matches_path_for(expected: &DogfoodActivationBinary, path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    let modified_unix_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis());
-    if metadata.len() == expected.size_bytes && modified_unix_ms == expected.modified_unix_ms {
-        return true;
-    }
     file_blake3(path).is_ok_and(|hash| hash == expected.blake3)
 }
 
@@ -225,16 +211,9 @@ mod tests {
     use super::*;
 
     fn fingerprint(path: &Path) -> DogfoodActivationBinary {
-        let metadata = fs::metadata(path).expect("stat fixture");
         DogfoodActivationBinary {
             path: path.to_path_buf(),
             blake3: file_blake3(path).expect("hash fixture"),
-            size_bytes: metadata.len(),
-            modified_unix_ms: metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis()),
         }
     }
 
