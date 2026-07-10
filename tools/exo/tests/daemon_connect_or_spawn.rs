@@ -295,6 +295,23 @@ fn parse_cli_json(output: &std::process::Output) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> u32 {
+    let output = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .expect("read process group with ps");
+    assert!(
+        output.status.success(),
+        "ps should read process group for {pid}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("ps should report a numeric process group")
+}
+
 fn read_ndjson(path: &Path) -> Vec<serde_json::Value> {
     let contents = std::fs::read_to_string(path).unwrap();
     let lines = contents
@@ -729,6 +746,66 @@ async fn daemon_ensure_cli_returns_actual_runtime_metadata(backend: &str) {
         "project endpoint should accept connections"
     );
     assert!(paths.pid_path().exists(), "project PID should exist");
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_ensure_cli_survives_short_lived_parent_exit(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+
+    // `run_exo_daemon_ensure` is a short-lived parent process: it starts the
+    // daemon, returns its report, and exits before this test checks health.
+    let ensure = run_exo_daemon_ensure(&workspace, true);
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed: {}",
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+    let ensure = parse_cli_json(&ensure);
+    let pid = ensure
+        .get("result")
+        .and_then(|result| result.get("pid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("daemon ensure should report a daemon PID");
+
+    #[cfg(unix)]
+    assert_ne!(
+        process_group_id(pid),
+        process_group_id(std::process::id()),
+        "spawned daemon must not inherit the short-lived parent's process group"
+    );
+
+    std::thread::sleep(Duration::from_millis(250));
+    let status = run_exo_daemon_status(&workspace);
+    assert!(
+        status.status.success(),
+        "daemon status failed after ensure parent exit: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = parse_cli_json(&status);
+    let result = status.get("result").expect("daemon status result");
+    assert_eq!(
+        result.get("state").and_then(serde_json::Value::as_str),
+        Some("running_current"),
+        "daemon should remain healthy after its ensure parent exits: {result}"
+    );
+    assert_eq!(
+        result.get("pid_alive").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        result
+            .get("socket_connectable")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        result.get("probe_ok").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
 }
 
 #[test_matrix(["sqlite"])]
