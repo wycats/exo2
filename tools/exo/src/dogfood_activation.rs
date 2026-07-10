@@ -311,4 +311,27 @@ mod tests {
             blake3::hash(&bytes).to_hex().to_string()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_rejects_same_size_same_mtime_content_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("proxy");
+        let reference = temp.path().join("reference");
+        fs::write(&path, "original").expect("write proxy");
+        fs::copy(&path, &reference).expect("copy timestamp reference");
+        let expected = fingerprint(&path);
+        fs::write(&path, "replaced").expect("replace proxy with same size");
+        let status = std::process::Command::new("touch")
+            .args([
+                "-r",
+                reference.to_str().expect("reference path"),
+                path.to_str().expect("proxy path"),
+            ])
+            .status()
+            .expect("restore mtime");
+        assert!(status.success());
+
+        assert!(!fingerprint_matches_path_for(&expected, &path));
+    }
 }

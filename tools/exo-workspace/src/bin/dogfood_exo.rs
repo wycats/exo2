@@ -68,11 +68,7 @@ fn main() -> Result<()> {
 
     step("Pinning local Codex Exo plugin MCP command");
     let pinned_configs = pin_local_codex_exo_plugin_mcp(&root, &install_root, &activation)?;
-    if pinned_configs.is_empty() {
-        bail!(
-            "No installed Codex Exo plugin cache was pinned with the dogfood activation; install the Exo plugin cache before running `cargo dogfood-exo`"
-        );
-    }
+    require_pinned_configs(&pinned_configs)?;
 
     step("Building WASM bindings");
     run_workspace_helper(&root, "build_wasm")?;
@@ -247,6 +243,15 @@ fn pin_local_codex_exo_plugin_mcp(
         );
     }
     Ok(paths)
+}
+
+fn require_pinned_configs(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        bail!(
+            "No installed Codex Exo plugin cache was pinned with the dogfood activation; install the Exo plugin cache before running `cargo dogfood-exo`"
+        );
+    }
+    Ok(())
 }
 
 fn installed_exo_path(install_root: &Path) -> Result<PathBuf> {
@@ -816,6 +821,16 @@ mod tests {
         assert_ne!(first, second);
         assert!(second.contains(&blake3::hash(b"second build").to_hex().to_string()));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dogfood_refuses_to_verify_without_a_pinned_plugin_config() {
+        let error = require_pinned_configs(&[]).expect_err("empty pin set should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("No installed Codex Exo plugin cache")
+        );
     }
 
     #[test]

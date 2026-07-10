@@ -840,16 +840,10 @@ fn is_direct_exo_worker_spec(spec: &WorkerSpec) -> bool {
 }
 
 fn worker_spec() -> Result<WorkerSpec, std::io::Error> {
-    if let Some(path) = DogfoodActivation::source_worker_path_from_environment() {
-        return Ok(exo_worker_spec(path));
-    }
-    if let Some(path) = std::env::var_os("EXO_MCP_WORKER") {
-        return Ok(exo_worker_spec(PathBuf::from(path)));
-    }
-
     let current = std::env::current_exe()?;
-    Ok(worker_spec_for_activation(
-        None,
+    Ok(worker_spec_for_environment(
+        DogfoodActivation::source_worker_path_from_environment(),
+        std::env::var_os("EXO_MCP_WORKER").map(PathBuf::from),
         &current,
         current.with_file_name(worker_binary_name()).is_file(),
         std::env::var_os("CARGO").map(PathBuf::from),
@@ -857,14 +851,18 @@ fn worker_spec() -> Result<WorkerSpec, std::io::Error> {
     ))
 }
 
-fn worker_spec_for_activation(
+fn worker_spec_for_environment(
     source_worker: Option<PathBuf>,
+    override_worker: Option<PathBuf>,
     current_exe: &Path,
     sibling_exists: bool,
     cargo: Option<PathBuf>,
     manifest_path: &Path,
 ) -> WorkerSpec {
     if let Some(path) = source_worker {
+        return exo_worker_spec(path);
+    }
+    if let Some(path) = override_worker {
         return exo_worker_spec(path);
     }
     worker_spec_for(current_exe, sibling_exists, cargo, manifest_path)
@@ -934,7 +932,7 @@ mod tests {
 
     use super::{
         bind_outcome_request_id, exo_worker_spec, worker_binary_name, worker_identity_check_path,
-        worker_spec_for, worker_spec_for_activation,
+        worker_spec_for, worker_spec_for_environment,
     };
 
     #[test]
@@ -1042,8 +1040,26 @@ mod tests {
     #[test]
     fn dogfood_activation_prefers_the_source_worker_over_the_installed_sibling() {
         let source_worker = PathBuf::from("/workspace/target/debug/exo");
-        let spec = worker_spec_for_activation(
+        let spec = worker_spec_for_environment(
             Some(source_worker.clone()),
+            None,
+            Path::new("/install/bin/exo-mcp"),
+            true,
+            None,
+            Path::new("/workspace/tools/exo/Cargo.toml"),
+        );
+
+        assert_eq!(spec.program(), source_worker);
+        assert_eq!(spec.args(), ["mcp", "worker"]);
+    }
+
+    #[test]
+    fn dogfood_activation_precedes_an_ambient_worker_override() {
+        let source_worker = PathBuf::from("/workspace/target/debug/exo");
+        let override_worker = PathBuf::from("/stale/exo");
+        let spec = worker_spec_for_environment(
+            Some(source_worker.clone()),
+            Some(override_worker),
             Path::new("/install/bin/exo-mcp"),
             true,
             None,
