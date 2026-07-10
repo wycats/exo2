@@ -164,9 +164,37 @@ fn epoch_count(db_path: &Path, title: &str) -> usize {
         .count()
 }
 
+fn runtime_outcome_completed(path: &Path, request_id: &str) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(connection) = exosuit_storage::Connection::open_with_flags(
+        path,
+        exosuit_storage::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT response_json IS NOT NULL FROM daemon_request_outcomes
+             WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+}
+
 async fn send_machine_request(
     stream: exo::daemon_transport::DaemonStream,
     request: &str,
+) -> serde_json::Value {
+    send_machine_request_with_timeout(stream, request, Duration::from_secs(30)).await
+}
+
+async fn send_machine_request_with_timeout(
+    stream: exo::daemon_transport::DaemonStream,
+    request: &str,
+    timeout: Duration,
 ) -> serde_json::Value {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
@@ -174,7 +202,7 @@ async fn send_machine_request(
     writer.write_all(request.as_bytes()).await.unwrap();
     writer.write_all(b"\n").await.unwrap();
 
-    let response = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+    let response = tokio::time::timeout(timeout, lines.next_line())
         .await
         .expect("timeout waiting for response")
         .expect("IO error")
@@ -1510,6 +1538,53 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
+async fn atomic_request_hydrates_projection_before_rollback(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let db_path = project.db_path();
+    let writer = exo::context::SqliteWriter::open(&db_path).expect("open project writer");
+    writer
+        .add_epoch("Projected Epoch", Some("projected-epoch"), &[])
+        .expect("add projected epoch");
+    drop(writer);
+    let database = exosuit_storage::open_database(&db_path).expect("open project database");
+    let epochs_projection = exosuit_storage::dump_tables(database.connection())
+        .expect("dump project state")
+        .into_iter()
+        .find_map(|(table, contents)| (table == "epochs_data").then_some(contents))
+        .expect("epochs projection");
+    drop(database);
+    let projection_dir = workspace.join("docs/agent-context");
+    std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+    std::fs::write(projection_dir.join("epochs.sql"), epochs_projection)
+        .expect("write projected epoch");
+    std::fs::remove_file(&db_path).expect("remove initialized project database");
+    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+    let stream = exo::daemon::ensure_daemon(&workspace)
+        .await
+        .expect("spawn daemon");
+    let failed = send_machine_request_with_timeout(
+        stream,
+        r#"{"protocol_version":1,"id":"failed-after-hydration","op":{"kind":"call","params":{"address":{"kind":"operation","path":["epoch","start"]},"input":{"id":"missing-epoch"}}}}"#,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert_eq!(failed["status"], "error", "{failed}");
+    assert!(
+        failed.get("effect").is_none(),
+        "rolled-back request must not report a committed write: {failed}"
+    );
+    assert_db_has_epoch(&db_path, "Projected Epoch");
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
 async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: &str) {
     assert_eq!(backend, "sqlite");
     let dir = TempDir::new().unwrap();
@@ -1526,17 +1601,64 @@ async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: 
     first_stream.flush().await.unwrap();
     drop(first_stream);
 
+    let runtime_ledger_path = exo::daemon::paths_for_workspace(&workspace)
+        .expect("daemon paths")
+        .outcome_ledger_path();
     let wait_start = std::time::Instant::now();
-    while epoch_count(&project.db_path(), "Recovered Daemon Epoch") == 0
-        && wait_start.elapsed() < Duration::from_secs(5)
+    while !runtime_outcome_completed(&runtime_ledger_path, "lost-write-response")
+        && wait_start.elapsed() < Duration::from_secs(60)
     {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        runtime_outcome_completed(&runtime_ledger_path, "lost-write-response"),
+        "first request should persist its response before outcome replay"
+    );
     assert_eq!(
         epoch_count(&project.db_path(), "Recovered Daemon Epoch"),
         1,
         "first request should commit before outcome replay"
     );
+    let project_db = exosuit_storage::open_database(project.db_path())
+        .expect("open project database after atomic request");
+    let canonical_response: String = project_db
+        .connection()
+        .query_row(
+            "SELECT response_json FROM atomic_request_outcomes WHERE request_id = ?1",
+            ["lost-write-response"],
+            |row| row.get(0),
+        )
+        .expect("canonical response should commit with project state");
+    let canonical_response: serde_json::Value =
+        serde_json::from_str(&canonical_response).expect("canonical response json");
+    assert!(
+        canonical_response["result"].get("post_write").is_none(),
+        "canonical outcome stores the core response before idempotent finalization"
+    );
+    let command_events: i64 = project_db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'command' AND namespace = 'epoch' AND operation = 'add'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count command events");
+    assert_eq!(
+        command_events, 1,
+        "command event should commit with state and canonical response"
+    );
+
+    let runtime_ledger = exosuit_storage::Connection::open(&runtime_ledger_path)
+        .expect("open runtime outcome ledger");
+    runtime_ledger
+        .execute(
+            "UPDATE daemon_request_outcomes
+             SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+             WHERE request_id = 'lost-write-response'",
+            [],
+        )
+        .expect("simulate daemon loss after canonical commit");
 
     let replay_stream = exo::daemon::connect_to_daemon(&workspace)
         .await
@@ -1550,11 +1672,33 @@ async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: 
         1,
         "replayed request id must not execute the mutation twice"
     );
+    let command_events: i64 = project_db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'command' AND namespace = 'epoch' AND operation = 'add'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count command events after replay");
+    assert_eq!(
+        command_events, 1,
+        "canonical replay must not duplicate the command event"
+    );
+    let runtime_response_recorded: bool = runtime_ledger
+        .query_row(
+            "SELECT response_json IS NOT NULL FROM daemon_request_outcomes
+             WHERE request_id = 'lost-write-response'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired runtime outcome");
     assert!(
-        exo::daemon::paths_for_workspace(&workspace)
-            .expect("daemon paths")
-            .outcome_ledger_path()
-            .exists(),
+        runtime_response_recorded,
+        "canonical replay should repopulate the runtime outcome"
+    );
+    assert!(
+        runtime_ledger_path.exists(),
         "daemon should persist request outcomes in the project runtime"
     );
 }

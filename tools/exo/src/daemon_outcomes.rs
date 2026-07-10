@@ -6,15 +6,16 @@
 //! executing the command a second time.
 
 use crate::api::protocol::{
-    Address, Effect, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope,
-    Status,
+    Address, Effect, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RecoveryClass, RequestEnvelope,
+    ResponseEnvelope, Status,
 };
 use crate::command::command_spec::CommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::Invocation;
 use anyhow::{Context, Result, anyhow};
-use exosuit_storage::rusqlite::TransactionBehavior;
-use exosuit_storage::{Connection, OptionalExtension, params};
+use exosuit_storage::rusqlite::{OpenFlags, TransactionBehavior};
+use exosuit_storage::{Connection, OptionalExtension, RequestTransaction, params};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
@@ -32,14 +33,41 @@ pub struct RequestOutcomeLedger {
 enum Reservation {
     Execute,
     Replay(Box<ResponseEnvelope>),
-    InFlight { instance_id: String },
+    InFlight {
+        instance_id: String,
+        recovery_class: Option<RecoveryClass>,
+    },
     Conflict,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeOutcomeState {
+    Missing,
+    InFlight {
+        instance_id: String,
+        recovery_class: Option<RecoveryClass>,
+    },
+    Terminal,
 }
 
 #[derive(Debug)]
 pub struct OutcomeExecution {
     pub response: ResponseEnvelope,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedRequestRecovery {
+    pub effect: Effect,
+    pub recovery_class: RecoveryClass,
+}
+
+#[derive(Debug)]
+struct AtomicCoreExecution {
+    response: ResponseEnvelope,
+    committed: bool,
+    replayed: bool,
+    request_id_conflict: bool,
 }
 
 impl RequestOutcomeLedger {
@@ -60,6 +88,7 @@ impl RequestOutcomeLedger {
                  request_hash TEXT NOT NULL,
                  effect TEXT NOT NULL,
                  instance_id TEXT NOT NULL,
+                 recovery_class TEXT,
                  response_json TEXT,
                  started_at INTEGER NOT NULL,
                  completed_at INTEGER
@@ -67,12 +96,75 @@ impl RequestOutcomeLedger {
              CREATE INDEX IF NOT EXISTS daemon_request_outcomes_completed_at
                  ON daemon_request_outcomes(completed_at);",
         )?;
+        let has_recovery_class: bool = connection.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pragma_table_info('daemon_request_outcomes')
+                 WHERE name = 'recovery_class'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_recovery_class {
+            connection.execute(
+                "ALTER TABLE daemon_request_outcomes ADD COLUMN recovery_class TEXT",
+                [],
+            )?;
+        }
         ledger.prune_completed(&connection)?;
         Ok(ledger)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return whether an atomic request may execute and therefore needs current
+    /// project preparation. Completed, conflicting, and same-instance in-flight
+    /// requests are resolved by the outcome ledger before mutable preparation.
+    pub(crate) fn atomic_request_needs_preparation(
+        &self,
+        request: &RequestEnvelope,
+        project_db_path: &Path,
+        instance_id: &str,
+    ) -> Result<bool> {
+        let request_hash = request_hash(request)?;
+        let runtime_outcome = self.runtime_outcome_state(&request.id, &request_hash);
+        if matches!(runtime_outcome, Ok(RuntimeOutcomeState::Terminal))
+            || matches!(
+                &runtime_outcome,
+                Ok(RuntimeOutcomeState::InFlight {
+                    instance_id: owner,
+                    ..
+                }) if owner == instance_id
+            )
+            || matches!(
+                &runtime_outcome,
+                Ok(RuntimeOutcomeState::InFlight {
+                    recovery_class: Some(recovery_class),
+                    ..
+                }) if *recovery_class != RecoveryClass::AtomicProjectState
+            )
+            || matches!(
+                &runtime_outcome,
+                Ok(RuntimeOutcomeState::InFlight {
+                    recovery_class: None,
+                    ..
+                })
+            )
+        {
+            return Ok(false);
+        }
+        let canonical_outcome = canonical_atomic_outcome_exists(project_db_path, &request.id);
+        match (runtime_outcome, canonical_outcome) {
+            (_, Ok(true)) => Ok(false),
+            (
+                Ok(RuntimeOutcomeState::Missing | RuntimeOutcomeState::InFlight { .. }),
+                Ok(false),
+            ) => Ok(true),
+            (Err(_), Ok(false)) => Ok(true),
+            (_, Err(error)) => Err(error),
+            (Ok(RuntimeOutcomeState::Terminal), _) => Ok(false),
+        }
     }
 
     pub fn execute<F>(
@@ -103,7 +195,13 @@ impl RequestOutcomeLedger {
             }
         };
 
-        match self.reserve(&request_id, &request_hash, effect, instance_id) {
+        match self.reserve(
+            &request_id,
+            &request_hash,
+            effect,
+            RecoveryClass::ExternalAtMostOnce,
+            instance_id,
+        ) {
             Ok(Reservation::Replay(response)) => OutcomeExecution {
                 response: *response,
                 replayed: true,
@@ -112,7 +210,9 @@ impl RequestOutcomeLedger {
                 response: request_id_conflict_response(request_id, effect),
                 replayed: false,
             },
-            Ok(Reservation::InFlight { instance_id: owner }) if owner == instance_id => {
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) if owner == instance_id => {
                 match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
                     Ok(Some(response)) => OutcomeExecution {
                         response,
@@ -134,7 +234,9 @@ impl RequestOutcomeLedger {
                     },
                 }
             }
-            Ok(Reservation::InFlight { instance_id: owner }) => OutcomeExecution {
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) => OutcomeExecution {
                 response: in_flight_response(request_id, effect, &owner, true),
                 replayed: false,
             },
@@ -170,6 +272,200 @@ impl RequestOutcomeLedger {
         }
     }
 
+    /// Execute a canonical project-state request with state and core response
+    /// committed in one SQLite transaction.
+    ///
+    /// A reservation owned by a previous daemon instance is recoverable for
+    /// this class: V021 either contains the committed response or proves that
+    /// the interrupted transaction did not commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_atomic_project_state<F, G>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        instance_id: &str,
+        in_flight_wait: Duration,
+        project_db_path: &Path,
+        execute: F,
+        finalize: G,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
+    {
+        let request_id = request.id.clone();
+        let request_hash = match request_hash(&request) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return OutcomeExecution {
+                    response: without_committed_effect(ledger_error_response(
+                        request_id,
+                        effect,
+                        "daemon.request_outcome_fingerprint_failed",
+                        error,
+                        false,
+                    )),
+                    replayed: false,
+                };
+            }
+        };
+
+        let owns_runtime_reservation = match self.reserve(
+            &request_id,
+            &request_hash,
+            effect,
+            RecoveryClass::AtomicProjectState,
+            instance_id,
+        ) {
+            Ok(Reservation::Replay(response)) => {
+                return OutcomeExecution {
+                    response: *response,
+                    replayed: true,
+                };
+            }
+            Ok(Reservation::Conflict) => {
+                return OutcomeExecution {
+                    response: without_committed_effect(request_id_conflict_response(
+                        request_id, effect,
+                    )),
+                    replayed: false,
+                };
+            }
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) if owner == instance_id => {
+                match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
+                    Ok(Some(response)) => {
+                        return OutcomeExecution {
+                            response,
+                            replayed: true,
+                        };
+                    }
+                    Ok(None) => {
+                        match canonical_atomic_outcome_exists(project_db_path, &request_id) {
+                            Ok(true) => false,
+                            Ok(false) => {
+                                return OutcomeExecution {
+                                    response: in_flight_response(request_id, effect, &owner, false),
+                                    replayed: false,
+                                };
+                            }
+                            Err(error) => {
+                                return OutcomeExecution {
+                                    response: without_committed_effect(ledger_error_response(
+                                        request_id,
+                                        effect,
+                                        "daemon.request_outcome_lookup_failed",
+                                        error,
+                                        false,
+                                    )),
+                                    replayed: false,
+                                };
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return OutcomeExecution {
+                            response: without_committed_effect(ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_lookup_failed",
+                                error,
+                                false,
+                            )),
+                            replayed: false,
+                        };
+                    }
+                }
+            }
+            Ok(Reservation::Execute) => true,
+            Ok(Reservation::InFlight {
+                recovery_class: Some(RecoveryClass::AtomicProjectState),
+                ..
+            }) => false,
+            Ok(Reservation::InFlight {
+                instance_id: owner, ..
+            }) => {
+                return OutcomeExecution {
+                    response: in_flight_response(request_id, effect, &owner, true),
+                    replayed: false,
+                };
+            }
+            // V021 remains sufficient when the runtime-only ledger is
+            // temporarily unavailable. Completion below is best-effort.
+            Err(_) => false,
+        };
+
+        let atomic = match execute_atomic_core(
+            project_db_path,
+            &request_hash,
+            effect,
+            request,
+            execute,
+            || Ok(()),
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                if owns_runtime_reservation {
+                    let _ = self.abandon(&request_id, &request_hash, instance_id);
+                }
+                return OutcomeExecution {
+                    response: without_committed_effect(ledger_error_response(
+                        request_id,
+                        effect,
+                        "daemon.atomic_request_commit_failed",
+                        error,
+                        false,
+                    )),
+                    replayed: false,
+                };
+            }
+        };
+
+        if atomic.request_id_conflict {
+            if owns_runtime_reservation {
+                let _ = self.abandon(&request_id, &request_hash, instance_id);
+            }
+            return OutcomeExecution {
+                response: atomic.response,
+                replayed: false,
+            };
+        }
+
+        let response = if atomic.committed {
+            match finalize(atomic.response) {
+                Ok(response) => response,
+                Err(response) => {
+                    // Finalization is idempotent. Removing the runtime-only
+                    // reservation lets the same request replay the canonical
+                    // core response and retry projection/checkpoint work.
+                    if owns_runtime_reservation {
+                        let _ = self.abandon(&request_id, &request_hash, instance_id);
+                    }
+                    return OutcomeExecution {
+                        response,
+                        replayed: atomic.replayed,
+                    };
+                }
+            }
+        } else {
+            atomic.response
+        };
+
+        if self
+            .complete(&request_id, &request_hash, &response)
+            .is_err()
+            && owns_runtime_reservation
+        {
+            let _ = self.abandon(&request_id, &request_hash, instance_id);
+        }
+        let _ = self.prune_canonical_outcomes(project_db_path);
+        OutcomeExecution {
+            response,
+            replayed: atomic.replayed,
+        }
+    }
+
     fn connection(&self) -> Result<Connection> {
         let connection = Connection::open(&self.path)
             .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))?;
@@ -179,18 +475,15 @@ impl RequestOutcomeLedger {
         Ok(connection)
     }
 
-    fn reserve(
+    fn runtime_outcome_state(
         &self,
         request_id: &str,
         request_hash: &str,
-        effect: Effect,
-        instance_id: &str,
-    ) -> Result<Reservation> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = transaction
+    ) -> Result<RuntimeOutcomeState> {
+        let connection = self.connection()?;
+        let existing = connection
             .query_row(
-                "SELECT request_hash, instance_id, response_json
+                "SELECT request_hash, instance_id, recovery_class, response_json
                  FROM daemon_request_outcomes
                  WHERE request_id = ?1",
                 [request_id],
@@ -199,30 +492,74 @@ impl RequestOutcomeLedger {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match existing {
+            None => RuntimeOutcomeState::Missing,
+            Some((stored_hash, _, _, _)) if stored_hash != request_hash => {
+                RuntimeOutcomeState::Terminal
+            }
+            Some((_, _, _, Some(_))) => RuntimeOutcomeState::Terminal,
+            Some((_, instance_id, recovery_class, None)) => RuntimeOutcomeState::InFlight {
+                instance_id,
+                recovery_class: recovery_class.as_deref().and_then(recovery_class_from_name),
+            },
+        })
+    }
+
+    fn reserve(
+        &self,
+        request_id: &str,
+        request_hash: &str,
+        effect: Effect,
+        recovery_class: RecoveryClass,
+        instance_id: &str,
+    ) -> Result<Reservation> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_hash, instance_id, recovery_class, response_json
+                 FROM daemon_request_outcomes
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
 
         let reservation = match existing {
-            Some((stored_hash, _, _)) if stored_hash != request_hash => Reservation::Conflict,
-            Some((_, _, Some(response_json))) => Reservation::Replay(Box::new(
+            Some((stored_hash, _, _, _)) if stored_hash != request_hash => Reservation::Conflict,
+            Some((_, _, _, Some(response_json))) => Reservation::Replay(Box::new(
                 serde_json::from_str(&response_json)
                     .context("deserialize recorded daemon response")?,
             )),
-            Some((_, owner_instance_id, None)) => Reservation::InFlight {
+            Some((_, owner_instance_id, stored_recovery_class, None)) => Reservation::InFlight {
                 instance_id: owner_instance_id,
+                recovery_class: stored_recovery_class
+                    .as_deref()
+                    .and_then(recovery_class_from_name),
             },
             None => {
                 transaction.execute(
                     "INSERT INTO daemon_request_outcomes (
-                         request_id, request_hash, effect, instance_id, started_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                         request_id, request_hash, effect, instance_id, recovery_class, started_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         request_id,
                         request_hash,
                         effect_name(effect),
                         instance_id,
+                        recovery_class_name(recovery_class),
                         now_timestamp(),
                     ],
                 )?;
@@ -293,6 +630,17 @@ impl RequestOutcomeLedger {
         }
     }
 
+    fn abandon(&self, request_id: &str, request_hash: &str, instance_id: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM daemon_request_outcomes
+             WHERE request_id = ?1 AND request_hash = ?2 AND instance_id = ?3
+               AND response_json IS NULL",
+            params![request_id, request_hash, instance_id],
+        )?;
+        Ok(())
+    }
+
     fn prune_completed(&self, connection: &Connection) -> Result<()> {
         let cutoff = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS;
         connection.execute(
@@ -302,27 +650,264 @@ impl RequestOutcomeLedger {
         )?;
         Ok(())
     }
+
+    fn prune_canonical_outcomes(&self, project_db_path: &Path) -> Result<()> {
+        if !project_db_path.exists() {
+            return Ok(());
+        }
+
+        // Hold the runtime write lock while choosing canonical rows. A retry
+        // cannot create a new unresolved reservation between this snapshot and
+        // the canonical deletion. Maintenance is best-effort, so contention
+        // skips this pass instead of delaying the request response.
+        let mut runtime_connection = self.connection()?;
+        runtime_connection.pragma_update(None, "busy_timeout", 0)?;
+        let runtime_transaction =
+            runtime_connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unresolved_request_ids: HashSet<String> = {
+            let mut statement = runtime_transaction.prepare(
+                "SELECT request_id FROM daemon_request_outcomes
+                 WHERE response_json IS NULL",
+            )?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?
+        };
+
+        let mut project_connection = Connection::open(project_db_path)
+            .with_context(|| format!("open project database {}", project_db_path.display()))?;
+        project_connection.pragma_update(None, "busy_timeout", 0)?;
+        let project_transaction =
+            project_connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let table_exists: bool = project_transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'atomic_request_outcomes'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_exists {
+            let cutoff = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS;
+            let expired_request_ids: Vec<String> = {
+                let mut statement = project_transaction.prepare(
+                    "SELECT request_id FROM atomic_request_outcomes
+                     WHERE committed_at < ?1",
+                )?;
+                statement
+                    .query_map([cutoff], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for request_id in expired_request_ids {
+                if !unresolved_request_ids.contains(&request_id) {
+                    project_transaction.execute(
+                        "DELETE FROM atomic_request_outcomes WHERE request_id = ?1",
+                        [&request_id],
+                    )?;
+                }
+            }
+        }
+        project_transaction.commit()?;
+        runtime_transaction.commit()?;
+        Ok(())
+    }
 }
 
-pub fn resolved_request_effect(workspace_root: &Path, request: &RequestEnvelope) -> Option<Effect> {
+fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> Result<bool> {
+    if !project_db_path.exists() {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(project_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "open canonical atomic outcome database {}",
+                project_db_path.display()
+            )
+        })?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'atomic_request_outcomes'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM atomic_request_outcomes WHERE request_id = ?1",
+            [request_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+pub fn resolved_request_recovery(
+    workspace_root: &Path,
+    request: &RequestEnvelope,
+) -> Option<ResolvedRequestRecovery> {
+    let Op::Call(params) = &request.op else {
+        return None;
+    };
+    let (namespace, operation) = request_command_path(request)?;
+    static COMMAND_SPEC: OnceLock<CommandSpec> = OnceLock::new();
+    let spec = COMMAND_SPEC.get_or_init(|| CommandSpec::from_registry(&default_registry()));
+    let invocation = Invocation::from_json(&params.input, &namespace, &operation, spec).ok()?;
+    build_command_from_invocation(&invocation, workspace_root)
+        .ok()?
+        .map(|command| ResolvedRequestRecovery {
+            effect: command.effect(),
+            recovery_class: command.recovery_class(),
+        })
+}
+
+pub fn request_command_path(request: &RequestEnvelope) -> Option<(String, String)> {
     let Op::Call(params) = &request.op else {
         return None;
     };
     let Address::Operation { path } = &params.address else {
         return None;
     };
-    let (namespace, operation) = match path.as_slice() {
-        [operation] => ("", operation.clone()),
-        [namespace, operation] => (namespace.as_str(), operation.clone()),
-        [namespace, first, second] => (namespace.as_str(), format!("{first}.{second}")),
-        _ => return None,
-    };
-    static COMMAND_SPEC: OnceLock<CommandSpec> = OnceLock::new();
-    let spec = COMMAND_SPEC.get_or_init(|| CommandSpec::from_registry(&default_registry()));
-    let invocation = Invocation::from_json(&params.input, namespace, &operation, spec).ok()?;
-    build_command_from_invocation(&invocation, workspace_root)
-        .ok()?
-        .map(|command| command.effect())
+    match path.as_slice() {
+        [operation] => Some((String::new(), operation.clone())),
+        [namespace, operation] => Some((namespace.clone(), operation.clone())),
+        [namespace, first, second] => Some((namespace.clone(), format!("{first}.{second}"))),
+        _ => None,
+    }
+}
+
+pub fn resolved_request_effect(workspace_root: &Path, request: &RequestEnvelope) -> Option<Effect> {
+    resolved_request_recovery(workspace_root, request).map(|recovery| recovery.effect)
+}
+
+fn execute_atomic_core<F, H>(
+    project_db_path: &Path,
+    request_hash: &str,
+    effect: Effect,
+    request: RequestEnvelope,
+    execute: F,
+    before_commit: H,
+) -> Result<AtomicCoreExecution>
+where
+    F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+    H: FnOnce() -> Result<()>,
+{
+    let request_id = request.id.clone();
+    let transaction =
+        RequestTransaction::begin(project_db_path).context("begin atomic request transaction")?;
+    let existing = transaction
+        .database()
+        .connection()
+        .query_row(
+            "SELECT request_hash, response_json
+             FROM atomic_request_outcomes
+             WHERE request_id = ?1",
+            [&request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    if let Some((stored_hash, _)) = &existing
+        && stored_hash != request_hash
+    {
+        transaction.rollback()?;
+        return Ok(AtomicCoreExecution {
+            response: without_committed_effect(request_id_conflict_response(request_id, effect)),
+            committed: false,
+            replayed: false,
+            request_id_conflict: true,
+        });
+    }
+
+    if let Some((_, response_json)) = existing {
+        let response = serde_json::from_str(&response_json)
+            .context("deserialize canonical atomic request outcome")?;
+        transaction.rollback()?;
+        return Ok(AtomicCoreExecution {
+            response,
+            committed: true,
+            replayed: true,
+            request_id_conflict: false,
+        });
+    }
+
+    let mut response = execute(request);
+    if !atomic_response_commits(&response) {
+        response.effect = None;
+        transaction.rollback()?;
+        return Ok(AtomicCoreExecution {
+            response,
+            committed: false,
+            replayed: false,
+            request_id_conflict: false,
+        });
+    }
+    response.effect.get_or_insert(effect);
+
+    let response_json =
+        serde_json::to_string(&response).context("serialize canonical atomic request outcome")?;
+    transaction.database().connection().execute(
+        "INSERT INTO atomic_request_outcomes (
+             request_id, request_hash, effect, response_json, committed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            request_id,
+            request_hash,
+            effect_name(effect),
+            response_json,
+            now_timestamp(),
+        ],
+    )?;
+    before_commit()?;
+    transaction.commit()?;
+
+    Ok(AtomicCoreExecution {
+        response,
+        committed: true,
+        replayed: false,
+        request_id_conflict: false,
+    })
+}
+
+fn atomic_response_commits(response: &ResponseEnvelope) -> bool {
+    response.status == Status::Ok
+        || response.status == Status::Error
+            && response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == ErrorCode::PreconditionFailed)
+            && response.error.as_ref().is_some_and(|error| {
+                error
+                    .details
+                    .as_ref()
+                    .is_some_and(contains_recorded_workflow_confirmation)
+            })
+}
+
+fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
+    response.effect = None;
+    response
+}
+
+fn contains_recorded_workflow_confirmation(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object
+                .get("workflow_confirmation")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|workflow| workflow.get("evidence_recorded"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || object.values().any(contains_recorded_workflow_confirmation)
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(contains_recorded_workflow_confirmation)
+        }
+        _ => false,
+    }
 }
 
 fn request_hash(request: &RequestEnvelope) -> Result<String> {
@@ -342,6 +927,23 @@ const fn effect_name(effect: Effect) -> &'static str {
         Effect::Pure => "pure",
         Effect::Write => "write",
         Effect::Exec => "exec",
+    }
+}
+
+const fn recovery_class_name(recovery_class: RecoveryClass) -> &'static str {
+    match recovery_class {
+        RecoveryClass::ReplayableRead => "replayable_read",
+        RecoveryClass::AtomicProjectState => "atomic_project_state",
+        RecoveryClass::ExternalAtMostOnce => "external_at_most_once",
+    }
+}
+
+fn recovery_class_from_name(name: &str) -> Option<RecoveryClass> {
+    match name {
+        "replayable_read" => Some(RecoveryClass::ReplayableRead),
+        "atomic_project_state" => Some(RecoveryClass::AtomicProjectState),
+        "external_at_most_once" => Some(RecoveryClass::ExternalAtMostOnce),
+        _ => None,
     }
 }
 
@@ -444,6 +1046,8 @@ fn ledger_error_response(
 mod tests {
     use super::*;
     use crate::api::protocol::{CallParams, Op};
+    use crate::context::SqliteWriter;
+    use exosuit_storage::open_database;
     use std::cell::Cell;
 
     fn request(id: &str, task_id: &str) -> RequestEnvelope {
@@ -477,6 +1081,86 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn error_response(
+        id: &str,
+        code: ErrorCode,
+        details: Option<serde_json::Value>,
+    ) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::Error,
+            result: None,
+            error: Some(ErrorBody {
+                code,
+                message: "request failed".to_string(),
+                details,
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Write),
+            trace: None,
+        }
+    }
+
+    fn insert_epoch(db_path: &Path, text_id: &str) {
+        SqliteWriter::open(db_path)
+            .expect("open request writer")
+            .add_epoch(text_id, None, &[])
+            .expect("insert epoch");
+    }
+
+    fn epoch_count(db_path: &Path) -> i64 {
+        open_database(db_path)
+            .expect("open project database")
+            .connection()
+            .query_row("SELECT COUNT(*) FROM epochs_data", [], |row| row.get(0))
+            .expect("count epochs")
+    }
+
+    fn atomic_outcome_count(db_path: &Path) -> i64 {
+        open_database(db_path)
+            .expect("open project database")
+            .connection()
+            .query_row("SELECT COUNT(*) FROM atomic_request_outcomes", [], |row| {
+                row.get(0)
+            })
+            .expect("count atomic outcomes")
+    }
+
+    fn atomic_outcome_exists(db_path: &Path, request_id: &str) -> bool {
+        open_database(db_path)
+            .expect("open project database")
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM atomic_request_outcomes WHERE request_id = ?1
+                 )",
+                [request_id],
+                |row| row.get(0),
+            )
+            .expect("check atomic outcome")
+    }
+
+    fn runtime_reservation(
+        ledger: &RequestOutcomeLedger,
+        request_id: &str,
+    ) -> Option<(String, bool)> {
+        Connection::open(ledger.path())
+            .expect("open runtime ledger")
+            .query_row(
+                "SELECT instance_id, response_json IS NOT NULL
+                 FROM daemon_request_outcomes WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .expect("read runtime reservation")
     }
 
     #[test]
@@ -553,6 +1237,63 @@ mod tests {
     }
 
     #[test]
+    fn canonical_request_id_conflict_does_not_mask_the_original_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = request("request-canonical-conflict", "task-a");
+        let original_hash = request_hash(&original).expect("original request hash");
+        execute_atomic_core(
+            &db_path,
+            &original_hash,
+            Effect::Write,
+            original.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit original canonical outcome");
+
+        let conflict = ledger.execute_atomic_project_state(
+            request("request-canonical-conflict", "task-b"),
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(conflict.response.status, Status::Error);
+        assert_eq!(
+            conflict.response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::InvalidInput)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, "request-canonical-conflict"),
+            None,
+            "canonical conflict must abandon the newly inserted runtime reservation"
+        );
+
+        let executions = Cell::new(0);
+        let replay = ledger.execute_atomic_project_state(
+            original,
+            Effect::Write,
+            "instance-c",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            Ok,
+        );
+        assert!(replay.replayed);
+        assert_eq!(replay.response.status, Status::Ok);
+        assert_eq!(executions.get(), 0);
+    }
+
+    #[test]
     fn unfinished_previous_instance_is_not_reexecuted() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
@@ -561,7 +1302,13 @@ mod tests {
         let hash = request_hash(&request).expect("request hash");
         assert!(matches!(
             ledger
-                .reserve(&request.id, &hash, Effect::Exec, "instance-a")
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Exec,
+                    RecoveryClass::ExternalAtMostOnce,
+                    "instance-a",
+                )
                 .expect("reserve"),
             Reservation::Execute
         ));
@@ -583,6 +1330,650 @@ mod tests {
             }),
             Some("daemon.request_outcome_indeterminate")
         );
+    }
+
+    #[test]
+    fn legacy_in_flight_atomic_request_remains_indeterminate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger_path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let request = request("request-legacy-in-flight", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        let legacy = Connection::open(&ledger_path).expect("open legacy runtime ledger");
+        legacy
+            .execute_batch(
+                "CREATE TABLE daemon_request_outcomes (
+                     request_id TEXT PRIMARY KEY,
+                     request_hash TEXT NOT NULL,
+                     effect TEXT NOT NULL,
+                     instance_id TEXT NOT NULL,
+                     response_json TEXT,
+                     started_at INTEGER NOT NULL,
+                     completed_at INTEGER
+                 );",
+            )
+            .expect("create legacy runtime schema");
+        legacy
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, started_at
+                 ) VALUES (?1, ?2, 'write', 'instance-old', ?3)",
+                params![request.id, hash, now_timestamp()],
+            )
+            .expect("insert legacy in-flight reservation");
+        drop(legacy);
+
+        let ledger = RequestOutcomeLedger::open(&ledger_path).expect("upgrade runtime ledger");
+        assert!(
+            !ledger
+                .atomic_request_needs_preparation(&request, &db_path, "instance-new")
+                .expect("probe legacy reservation"),
+            "legacy in-flight reservations must return indeterminate before preparation"
+        );
+        let executions = Cell::new(0);
+        let result = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-new",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            Ok,
+        );
+
+        assert_eq!(executions.get(), 0);
+        assert_eq!(result.response.status, Status::Error);
+        assert_eq!(
+            result.response.error.as_ref().and_then(|error| {
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["kind"].as_str())
+            }),
+            Some("daemon.request_outcome_indeterminate")
+        );
+        assert_eq!(atomic_outcome_count(&db_path), 0);
+    }
+
+    #[test]
+    fn same_instance_atomic_retry_remains_pending_without_db_contention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let request = request("request-atomic-in-flight", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
+                .expect("reserve active request"),
+            Reservation::Execute
+        ));
+
+        let executions = Cell::new(0);
+        let result = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            Ok,
+        );
+
+        assert_eq!(executions.get(), 0);
+        assert_eq!(result.response.status, Status::Error);
+        assert_eq!(
+            result.response.error.as_ref().and_then(|error| {
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["kind"].as_str())
+            }),
+            Some("daemon.request_outcome_pending")
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, "request-atomic-in-flight"),
+            Some(("instance-a".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn same_instance_atomic_retry_replays_visible_canonical_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let request = request("request-atomic-visible", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
+                .expect("reserve active request"),
+            Reservation::Execute
+        ));
+        execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit canonical outcome");
+
+        let executions = Cell::new(0);
+        let result = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            Ok,
+        );
+
+        assert!(result.replayed);
+        assert_eq!(result.response.status, Status::Ok);
+        assert_eq!(executions.get(), 0);
+    }
+
+    #[test]
+    fn failed_atomic_recovery_preserves_another_instances_reservation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let invalid_db_path = temp.path().join("database-directory");
+        std::fs::create_dir(&invalid_db_path).expect("create invalid database path");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let request = request("request-atomic-recovery", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
+                .expect("reserve previous request"),
+            Reservation::Execute
+        ));
+
+        let result = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            &invalid_db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+
+        assert_eq!(result.response.status, Status::Error);
+        assert_eq!(
+            result.response.error.as_ref().and_then(|error| {
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["kind"].as_str())
+            }),
+            Some("daemon.atomic_request_commit_failed")
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, "request-atomic-recovery"),
+            Some(("instance-a".to_string(), false)),
+            "recovery failure must not delete another instance's reservation"
+        );
+    }
+
+    #[test]
+    fn atomic_request_rolls_back_state_and_outcome_before_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let request = request("request-atomic-rollback", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+
+        let result = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request,
+            |request| {
+                insert_epoch(&db_path, "epoch-before-crash");
+                response(&request.id)
+            },
+            || Err(anyhow!("failpoint before commit")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(epoch_count(&db_path), 0);
+        assert_eq!(atomic_outcome_count(&db_path), 0);
+    }
+
+    #[test]
+    fn atomic_preparation_probe_distinguishes_replay_pending_and_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+
+        let runtime_request = request("request-runtime-terminal", "task-a");
+        let runtime_outcome = ledger.execute(
+            runtime_request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        assert_eq!(runtime_outcome.response.status, Status::Ok);
+        assert!(
+            !ledger
+                .atomic_request_needs_preparation(&runtime_request, &db_path, "instance-a")
+                .expect("probe runtime outcome"),
+            "completed runtime outcome should replay before preparation"
+        );
+
+        let incomplete_request = request("request-runtime-incomplete", "task-a");
+        let incomplete_hash = request_hash(&incomplete_request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &incomplete_request.id,
+                    &incomplete_hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
+                .expect("reserve incomplete request"),
+            Reservation::Execute
+        ));
+        assert!(
+            !ledger
+                .atomic_request_needs_preparation(&incomplete_request, &db_path, "instance-a")
+                .expect("probe same-instance outcome"),
+            "same-instance in-flight request should return pending before preparation"
+        );
+        assert!(
+            ledger
+                .atomic_request_needs_preparation(&incomplete_request, &db_path, "instance-b")
+                .expect("probe previous-instance outcome"),
+            "previous-instance request without a canonical outcome may need recovery execution"
+        );
+
+        let canonical_request = request("request-canonical-terminal", "task-a");
+        let canonical_hash = request_hash(&canonical_request).expect("request hash");
+        execute_atomic_core(
+            &db_path,
+            &canonical_hash,
+            Effect::Write,
+            canonical_request.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit canonical outcome");
+        assert!(
+            !ledger
+                .atomic_request_needs_preparation(&canonical_request, &db_path, "instance-b")
+                .expect("probe canonical outcome"),
+            "canonical outcome should replay before preparation"
+        );
+
+        let missing_request = request("request-missing", "task-a");
+        assert!(
+            ledger
+                .atomic_request_needs_preparation(&missing_request, &db_path, "instance-a")
+                .expect("probe missing outcome"),
+            "new requests require current project preparation"
+        );
+    }
+
+    #[test]
+    fn canonical_pruning_preserves_outcomes_with_unresolved_runtime_references() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+
+        let protected = request("request-expired-protected", "task-a");
+        let protected_hash = request_hash(&protected).expect("protected request hash");
+        execute_atomic_core(
+            &db_path,
+            &protected_hash,
+            Effect::Write,
+            protected.clone(),
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit protected canonical outcome");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &protected.id,
+                    &protected_hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-old",
+                )
+                .expect("reserve unresolved runtime reference"),
+            Reservation::Execute
+        ));
+
+        let unreferenced = request("request-expired-unreferenced", "task-a");
+        let unreferenced_hash = request_hash(&unreferenced).expect("unreferenced request hash");
+        execute_atomic_core(
+            &db_path,
+            &unreferenced_hash,
+            Effect::Write,
+            unreferenced,
+            |request| response(&request.id),
+            || Ok(()),
+        )
+        .expect("commit unreferenced canonical outcome");
+        open_database(&db_path)
+            .expect("open project database")
+            .connection()
+            .execute(
+                "UPDATE atomic_request_outcomes SET committed_at = ?1
+                 WHERE request_id IN ('request-expired-protected', 'request-expired-unreferenced')",
+                [now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS - 1],
+            )
+            .expect("expire canonical outcomes");
+
+        let trigger = ledger.execute_atomic_project_state(
+            request("request-prune-trigger", "task-a"),
+            Effect::Write,
+            "instance-current",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(trigger.response.status, Status::Ok);
+        assert!(atomic_outcome_exists(&db_path, "request-expired-protected"));
+        assert!(
+            !atomic_outcome_exists(&db_path, "request-expired-unreferenced"),
+            "expired canonical outcomes without unresolved references should still prune"
+        );
+    }
+
+    #[test]
+    fn previous_daemon_recovers_canonical_outcome_after_atomic_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("request-atomic-recovery", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &request.id,
+                    &hash,
+                    Effect::Write,
+                    RecoveryClass::AtomicProjectState,
+                    "instance-a",
+                )
+                .expect("reserve runtime request"),
+            Reservation::Execute
+        ));
+
+        let committed = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request.clone(),
+            |request| {
+                insert_epoch(&db_path, "epoch-committed");
+                response(&request.id)
+            },
+            || Ok(()),
+        )
+        .expect("commit canonical state and response");
+        assert!(committed.committed);
+        assert_eq!(epoch_count(&db_path), 1);
+
+        let executions = Cell::new(0);
+        let recovered = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                executions.set(executions.get() + 1);
+                response("request-atomic-recovery")
+            },
+            Ok,
+        );
+
+        assert!(recovered.replayed);
+        assert_eq!(recovered.response.status, Status::Ok);
+        assert_eq!(executions.get(), 0);
+        assert_eq!(epoch_count(&db_path), 1);
+    }
+
+    #[test]
+    fn finalization_failure_keeps_atomic_request_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("request-finalization-retry", "task-a");
+        let executions = Cell::new(0);
+        let finalizations = Cell::new(0);
+
+        let first = ledger.execute_atomic_project_state(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                executions.set(executions.get() + 1);
+                insert_epoch(&db_path, "epoch-finalize");
+                response(&request.id)
+            },
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Err(error_response(
+                    &response.id,
+                    ErrorCode::PreconditionFailed,
+                    Some(serde_json::json!({ "kind": "test.finalization" })),
+                ))
+            },
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(first.response.effect, Some(Effect::Write));
+
+        let second = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                executions.set(executions.get() + 1);
+                response("request-finalization-retry")
+            },
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+        );
+
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(executions.get(), 1);
+        assert_eq!(finalizations.get(), 2);
+        assert_eq!(epoch_count(&db_path), 1);
+    }
+
+    #[test]
+    fn atomic_request_uses_canonical_outcome_when_runtime_ledger_is_unavailable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let unusable_ledger_path = temp.path().join("runtime-ledger-directory");
+        std::fs::create_dir(&unusable_ledger_path).expect("create unusable ledger path");
+        let ledger = RequestOutcomeLedger {
+            path: unusable_ledger_path,
+        };
+        let request = request("request-without-runtime-ledger", "task-a");
+        assert!(
+            ledger
+                .atomic_request_needs_preparation(&request, &db_path, "instance-a")
+                .expect("canonical database should authorize preparation"),
+            "runtime lookup failure must not block canonical atomic execution"
+        );
+
+        let execution = ledger.execute_atomic_project_state(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                insert_epoch(&db_path, "epoch-without-runtime-ledger");
+                response(&request.id)
+            },
+            Ok,
+        );
+
+        assert_eq!(execution.response.status, Status::Ok);
+        assert_eq!(epoch_count(&db_path), 1);
+        assert_eq!(atomic_outcome_count(&db_path), 1);
+    }
+
+    #[test]
+    fn completion_review_precondition_commits_stateful_response() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let request = request("request-review", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+
+        let execution = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request,
+            |request| {
+                insert_epoch(&db_path, "epoch-review");
+                error_response(
+                    &request.id,
+                    ErrorCode::PreconditionFailed,
+                    Some(serde_json::json!({
+                        "details": {
+                            "workflow_confirmation": {
+                                "kind": "workflow_completion_confirmation",
+                                "evidence_recorded": true
+                            }
+                        }
+                    })),
+                )
+            },
+            || Ok(()),
+        )
+        .expect("commit stateful review response");
+
+        assert!(execution.committed);
+        assert_eq!(epoch_count(&db_path), 1);
+        assert_eq!(atomic_outcome_count(&db_path), 1);
+    }
+
+    #[test]
+    fn completion_review_prompt_without_evidence_rolls_back() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let request = request("request-review-prompt", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+
+        let execution = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request,
+            |request| {
+                insert_epoch(&db_path, "epoch-review-prompt");
+                error_response(
+                    &request.id,
+                    ErrorCode::PreconditionFailed,
+                    Some(serde_json::json!({
+                        "details": {
+                            "workflow_confirmation": {
+                                "kind": "workflow_completion_confirmation",
+                                "evidence_recorded": false
+                            }
+                        }
+                    })),
+                )
+            },
+            || Ok(()),
+        )
+        .expect("return approval prompt without committing state");
+
+        assert!(!execution.committed);
+        assert_eq!(execution.response.effect, None);
+        assert_eq!(epoch_count(&db_path), 0);
+        assert_eq!(atomic_outcome_count(&db_path), 0);
+    }
+
+    #[test]
+    fn ordinary_error_rolls_back_atomic_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let request = request("request-error", "task-a");
+        let hash = request_hash(&request).expect("request hash");
+
+        let execution = execute_atomic_core(
+            &db_path,
+            &hash,
+            Effect::Write,
+            request,
+            |request| {
+                insert_epoch(&db_path, "epoch-error");
+                error_response(&request.id, ErrorCode::InvalidInput, None)
+            },
+            || Ok(()),
+        )
+        .expect("return ordinary command error");
+
+        assert!(!execution.committed);
+        assert_eq!(execution.response.effect, None);
+        assert_eq!(epoch_count(&db_path), 0);
+        assert_eq!(atomic_outcome_count(&db_path), 0);
     }
 
     #[test]
@@ -618,6 +2009,41 @@ mod tests {
         assert_eq!(
             resolved_request_effect(Path::new("."), &apply),
             Some(Effect::Pure)
+        );
+    }
+
+    #[test]
+    fn resolved_recovery_class_separates_atomic_and_external_commands() {
+        let mut epoch_add = request("request-epoch", "task-a");
+        let Op::Call(params) = &mut epoch_add.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["epoch".to_string(), "add".to_string()],
+        };
+        params.input = serde_json::json!({ "title": "Atomic Epoch" });
+        assert_eq!(
+            resolved_request_recovery(Path::new("."), &epoch_add),
+            Some(ResolvedRequestRecovery {
+                effect: Effect::Write,
+                recovery_class: RecoveryClass::AtomicProjectState,
+            })
+        );
+
+        let mut phase_finish = request("request-phase", "task-a");
+        let Op::Call(params) = &mut phase_finish.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["phase".to_string(), "finish".to_string()],
+        };
+        params.input = serde_json::json!({ "message": "Finish phase" });
+        assert_eq!(
+            resolved_request_recovery(Path::new("."), &phase_finish),
+            Some(ResolvedRequestRecovery {
+                effect: Effect::Write,
+                recovery_class: RecoveryClass::ExternalAtMostOnce,
+            })
         );
     }
 }

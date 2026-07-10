@@ -8,6 +8,7 @@ pub mod dump;
 mod functions;
 pub mod maintenance;
 mod migrations;
+mod request_transaction;
 mod revisions;
 mod schema;
 mod trace;
@@ -22,6 +23,7 @@ pub use maintenance::{
     DEFAULT_INCREMENTAL_VACUUM_PAGE_BUDGET,
 };
 pub use migrations::run_migrations;
+pub use request_transaction::{active_request_database, open_request_database, RequestTransaction};
 pub use revisions::{RevisionStore, SqliteStateProvider};
 pub use schema::{Database, DatabaseError};
 pub use trace::{

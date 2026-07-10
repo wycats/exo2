@@ -12,16 +12,66 @@ use crate::failure::ExoFailure;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use exosuit_storage::{
-    Connection, Database, OptionalExtension, open_database, open_memory_database, params,
+    Connection, Database, OptionalExtension, open_memory_database, open_request_database, params,
 };
 use fractional_index::FractionalIndex;
 use std::collections::BTreeSet;
+use std::ops::Deref;
 use std::path::Path;
+use std::rc::Rc;
 
 /// Writer for project state mutations to `SQLite` database.
 #[derive(Debug)]
 pub struct SqliteWriter {
-    db: Database,
+    db: Rc<Database>,
+}
+
+struct SqliteSavepoint<'conn> {
+    connection: &'conn Connection,
+    name: &'static str,
+    active: bool,
+}
+
+impl<'conn> SqliteSavepoint<'conn> {
+    fn begin(connection: &'conn Connection, name: &'static str) -> Result<Self> {
+        connection
+            .execute_batch(&format!("SAVEPOINT {name}"))
+            .with_context(|| format!("Failed to start SQLite savepoint {name}"))?;
+        Ok(Self {
+            connection,
+            name,
+            active: true,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.connection
+            .execute_batch(&format!("RELEASE SAVEPOINT {}", self.name))
+            .with_context(|| format!("Failed to release SQLite savepoint {}", self.name))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Deref for SqliteSavepoint<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+    }
+}
+
+impl Drop for SqliteSavepoint<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = self.connection.execute_batch(&format!(
+            "ROLLBACK TO SAVEPOINT {}; RELEASE SAVEPOINT {}",
+            self.name, self.name
+        ));
+        self.active = false;
+    }
 }
 
 /// Canonical task identity and its planning context.
@@ -38,7 +88,7 @@ pub struct ResolvedTaskReference {
 impl SqliteWriter {
     /// Open a database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = open_database(path.as_ref())
+        let db = open_request_database(path.as_ref())
             .with_context(|| format!("Failed to open database at {}", path.as_ref().display()))?;
         Ok(Self { db })
     }
@@ -46,11 +96,11 @@ impl SqliteWriter {
     /// Create an in-memory database for testing.
     pub fn open_memory() -> Result<Self> {
         let db = open_memory_database().context("Failed to create in-memory database")?;
-        Ok(Self { db })
+        Ok(Self { db: Rc::new(db) })
     }
 
     /// Get a reference to the underlying database.
-    pub const fn database(&self) -> &Database {
+    pub fn database(&self) -> &Database {
         &self.db
     }
 
@@ -956,9 +1006,7 @@ impl SqliteWriter {
                 exclusively_owned_references.insert(legacy_reference);
             }
         }
-        let tx = conn
-            .unchecked_transaction()
-            .context("Failed to start task rename transaction")?;
+        let tx = SqliteSavepoint::begin(conn, "exo_task_rename")?;
 
         tx.execute(
             "DELETE FROM entity_aliases
@@ -1452,9 +1500,7 @@ impl SqliteWriter {
         establish_baseline: bool,
     ) -> Result<()> {
         let conn = self.db.connection();
-        let tx = conn
-            .unchecked_transaction()
-            .context("Failed to start canonical RFC reconciliation transaction")?;
+        let tx = SqliteSavepoint::begin(conn, "exo_canonical_rfc_reconciliation")?;
         let now = Utc::now().to_rfc3339();
 
         for record in changed_records {
@@ -1548,11 +1594,7 @@ impl SqliteWriter {
         observations: &[RfcWorkspaceObservation],
         diagnostics: &[RfcWorkspaceDiagnostic],
     ) -> Result<()> {
-        let tx = self
-            .db
-            .connection()
-            .unchecked_transaction()
-            .context("Failed to start RFC workspace snapshot transaction")?;
+        let tx = SqliteSavepoint::begin(self.db.connection(), "exo_rfc_workspace_snapshot")?;
 
         let updated = tx
             .execute(
@@ -2967,6 +3009,54 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(status, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn task_rename_savepoint_composes_with_request_transaction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("exo.db");
+        let writer = SqliteWriter::open(&db_path)?;
+        let epoch_id = writer.add_epoch("E1", None, &[])?;
+        let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+        writer.add_goal(
+            &phase_id,
+            "g1",
+            "Goal 1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )?;
+        writer.add_task("g1", "old-task", "Task", None)?;
+        let task = writer
+            .resolve_task_reference("old-task")?
+            .expect("task reference");
+        drop(writer);
+
+        let transaction = exosuit_storage::RequestTransaction::begin(&db_path)?;
+        let writer = SqliteWriter::open(&db_path)?;
+        writer.rename_task_handle(task.row_id, "old-task", "new-task")?;
+        transaction.commit()?;
+
+        let writer = SqliteWriter::open(&db_path)?;
+        assert_eq!(
+            writer
+                .resolve_task_reference("new-task")?
+                .expect("renamed task")
+                .row_id,
+            task.row_id
+        );
+        assert_eq!(
+            writer
+                .resolve_task_reference("old-task")?
+                .expect("retained alias")
+                .row_id,
+            task.row_id
+        );
         Ok(())
     }
 

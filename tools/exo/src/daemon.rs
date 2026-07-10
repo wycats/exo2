@@ -28,16 +28,23 @@
 //! 4. Wait for socket to become available
 //! 5. Connect and return stream
 
-use crate::api::handler::handle_request_with_project_and_diagnostics_as_writer;
-use crate::api::protocol::{
-    Effect, ErrorBody, ErrorCode, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, Status,
+use crate::api::handler::{
+    finalize_atomic_response_after_commit,
+    handle_request_with_project_and_diagnostics_as_atomic_writer,
+    handle_request_with_project_and_diagnostics_as_writer,
 };
+use crate::api::protocol::{
+    Effect, ErrorBody, ErrorCode, PROTOCOL_VERSION, RecoveryClass, RequestEnvelope,
+    ResponseEnvelope, Status,
+};
+use crate::context::AgentContext;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, DaemonDiagnosticsConfig, effect_name, elapsed_ms, request_op_path,
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, RequestOutcomeLedger, resolved_request_effect,
+    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
+    resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::Project;
@@ -1010,6 +1017,62 @@ fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
     Ok(current)
 }
 
+fn atomic_request_project(
+    workspace: &Path,
+    startup_project: &Project,
+    outcome_ledger: &RequestOutcomeLedger,
+    request: &RequestEnvelope,
+    instance_id: &str,
+) -> io::Result<Project> {
+    if !outcome_ledger
+        .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
+        .map_err(to_io_error)?
+    {
+        return Ok(startup_project.clone());
+    }
+
+    let request_project = daemon_request_project(startup_project)?;
+    AgentContext::prepare_request_transaction(workspace, Some(&request_project))
+        .map_err(to_io_error)?;
+    Ok(request_project)
+}
+
+fn execute_ledgered_daemon_request(
+    workspace: &Path,
+    startup_project: &Project,
+    outcome_ledger: &RequestOutcomeLedger,
+    request: RequestEnvelope,
+    effect: Effect,
+    instance_id: &str,
+    diagnostics: &DaemonDiagnostics,
+) -> OutcomeExecution {
+    outcome_ledger.execute(
+        request,
+        effect,
+        instance_id,
+        Duration::from_secs(30),
+        |request| {
+            let request_id = request.id.clone();
+            let request_project = match daemon_request_project(startup_project) {
+                Ok(project) => project,
+                Err(error) => {
+                    return daemon_handler_error_response(
+                        request_id,
+                        ErrorCode::PreconditionFailed,
+                        error.to_string(),
+                    );
+                }
+            };
+            handle_request_with_project_and_diagnostics_as_writer(
+                workspace,
+                Some(&request_project),
+                request,
+                diagnostics,
+            )
+        },
+    )
+}
+
 fn spawn_daemon_after_lock(
     paths: &LocalRuntimePaths,
     socket_path: &Path,
@@ -1908,40 +1971,99 @@ pub async fn run_daemon(
                 let instance_id = Arc::clone(&request_instance_id);
                 async move {
                     let request_id = req.id.clone();
+                    let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let effect = resolved_request_effect(&workspace, &req);
-                        let execute = |req: RequestEnvelope| {
-                            let request_id = req.id.clone();
-                            match daemon_request_project(project.as_ref()) {
-                                Ok(project) => {
-                                    handle_request_with_project_and_diagnostics_as_writer(
-                                        &workspace,
-                                        Some(&project),
-                                        req,
-                                        &diagnostics,
-                                    )
-                                }
-                                Err(error) => daemon_handler_error_response(
-                                    request_id,
-                                    ErrorCode::PreconditionFailed,
-                                    error.to_string(),
-                                ),
-                            }
-                        };
-
-                        match effect {
-                            Some(effect @ (Effect::Write | Effect::Exec)) => {
+                        let recovery = resolved_request_recovery(&workspace, &req);
+                        match recovery {
+                            Some(recovery)
+                                if recovery.recovery_class
+                                    == RecoveryClass::AtomicProjectState =>
+                            {
+                                let Some((namespace, operation)) = request_command_path(&req)
+                                else {
+                                    return daemon_handler_error_response(
+                                        handler_request_id,
+                                        ErrorCode::InvalidInput,
+                                        "atomic request is missing a command path".to_string(),
+                                    );
+                                };
+                                let request_project = match atomic_request_project(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &outcome_ledger,
+                                    &req,
+                                    &instance_id,
+                                ) {
+                                    Ok(project) => project,
+                                    Err(error) => {
+                                        return daemon_handler_error_response(
+                                            handler_request_id,
+                                            ErrorCode::PreconditionFailed,
+                                            error.to_string(),
+                                        );
+                                    }
+                                };
                                 outcome_ledger
-                                    .execute(
+                                    .execute_atomic_project_state(
                                         req,
-                                        effect,
+                                        recovery.effect,
                                         &instance_id,
                                         Duration::from_secs(30),
-                                        execute,
+                                        &request_project.db_path(),
+                                        |req| {
+                                            handle_request_with_project_and_diagnostics_as_atomic_writer(
+                                                &workspace,
+                                                Some(&request_project),
+                                                req,
+                                                &diagnostics,
+                                            )
+                                        },
+                                        |response| {
+                                            finalize_atomic_response_after_commit(
+                                                &workspace,
+                                                Some(&request_project),
+                                                &namespace,
+                                                &operation,
+                                                recovery.effect,
+                                                response,
+                                                &diagnostics,
+                                            )
+                                        },
                                     )
                                     .response
                             }
-                            _ => execute(req),
+                            Some(recovery)
+                                if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
+                            {
+                                execute_ledgered_daemon_request(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &outcome_ledger,
+                                    req,
+                                    recovery.effect,
+                                    &instance_id,
+                                    &diagnostics,
+                                )
+                                    .response
+                            }
+                            _ => {
+                                let request_project = match daemon_request_project(project.as_ref()) {
+                                    Ok(project) => project,
+                                    Err(error) => {
+                                        return daemon_handler_error_response(
+                                            handler_request_id,
+                                            ErrorCode::PreconditionFailed,
+                                            error.to_string(),
+                                        );
+                                    }
+                                };
+                                handle_request_with_project_and_diagnostics_as_writer(
+                                    &workspace,
+                                    Some(&request_project),
+                                    req,
+                                    &diagnostics,
+                                )
+                            }
                         }
                     })
                     .await
@@ -2384,6 +2506,175 @@ mod tests {
         assert_eq!(
             refreshed.sidecar_auto_push,
             crate::project::SidecarAutoPushPolicy::Always
+        );
+    }
+
+    fn recorded_atomic_request(
+        temp: &tempfile::TempDir,
+        request_id: &str,
+    ) -> (RequestOutcomeLedger, RequestEnvelope) {
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "id": request_id,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": {
+                        "kind": "operation",
+                        "path": ["epoch", "add"]
+                    },
+                    "input": {"title": "Recorded epoch"}
+                }
+            }
+        }))
+        .expect("parse request");
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let execution = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                daemon_handler_error_response(
+                    request.id,
+                    ErrorCode::Internal,
+                    "recorded response".to_string(),
+                )
+            },
+        );
+        assert!(!execution.replayed);
+        (ledger, request)
+    }
+
+    #[test]
+    fn recorded_non_atomic_replay_skips_project_policy_refresh() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&config_path, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        let mut project = test_project(&workspace, workspace.join(".exo"));
+        project.projects_config_path = Some(config_path);
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-write-policy-drift");
+
+        assert!(
+            daemon_request_project(&project).is_err(),
+            "fixture must fail mutable policy refresh"
+        );
+        let execution = execute_ledgered_daemon_request(
+            &workspace,
+            &project,
+            &ledger,
+            request,
+            Effect::Write,
+            "instance-a",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(execution.replayed);
+        assert_eq!(
+            execution.response.error.expect("recorded error").message,
+            "recorded response"
+        );
+    }
+
+    #[test]
+    fn recorded_non_atomic_conflict_skips_projection_hydration() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let projection_dir = workspace.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "not valid SQL projection",
+        )
+        .expect("write invalid projection");
+        let project = test_project(&workspace, workspace.clone());
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-write-conflict");
+        let mut conflicting_request =
+            serde_json::to_value(request).expect("serialize recorded request");
+        conflicting_request["op"]["params"]["input"]["title"] =
+            serde_json::json!("Conflicting epoch");
+        let conflicting_request =
+            serde_json::from_value(conflicting_request).expect("parse conflicting request");
+
+        let execution = execute_ledgered_daemon_request(
+            &workspace,
+            &project,
+            &ledger,
+            conflicting_request,
+            Effect::Write,
+            "instance-a",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(!execution.replayed);
+        assert_eq!(
+            execution.response.error.expect("conflict error").details,
+            Some(serde_json::json!({
+                "kind": "daemon.request_id_conflict",
+                "request_id": "recorded-write-conflict",
+                "mutation_performed": false,
+            }))
+        );
+        assert!(
+            !project.db_path().exists(),
+            "request-id conflict must not hydrate the broken projection"
+        );
+    }
+
+    #[test]
+    fn recorded_atomic_replay_skips_project_policy_refresh() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let config_path = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&config_path, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        let mut project = test_project(&workspace, workspace.join(".exo"));
+        project.projects_config_path = Some(config_path);
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-before-policy-drift");
+
+        assert!(
+            daemon_request_project(&project).is_err(),
+            "fixture must fail mutable policy refresh"
+        );
+        let replay_project =
+            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+                .expect("recorded response should bypass policy refresh");
+        assert_eq!(replay_project, project);
+    }
+
+    #[test]
+    fn recorded_atomic_replay_skips_projection_hydration() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(workspace.join("docs/agent-context"))
+            .expect("create projection directory");
+        std::fs::write(
+            workspace.join("docs/agent-context/epochs.sql"),
+            "not valid SQL projection",
+        )
+        .expect("write invalid projection");
+        let project = test_project(&workspace, workspace.clone());
+        let (ledger, request) = recorded_atomic_request(&temp, "recorded-before-hydration-drift");
+
+        assert!(
+            AgentContext::prepare_request_transaction(&workspace, Some(&project)).is_err(),
+            "fixture must fail projection hydration"
+        );
+        let _ = std::fs::remove_dir_all(project.db_path().parent().expect("database parent"));
+        let replay_project =
+            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+                .expect("recorded response should bypass projection hydration");
+        assert_eq!(replay_project, project);
+        assert!(
+            !project.db_path().exists(),
+            "replay preparation must not recreate the project database"
         );
     }
 

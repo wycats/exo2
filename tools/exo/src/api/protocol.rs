@@ -20,6 +20,18 @@ pub enum Effect {
     Exec,
 }
 
+/// Recovery behavior for a built command after daemon replacement.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    /// The request can be executed again because it cannot mutate state.
+    ReplayableRead,
+    /// State and the replayable core response commit in one project transaction.
+    AtomicProjectState,
+    /// The request may perform effects outside the canonical SQLite transaction.
+    ExternalAtMostOnce,
+}
+
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {

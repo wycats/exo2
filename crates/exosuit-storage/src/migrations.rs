@@ -118,6 +118,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/V020__reactive_revision_coverage.sql"),
     },
     Migration {
+        version: 21,
+        name: "atomic_request_outcomes",
+        sql: include_str!("../migrations/V021__atomic_request_outcomes.sql"),
+    },
+    Migration {
         version: 22,
         name: "rfc_workspace_observations",
         sql: include_str!("../migrations/V022__rfc_workspace_observations.sql"),
@@ -170,6 +175,41 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn v021_applies_when_v022_is_already_recorded() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE __schema_history (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO __schema_history (version, name)
+             VALUES (22, 'rfc_workspace_observations');",
+        )
+        .expect("seed later migration record");
+
+        run_migrations(&conn).expect("apply missing V021 migration");
+
+        let table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'atomic_request_outcomes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("V021 outcome table");
+        assert_eq!(table, "atomic_request_outcomes");
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 21",
+                [],
+                |row| row.get(0),
+            )
+            .expect("V021 schema history");
+        assert_eq!(applied, 1);
+    }
 
     #[test]
     fn v018_recreates_existing_inbox_vtab_with_action_payload_column() {

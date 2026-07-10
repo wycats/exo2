@@ -962,6 +962,7 @@ fn reconcile_and_refresh_locked(
     reconcile_shared: bool,
 ) -> Result<ReconcileResult> {
     let key = ReconcileKey::new(root, project, source);
+    let publish_reconciled_key = can_publish_reconciled_key(root, project)?;
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let should_reconcile = {
         let reconciled_keys = reconciled_keys
@@ -975,7 +976,7 @@ fn reconcile_and_refresh_locked(
         ReconcileResult::default()
     };
     refresh_workspace_rfc_snapshot(root, project, source)?;
-    if should_reconcile && key.canonical_oid.is_some() {
+    if should_reconcile && key.canonical_oid.is_some() && publish_reconciled_key {
         let mut reconciled_keys = reconciled_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -983,6 +984,11 @@ fn reconcile_and_refresh_locked(
         drop(reconciled_keys);
     }
     Ok(result)
+}
+
+fn can_publish_reconciled_key(root: &Path, project: Option<&Project>) -> Result<bool> {
+    let db_path = crate::context::db_path(root, project);
+    Ok(exosuit_storage::active_request_database(&db_path)?.is_none())
 }
 
 fn with_reconcile_lock<T>(
@@ -4791,6 +4797,32 @@ mod tests {
                 "refs/remotes/origin/HEAD",
                 "refs/remotes/origin/main",
             ],
+        );
+    }
+
+    #[test]
+    fn request_transaction_defers_reconciled_key_publication() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = crate::context::db_path(temp.path(), None);
+        std::fs::create_dir_all(db_path.parent().expect("database parent"))
+            .expect("create database parent");
+        drop(exosuit_storage::open_database(&db_path).expect("initialize project database"));
+
+        assert!(
+            can_publish_reconciled_key(temp.path(), None)
+                .expect("check publication outside request")
+        );
+        let transaction = exosuit_storage::RequestTransaction::begin(&db_path)
+            .expect("begin request transaction");
+        assert!(
+            !can_publish_reconciled_key(temp.path(), None)
+                .expect("check publication during request")
+        );
+        transaction
+            .rollback()
+            .expect("rollback request transaction");
+        assert!(
+            can_publish_reconciled_key(temp.path(), None).expect("check publication after request")
         );
     }
 

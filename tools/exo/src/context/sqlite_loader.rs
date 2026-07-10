@@ -25,11 +25,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use exosuit_storage::rusqlite::config::DbConfig;
 use exosuit_storage::{
-    Connection, Database, OptionalExtension, Row, open_database, open_memory_database,
+    Connection, Database, OptionalExtension, Row, open_memory_database, open_request_database,
 };
 use fractional_index::FractionalIndex;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 const LEGACY_COMPLETION_APPROVAL_SUBJECT: &str = "Workflow confirmation accepted";
 const COMPLETION_APPROVAL_SUBJECT: &str = "Outcome approved";
@@ -88,7 +89,7 @@ pub struct CompletionOutcomeDigest {
 /// output, enabling gradual migration.
 #[derive(Debug)]
 pub struct SqliteLoader {
-    db: Database,
+    db: Rc<Database>,
 }
 
 struct DefensiveModeGuard<'conn> {
@@ -323,7 +324,7 @@ pub struct PhaseDetailsData {
 impl SqliteLoader {
     /// Open a database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = open_database(path.as_ref())
+        let db = open_request_database(path.as_ref())
             .with_context(|| format!("Failed to open database at {}", path.as_ref().display()))?;
         Ok(Self { db })
     }
@@ -335,11 +336,11 @@ impl SqliteLoader {
         db.connection()
             .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
             .context("Failed to disable SQLite defensive mode for test fixtures")?;
-        Ok(Self { db })
+        Ok(Self { db: Rc::new(db) })
     }
 
     /// Get a reference to the underlying database.
-    pub const fn database(&self) -> &Database {
+    pub fn database(&self) -> &Database {
         &self.db
     }
 

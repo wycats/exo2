@@ -50,7 +50,6 @@ pub fn add_axiom(root: &Path, scope: &str, axiom: Axiom) -> ExoResult<()> {
         &axiom.implications,
         &axiom.tags,
     )?;
-    crate::context::write_sql_dump(root);
     Ok(())
 }
 
@@ -58,6 +57,58 @@ pub fn remove_axiom(root: &Path, id: &str) -> ExoResult<()> {
     let db_path = crate::context::db_path_resolving_project(root);
     let writer = crate::context::SqliteWriter::open(db_path)?;
     writer.remove_axiom(id)?;
-    crate::context::write_sql_dump(root);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn axiom(id: &str) -> Axiom {
+        Axiom {
+            id: id.to_string(),
+            principle: format!("Principle {id}"),
+            rationale: None,
+            implications: Vec::new(),
+            notes: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn atomic_axiom_mutations_defer_projection_until_post_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let db_path = root.join(crate::context::SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().expect("database parent"))
+            .expect("create database directory");
+        drop(exosuit_storage::open_database(&db_path).expect("initialize database"));
+        crate::context::SqliteWriter::open(&db_path)
+            .expect("open writer")
+            .add_axiom(
+                "existing",
+                "workflow",
+                "Existing principle",
+                None,
+                None,
+                &[],
+                &[],
+            )
+            .expect("seed axiom");
+
+        let transaction =
+            exosuit_storage::RequestTransaction::begin(&db_path).expect("begin request");
+        remove_axiom(root, "existing").expect("remove axiom in request");
+        add_axiom(root, "workflow", axiom("new")).expect("add axiom in request");
+
+        assert!(
+            !root.join("docs/agent-context/axioms.sql").exists(),
+            "axiom commands must leave projection publication to post-commit persistence"
+        );
+        transaction.rollback().expect("roll back request");
+
+        let axioms = list_axioms(root, "workflow").expect("read rolled-back axioms");
+        assert_eq!(axioms.len(), 1);
+        assert_eq!(axioms[0].id, "existing");
+    }
 }

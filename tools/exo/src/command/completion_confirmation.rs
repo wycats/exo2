@@ -78,6 +78,7 @@ pub(super) fn record_completion_approval_evidence(
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct WorkflowCompletionConfirmation {
     pub kind: &'static str,
+    pub evidence_recorded: bool,
     pub entity_type: &'static str,
     pub entity_id: String,
     pub completion_input: WorkflowCompletionInput,
@@ -137,6 +138,7 @@ pub(super) fn goal_workflow_confirmation(
 
     WorkflowCompletionConfirmation {
         kind: WORKFLOW_COMPLETION_CONFIRMATION_KIND,
+        evidence_recorded: workflow_evidence_recorded,
         entity_type: "goal",
         entity_id: goal_id.to_string(),
         completion_input: WorkflowCompletionInput {
@@ -198,6 +200,7 @@ pub(super) fn task_workflow_confirmation(
 
     WorkflowCompletionConfirmation {
         kind: WORKFLOW_COMPLETION_CONFIRMATION_KIND,
+        evidence_recorded: workflow_evidence_recorded,
         entity_type: "task",
         entity_id: task_id.to_string(),
         completion_input: WorkflowCompletionInput {
