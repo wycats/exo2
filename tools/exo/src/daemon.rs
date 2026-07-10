@@ -1021,9 +1021,10 @@ fn atomic_request_project(
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
     request: &RequestEnvelope,
+    instance_id: &str,
 ) -> io::Result<Project> {
-    if outcome_ledger
-        .has_recorded_atomic_outcome(request, &startup_project.db_path())
+    if !outcome_ledger
+        .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
         .map_err(to_io_error)?
     {
         return Ok(startup_project.clone());
@@ -1954,6 +1955,7 @@ pub async fn run_daemon(
                                     project.as_ref(),
                                     &outcome_ledger,
                                     &req,
+                                    &instance_id,
                                 ) {
                                     Ok(project) => project,
                                     Err(error) => {
@@ -2541,8 +2543,9 @@ mod tests {
             daemon_request_project(&project).is_err(),
             "fixture must fail mutable policy refresh"
         );
-        let replay_project = atomic_request_project(&workspace, &project, &ledger, &request)
-            .expect("recorded response should bypass policy refresh");
+        let replay_project =
+            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+                .expect("recorded response should bypass policy refresh");
         assert_eq!(replay_project, project);
     }
 
@@ -2565,8 +2568,9 @@ mod tests {
             "fixture must fail projection hydration"
         );
         let _ = std::fs::remove_dir_all(project.db_path().parent().expect("database parent"));
-        let replay_project = atomic_request_project(&workspace, &project, &ledger, &request)
-            .expect("recorded response should bypass projection hydration");
+        let replay_project =
+            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+                .expect("recorded response should bypass projection hydration");
         assert_eq!(replay_project, project);
         assert!(
             !project.db_path().exists(),

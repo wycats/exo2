@@ -83,8 +83,9 @@ outcome-review precondition is an explicit stateful response and may commit
 approval evidence with its replayable response. SQL projection and sidecar
 checkpoint work run after the canonical commit as an idempotent finalization
 stage; replacement daemons resume that stage from the canonical response.
-Completed runtime and canonical outcomes are retained for seven days and
-pruned during outcome-ledger activity.
+Completed runtime and canonical outcomes are retained for at least seven days
+and pruned during outcome-ledger activity. Canonical proof remains retained
+while an unresolved runtime reservation references the request ID.
 
 ## Cockpit / Workbench Direction
 
