@@ -526,10 +526,17 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
     assert_eq!(restarted["error"]["code"], -32000, "{restarted}");
     let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-failure");
     assert!(status["result"]["worker"].is_null(), "{status}");
+    assert_eq!(
+        status["result"]["last_error"],
+        JsonValue::String(
+            "worker protocol error: dogfood activation source worker is not executable".to_string(),
+        ),
+        "{status}"
+    );
     assert!(
-        status["result"]["last_error"]
+        !status["result"]["last_error"]
             .as_str()
-            .is_some_and(|error| error.contains("source worker is not executable")),
+            .is_some_and(|error| error.contains(&alt_source.display().to_string())),
         "{status}"
     );
 

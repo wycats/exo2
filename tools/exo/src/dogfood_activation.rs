@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
+use crate::mcp::{ExecutableIdentity, executable_identity_matches_path};
+
 pub const DOGFOOD_ACTIVATION_ENV: &str = "EXO_DOGFOOD_ACTIVATION";
 const DOGFOOD_ACTIVATION_VERSION: u32 = 2;
 
@@ -240,11 +242,14 @@ fn worker_matches_source(expected: &DogfoodActivationBinary, worker_identity: &J
         .and_then(JsonValue::as_str)
         .map(PathBuf::from)
         .map(|path| path.canonicalize().unwrap_or(path));
-    let worker_hash = worker_identity
-        .pointer("/executable_identity/stable_hash")
-        .and_then(JsonValue::as_str);
+    let worker_executable_identity = worker_identity
+        .get("executable_identity")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ExecutableIdentity>(value).ok());
     worker_path.as_deref() == Some(expected_path.as_path())
-        && file_blake3(&expected.path).ok().as_deref() == worker_hash
+        && worker_executable_identity.as_ref().is_some_and(|identity| {
+            executable_identity_matches_path(identity, &expected.path).unwrap_or(false)
+        })
 }
 
 fn path_matches(expected: &Path, actual: &Path) -> bool {
@@ -277,6 +282,8 @@ pub fn status_value(status: DogfoodActivationStatus) -> JsonValue {
 
 #[cfg(test)]
 mod tests {
+    use crate::mcp::executable_identity_for_path;
+
     use super::*;
 
     fn fingerprint(path: &Path) -> DogfoodActivationBinary {
@@ -323,7 +330,7 @@ mod tests {
         let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
         let worker = json!({
             "executable_path": source_exo,
-            "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") }
+            "executable_identity": executable_identity_for_path(&source_exo).expect("identity")
         });
 
         let status = activation.status(&installed_mcp, Some(&worker));
@@ -342,11 +349,12 @@ mod tests {
             fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
         }
         let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
+        let stale_identity = executable_identity_for_path(&source_exo).expect("identity");
         fs::write(&source_exo, "new source build").expect("update source build");
 
         let worker = json!({
-            "executable_path": installed_exo,
-            "executable_identity": { "stable_hash": file_blake3(&installed_exo).expect("hash") }
+            "executable_path": source_exo,
+            "executable_identity": stale_identity,
         });
         let status = activation.status(&installed_mcp, Some(&worker));
         assert!(!status.ok);
@@ -368,7 +376,7 @@ mod tests {
         fs::write(&source_mcp, "rebuilt source proxy").expect("rebuild source proxy");
         let worker = json!({
             "executable_path": source_exo,
-            "executable_identity": { "stable_hash": file_blake3(&source_exo).expect("hash") }
+            "executable_identity": executable_identity_for_path(&source_exo).expect("identity")
         });
 
         let status = activation.status(&source_mcp, Some(&worker));

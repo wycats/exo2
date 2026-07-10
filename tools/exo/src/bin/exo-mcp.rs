@@ -486,10 +486,9 @@ impl ProxyWorker {
                 )
             })?;
         if !is_executable_file(&source_worker) {
-            return Err(HostError::Protocol(format!(
-                "dogfood activation source worker is not executable: {}",
-                source_worker.display()
-            )));
+            return Err(HostError::Protocol(
+                "dogfood activation source worker is not executable".to_string(),
+            ));
         }
         self.spec = exo_worker_spec(source_worker).current_dir(std::env::current_dir()?);
         Ok(())
