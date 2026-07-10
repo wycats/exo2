@@ -1114,6 +1114,52 @@ fn dogfood_rejects_proxy_health_with_stale_worker_identity() {
 
 #[cfg(unix)]
 #[test]
+fn dogfood_accepts_a_current_activation_source_worker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut payload = healthy_proxy_payload();
+    payload["status"]["worker"]["identity"]["executable_identity"]["stable_hash"] =
+        JsonValue::String("source-worker-hash".to_string());
+    payload["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": true,
+        "state": "current"
+    });
+    fs::write(&fake_proxy, proxy_health_script_with_payload(payload, ""))
+        .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env(
+                "PATH",
+                std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                    .expect("join fake PATH"),
+            )
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(dogfood["plugin"]["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "current"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dogfood_verify_reports_stale_dogfood_activation() {
     let temp = tempfile::tempdir().expect("tempdir");
     git_init(temp.path());

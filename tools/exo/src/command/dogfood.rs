@@ -1037,6 +1037,10 @@ fn plugin_proxy_binary_for_path(
                 path.display()
             ))
         } else if let Some(worker) = health.as_ref().and_then(|health| health.worker.as_ref())
+            && !health
+                .as_ref()
+                .and_then(|health| health.activation.as_ref())
+                .is_some_and(|activation| activation.configured && activation.ok)
             && worker.blake3 != current_binary.blake3
         {
             Some(format!(

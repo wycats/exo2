@@ -424,6 +424,60 @@ fn exo_mcp_proxy_health_reports_invalid_dogfood_activation() {
 }
 
 #[cfg(unix)]
+#[test]
+fn exo_mcp_proxy_health_reaps_worker_rejected_by_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_worker = temp.path().join("source-exo");
+    std::fs::write(&source_worker, "expected source worker").expect("write source worker");
+    let exo = assert_cmd::cargo::cargo_bin!("exo");
+    let exo_mcp = assert_cmd::cargo::cargo_bin!("exo-mcp");
+    let activation = temp.path().join("activation.json");
+    let binary = |path: &std::path::Path| {
+        serde_json::json!({
+            "path": path,
+            "blake3": "unused-by-this-fixture",
+            "size_bytes": 0,
+            "modified_unix_ms": null,
+        })
+    };
+    std::fs::write(
+        &activation,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source": {
+                "exo": binary(&source_worker),
+                "exo_mcp": binary(&exo_mcp),
+            },
+            "installed": {
+                "exo": binary(&exo),
+                "exo_mcp": binary(&exo_mcp),
+            },
+        }))
+        .expect("serialize activation"),
+    )
+    .expect("write activation");
+
+    let output = Command::new(&exo_mcp)
+        .arg("--proxy-health")
+        .current_dir(temp.path())
+        .env(exo::dogfood_activation::DOGFOOD_ACTIVATION_ENV, &activation)
+        .env("EXO_MCP_WORKER", &exo)
+        .output()
+        .expect("run proxy health");
+    assert!(output.status.success());
+
+    let health: JsonValue = serde_json::from_slice(&output.stdout).expect("proxy health JSON");
+    assert_eq!(health["ok"], false, "{health}");
+    assert!(
+        health["issue"]
+            .as_str()
+            .is_some_and(|issue| issue.contains("does not match the current source build")),
+        "{health}"
+    );
+    assert!(health["status"]["worker"].is_null(), "{health}");
+}
+
+#[cfg(unix)]
 fn install_exo_worker_binary(path: &std::path::Path) {
     let source = assert_cmd::cargo::cargo_bin!("exo");
     if path.exists() {

@@ -578,9 +578,18 @@ fn write_dogfood_activation(root: &Path, install_root: &Path) -> Result<PathBuf>
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serialized)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("failed to publish {}", path.display()))?;
+    replace_file(&temporary, &path)?;
     Ok(path)
+}
+
+fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to replace existing {}", path.display()))?;
+    }
+
+    fs::rename(temporary, path).with_context(|| format!("failed to publish {}", path.display()))
 }
 
 fn dogfood_activation_binary(path: &Path) -> Result<DogfoodActivationBinary> {
@@ -768,6 +777,39 @@ mod tests {
                 .len(),
             1
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn repeated_activation_replaces_the_existing_record() {
+        let root = temp_dir("repeated-activation");
+        let install_root = root.join("install-root");
+        for path in [
+            exo_debug_binary(&root),
+            debug_binary(&root, "exo-mcp"),
+            install_root
+                .join("bin")
+                .join(format!("exo{}", std::env::consts::EXE_SUFFIX)),
+            install_root
+                .join("bin")
+                .join(format!("exo-mcp{}", std::env::consts::EXE_SUFFIX)),
+        ] {
+            fs::create_dir_all(path.parent().expect("binary parent")).expect("create binary dir");
+            fs::write(path, "first build").expect("write binary");
+        }
+
+        let activation_path =
+            write_dogfood_activation(&root, &install_root).expect("write first activation");
+        let first = fs::read_to_string(&activation_path).expect("read first activation");
+        fs::write(exo_debug_binary(&root), "second build").expect("update source exo");
+
+        let repeated_path =
+            write_dogfood_activation(&root, &install_root).expect("replace activation");
+        let second = fs::read_to_string(&repeated_path).expect("read second activation");
+
+        assert_eq!(activation_path, repeated_path);
+        assert_ne!(first, second);
+        assert!(second.contains(&blake3::hash(b"second build").to_hex().to_string()));
         fs::remove_dir_all(root).ok();
     }
 

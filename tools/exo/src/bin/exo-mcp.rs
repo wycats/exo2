@@ -446,9 +446,18 @@ impl ProxyWorker {
         let Some(running) = self.running.as_ref() else {
             return Err(HostError::Protocol("worker did not start".to_string()));
         };
-        self.dogfood_activation
+        let activation_result = self
+            .dogfood_activation
             .ensure_worker(&self.proxy_identity.executable_path, &running.identity)
-            .map_err(HostError::Protocol)?;
+            .map_err(HostError::Protocol);
+        if let Err(error) = activation_result {
+            // The worker was launched before its activation identity could be
+            // checked. Dropping it reaps the child so it cannot serve a later
+            // request after this start was rejected.
+            self.running = None;
+            self.record_restart_error(&reason, &error);
+            return Err(error);
+        }
         Ok(Some(reason))
     }
 
