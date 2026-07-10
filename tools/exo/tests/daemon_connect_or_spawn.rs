@@ -168,7 +168,10 @@ fn runtime_outcome_completed(path: &Path, request_id: &str) -> bool {
     if !path.exists() {
         return false;
     }
-    let Ok(connection) = exosuit_storage::Connection::open(path) else {
+    let Ok(connection) = exosuit_storage::Connection::open_with_flags(
+        path,
+        exosuit_storage::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
         return false;
     };
     connection
