@@ -59,12 +59,37 @@ process-start identity. The client probes that exact instance before reuse and
 revalidates process identity before each termination signal. This prevents a
 stale PID file or PID reuse from authorizing a signal to another process.
 
-Pure requests may be replayed with the same request ID after automatic repair.
-Write and exec requests require a durable request/outcome record before they
-can be recovered transparently: reconnecting clients must query or replay the
-same globally unique request ID and receive the recorded response without
-executing a committed mutation twice. Until that ledger is implemented, the
-non-replay safety boundary remains in force.
+Every built command declares one recovery class through the shared command
+specification:
+
+- `replayable_read` requests may execute again because they do not mutate
+  project state;
+- `atomic_project_state` requests commit their canonical SQLite mutation,
+  deterministic command event, and serialized core response in one
+  request-scoped transaction;
+- `external_at_most_once` requests retain the non-replay boundary because they
+  can own Git, filesystem, process, or other effects outside that transaction.
+
+The atomic project-state class covers the mutable axiom, epoch, goal, task,
+inbox, plan, and GC surfaces, phase mutations other than `phase finish`, and
+`idea add` / `idea archive`. V021 stores their canonical request outcomes in
+the project database. Reconnecting clients reuse the globally unique request
+ID: a committed V021 outcome is replayed, while absence of an outcome proves
+that the interrupted SQLite transaction did not commit and may be executed
+again safely.
+
+Ordinary command failures roll back the request transaction. An outcome-review
+prompt without approval evidence also rolls back. When a matching approval has
+been supplied, the structured outcome-review precondition commits the recorded
+approval evidence with its replayable response. SQL projection and sidecar
+checkpoint work run after the canonical commit as an idempotent finalization
+stage; replacement daemons resume that stage from the canonical response.
+Runtime reservations record the recovery class that created them. An in-flight
+reservation without that marker predates this atomic contract and remains
+indeterminate after daemon replacement rather than authorizing execution.
+Completed runtime and canonical outcomes are retained for at least seven days
+and pruned during outcome-ledger activity. Canonical proof remains retained
+while an unresolved runtime reservation references the request ID.
 
 ## Cockpit / Workbench Direction
 
@@ -89,10 +114,6 @@ target for this phase.
 
 ## Open Questions
 
-- What transaction boundary should atomically associate a mutating command's
-  durable state change with its replayable response?
-- How long should completed daemon request outcomes be retained, and which
-  bounded maintenance path removes expired entries?
 - What is the minimum lane-centered workbench slice that proves a lane can be
   created, focused, and resumed from canonical project state?
 - Which daemon/API surfaces should the first lane workbench implementation

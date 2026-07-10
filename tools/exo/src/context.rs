@@ -1154,6 +1154,19 @@ impl AgentContext {
         })
     }
 
+    /// Hydrate and reconcile the project database before a request-scoped
+    /// transaction begins. This keeps projection import and RFC cache
+    /// publication outside any command transaction that may roll back.
+    pub(crate) fn prepare_request_transaction(
+        root: &Path,
+        project: Option<&Project>,
+    ) -> ExoResult<()> {
+        let _loader = Self::open_sqlite_loader(root, project)?;
+        crate::rfc::reconcile_rfcs_once_with_project(root, project)
+            .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        Ok(())
+    }
+
     /// Load context and the coherent RFC view observed by the same request.
     #[allow(clippy::missing_errors_doc)]
     pub fn load_with_project_and_rfc_view(
@@ -1186,8 +1199,11 @@ impl AgentContext {
 
     fn load_from_sqlite(root: &Path, project: Option<&Project>) -> ExoResult<ExoState> {
         let loader = Self::open_sqlite_loader(root, project)?;
-        crate::rfc::reconcile_rfcs_once_with_project(root, project)
-            .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        let db_path = db_path(root, project);
+        if exosuit_storage::active_request_database(&db_path)?.is_none() {
+            crate::rfc::reconcile_rfcs_once_with_project(root, project)
+                .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        }
         loader
             .load_state()
             .with_context(|| "Failed to load state from SQLite database")

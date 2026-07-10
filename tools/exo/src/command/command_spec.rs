@@ -32,7 +32,7 @@
 //! let help = spec.namespace("phase").unwrap().to_help_text();
 //! ```
 
-use crate::api::protocol::Effect;
+use crate::api::protocol::{Effect, RecoveryClass};
 use crate::command::lm_tool_metadata;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -160,6 +160,8 @@ pub struct OperationSpec {
     pub description: String,
     /// Effect classification (Pure, Write, Exec).
     pub effect: Effect,
+    /// Recovery behavior after daemon replacement.
+    pub recovery_class: RecoveryClass,
     /// Whether this operation requires an upgrade gate check.
     pub needs_upgrade_gate: bool,
     /// Arguments this operation accepts.
@@ -179,6 +181,11 @@ impl OperationSpec {
             name: name.into(),
             description: description.into(),
             effect,
+            recovery_class: if effect == Effect::Pure {
+                RecoveryClass::ReplayableRead
+            } else {
+                RecoveryClass::ExternalAtMostOnce
+            },
             needs_upgrade_gate: false,
             args: Vec::new(),
             example: None,
@@ -523,6 +530,22 @@ impl CommandSpec {
 
         // Override root operations with ExoSpec-generated definitions
         spec.merge_exospec_root::<super::root::RootCommands>();
+
+        // ExoSpec owns syntax while the registered command owns runtime
+        // behavior. Reapply effect and recovery after ExoSpec replacement.
+        for cmd in registry.iter() {
+            let operation = if cmd.namespace().is_empty() {
+                spec.root_operations.get_mut(cmd.operation())
+            } else {
+                spec.namespaces
+                    .get_mut(cmd.namespace())
+                    .and_then(|namespace| namespace.operations.get_mut(cmd.operation()))
+            };
+            if let Some(operation) = operation {
+                operation.effect = cmd.effect();
+                operation.recovery_class = cmd.recovery_class();
+            }
+        }
 
         // Calculate total operation count
         let namespace_ops: usize = spec.namespaces.values().map(|ns| ns.operations.len()).sum();
@@ -930,6 +953,47 @@ mod tests {
             .expect("epoch namespace should exist");
         assert!(epoch.operation("list").is_some());
         assert!(epoch.operation("review").is_some());
+    }
+
+    #[test]
+    fn command_spec_recovery_classes_match_registered_commands() {
+        let registry = default_registry();
+        let spec = CommandSpec::from_registry(&registry);
+
+        for command in registry.metadata() {
+            let operation = if command.namespace.is_empty() {
+                spec.root_operations.get(command.operation)
+            } else {
+                spec.namespaces
+                    .get(command.namespace)
+                    .and_then(|namespace| namespace.operations.get(command.operation))
+            }
+            .expect("registered command should be present in the command spec");
+
+            assert_eq!(
+                operation.recovery_class, command.recovery_class,
+                "recovery class drift for {} {}",
+                command.namespace, command.operation
+            );
+            assert_eq!(
+                operation.effect, command.effect,
+                "effect drift for {} {}",
+                command.namespace, command.operation
+            );
+        }
+
+        assert_eq!(
+            spec.namespace("context")
+                .and_then(|namespace| namespace.operation("restore"))
+                .map(|operation| operation.recovery_class),
+            Some(RecoveryClass::ReplayableRead)
+        );
+        assert_eq!(
+            spec.namespace("sidecar")
+                .and_then(|namespace| namespace.operation("repo"))
+                .map(|operation| operation.recovery_class),
+            Some(RecoveryClass::ExternalAtMostOnce)
+        );
     }
 
     #[test]

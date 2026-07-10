@@ -22,6 +22,9 @@ pub enum DatabaseError {
 
     #[error("Constraint violation: {0}")]
     Constraint(String),
+
+    #[error("Request database scope error: {0}")]
+    RequestScope(String),
 }
 
 /// Shadow tables that need reactive virtual table wrappers.
