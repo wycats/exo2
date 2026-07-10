@@ -179,6 +179,50 @@ impl RequestOutcomeLedger {
         Ok(None)
     }
 
+    /// Return the recorded recovery authority for a matching in-flight request.
+    /// This preserves at-most-once handling when current command construction
+    /// depends on a workspace path or argument file that is no longer present.
+    pub(crate) fn reserved_request_recovery_before_preparation(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<Option<ResolvedRequestRecovery>> {
+        let request_hash = request_hash(request)?;
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))?;
+        connection.pragma_update(None, "busy_timeout", 5_000)?;
+        let reserved = connection
+            .query_row(
+                "SELECT request_hash, effect, recovery_class, response_json
+                 FROM daemon_request_outcomes
+                 WHERE request_id = ?1",
+                [&request.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((stored_hash, effect, recovery_class, None)) = reserved else {
+            return Ok(None);
+        };
+        if stored_hash != request_hash {
+            return Ok(None);
+        }
+
+        Ok(Some(ResolvedRequestRecovery {
+            effect: effect_from_name(&effect)?,
+            recovery_class: recovery_class
+                .as_deref()
+                .and_then(recovery_class_from_name)
+                .unwrap_or(RecoveryClass::ExternalAtMostOnce),
+        }))
+    }
+
     /// Return whether an atomic request may execute and therefore needs current
     /// project preparation. Completed, conflicting, and same-instance in-flight
     /// requests are resolved by the outcome ledger before mutable preparation.

@@ -47,7 +47,7 @@ use crate::daemon_outcomes::{
     request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
-use crate::project::{Project, ProjectResolver};
+use crate::project::{Project, ProjectResolver, git_common_dir_from_filesystem};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, Metadata};
@@ -1059,6 +1059,13 @@ fn validated_request_workspace(
             "daemon request workspace path could not be canonicalized",
         )
     })?;
+    if workspace_root == startup_workspace
+        && git_common_dir_from_filesystem(&workspace_root).as_deref()
+            == Some(startup_project.git_common_dir.as_path())
+    {
+        return Ok(startup_workspace.to_path_buf());
+    }
+
     let resolver = startup_project
         .projects_config_path
         .as_deref()
@@ -2097,6 +2104,10 @@ pub async fn run_daemon(
                             return outcome.response;
                         }
                         let declared_recovery = request_declared_recovery(&req);
+                        let reserved_recovery = outcome_ledger
+                            .reserved_request_recovery_before_preparation(&req)
+                            .ok()
+                            .flatten();
                         let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
                             recovery.recovery_class == RecoveryClass::AtomicProjectState
                                 && outcome_ledger
@@ -2109,6 +2120,8 @@ pub async fn run_daemon(
                         });
                         let recovery = if canonical_atomic_replay {
                             declared_recovery
+                        } else if reserved_recovery.is_some() {
+                            reserved_recovery
                         } else {
                             let request_workspace = match validated_request_workspace(
                                 &workspace,
@@ -3045,6 +3058,28 @@ mod tests {
     }
 
     #[test]
+    fn validated_startup_workspace_reuses_retained_git_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "startup-fast-path");
+        let mut startup = Project::resolve(&workspace).expect("resolve project");
+        let invalid_config = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(invalid_config.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&invalid_config, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        startup.projects_config_path = Some(invalid_config);
+        let request = request_for_workspace(Some(&workspace));
+
+        let resolved = validated_request_workspace(&workspace, &startup, &request)
+            .expect("matching retained Git identity should avoid policy resolution");
+
+        assert_eq!(
+            resolved,
+            workspace.canonicalize().expect("canonical workspace")
+        );
+    }
+
+    #[test]
     fn linked_worktree_local_arguments_drive_recovery_classification() {
         let temp = tempfile::tempdir().expect("tempdir");
         let primary = create_test_git_repo(&temp, "primary");
@@ -3091,6 +3126,104 @@ mod tests {
 
         assert_eq!(recovery.effect, Effect::Write);
         assert_eq!(recovery.recovery_class, RecoveryClass::ExternalAtMostOnce);
+    }
+
+    #[test]
+    fn removed_workspace_retry_preserves_in_flight_at_most_once_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked-in-flight");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-in-flight-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        std::fs::write(linked.join("replacement.md"), "Replacement body.\n")
+            .expect("write request argument file");
+        let project = Project::resolve(&primary).expect("resolve daemon project");
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "removed-workspace-in-flight-retry",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["rfc", "edit"] },
+                    "input": {
+                        "id": "0001",
+                        "body-file": "replacement.md"
+                    }
+                }
+            }
+        }))
+        .expect("parse linked RFC edit request");
+        let recovery = resolved_request_recovery(&linked, &request)
+            .expect("classify request before its workspace disappears");
+        assert_eq!(recovery.effect, Effect::Write);
+        assert_eq!(recovery.recovery_class, RecoveryClass::ExternalAtMostOnce);
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let first = ledger.execute(
+            request.clone(),
+            recovery.effect,
+            "retired-instance",
+            Duration::ZERO,
+            |request| {
+                daemon_handler_error_response(
+                    request.id,
+                    ErrorCode::Internal,
+                    "recorded response".to_string(),
+                )
+            },
+        );
+        assert!(!first.replayed);
+        exosuit_storage::Connection::open(ledger.path())
+            .expect("open runtime outcome database")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET response_json = NULL, completed_at = NULL
+                 WHERE request_id = ?1",
+                [&request.id],
+            )
+            .expect("simulate interrupted external request");
+        std::fs::remove_dir_all(&linked).expect("remove issuing worktree and body file");
+
+        assert!(
+            resolved_request_recovery(&linked, &request).is_none(),
+            "current command construction should fail after the workspace disappears"
+        );
+        let reserved = ledger
+            .reserved_request_recovery_before_preparation(&request)
+            .expect("read in-flight recovery authority")
+            .expect("matching in-flight reservation");
+        assert_eq!(reserved, recovery);
+        let retry = execute_ledgered_daemon_request(
+            &primary,
+            &project,
+            &ledger,
+            request,
+            reserved.effect,
+            "replacement-instance",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(!retry.replayed);
+        assert_eq!(retry.response.status, Status::Error);
+        assert_eq!(
+            retry
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("kind")),
+            Some(&serde_json::json!("daemon.request_outcome_indeterminate"))
+        );
     }
 
     fn recorded_atomic_request(
