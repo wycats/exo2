@@ -37,6 +37,7 @@ export type WorkflowCompletionConfirmationKind =
 export type MachineChannelRequestEnvelope = {
   protocol_version: number;
   id: string;
+  workspace_root?: string;
   op: {
     kind: MachineChannelOpKind;
     params:

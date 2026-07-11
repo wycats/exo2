@@ -118,6 +118,111 @@ impl RequestOutcomeLedger {
         &self.path
     }
 
+    /// Return a completed runtime response or request-ID conflict before
+    /// request preparation. Canonical atomic outcomes still pass through the
+    /// atomic recovery path so finalization can repopulate this runtime ledger.
+    pub(crate) fn terminal_outcome_before_preparation(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<Option<OutcomeExecution>> {
+        let request_hash = request_hash(request)?;
+        let runtime_outcome =
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))
+                .and_then(|connection| {
+                    connection.pragma_update(None, "busy_timeout", 5_000)?;
+                    connection
+                        .query_row(
+                            "SELECT request_hash, effect, recovery_class, response_json
+             FROM daemon_request_outcomes
+             WHERE request_id = ?1",
+                            [&request.id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(Into::into)
+                });
+
+        if let Ok(Some((stored_hash, effect, recovery_class, response_json))) = &runtime_outcome {
+            let effect = effect_from_name(&effect)?;
+            if stored_hash != &request_hash {
+                let response = request_id_conflict_response(request.id.clone(), effect);
+                return Ok(Some(OutcomeExecution {
+                    response: if matches!(
+                        recovery_class.as_deref().and_then(recovery_class_from_name),
+                        None | Some(RecoveryClass::AtomicProjectState)
+                    ) {
+                        without_committed_effect(response)
+                    } else {
+                        response
+                    },
+                    replayed: false,
+                }));
+            }
+            if let Some(response_json) = response_json {
+                return Ok(Some(OutcomeExecution {
+                    response: serde_json::from_str(response_json)
+                        .context("deserialize recorded daemon response")?,
+                    replayed: true,
+                }));
+            }
+        }
+
+        runtime_outcome?;
+        Ok(None)
+    }
+
+    /// Return the recorded recovery authority for a matching in-flight request.
+    /// This preserves at-most-once handling when current command construction
+    /// depends on a workspace path or argument file that is no longer present.
+    pub(crate) fn reserved_request_recovery_before_preparation(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<Option<ResolvedRequestRecovery>> {
+        let request_hash = request_hash(request)?;
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))?;
+        connection.pragma_update(None, "busy_timeout", 5_000)?;
+        let reserved = connection
+            .query_row(
+                "SELECT request_hash, effect, recovery_class, response_json
+                 FROM daemon_request_outcomes
+                 WHERE request_id = ?1",
+                [&request.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((stored_hash, effect, recovery_class, None)) = reserved else {
+            return Ok(None);
+        };
+        if stored_hash != request_hash {
+            return Ok(None);
+        }
+
+        Ok(Some(ResolvedRequestRecovery {
+            effect: effect_from_name(&effect)?,
+            recovery_class: recovery_class
+                .as_deref()
+                .and_then(recovery_class_from_name)
+                .unwrap_or(RecoveryClass::ExternalAtMostOnce),
+        }))
+    }
+
     /// Return whether an atomic request may execute and therefore needs current
     /// project preparation. Completed, conflicting, and same-instance in-flight
     /// requests are resolved by the outcome ledger before mutable preparation.
@@ -764,6 +869,20 @@ pub fn resolved_request_recovery(
         })
 }
 
+pub fn request_declared_recovery(request: &RequestEnvelope) -> Option<ResolvedRequestRecovery> {
+    let Some((namespace, operation)) = request_command_path(request) else {
+        return None;
+    };
+    static COMMAND_SPEC: OnceLock<CommandSpec> = OnceLock::new();
+    COMMAND_SPEC
+        .get_or_init(|| CommandSpec::from_registry(&default_registry()))
+        .operation(&namespace, &operation)
+        .map(|operation| ResolvedRequestRecovery {
+            effect: operation.effect,
+            recovery_class: operation.recovery_class,
+        })
+}
+
 pub fn request_command_path(request: &RequestEnvelope) -> Option<(String, String)> {
     let Op::Call(params) = &request.op else {
         return None;
@@ -930,6 +1049,15 @@ const fn effect_name(effect: Effect) -> &'static str {
     }
 }
 
+fn effect_from_name(name: &str) -> Result<Effect> {
+    match name {
+        "pure" => Ok(Effect::Pure),
+        "write" => Ok(Effect::Write),
+        "exec" => Ok(Effect::Exec),
+        _ => Err(anyhow!("unknown recorded daemon effect {name}")),
+    }
+}
+
 const fn recovery_class_name(recovery_class: RecoveryClass) -> &'static str {
     match recovery_class {
         RecoveryClass::ReplayableRead => "replayable_read",
@@ -1060,6 +1188,7 @@ mod tests {
                 },
                 input: serde_json::json!({ "id": task_id, "log": "Done" }),
             }),
+            workspace_root: None,
             auth: None,
             workflow_confirmation: None,
             agent_id: None,
@@ -1198,6 +1327,189 @@ mod tests {
         assert_eq!(replay.response.status, Status::Ok);
         assert_eq!(replay.response.result, first.response.result);
         assert_eq!(executions.get(), 1);
+    }
+
+    #[test]
+    fn terminal_runtime_outcome_replays_after_issuing_workspace_is_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let workspace = temp.path().join("linked-worktree");
+        std::fs::create_dir(&workspace).expect("create issuing workspace");
+        let mut request = request("request-removed-runtime-workspace", "task-a");
+        request.workspace_root = Some(workspace.clone());
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        std::fs::remove_dir(&workspace).expect("remove issuing workspace");
+
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request)
+            .expect("probe terminal runtime outcome")
+            .expect("completed runtime outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn dynamic_effect_runtime_outcome_replays_after_issuing_workspace_is_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let workspace = temp.path().join("linked-worktree");
+        std::fs::create_dir(&workspace).expect("create issuing workspace");
+        let mut request = request("request-removed-dynamic-workspace", "task-a");
+        let Op::Call(params) = &mut request.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["dogfood".to_string(), "repair".to_string()],
+        };
+        params.input = serde_json::json!({ "apply": true });
+        request.workspace_root = Some(workspace.clone());
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        std::fs::remove_dir(&workspace).expect("remove issuing workspace");
+
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request)
+            .expect("probe dynamic terminal runtime outcome")
+            .expect("completed dynamic runtime outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn terminal_runtime_outcome_replay_does_not_require_registered_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let mut request = request("request-retired-command", "task-a");
+        let Op::Call(params) = &mut request.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["retired".to_string(), "command".to_string()],
+        };
+        request.workspace_root = Some(temp.path().join("removed-worktree"));
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+
+        assert!(resolved_request_recovery(temp.path(), &request).is_none());
+        let replay = ledger
+            .terminal_outcome_before_preparation(&request)
+            .expect("probe retired command outcome")
+            .expect("completed retired command outcome");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.result, first.response.result);
+    }
+
+    #[test]
+    fn terminal_atomic_request_id_conflict_has_no_committed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = request("request-terminal-atomic-conflict", "task-a");
+        let first = ledger.execute_atomic_project_state(
+            original,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(first.response.status, Status::Ok);
+
+        let conflict = ledger
+            .terminal_outcome_before_preparation(&request(
+                "request-terminal-atomic-conflict",
+                "task-b",
+            ))
+            .expect("probe terminal atomic conflict")
+            .expect("terminal conflict response");
+
+        assert!(!conflict.replayed);
+        assert_eq!(conflict.response.status, Status::Error);
+        assert_eq!(conflict.response.effect, None);
+        assert_eq!(
+            conflict
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("mutation_performed")),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
+    fn terminal_legacy_atomic_request_id_conflict_has_no_committed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+        drop(open_database(&db_path).expect("initialize project database"));
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = request("request-terminal-legacy-atomic-conflict", "task-a");
+        let first = ledger.execute_atomic_project_state(
+            original,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &db_path,
+            |request| response(&request.id),
+            Ok,
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        Connection::open(ledger.path())
+            .expect("open runtime outcome ledger")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET recovery_class = NULL
+                 WHERE request_id = 'request-terminal-legacy-atomic-conflict'",
+                [],
+            )
+            .expect("simulate a migrated completed atomic outcome");
+
+        let conflict = ledger
+            .terminal_outcome_before_preparation(&request(
+                "request-terminal-legacy-atomic-conflict",
+                "task-b",
+            ))
+            .expect("probe legacy terminal atomic conflict")
+            .expect("legacy terminal conflict response");
+
+        assert!(!conflict.replayed);
+        assert_eq!(conflict.response.status, Status::Error);
+        assert_eq!(conflict.response.effect, None);
+        assert_eq!(
+            conflict
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("mutation_performed")),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]
@@ -1978,6 +2290,15 @@ mod tests {
 
     #[test]
     fn resolved_effect_comes_from_built_command() {
+        let mut status = request("request-status", "task-a");
+        let Op::Call(params) = &mut status.op else {
+            unreachable!("test request is a call");
+        };
+        params.address = Address::Operation {
+            path: vec!["status".to_string()],
+        };
+        params.input = serde_json::json!({});
+
         assert_eq!(
             resolved_request_effect(Path::new("."), &request("request-1", "task-a")),
             Some(Effect::Write)

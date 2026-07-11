@@ -40,6 +40,7 @@ fn command_capture_e2e() {
                 "id": "test-goal"
             }),
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: Some("test-agent".to_string()),

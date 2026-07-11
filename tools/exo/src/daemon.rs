@@ -44,10 +44,10 @@ use crate::daemon_diagnostics::{
 };
 use crate::daemon_outcomes::{
     DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
-    resolved_request_recovery,
+    request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
-use crate::project::Project;
+use crate::project::{Project, ProjectResolver, git_common_dir_from_filesystem};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, Metadata};
@@ -1017,28 +1017,147 @@ fn daemon_request_project(startup_project: &Project) -> io::Result<Project> {
     Ok(current)
 }
 
-fn atomic_request_project(
-    workspace: &Path,
+#[derive(Debug)]
+struct DaemonRequestContext {
+    workspace_root: PathBuf,
+    project: Project,
+}
+
+fn daemon_request_context(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> io::Result<DaemonRequestContext> {
+    let workspace_root = validated_request_workspace(startup_workspace, startup_project, request)?;
+    let mut request_project = daemon_request_project(startup_project)?;
+    request_project.workspace_root = Some(workspace_root.clone());
+    Ok(DaemonRequestContext {
+        workspace_root,
+        project: request_project,
+    })
+}
+
+fn validated_request_workspace(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> io::Result<PathBuf> {
+    let Some(requested_workspace) = request.workspace_root.as_deref() else {
+        return Ok(startup_workspace.to_path_buf());
+    };
+
+    if !requested_workspace.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon request workspace must be an absolute path",
+        ));
+    }
+
+    let workspace_root = requested_workspace.canonicalize().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon request workspace path could not be canonicalized",
+        )
+    })?;
+    if workspace_root == startup_workspace
+        && git_common_dir_from_filesystem(&workspace_root).as_deref()
+            == Some(startup_project.git_common_dir.as_path())
+    {
+        return Ok(startup_workspace.to_path_buf());
+    }
+
+    let resolver = startup_project
+        .projects_config_path
+        .as_deref()
+        .map_or_else(ProjectResolver::default, |path| {
+            ProjectResolver::default().with_projects_config_path(path)
+        });
+    let resolved = resolver.resolve(&workspace_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        )
+    })?;
+    if resolved.id != startup_project.id || resolved.state_root != startup_project.state_root {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        ));
+    }
+
+    resolved.workspace_root.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request workspace does not belong to this daemon's project and state root",
+        )
+    })
+}
+
+fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
+    let code = if error.kind() == io::ErrorKind::InvalidInput {
+        ErrorCode::InvalidInput
+    } else {
+        ErrorCode::PreconditionFailed
+    };
+    daemon_handler_error_response(id, code, error.to_string())
+}
+
+fn replay_request_context(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> io::Result<DaemonRequestContext> {
+    let workspace_root = match request.workspace_root.as_deref() {
+        None => startup_workspace.to_path_buf(),
+        Some(workspace) if !workspace.is_absolute() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon request workspace must be an absolute path",
+            ));
+        }
+        Some(workspace) => match workspace.canonicalize() {
+            Ok(_) => validated_request_workspace(startup_workspace, startup_project, request)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                startup_workspace.to_path_buf()
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "daemon request workspace path could not be canonicalized",
+                ));
+            }
+        },
+    };
+    let mut project = startup_project.clone();
+    project.workspace_root = Some(workspace_root.clone());
+    Ok(DaemonRequestContext {
+        workspace_root,
+        project,
+    })
+}
+
+fn atomic_request_context(
+    startup_workspace: &Path,
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
     request: &RequestEnvelope,
     instance_id: &str,
-) -> io::Result<Project> {
+) -> io::Result<DaemonRequestContext> {
     if !outcome_ledger
         .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
         .map_err(to_io_error)?
     {
-        return Ok(startup_project.clone());
+        return replay_request_context(startup_workspace, startup_project, request);
     }
 
-    let request_project = daemon_request_project(startup_project)?;
-    AgentContext::prepare_request_transaction(workspace, Some(&request_project))
+    let context = daemon_request_context(startup_workspace, startup_project, request)?;
+    AgentContext::prepare_request_transaction(&context.workspace_root, Some(&context.project))
         .map_err(to_io_error)?;
-    Ok(request_project)
+    Ok(context)
 }
 
 fn execute_ledgered_daemon_request(
-    workspace: &Path,
+    startup_workspace: &Path,
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
     request: RequestEnvelope,
@@ -1053,19 +1172,16 @@ fn execute_ledgered_daemon_request(
         Duration::from_secs(30),
         |request| {
             let request_id = request.id.clone();
-            let request_project = match daemon_request_project(startup_project) {
-                Ok(project) => project,
+            let context = match daemon_request_context(startup_workspace, startup_project, &request)
+            {
+                Ok(context) => context,
                 Err(error) => {
-                    return daemon_handler_error_response(
-                        request_id,
-                        ErrorCode::PreconditionFailed,
-                        error.to_string(),
-                    );
+                    return daemon_workspace_error_response(request_id, &error);
                 }
             };
             handle_request_with_project_and_diagnostics_as_writer(
-                workspace,
-                Some(&request_project),
+                &context.workspace_root,
+                Some(&context.project),
                 request,
                 diagnostics,
             )
@@ -1982,7 +2098,46 @@ pub async fn run_daemon(
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let recovery = resolved_request_recovery(&workspace, &req);
+                        if let Ok(Some(outcome)) =
+                            outcome_ledger.terminal_outcome_before_preparation(&req)
+                        {
+                            return outcome.response;
+                        }
+                        let declared_recovery = request_declared_recovery(&req);
+                        let reserved_recovery = outcome_ledger
+                            .reserved_request_recovery_before_preparation(&req)
+                            .ok()
+                            .flatten();
+                        let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
+                            recovery.recovery_class == RecoveryClass::AtomicProjectState
+                                && outcome_ledger
+                                    .atomic_request_needs_preparation(
+                                        &req,
+                                        &project.db_path(),
+                                        &instance_id,
+                                    )
+                                    .is_ok_and(|needs_preparation| !needs_preparation)
+                        });
+                        let recovery = if canonical_atomic_replay {
+                            declared_recovery
+                        } else if reserved_recovery.is_some() {
+                            reserved_recovery
+                        } else {
+                            let request_workspace = match validated_request_workspace(
+                                &workspace,
+                                project.as_ref(),
+                                &req,
+                            ) {
+                                Ok(workspace) => workspace,
+                                Err(error) => {
+                                    return daemon_workspace_error_response(
+                                        handler_request_id,
+                                        &error,
+                                    );
+                                }
+                            };
+                            resolved_request_recovery(&request_workspace, &req)
+                        };
                         match recovery {
                             Some(recovery)
                                 if recovery.recovery_class
@@ -1996,7 +2151,7 @@ pub async fn run_daemon(
                                         "atomic request is missing a command path".to_string(),
                                     );
                                 };
-                                let request_project = match atomic_request_project(
+                                let request_context = match atomic_request_context(
                                     &workspace,
                                     project.as_ref(),
                                     &outcome_ledger,
@@ -2005,13 +2160,14 @@ pub async fn run_daemon(
                                 ) {
                                     Ok(project) => project,
                                     Err(error) => {
-                                        return daemon_handler_error_response(
+                                        return daemon_workspace_error_response(
                                             handler_request_id,
-                                            ErrorCode::PreconditionFailed,
-                                            error.to_string(),
+                                            &error,
                                         );
                                     }
                                 };
+                                let request_workspace = request_context.workspace_root;
+                                let request_project = request_context.project;
                                 outcome_ledger
                                     .execute_atomic_project_state(
                                         req,
@@ -2021,7 +2177,7 @@ pub async fn run_daemon(
                                         &request_project.db_path(),
                                         |req| {
                                             handle_request_with_project_and_diagnostics_as_atomic_writer(
-                                                &workspace,
+                                                &request_workspace,
                                                 Some(&request_project),
                                                 req,
                                                 &diagnostics,
@@ -2029,7 +2185,7 @@ pub async fn run_daemon(
                                         },
                                         |response| {
                                             finalize_atomic_response_after_commit(
-                                                &workspace,
+                                                &request_workspace,
                                                 Some(&request_project),
                                                 &namespace,
                                                 &operation,
@@ -2056,19 +2212,22 @@ pub async fn run_daemon(
                                     .response
                             }
                             _ => {
-                                let request_project = match daemon_request_project(project.as_ref()) {
-                                    Ok(project) => project,
+                                let request_context = match daemon_request_context(
+                                    &workspace,
+                                    project.as_ref(),
+                                    &req,
+                                ) {
+                                    Ok(context) => context,
                                     Err(error) => {
-                                        return daemon_handler_error_response(
+                                        return daemon_workspace_error_response(
                                             handler_request_id,
-                                            ErrorCode::PreconditionFailed,
-                                            error.to_string(),
+                                            &error,
                                         );
                                     }
                                 };
                                 handle_request_with_project_and_diagnostics_as_writer(
-                                    &workspace,
-                                    Some(&request_project),
+                                    &request_context.workspace_root,
+                                    Some(&request_context.project),
                                     req,
                                     &diagnostics,
                                 )
@@ -2414,6 +2573,59 @@ mod tests {
         MAX_PORTABLE_UNIX_SOCKET_PATH_LEN, ProjectId, SidecarAutoPushPolicy, StatePolicy,
     };
     use std::path::PathBuf;
+    use std::process::Command;
+
+    fn run_test_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn create_test_git_repo(temp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let workspace = temp.path().join(name);
+        std::fs::create_dir(&workspace).expect("create git workspace");
+        run_test_git(&workspace, &["init"]);
+        std::fs::write(workspace.join("README.md"), name).expect("write test file");
+        run_test_git(&workspace, &["add", "."]);
+        run_test_git(
+            &workspace,
+            &[
+                "-c",
+                "user.name=Exo Test",
+                "-c",
+                "user.email=exo@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        workspace.canonicalize().expect("canonical git workspace")
+    }
+
+    fn request_for_workspace(workspace_root: Option<&Path>) -> RequestEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "workspace-context-test",
+            "workspace_root": workspace_root,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["project", "resolve"] },
+                    "input": {}
+                }
+            }
+        }))
+        .expect("workspace request")
+    }
 
     #[tokio::test]
     async fn daemon_probe_requires_matching_instance_response() {
@@ -2515,6 +2727,502 @@ mod tests {
         assert_eq!(
             refreshed.sidecar_auto_push,
             crate::project::SidecarAutoPushPolicy::Always
+        );
+    }
+
+    #[test]
+    fn daemon_request_context_accepts_linked_worktree_for_same_project_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&linked));
+
+        let context = daemon_request_context(&primary, &startup, &request)
+            .expect("linked worktree request context");
+
+        assert_eq!(context.workspace_root, linked);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_accepts_git_submodule_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = create_test_git_repo(&temp, "submodule-source");
+        let parent = create_test_git_repo(&temp, "parent");
+        run_test_git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().expect("source path"),
+                "modules/child",
+            ],
+        );
+        let child = parent
+            .join("modules/child")
+            .canonicalize()
+            .expect("canonical submodule workspace");
+        let startup = Project::resolve(&child).expect("resolve submodule project");
+        assert!(
+            !startup
+                .worktree_index()
+                .is_some_and(|worktrees| worktrees.contains_key(&child)),
+            "the submodule workspace is not represented by the worktree index"
+        );
+        let request = request_for_workspace(Some(&child));
+
+        let context = daemon_request_context(&child, &startup, &request)
+            .expect("submodule workspace should resolve through project identity");
+
+        assert_eq!(context.workspace_root, child);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn daemon_request_context_normalizes_nested_directory_to_worktree_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "nested-project");
+        let nested = workspace.join("nested/directory");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        let startup = Project::resolve(&workspace).expect("resolve project");
+        let request = request_for_workspace(Some(&nested));
+
+        let context = daemon_request_context(&workspace, &startup, &request)
+            .expect("nested directory should resolve to its worktree root");
+
+        assert_eq!(
+            context.workspace_root,
+            workspace.canonicalize().expect("canonical worktree root")
+        );
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_normalizes_file_path_to_worktree_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "file-project");
+        let file = workspace.join("README.md");
+        let startup = Project::resolve(&workspace).expect("resolve project");
+        let request = request_for_workspace(Some(&file));
+
+        let context = daemon_request_context(&workspace, &startup, &request)
+            .expect("file path should resolve to its worktree root");
+
+        assert_eq!(
+            context.workspace_root,
+            workspace.canonicalize().expect("canonical worktree root")
+        );
+        assert_eq!(context.project.workspace_root, Some(context.workspace_root));
+    }
+
+    #[test]
+    fn daemon_request_context_rejects_workspace_from_another_project() {
+        let primary_temp = tempfile::tempdir().expect("primary tempdir");
+        let primary = create_test_git_repo(&primary_temp, "primary");
+        let foreign_temp = tempfile::tempdir().expect("foreign tempdir");
+        let foreign = create_test_git_repo(&foreign_temp, "foreign");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&foreign));
+
+        let error = daemon_request_context(&primary, &startup, &request)
+            .expect_err("foreign workspace must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+        let response = daemon_workspace_error_response("foreign-workspace".to_string(), &error);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn daemon_request_context_reports_unavailable_workspace_without_leaking_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let missing = temp.path().join("missing-worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&missing));
+
+        let error = daemon_request_context(&primary, &startup, &request)
+            .expect_err("missing workspace must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "daemon request workspace path could not be canonicalized"
+        );
+        assert!(!error.to_string().contains(&missing.to_string_lossy()[..]));
+        let response = daemon_workspace_error_response("missing-workspace".to_string(), &error);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn canonical_replay_rejects_workspace_path_reused_by_another_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-replay-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let mut request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "canonical-replay-reused-workspace",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["epoch", "add"] },
+                    "input": { "title": "Recorded epoch" }
+                }
+            }
+        }))
+        .expect("parse atomic request");
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        std::fs::create_dir_all(startup.db_path().parent().expect("database parent"))
+            .expect("create project state directory");
+        drop(
+            exosuit_storage::open_database(&startup.db_path())
+                .expect("initialize project database"),
+        );
+        let execution = ledger.execute_atomic_project_state(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            &startup.db_path(),
+            |request| ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(serde_json::json!({ "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Write),
+                trace: None,
+            },
+            Ok,
+        );
+        assert_eq!(execution.response.status, Status::Ok);
+        exosuit_storage::Connection::open(ledger.path())
+            .expect("open runtime outcome database")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+                 WHERE request_id = ?1",
+                [&request.id],
+            )
+            .expect("simulate runtime outcome loss after canonical commit");
+
+        std::fs::remove_dir_all(&linked).expect("remove original linked worktree");
+        let foreign = create_test_git_repo(&temp, "linked");
+        assert_eq!(
+            foreign.canonicalize().expect("canonical foreign repo"),
+            linked.canonicalize().expect("canonical reused path")
+        );
+        assert_eq!(
+            startup
+                .worktree_index()
+                .expect("read retained worktree index")
+                .get(&linked.canonicalize().expect("canonical foreign path")),
+            Some(&false),
+            "the retained Git index alone still accepts the reused path"
+        );
+
+        request.workspace_root = Some(linked);
+        let error = atomic_request_context(&primary, &startup, &ledger, &request, "instance-b")
+            .expect_err("replay must reject a workspace path reused by another project");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+    }
+
+    #[test]
+    fn explicit_startup_workspace_rejects_path_reused_by_another_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked-startup");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-startup-reuse-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        let startup = Project::resolve(&linked).expect("resolve linked startup project");
+        let request = request_for_workspace(Some(&linked));
+
+        std::fs::remove_dir_all(&linked).expect("remove startup worktree");
+        let foreign = create_test_git_repo(&temp, "linked-startup");
+        assert_eq!(
+            foreign.canonicalize().expect("canonical foreign repo"),
+            linked
+        );
+
+        let error = daemon_request_context(&linked, &startup, &request)
+            .expect_err("explicit reused startup path must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "request workspace does not belong to this daemon's project and state root"
+        );
+    }
+
+    #[test]
+    fn replay_request_context_uses_startup_workspace_when_issuing_worktree_is_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let missing = temp.path().join("removed-linked-worktree");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&missing));
+
+        let context = replay_request_context(&primary, &startup, &request)
+            .expect("removed issuing worktree should use the retained daemon workspace");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn daemon_request_context_uses_startup_workspace_for_legacy_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(None);
+
+        let context =
+            daemon_request_context(&primary, &startup, &request).expect("legacy request context");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project.id, startup.id);
+        assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn daemon_request_context_reuses_startup_project_for_explicit_startup_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request = request_for_workspace(Some(&primary));
+
+        let context = daemon_request_context(&primary, &startup, &request)
+            .expect("explicit startup workspace context");
+
+        assert_eq!(context.workspace_root, primary);
+        assert_eq!(context.project, startup);
+    }
+
+    #[test]
+    fn validated_startup_workspace_reuses_retained_git_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = create_test_git_repo(&temp, "startup-fast-path");
+        let mut startup = Project::resolve(&workspace).expect("resolve project");
+        let invalid_config = temp.path().join("config/exo/projects.toml");
+        std::fs::create_dir_all(invalid_config.parent().expect("config parent"))
+            .expect("create config directory");
+        std::fs::write(&invalid_config, "this is not valid TOML = [")
+            .expect("write invalid project policy");
+        startup.projects_config_path = Some(invalid_config);
+        let request = request_for_workspace(Some(&workspace));
+
+        let resolved = validated_request_workspace(&workspace, &startup, &request)
+            .expect("matching retained Git identity should avoid policy resolution");
+
+        assert_eq!(
+            resolved,
+            workspace.canonicalize().expect("canonical workspace")
+        );
+    }
+
+    #[test]
+    fn linked_worktree_local_arguments_drive_recovery_classification() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-recovery-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        std::fs::write(linked.join("replacement.md"), "Replacement body.\n")
+            .expect("write linked-worktree body file");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "linked-recovery-classification",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["rfc", "edit"] },
+                    "input": {
+                        "id": "0001",
+                        "body-file": "replacement.md"
+                    }
+                }
+            }
+        }))
+        .expect("linked RFC edit request");
+
+        assert!(
+            resolved_request_recovery(&primary, &request).is_none(),
+            "the body file is intentionally absent from the daemon startup workspace"
+        );
+        let request_workspace = validated_request_workspace(&primary, &startup, &request)
+            .expect("validate linked request workspace");
+        let recovery = resolved_request_recovery(&request_workspace, &request)
+            .expect("classify linked-worktree RFC edit");
+
+        assert_eq!(recovery.effect, Effect::Write);
+        assert_eq!(recovery.recovery_class, RecoveryClass::ExternalAtMostOnce);
+    }
+
+    #[test]
+    fn removed_workspace_retry_preserves_in_flight_at_most_once_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let linked = temp.path().join("linked-in-flight");
+        run_test_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-in-flight-test",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        std::fs::write(linked.join("replacement.md"), "Replacement body.\n")
+            .expect("write request argument file");
+        let project = Project::resolve(&primary).expect("resolve daemon project");
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "removed-workspace-in-flight-retry",
+            "workspace_root": linked,
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["rfc", "edit"] },
+                    "input": {
+                        "id": "0001",
+                        "body-file": "replacement.md"
+                    }
+                }
+            }
+        }))
+        .expect("parse linked RFC edit request");
+        let recovery = resolved_request_recovery(&linked, &request)
+            .expect("classify request before its workspace disappears");
+        assert_eq!(recovery.effect, Effect::Write);
+        assert_eq!(recovery.recovery_class, RecoveryClass::ExternalAtMostOnce);
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let first = ledger.execute(
+            request.clone(),
+            recovery.effect,
+            "retired-instance",
+            Duration::ZERO,
+            |request| {
+                daemon_handler_error_response(
+                    request.id,
+                    ErrorCode::Internal,
+                    "recorded response".to_string(),
+                )
+            },
+        );
+        assert!(!first.replayed);
+        exosuit_storage::Connection::open(ledger.path())
+            .expect("open runtime outcome database")
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET response_json = NULL, completed_at = NULL
+                 WHERE request_id = ?1",
+                [&request.id],
+            )
+            .expect("simulate interrupted external request");
+        std::fs::remove_dir_all(&linked).expect("remove issuing worktree and body file");
+
+        assert!(
+            resolved_request_recovery(&linked, &request).is_none(),
+            "current command construction should fail after the workspace disappears"
+        );
+        let reserved = ledger
+            .reserved_request_recovery_before_preparation(&request)
+            .expect("read in-flight recovery authority")
+            .expect("matching in-flight reservation");
+        assert_eq!(reserved, recovery);
+        let retry = execute_ledgered_daemon_request(
+            &primary,
+            &project,
+            &ledger,
+            request,
+            reserved.effect,
+            "replacement-instance",
+            &DaemonDiagnostics::disabled(),
+        );
+
+        assert!(!retry.replayed);
+        assert_eq!(retry.response.status, Status::Error);
+        assert_eq!(
+            retry
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("kind")),
+            Some(&serde_json::json!("daemon.request_outcome_indeterminate"))
         );
     }
 
@@ -2652,10 +3360,10 @@ mod tests {
             daemon_request_project(&project).is_err(),
             "fixture must fail mutable policy refresh"
         );
-        let replay_project =
-            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+        let replay_context =
+            atomic_request_context(&workspace, &project, &ledger, &request, "instance-a")
                 .expect("recorded response should bypass policy refresh");
-        assert_eq!(replay_project, project);
+        assert_eq!(replay_context.project, project);
     }
 
     #[test]
@@ -2677,10 +3385,10 @@ mod tests {
             "fixture must fail projection hydration"
         );
         let _ = std::fs::remove_dir_all(project.db_path().parent().expect("database parent"));
-        let replay_project =
-            atomic_request_project(&workspace, &project, &ledger, &request, "instance-a")
+        let replay_context =
+            atomic_request_context(&workspace, &project, &ledger, &request, "instance-a")
                 .expect("recorded response should bypass projection hydration");
-        assert_eq!(replay_project, project);
+        assert_eq!(replay_context.project, project);
         assert!(
             !project.db_path().exists(),
             "replay preparation must not recreate the project database"

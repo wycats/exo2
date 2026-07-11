@@ -551,6 +551,7 @@ fn dispatch_via_daemon_with_prompter(
             protocol_version: PROTOCOL_VERSION,
             id: generate_request_id(),
             op,
+            workspace_root: Some(daemon_workspace.clone()),
             auth: (effect == Effect::Exec).then(|| Auth {
                 ticket: ticket_for_exec_call(&address, &input),
                 confirm: true,
@@ -2769,6 +2770,7 @@ mod tests {
                 },
                 input: serde_json::json!({ "id": "goal::task" }),
             }),
+            workspace_root: None,
             auth: None,
             workflow_confirmation: None,
             agent_id: None,

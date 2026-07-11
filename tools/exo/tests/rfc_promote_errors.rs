@@ -19,6 +19,7 @@ fn rfc_promote_request(id: &str, stage: i64) -> RequestEnvelope {
             },
             input: json!({ "id": id, "stage": stage }),
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,

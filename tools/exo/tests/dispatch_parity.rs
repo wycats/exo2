@@ -123,6 +123,7 @@ fn run_machine_channel(
             },
             input,
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: None,

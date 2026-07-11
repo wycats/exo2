@@ -362,6 +362,7 @@ export class DaemonChannelServer {
   private generation = 0;
   private lastLifecycleResetGeneration: number | null = null;
   private daemonInstanceId: string | null = null;
+  private daemonWorkspaceRoot: string | null = null;
 
   private readonly deps: ResolvedDaemonChannelServerDeps;
   private readonly config: DaemonChannelServerConfig;
@@ -373,6 +374,7 @@ export class DaemonChannelServer {
   ) {
     const defaultDeps = createDefaultDeps();
     const testingLifecycle = async (): Promise<DaemonEnsureResult> => ({
+      workspaceRoot,
       runtimeDir: "<test-runtime>",
       socketPath: "<test-socket>",
       pidPath: "<test-pid>",
@@ -451,6 +453,7 @@ export class DaemonChannelServer {
     envelope = {
       ...envelope,
       id: `${envelope.id}.${randomUUID()}`,
+      workspace_root: undefined,
     };
 
     // No extension-local request handling remains here.
@@ -478,6 +481,7 @@ export class DaemonChannelServer {
       }
 
       try {
+        envelope = this.bindDaemonWorkspace(envelope);
         const daemonResponse = await this.connection.request(
           envelope,
           this.config.requestTimeoutMs,
@@ -543,6 +547,7 @@ export class DaemonChannelServer {
       }
 
       try {
+        envelope = this.bindDaemonWorkspace(envelope);
         const daemonResponse = await connection.request(
           envelope,
           this.config.requestTimeoutMs,
@@ -643,6 +648,7 @@ export class DaemonChannelServer {
 
   private async ensureDaemonLifecycleReused(): Promise<DaemonEnsureResult | null> {
     const result = await this.deps.ensureLifecycle(this.workspaceRoot);
+    this.daemonWorkspaceRoot = result.workspaceRoot ?? this.workspaceRoot;
     const nextInstanceId = result.instanceId ?? null;
     const instanceChanged =
       this.daemonInstanceId !== null &&
@@ -758,6 +764,7 @@ export class DaemonChannelServer {
 
       this.readConnections[index] = connection;
       this.daemonInstanceId = lifecycle.instanceId ?? null;
+      this.daemonWorkspaceRoot = lifecycle.workspaceRoot ?? this.workspaceRoot;
       this.markConnected();
 
       connection.onNotification = (notification) => {
@@ -863,6 +870,7 @@ export class DaemonChannelServer {
 
       this.connection = connection;
       this.daemonInstanceId = lifecycle.instanceId ?? null;
+      this.daemonWorkspaceRoot = lifecycle.workspaceRoot ?? this.workspaceRoot;
 
       this.markConnected();
 
@@ -932,6 +940,18 @@ export class DaemonChannelServer {
 
       throw error;
     }
+  }
+
+  private bindDaemonWorkspace(
+    envelope: MachineChannelRequestEnvelope,
+  ): MachineChannelRequestEnvelope {
+    if (envelope.workspace_root !== undefined) {
+      return envelope;
+    }
+    return {
+      ...envelope,
+      workspace_root: this.daemonWorkspaceRoot ?? this.workspaceRoot,
+    };
   }
 
   /**

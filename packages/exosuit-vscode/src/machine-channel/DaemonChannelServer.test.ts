@@ -207,7 +207,35 @@ describe("DaemonChannelServer", () => {
     expect(response.status).toBe("ok");
     expect(connect).toHaveBeenCalledTimes(1);
     expect(connection.request).toHaveBeenCalledTimes(1);
+    expect(connection.request.mock.calls[0]?.[0]).toMatchObject({
+      workspace_root: "/tmp/exo2-daemon-1",
+    });
     expect(traceCache.notifyWrite).not.toHaveBeenCalled();
+  });
+
+  it("stamps the lifecycle-resolved worktree root for nested workspace folders", async () => {
+    const traceCache = { notifyWrite: vi.fn() };
+    const connection = createConnection();
+    const connect = vi.fn(async () => connection);
+    const ensureLifecycle = vi.fn(async (): Promise<DaemonEnsureResult> => ({
+      workspaceRoot: "/tmp/exo2-daemon-root",
+      runtimeDir: "/tmp/exo-runtime",
+      socketPath: "/tmp/exo-runtime/daemon.sock",
+      pidPath: "/tmp/exo-runtime/daemon.pid",
+      reused: true,
+      spawned: false,
+      state: "connected_existing",
+    }));
+    const server = DaemonChannelServer.createForTesting(
+      "/tmp/exo2-daemon-root/packages/extension",
+      { connect, ensureLifecycle, traceCache },
+    );
+
+    await server.request(makeRequestEnvelope());
+
+    expect(connection.request.mock.calls[0]?.[0]).toMatchObject({
+      workspace_root: "/tmp/exo2-daemon-root",
+    });
   });
 
   it("routes concurrent pure reads over bounded read lanes", async () => {

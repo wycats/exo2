@@ -114,6 +114,7 @@ fn machine_call(root: &Path, path: &[&str], input: serde_json::Value) -> Respons
             },
             input,
         }),
+        workspace_root: None,
         auth: None,
         workflow_confirmation: None,
         agent_id: Some("agent://plan-reorganization-test".to_string()),
