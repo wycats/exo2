@@ -525,6 +525,7 @@ fn wait_for_daemon_operation(path: &Path, namespace: &str, operation: &str) -> V
                 event.get("event").and_then(JsonValue::as_str) == Some("request.invoke_end")
                     && event.get("namespace").and_then(JsonValue::as_str) == Some(namespace)
                     && event.get("operation").and_then(JsonValue::as_str) == Some(operation)
+                    && event.get("status").and_then(JsonValue::as_str) == Some("ok")
             }) {
                 return events;
             }

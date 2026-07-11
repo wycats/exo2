@@ -1759,7 +1759,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let is_direct = is_direct || (is_update_command(&args) && Project::resolve(&cwd).is_err());
+    let update_project = is_update_command(&args).then(|| Project::resolve(&cwd));
+    let is_direct = is_direct
+        || update_project
+            .as_ref()
+            .is_some_and(std::result::Result::is_err);
 
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
@@ -1965,7 +1969,11 @@ fn main() {
         || is_update_command(&args)
         || command_loads_request_context(&args)
     {
-        let project = Project::resolve(&cwd).ok();
+        let project = if is_update_command(&args) {
+            update_project.and_then(std::result::Result::ok)
+        } else {
+            Project::resolve(&cwd).ok()
+        };
         AgentContext {
             root: cwd,
             project,
