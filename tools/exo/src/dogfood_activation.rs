@@ -246,12 +246,18 @@ fn worker_matches_source(expected: &DogfoodActivationBinary, worker_identity: &J
         .get("executable_identity")
         .cloned()
         .and_then(|value| serde_json::from_value::<ExecutableIdentity>(value).ok());
+    #[cfg(unix)]
+    let identity_matches = worker_executable_identity.as_ref().is_some_and(|identity| {
+        identity
+            .metadata_matches_path(&expected.path)
+            .unwrap_or(false)
+    });
+    #[cfg(not(unix))]
+    let identity_matches = worker_executable_identity.as_ref().is_some_and(|identity| {
+        crate::mcp::executable_identity_matches_path(identity, &expected.path).unwrap_or(false)
+    });
     worker_path.as_deref() == Some(expected_path.as_path())
-        && worker_executable_identity.as_ref().is_some_and(|identity| {
-            identity
-                .metadata_matches_path(&expected.path)
-                .unwrap_or(false)
-        })
+        && identity_matches
 }
 
 fn path_matches(expected: &Path, actual: &Path) -> bool {
