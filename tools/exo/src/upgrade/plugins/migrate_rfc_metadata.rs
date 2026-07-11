@@ -262,6 +262,15 @@ fn document_matches_head(root: &Path, relative_path: &str) -> bool {
         return true;
     }
 
+    let head_exists = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !head_exists {
+        return true;
+    }
+
     Command::new("git")
         .args(["diff", "--quiet", "HEAD", "--", relative_path])
         .current_dir(root)
@@ -802,6 +811,14 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let db_path = root.join(SQLITE_DB_PATH);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -846,6 +863,14 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let db_path = root.join(SQLITE_DB_PATH);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -1045,6 +1070,10 @@ mod tests {
         .unwrap();
 
         let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
         MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
 
         let content = std::fs::read_to_string(rfc_path).unwrap();

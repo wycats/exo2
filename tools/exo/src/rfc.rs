@@ -3394,6 +3394,17 @@ fn format_rfc_metadata_marker(label: &str, value: &str) -> String {
     }
 }
 
+fn metadata_marker_is_replaced(line: &str, label: &str) -> bool {
+    let labels = if label == "Reason" {
+        &["Reason", "Withdrawal reason", "Archived reason"][..]
+    } else {
+        std::slice::from_ref(&label)
+    };
+    labels
+        .iter()
+        .any(|candidate| declared_metadata_value(line, candidate).declared)
+}
+
 fn upsert_rfc_metadata_markers(content: &str, markers: &[(&str, String)]) -> String {
     if markers.is_empty() {
         return content.to_string();
@@ -3433,7 +3444,7 @@ fn upsert_rfc_metadata_markers(content: &str, markers: &[(&str, String)]) -> Str
             && !in_fence
             && markers
                 .iter()
-                .any(|(label, _)| declared_metadata_value(line, label).declared)
+                .any(|(label, _)| metadata_marker_is_replaced(line, label))
         {
             continue;
         }
@@ -4257,24 +4268,38 @@ fn legacy_stage_from_status(metadata: &str) -> Option<u8> {
         return Some(stage);
     }
 
-    if normalized.contains("stable") {
+    if has_positive_lifecycle_keyword(&normalized, "stable") {
         Some(4)
-    } else if normalized.contains("candidate")
-        || (normalized.contains("implemented")
-            && !["not implemented", "never implemented", "unimplemented"]
-                .iter()
-                .any(|phrase| normalized.contains(phrase)))
+    } else if has_positive_lifecycle_keyword(&normalized, "candidate")
+        || has_positive_lifecycle_keyword(&normalized, "implemented")
     {
         Some(3)
-    } else if normalized.contains("draft") {
+    } else if has_positive_lifecycle_keyword(&normalized, "draft") {
         Some(2)
-    } else if normalized.contains("proposal") || normalized.contains("accepted") {
+    } else if has_positive_lifecycle_keyword(&normalized, "proposal")
+        || has_positive_lifecycle_keyword(&normalized, "accepted")
+    {
         Some(1)
-    } else if normalized.contains("idea") || normalized.contains("strawman") {
+    } else if has_positive_lifecycle_keyword(&normalized, "idea")
+        || has_positive_lifecycle_keyword(&normalized, "strawman")
+    {
         Some(0)
     } else {
         None
     }
+}
+
+fn has_positive_lifecycle_keyword(value: &str, keyword: &str) -> bool {
+    let words = value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().enumerate().any(|(index, word)| {
+        *word == keyword
+            && !words[index.saturating_sub(2)..index]
+                .iter()
+                .any(|word| matches!(*word, "not" | "never" | "no"))
+    })
 }
 
 pub(crate) fn retired_rfc_stage_from_document(
@@ -6257,6 +6282,14 @@ This RFC supersedes:
             legacy_stage_from_status("**Status**: Withdrawn (not implemented)"),
             None
         );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (unstable experiment)"),
+            None
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (not stable)"),
+            None
+        );
     }
 
     #[test]
@@ -7263,6 +7296,23 @@ This RFC supersedes:
             .unwrap();
         assert_eq!(repeated.stage, 2);
         assert_eq!(repeated.withdrawal_reason.as_deref(), Some("obsolete"));
+
+        let stale_alias_content = content.replace(
+            "- **Reason**: obsolete",
+            "- **Withdrawal reason**: stale reason\n- **Reason**: obsolete",
+        );
+        fs::write(&repeated_path, stale_alias_content).unwrap();
+        withdraw(&root.join("docs/rfcs"), "00001", Some("updated reason")).unwrap();
+        let updated_content = fs::read_to_string(&repeated_path).unwrap();
+        assert!(updated_content.contains("- **Reason**: updated reason"));
+        assert!(!updated_content.contains("Withdrawal reason"));
+        assert!(!updated_content.contains("stale reason"));
+        let updated = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.withdrawal_reason.as_deref(), Some("updated reason"));
     }
 
     #[test]
