@@ -256,8 +256,7 @@ fn worker_matches_source(expected: &DogfoodActivationBinary, worker_identity: &J
     let identity_matches = worker_executable_identity.as_ref().is_some_and(|identity| {
         crate::mcp::executable_identity_matches_path(identity, &expected.path).unwrap_or(false)
     });
-    worker_path.as_deref() == Some(expected_path.as_path())
-        && identity_matches
+    worker_path.as_deref() == Some(expected_path.as_path()) && identity_matches
 }
 
 fn path_matches(expected: &Path, actual: &Path) -> bool {
@@ -347,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_activation_checks_do_not_rehash_the_source_worker() {
+    fn repeated_activation_checks_use_the_platform_identity_strength() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_exo = temp.path().join("source-exo");
         let source_mcp = temp.path().join("source-mcp");
@@ -365,7 +364,10 @@ mod tests {
 
         assert!(activation.status(&installed_mcp, Some(&worker)).ok);
         assert!(activation.status(&installed_mcp, Some(&worker)).ok);
+        #[cfg(unix)]
         assert_eq!(test_support::stable_file_hash_calls(), 0);
+        #[cfg(not(unix))]
+        assert_eq!(test_support::stable_file_hash_calls(), 2);
     }
 
     #[test]
