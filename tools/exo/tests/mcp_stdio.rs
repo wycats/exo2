@@ -524,6 +524,12 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
     // rejects the newly configured non-executable source.
     let restarted = call_exo_run(&mut stdin, &mut stdout, 2, "status");
     assert_eq!(restarted["error"]["code"], -32000, "{restarted}");
+    assert!(
+        !restarted
+            .to_string()
+            .contains(alt_source.to_str().expect("alternate source worker path")),
+        "public MCP error disclosed source worker path: {restarted}"
+    );
     let status = call_proxy_status(&mut stdin, &mut stdout, "proxy-after-activation-failure");
     assert!(status["result"]["worker"].is_null(), "{status}");
     assert_eq!(
@@ -532,6 +538,12 @@ fn exo_mcp_proxy_revalidates_activation_after_worker_hot_restart() {
             "worker protocol error: dogfood activation source worker is not executable".to_string(),
         ),
         "{status}"
+    );
+    assert!(
+        !status
+            .to_string()
+            .contains(alt_source.to_str().expect("alternate source worker path")),
+        "proxy status disclosed source worker path: {status}"
     );
     assert!(
         !status["result"]["last_error"]

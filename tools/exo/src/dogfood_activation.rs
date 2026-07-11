@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use crate::mcp::{ExecutableIdentity, executable_identity_matches_path};
+use crate::mcp::ExecutableIdentity;
 
 pub const DOGFOOD_ACTIVATION_ENV: &str = "EXO_DOGFOOD_ACTIVATION";
 const DOGFOOD_ACTIVATION_VERSION: u32 = 2;
@@ -248,7 +248,9 @@ fn worker_matches_source(expected: &DogfoodActivationBinary, worker_identity: &J
         .and_then(|value| serde_json::from_value::<ExecutableIdentity>(value).ok());
     worker_path.as_deref() == Some(expected_path.as_path())
         && worker_executable_identity.as_ref().is_some_and(|identity| {
-            executable_identity_matches_path(identity, &expected.path).unwrap_or(false)
+            identity
+                .metadata_matches_path(&expected.path)
+                .unwrap_or(false)
         })
 }
 
@@ -282,7 +284,7 @@ pub fn status_value(status: DogfoodActivationStatus) -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::executable_identity_for_path;
+    use crate::mcp::{executable_identity_for_path, test_support};
 
     use super::*;
 
@@ -336,6 +338,28 @@ mod tests {
         let status = activation.status(&installed_mcp, Some(&worker));
         assert!(status.ok);
         assert_eq!(status.state, "current");
+    }
+
+    #[test]
+    fn repeated_activation_checks_do_not_rehash_the_source_worker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_exo = temp.path().join("source-exo");
+        let source_mcp = temp.path().join("source-mcp");
+        let installed_exo = temp.path().join("installed-exo");
+        let installed_mcp = temp.path().join("installed-mcp");
+        for path in [&source_exo, &source_mcp, &installed_exo, &installed_mcp] {
+            fs::write(path, path.as_os_str().as_encoded_bytes()).expect("write fixture");
+        }
+        let mut activation = activation(&source_exo, &source_mcp, &installed_exo, &installed_mcp);
+        let worker = json!({
+            "executable_path": source_exo,
+            "executable_identity": executable_identity_for_path(&source_exo).expect("identity")
+        });
+        test_support::reset_stable_file_hash_calls();
+
+        assert!(activation.status(&installed_mcp, Some(&worker)).ok);
+        assert!(activation.status(&installed_mcp, Some(&worker)).ok);
+        assert_eq!(test_support::stable_file_hash_calls(), 0);
     }
 
     #[test]

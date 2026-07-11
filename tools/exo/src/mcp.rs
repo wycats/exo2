@@ -390,6 +390,8 @@ pub fn executable_identity_matches_path(
 }
 
 fn stable_file_hash(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    STABLE_FILE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -403,6 +405,22 @@ fn stable_file_hash(path: &Path) -> std::io::Result<String> {
     }
 
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    static STABLE_FILE_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub mod test_support {
+    pub fn reset_stable_file_hash_calls() {
+        super::STABLE_FILE_HASH_CALLS.with(|calls| calls.set(0));
+    }
+
+    pub fn stable_file_hash_calls() -> usize {
+        super::STABLE_FILE_HASH_CALLS.with(std::cell::Cell::get)
+    }
 }
 
 fn metadata_modified_unix_ms(metadata: &std::fs::Metadata) -> Option<u64> {
