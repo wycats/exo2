@@ -319,9 +319,26 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .filter_map(|path| {
                     let content = std::fs::read_to_string(path).ok()?;
                     let ulid = extract_anchor_ulid(&content)?;
-                    rows.get(&ulid)?;
+                    let record = rows.get(&ulid)?;
                     let status = parse_status(path);
-                    (!retired_rfc_lifecycle_metadata_is_portable(&content, status)).then_some(())
+                    let portable_status = match status {
+                        "withdrawn" => "Withdrawn",
+                        "archived" => "Archived",
+                        _ => return None,
+                    };
+                    let reason = match status {
+                        "withdrawn" => record.withdrawal_reason.as_deref(),
+                        "archived" => record.archived_reason.as_deref(),
+                        _ => None,
+                    };
+                    (!retired_rfc_lifecycle_metadata_is_portable(&content, status)
+                        || backfill_rfc_lifecycle_metadata_content(
+                            &content,
+                            portable_status,
+                            record.stage,
+                            reason,
+                        ) != content)
+                        .then_some(())
                 })
                 .count()
         } else {
@@ -722,6 +739,50 @@ mod tests {
                 None,
                 Some("10177"),
                 None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+    }
+
+    #[test]
+    fn is_needed_detects_db_reason_missing_from_portable_lifecycle_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        std::fs::write(
+            rfc_dir.join("00001-retired.md"),
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**:\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                1,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Substantive database reason."),
                 None,
                 None,
             )

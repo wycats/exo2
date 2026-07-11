@@ -3449,12 +3449,22 @@ fn upsert_rfc_metadata_markers(content: &str, markers: &[(&str, String)]) -> Str
 
     if !inserted {
         let mut prefixed = String::new();
+        let (leading_anchor, remaining_content) = content
+            .strip_prefix("<!-- exo:")
+            .and_then(|suffix| suffix.split_once('\n'))
+            .map_or((None, content), |(anchor_suffix, remaining)| {
+                (Some(format!("<!-- exo:{anchor_suffix}")), remaining)
+            });
+        if let Some(anchor) = leading_anchor {
+            prefixed.push_str(&anchor);
+            prefixed.push_str("\n\n");
+        }
         for (label, value) in markers {
             prefixed.push_str(&format_rfc_metadata_marker(label, value));
             prefixed.push('\n');
         }
         prefixed.push('\n');
-        prefixed.push_str(content);
+        prefixed.push_str(remaining_content.trim_start_matches('\n'));
         return prefixed;
     }
 
@@ -4178,7 +4188,12 @@ fn legacy_stage_from_status(metadata: &str) -> Option<u8> {
 
     if normalized.contains("stable") {
         Some(4)
-    } else if normalized.contains("candidate") || normalized.contains("implemented") {
+    } else if normalized.contains("candidate")
+        || (normalized.contains("implemented")
+            && !["not implemented", "never implemented", "unimplemented"]
+                .iter()
+                .any(|phrase| normalized.contains(phrase)))
+    {
         Some(3)
     } else if normalized.contains("draft") {
         Some(2)
@@ -6167,6 +6182,10 @@ This RFC supersedes:
             legacy_stage_from_status("**Status**: Withdrawn (superseded by RFC 00003)"),
             None
         );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (not implemented)"),
+            None
+        );
     }
 
     #[test]
@@ -7233,6 +7252,16 @@ This RFC supersedes:
             &once,
             "withdrawn"
         ));
+    }
+
+    #[test]
+    fn lifecycle_metadata_materialization_preserves_leading_anchor_without_h1() {
+        let original = "<!-- exo:129 ulid:01runner -->\n\nHistorical body.\n";
+        let updated = materialize_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+
+        assert!(updated.starts_with("<!-- exo:129 ulid:01runner -->\n"));
+        assert!(updated.contains("- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**:"));
+        assert_eq!(updated.matches("<!-- exo:").count(), 1);
     }
 
     #[test]
