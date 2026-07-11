@@ -4045,19 +4045,18 @@ fn parse_rfc_document(
     let declared_stage = stage_marker
         .value
         .as_deref()
-        .and_then(parse_declared_stage)
-        .or_else(|| {
-            (status != "active")
-                .then(|| legacy_stage_from_status(&metadata))
-                .flatten()
-        });
+        .and_then(parse_declared_stage);
     let invalid_stage_marker = stage_marker.declared && declared_stage.is_none();
+    let legacy_stage = (status != "active")
+        .then(|| legacy_stage_from_status(&metadata))
+        .flatten();
+    let resolved_stage = declared_stage.or(legacy_stage);
     let path_stage = parse_stage(path);
     let stage_marker_conflicts = status == "active"
         && declared_stage.is_some_and(|declared_stage| declared_stage != path_stage);
     let stage = if status == "active" {
         path_stage
-    } else if let Some(stage) = declared_stage {
+    } else if let Some(stage) = resolved_stage {
         stage
     } else if let Some(existing) = existing {
         existing.stage
@@ -6112,6 +6111,19 @@ This RFC supersedes:
 
         assert_eq!(parsed.disk.supersedes.as_deref(), Some("10184"));
         assert!(parsed.disk.supersedes_declared);
+    }
+
+    #[test]
+    fn canonical_parser_flags_invalid_stage_marker_even_with_legacy_stage_hint() {
+        let parsed = parse_rfc_document(
+            "docs/rfcs/withdrawn/00129-legacy.md",
+            "<!-- exo:129 ulid:01legacy -->\n\n# RFC 129: Legacy\n\n**Status**: Withdrawn (Draft)\n**Stage**: not-a-number\n**Reason**: Retired.\n\n## Summary\n\nHistorical.\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.disk.stage, 2);
+        assert!(parsed.canonical_metadata_conflict);
     }
 
     #[test]
