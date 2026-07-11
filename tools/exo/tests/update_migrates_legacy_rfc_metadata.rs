@@ -74,7 +74,7 @@ fn update_refuses_non_workspace_without_creating_database() {
 
     let assert = assert_cmd::cargo::cargo_bin_cmd!("exo")
         .current_dir(root)
-        .args(["--direct", "--format", "json", "update"])
+        .args(["--format", "json", "update"])
         .assert()
         .failure();
 

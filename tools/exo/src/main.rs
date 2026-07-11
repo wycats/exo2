@@ -1740,8 +1740,7 @@ fn main() {
     let is_direct = has_direct_flag
         || std::env::var_os(TASK_DIRECT_MODE_ENV).is_some()
         || is_project_bootstrap_read(&args)
-        || is_sidecar_bootstrap_context_command(&args)
-        || is_update_command(&args);
+        || is_sidecar_bootstrap_context_command(&args);
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("exo {}", env!("CARGO_PKG_VERSION"));
@@ -1760,6 +1759,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let is_direct = is_direct || (is_update_command(&args) && Project::resolve(&cwd).is_err());
 
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
