@@ -182,6 +182,8 @@ fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
             "--name-status",
             "--format=",
             "--diff-filter=R",
+            "--",
+            RFCS_DIR,
         ])
         .current_dir(root)
         .output()
@@ -711,7 +713,7 @@ mod tests {
         let rfc_path = rfc_dir.join("00001-retired.md");
         std::fs::write(
             &active_path,
-            format!("<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Draft\n\nBody.\n"),
+            format!("<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Draft\n- **Reason**:\n\nBody.\n"),
         )
         .unwrap();
         for args in [
@@ -799,8 +801,8 @@ mod tests {
             "shared metadata should continue to follow the committed canonical document"
         );
         assert_eq!(
-            row.withdrawal_reason.as_deref(),
-            Some("The proposal was not implemented.")
+            row.withdrawal_reason, None,
+            "shared metadata should honor the canonical document's explicit empty reason"
         );
         let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
             .unwrap()
@@ -808,6 +810,11 @@ mod tests {
         assert_eq!(
             effective.record.stage, 3,
             "the issuing workspace should see the backfilled last-active stage"
+        );
+        assert_eq!(
+            effective.record.withdrawal_reason.as_deref(),
+            Some("The proposal was not implemented."),
+            "the issuing workspace should see the materialized lifecycle reason"
         );
         assert!(effective.provenance.differs_from_canonical);
         assert!(matches!(

@@ -3486,19 +3486,30 @@ pub(crate) fn backfill_rfc_lifecycle_metadata_content(
     let metadata = rfc_metadata_preamble(content);
     let mut markers = Vec::new();
 
-    let declared_reason = first_declared_value(
-        declared_metadata_value(
-            &metadata,
-            if status.eq_ignore_ascii_case("Withdrawn") {
-                "Withdrawal reason"
-            } else {
-                "Archived reason"
-            },
-        ),
-        Some(declared_metadata_value(&metadata, "Reason")),
-    );
-    if !declared_reason.declared {
-        markers.push(("Reason", reason.unwrap_or_default().to_string()));
+    let specific_reason_label = if status.eq_ignore_ascii_case("Withdrawn") {
+        "Withdrawal reason"
+    } else {
+        "Archived reason"
+    };
+    let specific_reason = declared_metadata_value(&metadata, specific_reason_label);
+    let generic_reason = declared_metadata_value(&metadata, "Reason");
+    let available_reason = specific_reason
+        .value
+        .as_deref()
+        .or(generic_reason.value.as_deref())
+        .or(reason.filter(|value| !value.trim().is_empty()));
+    if let Some(value) = available_reason {
+        if specific_reason.declared && specific_reason.value.is_none() {
+            markers.push((specific_reason_label, value.to_string()));
+        }
+        if generic_reason.declared && generic_reason.value.is_none() {
+            markers.push(("Reason", value.to_string()));
+        }
+        if !specific_reason.declared && !generic_reason.declared {
+            markers.push(("Reason", value.to_string()));
+        }
+    } else if !specific_reason.declared && !generic_reason.declared {
+        markers.push(("Reason", String::new()));
     }
     if declared_metadata_value(&metadata, "Stage")
         .value
@@ -7190,6 +7201,50 @@ This RFC supersedes:
             &once,
             "withdrawn"
         ));
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_fills_empty_reason_from_shared_evidence() {
+        let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Withdrawal reason**:\n\nBody.\n";
+
+        let updated = backfill_rfc_lifecycle_metadata_content(
+            original,
+            "Withdrawn",
+            1,
+            Some("The proposal was replaced."),
+        );
+
+        assert!(updated.contains("- **Withdrawal reason**: The proposal was replaced."));
+        assert!(!updated.contains("- **Withdrawal reason**:\n"));
+        assert_eq!(
+            updated,
+            backfill_rfc_lifecycle_metadata_content(
+                &updated,
+                "Withdrawn",
+                1,
+                Some("The proposal was replaced."),
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_preserves_intentional_empty_reason() {
+        let original = "<!-- exo:1 ulid:01archive -->\n\n# RFC 1: Archive Me\n\n- **Status**: Archived\n- **Stage**: 4\n- **Reason**:\n\nBody.\n";
+
+        assert_eq!(
+            original,
+            backfill_rfc_lifecycle_metadata_content(original, "Archived", 4, None)
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_aligns_empty_reason_aliases() {
+        let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Withdrawal reason**:\n- **Reason**: The proposal was replaced.\n\nBody.\n";
+
+        let updated = backfill_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+
+        assert!(updated.contains("- **Withdrawal reason**: The proposal was replaced."));
+        assert!(updated.contains("- **Reason**: The proposal was replaced."));
     }
 
     #[test]
