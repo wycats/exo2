@@ -194,32 +194,61 @@ fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
         return HashMap::new();
     }
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let change = fields.next()?;
-            let source = fields.next()?;
-            let destination = fields.next()?;
-            if !change.starts_with('R')
-                || !(destination.starts_with("docs/rfcs/withdrawn/")
-                    || destination.starts_with("docs/rfcs/archive/"))
+    let mut stages = HashMap::new();
+    let mut retired_renames = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\t');
+        let Some(change) = fields.next() else {
+            continue;
+        };
+        let Some(source) = fields.next() else {
+            continue;
+        };
+        let Some(destination) = fields.next() else {
+            continue;
+        };
+        let source = source.replace('\\', "/");
+        let destination = destination.replace('\\', "/");
+        if !change.starts_with('R')
+            || !(destination.starts_with("docs/rfcs/withdrawn/")
+                || destination.starts_with("docs/rfcs/archive/"))
+        {
+            continue;
+        }
+        if let Some(stage) = source
+            .strip_prefix("docs/rfcs/stage-")
+            .and_then(|path| path.split('/').next())
+            .and_then(|stage| stage.parse::<u8>().ok())
+            .filter(|stage| *stage <= 4)
+        {
+            stages.entry(destination).or_insert(stage);
+        } else if source.starts_with("docs/rfcs/withdrawn/")
+            || source.starts_with("docs/rfcs/archive/")
+        {
+            retired_renames.push((source, destination));
+        }
+    }
+
+    for _ in 0..retired_renames.len() {
+        let mut changed = false;
+        for (source, destination) in &retired_renames {
+            if let Some(stage) = stages.get(source).copied()
+                && !stages.contains_key(destination)
             {
-                return None;
+                stages.insert(destination.clone(), stage);
+                changed = true;
             }
-            let stage = source
-                .strip_prefix("docs/rfcs/stage-")?
-                .split('/')
-                .next()?
-                .parse::<u8>()
-                .ok()
-                .filter(|stage| *stage <= 4)?;
-            Some((destination.to_string(), stage))
-        })
-        .fold(HashMap::new(), |mut stages, (path, stage)| {
-            stages.entry(path).or_insert(stage);
-            stages
-        })
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    stages
+}
+
+fn historical_stage_for_path(stages: &HashMap<String, u8>, path: &str) -> Option<u8> {
+    stages.get(&path.replace('\\', "/")).copied()
 }
 
 // ─── Plugin implementation ───────────────────────────────────────────
@@ -373,7 +402,13 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .strip_prefix(&context.root)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
+            let frontmatter = (!already_anchored).then(|| parse_frontmatter(&file_content));
+            let frontmatter_stage = frontmatter
+                .as_ref()
+                .and_then(|data| fm_string(data, "stage"))
+                .and_then(|stage| stage.parse::<u8>().ok())
+                .filter(|stage| *stage <= 4);
 
             // Parse metadata: from anchor (if already migrated) or from frontmatter
             let (
@@ -421,20 +456,20 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 consolidated_into = existing.and_then(|record| record.consolidated_into.clone());
             } else {
                 // Parse YAML frontmatter for metadata
-                let fm_data = parse_frontmatter(&file_content);
-                let fm_title = fm_string(&fm_data, "title");
-                let fm_ulid = fm_string(&fm_data, "ulid").and_then(|value| canonical_ulid(&value));
-                feature = fm_string(&fm_data, "feature");
-                superseded_by = fm_string(&fm_data, "superseded_by")
-                    .or_else(|| fm_string(&fm_data, "superseded-by"));
-                supersedes = fm_string(&fm_data, "supersedes");
+                let fm_data = frontmatter.as_ref().expect("unanchored RFC frontmatter");
+                let fm_title = fm_string(fm_data, "title");
+                let fm_ulid = fm_string(fm_data, "ulid").and_then(|value| canonical_ulid(&value));
+                feature = fm_string(fm_data, "feature");
+                superseded_by = fm_string(fm_data, "superseded_by")
+                    .or_else(|| fm_string(fm_data, "superseded-by"));
+                supersedes = fm_string(fm_data, "supersedes");
                 let relationships = extract_rfc_relationships(&file_content);
                 superseded_by = superseded_by.or(relationships.superseded_by);
                 supersedes = supersedes.or(relationships.supersedes);
                 withdrawal_reason =
-                    fm_string_any(&fm_data, &["withdrawal_reason", "withdrawn_reason"]);
-                archived_reason = fm_string(&fm_data, "archived_reason");
-                consolidated_into = fm_string(&fm_data, "consolidated_into");
+                    fm_string_any(fm_data, &["withdrawal_reason", "withdrawn_reason"]);
+                archived_reason = fm_string(fm_data, "archived_reason");
+                consolidated_into = fm_string(fm_data, "consolidated_into");
 
                 // Resolve ULID
                 ulid = if let Some(ref existing) = fm_ulid {
@@ -498,7 +533,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             let portable_stage = if matches!(status, "withdrawn" | "archived") {
                 retired_rfc_stage_from_document(
                     &current_content,
-                    historical_stages.get(&rel_path).copied(),
+                    historical_stage_for_path(&historical_stages, &rel_path).or(frontmatter_stage),
                     existing_rfcs
                         .get(&ulid)
                         .map_or(stage, |record| record.stage),
@@ -710,6 +745,7 @@ mod tests {
 
         let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
         let active_path = active_dir.join("00001-retired.md");
+        let intermediate_path = rfc_dir.join("00001-retired-before-rename.md");
         let rfc_path = rfc_dir.join("00001-retired.md");
         std::fs::write(
             &active_path,
@@ -737,6 +773,27 @@ mod tests {
                 .args([
                     "mv",
                     "docs/rfcs/stage-3/00001-retired.md",
+                    "docs/rfcs/withdrawn/00001-retired-before-rename.md",
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(intermediate_path.exists());
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "withdraw RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "mv",
+                    "docs/rfcs/withdrawn/00001-retired-before-rename.md",
                     "docs/rfcs/withdrawn/00001-retired.md",
                 ])
                 .current_dir(root)
@@ -746,13 +803,12 @@ mod tests {
         );
         assert!(
             Command::new("git")
-                .args(["commit", "-qm", "withdraw RFC"])
+                .args(["commit", "-qm", "rename retired RFC"])
                 .current_dir(root)
                 .status()
                 .unwrap()
                 .success()
         );
-
         let db_path = root.join(SQLITE_DB_PATH);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let writer = SqliteWriter::open(&db_path).unwrap();
@@ -821,6 +877,38 @@ mod tests {
             MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
             UpgradeStatus::NotNeeded
         ));
+    }
+
+    #[test]
+    fn migration_preserves_retired_stage_from_yaml_before_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+        let rfc_path = rfc_dir.join("00002-yaml-retired.md");
+        std::fs::write(
+            &rfc_path,
+            "---\ntitle: YAML Retired\nstage: 3\nulid: 01kq09x2d9y6gc9eg27jatcgvg\nwithdrawal_reason: Replaced.\n---\n\n# RFC 2: YAML Retired\n\nBody.\n",
+        )
+        .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(rfc_path).unwrap();
+        assert!(content.contains("- **Status**: Withdrawn"));
+        assert!(content.contains("- **Stage**: 3"));
+        assert!(content.contains("- **Reason**: Replaced."));
+    }
+
+    #[test]
+    fn historical_stage_lookup_normalizes_windows_paths() {
+        let stages = HashMap::from([("docs/rfcs/withdrawn/00001-retired.md".to_string(), 3)]);
+
+        assert_eq!(
+            historical_stage_for_path(&stages, r"docs\rfcs\withdrawn\00001-retired.md"),
+            Some(3)
+        );
     }
 
     #[test]

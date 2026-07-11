@@ -4053,12 +4053,9 @@ fn parse_rfc_document(
     let lifecycle_status_conflicts = declared_status.is_some_and(|declared| declared != status);
     let lifecycle_status_declared = declared_status.is_some_and(|declared| declared == status);
     let stage_marker = declared_metadata_value_with_yaml(&metadata, "Stage", "stage");
-    let declared_stage = stage_marker
-        .value
-        .as_deref()
-        .and_then(parse_declared_stage);
+    let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
     let invalid_stage_marker = stage_marker.declared && declared_stage.is_none();
-    let legacy_stage = (status != "active")
+    let legacy_stage = (status != "active" && !stage_marker.declared)
         .then(|| legacy_stage_from_status(&metadata))
         .flatten();
     let resolved_stage = declared_stage.or(legacy_stage);
@@ -4164,20 +4161,30 @@ fn parse_declared_stage(value: &str) -> Option<u8> {
 
 fn legacy_stage_from_status(metadata: &str) -> Option<u8> {
     let value = declared_metadata_value(metadata, "Status").value?;
-    if let Some(stage) = parse_declared_stage(&value) {
+    let normalized = value.to_ascii_lowercase();
+    if let Some(stage) = normalized.match_indices("stage").find_map(|(index, _)| {
+        normalized[index + "stage".len()..]
+            .trim_start_matches(|ch: char| {
+                ch.is_ascii_whitespace() || matches!(ch, ':' | '=' | '-')
+            })
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .filter(|part| !part.is_empty())
+            .and_then(|part| part.parse::<u8>().ok())
+            .filter(|stage| *stage <= 4)
+    }) {
         return Some(stage);
     }
 
-    let value = value.to_ascii_lowercase();
-    if value.contains("stable") {
+    if normalized.contains("stable") {
         Some(4)
-    } else if value.contains("candidate") || value.contains("implemented") {
+    } else if normalized.contains("candidate") || normalized.contains("implemented") {
         Some(3)
-    } else if value.contains("draft") {
+    } else if normalized.contains("draft") {
         Some(2)
-    } else if value.contains("proposal") || value.contains("accepted") {
+    } else if normalized.contains("proposal") || normalized.contains("accepted") {
         Some(1)
-    } else if value.contains("idea") || value.contains("strawman") {
+    } else if normalized.contains("idea") || normalized.contains("strawman") {
         Some(0)
     } else {
         None
@@ -4190,11 +4197,13 @@ pub(crate) fn retired_rfc_stage_from_document(
     fallback: u8,
 ) -> u8 {
     let metadata = rfc_metadata_preamble(content);
-    declared_metadata_value(&metadata, "Stage")
-        .value
-        .as_deref()
-        .and_then(parse_declared_stage)
-        .or(historical_stage)
+    let stage_marker = declared_metadata_value(&metadata, "Stage");
+    let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
+    if stage_marker.declared {
+        return declared_stage.or(historical_stage).unwrap_or(fallback);
+    }
+
+    historical_stage
         .or_else(|| {
             declared_metadata_value_with_yaml(&metadata, "Stage", "stage")
                 .value
@@ -6133,8 +6142,31 @@ This RFC supersedes:
         )
         .unwrap();
 
-        assert_eq!(parsed.disk.stage, 2);
+        assert_eq!(parsed.disk.stage, 0);
         assert!(parsed.canonical_metadata_conflict);
+        assert_eq!(
+            retired_rfc_stage_from_document(
+                "# RFC 129: Legacy\n\n**Status**: Withdrawn (Draft)\n**Stage**: not-a-number\n",
+                None,
+                4,
+            ),
+            4,
+            "an invalid declared Stage marker must not fall through to legacy status wording"
+        );
+    }
+
+    #[test]
+    fn legacy_status_stage_parsing_ignores_successor_rfc_numbers() {
+        assert_eq!(
+            legacy_stage_from_status(
+                "**Status**: Withdrawn (superseded by RFC 00003; formerly Stage 1 Proposal)"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (superseded by RFC 00003)"),
+            None
+        );
     }
 
     #[test]
