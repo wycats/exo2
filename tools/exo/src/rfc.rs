@@ -3578,15 +3578,16 @@ pub(crate) fn retired_rfc_lifecycle_metadata_is_portable(content: &str, status: 
 
 pub(crate) fn retired_rfc_reason_from_document(content: &str, status: &str) -> Option<String> {
     let metadata = rfc_metadata_preamble(content);
-    let specific = declared_metadata_value(
+    declared_metadata_value(
         &metadata,
         if status == "withdrawn" {
             "Withdrawal reason"
         } else {
             "Archived reason"
         },
-    );
-    first_declared_value(specific, Some(declared_metadata_value(&metadata, "Reason"))).value
+    )
+    .value
+    .or_else(|| declared_metadata_value(&metadata, "Reason").value)
 }
 
 fn write_rfc_lifecycle_metadata(
@@ -3700,19 +3701,19 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
     let original_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let already_withdrawn = file_path
+    let source_retired_status = file_path
         .parent()
         .and_then(Path::file_name)
-        .is_some_and(|name| name == "withdrawn");
-    let original_stage = if already_withdrawn {
+        .and_then(|name| name.to_str())
+        .filter(|name| matches!(*name, "withdrawn" | "archive"));
+    let original_stage = if source_retired_status.is_some() {
         retired_rfc_stage_from_document(&original_content, None, parse_stage(&file_path))
     } else {
         parse_stage(&file_path)
     };
     let lifecycle_reason = reason.map(str::to_string).or_else(|| {
-        already_withdrawn
-            .then(|| retired_rfc_reason_from_document(&original_content, "withdrawn"))
-            .flatten()
+        source_retired_status
+            .and_then(|status| retired_rfc_reason_from_document(&original_content, status))
     });
 
     let withdrawn_dir = rfc_root.join("withdrawn");
@@ -3780,19 +3781,19 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
     let original_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let already_archived = file_path
+    let source_retired_status = file_path
         .parent()
         .and_then(Path::file_name)
-        .is_some_and(|name| name == "archive");
-    let original_stage = if already_archived {
+        .and_then(|name| name.to_str())
+        .filter(|name| matches!(*name, "withdrawn" | "archive"));
+    let original_stage = if source_retired_status.is_some() {
         retired_rfc_stage_from_document(&original_content, None, parse_stage(&file_path))
     } else {
         parse_stage(&file_path)
     };
     let lifecycle_reason = reason.map(str::to_string).or_else(|| {
-        already_archived
-            .then(|| retired_rfc_reason_from_document(&original_content, "archived"))
-            .flatten()
+        source_retired_status
+            .and_then(|status| retired_rfc_reason_from_document(&original_content, status))
     });
 
     let archive_dir = rfc_root.join("archive");
@@ -7327,6 +7328,35 @@ This RFC supersedes:
             repeated.archived_reason.as_deref(),
             Some("shipped and replaced")
         );
+
+        let withdrawn_dir = root.join("docs/rfcs/withdrawn");
+        fs::create_dir_all(&withdrawn_dir).unwrap();
+        let withdrawn_path = withdrawn_dir.join("00001-archive-me.md");
+        fs::rename(&repeated_path, &withdrawn_path).unwrap();
+        write_rfc_lifecycle_metadata(
+            &withdrawn_path,
+            "Withdrawn",
+            3,
+            Some("shipped and replaced"),
+        )
+        .unwrap();
+        sync_rfc_withdrawal(root, &withdrawn_path, 3, Some("shipped and replaced")).unwrap();
+        let corrected_path = archive(&root.join("docs/rfcs"), "00001", None).unwrap();
+        assert_eq!(corrected_path, new_path);
+        let corrected_content = fs::read_to_string(&corrected_path).unwrap();
+        assert!(corrected_content.contains("- **Status**: Archived"));
+        assert!(corrected_content.contains("- **Stage**: 3"));
+        assert!(corrected_content.contains("- **Reason**: shipped and replaced"));
+        let corrected = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(corrected.stage, 3);
+        assert_eq!(
+            corrected.archived_reason.as_deref(),
+            Some("shipped and replaced")
+        );
     }
 
     #[test]
@@ -7403,6 +7433,11 @@ This RFC supersedes:
         let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Withdrawal reason**:\n- **Reason**: The proposal was replaced.\n\nBody.\n";
 
         let updated = backfill_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+
+        assert_eq!(
+            retired_rfc_reason_from_document(original, "withdrawn").as_deref(),
+            Some("The proposal was replaced.")
+        );
 
         assert!(updated.contains("- **Withdrawal reason**: The proposal was replaced."));
         assert!(updated.contains("- **Reason**: The proposal was replaced."));
