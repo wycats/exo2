@@ -70,6 +70,7 @@ pub mod daemon_transport;
 pub mod derived;
 pub mod diagnostics;
 pub mod docs_links;
+pub mod dogfood_activation;
 pub mod event_db;
 pub mod failure;
 pub(crate) mod git_config;

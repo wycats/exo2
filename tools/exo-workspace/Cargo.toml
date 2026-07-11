@@ -11,7 +11,9 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0"
+blake3 = "1.8.2"
 cargo-config2 = "0.1.44"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9.8"
 uuid = { version = "1.19.0", features = ["v4"] }

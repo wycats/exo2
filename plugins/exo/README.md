@@ -41,8 +41,11 @@ sidecar policy.
 
 When running the full local dogfood lifecycle, `cargo dogfood-exo` installs the
 workspace binaries and updates any installed local Codex Exo plugin cache to
-launch the installed `exo-mcp` by absolute path. The source plugin package keeps
-the portable `exo-mcp` command so published installs can continue to use PATH.
+launch the installed `exo-mcp` by absolute path. That pinned launch also records
+the workspace build it supervises, so the durable proxy routes tool calls through
+the current `target/debug/exo` worker and replaces that worker after a rebuild.
+The source plugin package keeps the portable `exo-mcp` command so published
+installs can continue to use PATH.
 
 After a merge to `main`, GitHub Actions also builds downloadable `exo` and
 `exo-mcp` artifacts for currently supported runner platforms. If you have GitHub

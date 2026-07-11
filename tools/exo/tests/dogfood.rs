@@ -131,6 +131,35 @@ fn dogfood_exo_cmd(root: &Path) -> assert_cmd::Command {
     exo_cmd_with_home(root, &home, &config_home)
 }
 
+fn write_dogfood_activation_record(path: &Path, pinned_mcp_config: &Path) {
+    let unused = path
+        .parent()
+        .expect("activation parent")
+        .join("unused-binary");
+    fs::write(&unused, "unused").expect("write unused activation binary");
+    let binary = serde_json::json!({
+        "path": unused,
+        "blake3": "unused"
+    });
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "pinned_mcp_config": pinned_mcp_config,
+            "source": {
+                "exo": binary,
+                "exo_mcp": binary
+            },
+            "installed": {
+                "exo": binary,
+                "exo_mcp": binary
+            }
+        }))
+        .expect("serialize activation"),
+    )
+    .expect("write activation");
+}
+
 fn json_result(output: Vec<u8>) -> JsonValue {
     let envelope: JsonValue = serde_json::from_slice(&output).expect("valid json envelope");
     assert_eq!(envelope["status"], "ok");
@@ -240,6 +269,10 @@ fn path_with_git_only() -> std::ffi::OsString {
 }
 
 fn write_plugin_mcp(root: &Path, command: &str, args: &[&str]) {
+    write_plugin_mcp_with_env(root, command, args, serde_json::json!({}));
+}
+
+fn write_plugin_mcp_with_env(root: &Path, command: &str, args: &[&str], env: JsonValue) {
     let plugin_dir = root.join("plugins/exo");
     std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
     std::fs::write(
@@ -248,7 +281,8 @@ fn write_plugin_mcp(root: &Path, command: &str, args: &[&str]) {
             "mcpServers": {
                 "exo": {
                     "command": command,
-                    "args": args
+                    "args": args,
+                    "env": env
                 }
             }
         }))
@@ -1109,6 +1143,353 @@ fn dogfood_rejects_proxy_health_with_stale_worker_identity() {
             .expect("plugin issue")
             .contains("different executable hash than the current exo binary"),
         "{dogfood}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_accepts_a_current_activation_source_worker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut payload = healthy_proxy_payload();
+    payload["status"]["worker"]["identity"]["executable_identity"]["stable_hash"] =
+        JsonValue::String("source-worker-hash".to_string());
+    payload["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": true,
+        "state": "current"
+    });
+    fs::write(&fake_proxy, proxy_health_script_with_payload(payload, ""))
+        .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env(
+                "PATH",
+                std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                    .expect("join fake PATH"),
+            )
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(dogfood["plugin"]["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "current"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_verify_reports_stale_dogfood_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut payload = healthy_proxy_payload();
+    payload["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "the source Exo build recorded by dogfood activation is unavailable; run `cargo dogfood-exo` from the source checkout"
+    });
+    fs::write(&fake_proxy, proxy_health_script_with_payload(payload, ""))
+        .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let output = dogfood_exo_cmd(temp.path())
+        .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+        .env(
+            "PATH",
+            std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                .expect("join fake PATH"),
+        )
+        .output()
+        .expect("run dogfood verify");
+    assert_eq!(output.status.code(), Some(2));
+
+    let dogfood = json_result(output.stdout);
+    assert_eq!(dogfood["ok"], false);
+    assert_eq!(dogfood["plugin"]["ok"], false);
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "source_build_missing"
+    );
+    assert!(
+        dogfood["plugin"]["issue"]
+            .as_str()
+            .expect("plugin issue")
+            .contains("cargo dogfood-exo"),
+        "{dogfood}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_proxy_health_uses_the_pinned_activation_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut stale = healthy_proxy_payload();
+    stale["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "the source Exo build recorded by dogfood activation is unavailable; run `cargo dogfood-exo` from the source checkout"
+    });
+    let mut current = healthy_proxy_payload();
+    current["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": true,
+        "state": "current",
+        "issue": null
+    });
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--proxy-health\" ]; then\n  if [ -n \"${{EXO_DOGFOOD_ACTIVATION:-}}\" ]; then\n    printf '%s\\n' '{}'\n  else\n    printf '%s\\n' '{}'\n  fi\n  exit 0\nfi\nexit 0\n",
+            stale, current
+        ),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+    write_plugin_mcp_with_env(
+        temp.path(),
+        fake_proxy.to_str().expect("proxy path"),
+        &[],
+        serde_json::json!({ "EXO_DOGFOOD_ACTIVATION": temp.path().join("activation.json") }),
+    );
+
+    let output = dogfood_exo_cmd(temp.path())
+        .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+        .output()
+        .expect("run dogfood verify");
+    assert_eq!(output.status.code(), Some(2));
+
+    let dogfood = json_result(output.stdout);
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "source_build_missing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_proxy_health_does_not_inherit_parent_activation_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "exo-mcp", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let mut inherited = healthy_proxy_payload();
+    inherited["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "source_build_missing",
+        "issue": "inherited activation should not reach the probe"
+    });
+    let mut current = healthy_proxy_payload();
+    current["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": true,
+        "state": "current",
+        "issue": null
+    });
+    let activation = temp.path().join("parent-activation.json");
+    let configured_activation = temp.path().join("configured-activation.json");
+    std::os::unix::fs::symlink(&activation, &configured_activation)
+        .expect("link configured activation");
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--proxy-health\" ]; then\n  if [ \"${{EXO_DOGFOOD_ACTIVATION:-}}\" = '{}' ]; then\n    printf '%s\\n' '{}'\n  else\n    printf '%s\\n' '{}'\n  fi\n  exit 0\nfi\nexit 0\n",
+            configured_activation.display(), current, inherited
+        ),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+    write_plugin_mcp_with_env(
+        temp.path(),
+        "exo-mcp",
+        &[],
+        serde_json::json!({
+            "EXO_DOGFOOD_ACTIVATION": configured_activation
+        }),
+    );
+    write_dogfood_activation_record(&activation, &temp.path().join("plugins/exo/.mcp.json"));
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
+            .env(
+                "PATH",
+                std::env::join_paths([fake_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                    .expect("join fake PATH"),
+            )
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["proxy_binary"]["activation"]["state"],
+        "current"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dogfood_verify_uses_the_exact_activation_pinned_plugin_config() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init(temp.path());
+    write_plugin_mcp(temp.path(), "missing-source-proxy", &[]);
+
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin dir");
+    let fake_proxy = fake_bin.join(exo_mcp_binary_name());
+    let health_path = temp.path().join("proxy-health.json");
+    let mut current_health = healthy_proxy_payload();
+    current_health["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": true,
+        "state": "current",
+        "issue": null
+    });
+    fs::write(
+        &health_path,
+        serde_json::to_vec(&current_health).expect("health JSON"),
+    )
+    .expect("write current health");
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--proxy-health\" ]; then\n  cat '{}'\n  exit 0\nfi\nexit 0\n",
+            health_path.display()
+        ),
+    )
+    .expect("write fake proxy");
+    make_executable(&fake_proxy);
+
+    let pinned_plugin = temp.path().join("pinned-cache/exo/0.1.0");
+    fs::create_dir_all(&pinned_plugin).expect("create pinned plugin cache");
+    let activation = temp.path().join("activation.json");
+    write_plugin_mcp_with_env(
+        &pinned_plugin,
+        fake_proxy.to_str().expect("proxy path"),
+        &[],
+        serde_json::json!({
+            "EXO_DOGFOOD_ACTIVATION": activation
+        }),
+    );
+    let pinned_config = pinned_plugin.join("plugins/exo/.mcp.json");
+    write_dogfood_activation_record(&activation, &pinned_config);
+
+    let dogfood = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "verify", "--skip-receipt"])
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+
+    assert_eq!(dogfood["ok"], true, "{dogfood}");
+    assert_eq!(
+        dogfood["plugin"]["path"],
+        pinned_plugin
+            .join("plugins/exo")
+            .canonicalize()
+            .expect("canonical pinned plugin")
+            .display()
+            .to_string()
+    );
+
+    let receipt = json_result(
+        dogfood_exo_cmd(temp.path())
+            .args(["--format", "json", "dogfood", "receipt"])
+            .env("EXO_DOGFOOD_ACTIVATION", &activation)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+    let receipt_path = PathBuf::from(
+        receipt["receipt_path"]
+            .as_str()
+            .expect("receipt path is string"),
+    );
+    let receipt_json: JsonValue =
+        serde_json::from_str(&fs::read_to_string(receipt_path).expect("read dogfood receipt"))
+            .expect("parse dogfood receipt");
+    assert_eq!(
+        receipt_json["plugin"]["path"],
+        pinned_plugin
+            .join("plugins/exo")
+            .canonicalize()
+            .expect("canonical pinned plugin")
+            .display()
+            .to_string()
+    );
+
+    let mut stale_health = current_health;
+    stale_health["status"]["activation"] = serde_json::json!({
+        "configured": true,
+        "ok": false,
+        "state": "worker_source_mismatch",
+        "issue": "activation advanced"
+    });
+    fs::write(
+        &health_path,
+        serde_json::to_vec(&stale_health).expect("health JSON"),
+    )
+    .expect("write stale health");
+    let output = dogfood_exo_cmd(temp.path())
+        .args(["--format", "json", "dogfood", "verify"])
+        .env("EXO_DOGFOOD_ACTIVATION", &activation)
+        .output()
+        .expect("verify stale activation receipt");
+    assert_eq!(output.status.code(), Some(2));
+    let stale = json_result(output.stdout);
+    assert_eq!(stale["receipt"]["matches"], false, "{stale}");
+    assert!(
+        stale["receipt"]["mismatches"]
+            .as_array()
+            .is_some_and(|mismatches| mismatches
+                .iter()
+                .any(|mismatch| { mismatch["field"] == "plugin.proxy_binary.activation" })),
+        "{stale}"
     );
 }
 

@@ -197,7 +197,18 @@ The proxy exposes enough diagnostics to make runtime drift and workspace binding
 - last restart reason;
 - last worker error.
 
-Dogfood activation treats the proxy and worker as separate identities. A healthy dogfood run proves that the MCP client is connected to the expected proxy and that the proxy is routing through the expected worker for the active workspace.
+Dogfood activation treats the proxy and worker as separate identities. A local
+dogfood activation records the workspace build and injects that record into the
+pinned Codex MCP launch. That durable launch selects the recorded workspace
+`target/debug/exo` worker path. The existing worker identity check replaces that
+worker after a source rebuild, without requiring the agent to remember a
+separate install step.
+
+The activation record is local-only and carries executable paths and fingerprints
+for the source build and installed pair. It is absent from portable plugin
+configuration and is not exposed through public MCP output. If the recorded
+source build disappears or the pinned proxy no longer matches the activation,
+proxy health and tool calls return a structured, actionable activation error.
 
 ## Packaging
 
@@ -213,6 +224,11 @@ The Codex plugin launches:
 ```
 
 `exo mcp serve` may remain as a direct manual entrypoint. Dogfood health uses the proxy path because it exercises the durable runtime boundary this RFC defines.
+
+For local dogfood, the cached plugin configuration also carries the activation
+record location. That keeps the plugin package portable while giving the durable
+proxy an explicit source-build contract when it is launched outside the source
+checkout.
 
 RFC 10193 owns Codex-facing packaging, plugin README guidance, reload ergonomics, and cockpit strategy. This RFC owns the proxy and worker behavior.
 

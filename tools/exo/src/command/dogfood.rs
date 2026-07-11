@@ -13,6 +13,9 @@ use crate::daemon::{
     DaemonEnsureOutcome, DaemonEnsureState, DaemonStatusState, daemon_status_for_project,
     ensure_daemon_with_report,
 };
+use crate::dogfood_activation::{
+    DOGFOOD_ACTIVATION_ENV, DogfoodActivation, DogfoodActivationBinding,
+};
 use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
@@ -716,6 +719,11 @@ impl DogfoodVerifyOutput {
                     current_proxy.size_bytes,
                     &mut mismatches,
                 );
+                compare_activation(
+                    expected_proxy.activation.as_ref(),
+                    current_proxy.activation.as_ref(),
+                    &mut mismatches,
+                );
             }
         }
 
@@ -802,7 +810,12 @@ struct PluginIdentity {
 }
 
 impl PluginIdentity {
-    fn from_dir(root: &Path, path: &Path, current_binary: &BinaryIdentity) -> ExoResult<Self> {
+    fn from_dir(
+        root: &Path,
+        path: &Path,
+        current_binary: &BinaryIdentity,
+        activation: Option<&DogfoodActivationBinding>,
+    ) -> ExoResult<Self> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("Failed to canonicalize plugin dir {}", path.display()))?;
@@ -822,7 +835,7 @@ impl PluginIdentity {
         }
 
         let (mcp_server, proxy_binary, issue) =
-            plugin_mcp_server_identity(&canonical, root, current_binary);
+            plugin_mcp_server_identity(&canonical, root, current_binary, activation);
 
         Ok(Self {
             path: canonical,
@@ -853,6 +866,15 @@ struct PluginProxyBinaryIdentity {
     blake3: Option<String>,
     size_bytes: Option<u64>,
     modified_unix_ms: Option<u128>,
+    activation: Option<DogfoodActivationProbe>,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DogfoodActivationProbe {
+    configured: bool,
+    ok: bool,
+    state: String,
     issue: Option<String>,
 }
 
@@ -867,12 +889,15 @@ struct PluginMcpServerConfig {
     command: String,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 fn plugin_mcp_server_identity(
     plugin_dir: &Path,
     root: &Path,
     current_binary: &BinaryIdentity,
+    activation: Option<&DogfoodActivationBinding>,
 ) -> (
     Option<PluginMcpServerIdentity>,
     Option<PluginProxyBinaryIdentity>,
@@ -930,7 +955,31 @@ fn plugin_mcp_server_identity(
         );
     }
 
-    let proxy_binary = plugin_proxy_binary_identity(root, &server.command, current_binary);
+    if let Some(activation) = activation {
+        let configured_activation = server
+            .env
+            .get(DOGFOOD_ACTIVATION_ENV)
+            .map(PathBuf::from)
+            .map(|path| path.canonicalize().unwrap_or(path));
+        if configured_activation.as_deref() != Some(activation.activation_path.as_path()) {
+            let actual = configured_activation.as_deref().map_or_else(
+                || "not configured".to_string(),
+                |path| path.display().to_string(),
+            );
+            return (
+                Some(identity),
+                None,
+                Some(format!(
+                    "pinned plugin MCP config {} launches with dogfood activation {actual}, expected {}; run `cargo dogfood-exo` from the configured source checkout",
+                    activation.pinned_mcp_config.display(),
+                    activation.activation_path.display()
+                )),
+            );
+        }
+    }
+
+    let proxy_binary =
+        plugin_proxy_binary_identity(root, &server.command, current_binary, &server.env);
     let issue = proxy_binary.issue.clone();
     (Some(identity), Some(proxy_binary), issue)
 }
@@ -939,6 +988,7 @@ fn plugin_proxy_binary_identity(
     root: &Path,
     command: &str,
     current_binary: &BinaryIdentity,
+    env: &BTreeMap<String, String>,
 ) -> PluginProxyBinaryIdentity {
     let command_path = Path::new(command);
     if command_path.is_absolute() {
@@ -947,6 +997,7 @@ fn plugin_proxy_binary_identity(
             command_path.to_path_buf(),
             "plugin-command",
             current_binary,
+            env,
         );
     }
 
@@ -956,7 +1007,7 @@ fn plugin_proxy_binary_identity(
         .then(|| target.canonicalize().unwrap_or(target));
 
     if let Some(path) = find_command_in_path(command) {
-        return plugin_proxy_binary_for_path(command, path, "path", current_binary);
+        return plugin_proxy_binary_for_path(command, path, "path", current_binary, env);
     }
 
     let workspace_note = if let Some(workspace_target) = workspace_target {
@@ -976,6 +1027,7 @@ fn plugin_proxy_binary_identity(
         blake3: None,
         size_bytes: None,
         modified_unix_ms: None,
+        activation: None,
         issue: Some(format!(
             "plugin MCP server command `{command}` was not found on PATH{workspace_note}; run `cargo install --path tools/exo --locked`"
         )),
@@ -987,6 +1039,7 @@ fn plugin_proxy_binary_for_path(
     path: PathBuf,
     source: &'static str,
     current_binary: &BinaryIdentity,
+    env: &BTreeMap<String, String>,
 ) -> PluginProxyBinaryIdentity {
     let mut path = path.canonicalize().unwrap_or(path);
     let mut source = source;
@@ -1005,9 +1058,18 @@ fn plugin_proxy_binary_for_path(
             path.display()
         ))
     } else {
-        health = Some(proxy_health_probe(command, &path));
+        health = Some(proxy_health_probe(command, &path, env));
         if let Some(issue) = health.as_ref().and_then(|health| health.issue.clone()) {
             Some(issue)
+        } else if let Some(activation) = health
+            .as_ref()
+            .and_then(|health| health.activation.as_ref())
+            && activation.configured
+            && !activation.ok
+        {
+            Some(activation.issue.clone().unwrap_or_else(|| {
+                "the Exo MCP proxy dogfood activation is not current; run `cargo dogfood-exo` from the source checkout".to_string()
+            }))
         } else if health
             .as_ref()
             .and_then(|health| health.worker.as_ref())
@@ -1018,6 +1080,10 @@ fn plugin_proxy_binary_for_path(
                 path.display()
             ))
         } else if let Some(worker) = health.as_ref().and_then(|health| health.worker.as_ref())
+            && !health
+                .as_ref()
+                .and_then(|health| health.activation.as_ref())
+                .is_some_and(|activation| activation.configured && activation.ok)
             && worker.blake3 != current_binary.blake3
         {
             Some(format!(
@@ -1062,6 +1128,7 @@ fn plugin_proxy_binary_for_path(
                     .and_then(|metadata| metadata.modified().ok())
                     .and_then(system_time_ms)
             }),
+        activation: health.and_then(|health| health.activation),
         issue,
     }
 }
@@ -1071,6 +1138,7 @@ struct ProxyHealthProbe {
     issue: Option<String>,
     proxy: Option<ProbeExecutableIdentity>,
     worker: Option<ProbeExecutableIdentity>,
+    activation: Option<DogfoodActivationProbe>,
 }
 
 #[derive(Debug)]
@@ -1081,7 +1149,11 @@ struct ProbeExecutableIdentity {
     modified_unix_ms: Option<u128>,
 }
 
-fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
+fn proxy_health_probe(
+    command: &str,
+    path: &Path,
+    env: &BTreeMap<String, String>,
+) -> ProxyHealthProbe {
     let output_path = std::env::temp_dir().join(format!(
         "exo-proxy-health-{}-{}-{}.json",
         std::process::id(),
@@ -1112,6 +1184,8 @@ fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
     child_command
         .arg("--proxy-health")
         .env_remove("EXO_NO_REEXEC")
+        .env_remove(DOGFOOD_ACTIVATION_ENV)
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::null());
@@ -1216,9 +1290,16 @@ fn proxy_health_probe(command: &str, path: &Path) -> ProxyHealthProbe {
         };
     }
     ProxyHealthProbe {
-        issue: None,
+        issue: value
+            .get("issue")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
         proxy: probe_executable_identity(&value, "/status/proxy"),
         worker: probe_executable_identity(&value, "/status/worker/identity"),
+        activation: value
+            .pointer("/status/activation")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     }
 }
 
@@ -1813,6 +1894,8 @@ struct ReceiptPluginProxyBinary {
     executable: bool,
     blake3: Option<String>,
     size_bytes: Option<u64>,
+    #[serde(default)]
+    activation: Option<DogfoodActivationProbe>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2475,9 +2558,21 @@ fn default_plugin_identity(
     root: &Path,
     current_binary: &BinaryIdentity,
 ) -> ExoResult<Option<PluginIdentity>> {
+    if let Some(binding) =
+        DogfoodActivation::binding_from_environment().map_err(|error| anyhow!(error))?
+    {
+        let plugin_dir = binding.pinned_mcp_config.parent().ok_or_else(|| {
+            anyhow!(
+                "Pinned Codex plugin config has no plugin directory: {}",
+                binding.pinned_mcp_config.display()
+            )
+        })?;
+        return PluginIdentity::from_dir(root, plugin_dir, current_binary, Some(&binding))
+            .map(Some);
+    }
     let plugin_dir = root.join("plugins/exo");
     if plugin_dir.is_dir() {
-        return PluginIdentity::from_dir(root, &plugin_dir, current_binary).map(Some);
+        return PluginIdentity::from_dir(root, &plugin_dir, current_binary, None).map(Some);
     }
     Ok(None)
 }
@@ -3027,9 +3122,82 @@ fn compare_optional_u64(
     }
 }
 
+fn compare_activation(
+    expected: Option<&DogfoodActivationProbe>,
+    actual: Option<&DogfoodActivationProbe>,
+    mismatches: &mut Vec<ReceiptMismatch>,
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    let expected = serde_json::to_string(expected).unwrap_or_else(|_| "<invalid>".to_string());
+    let actual = actual
+        .and_then(|actual| serde_json::to_string(actual).ok())
+        .unwrap_or_else(|| "<missing>".to_string());
+    if expected != actual {
+        mismatches.push(ReceiptMismatch {
+            field: "plugin.proxy_binary.activation",
+            expected,
+            actual,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_plugin_config_must_launch_with_the_recorded_activation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin = temp.path().join("plugin");
+        fs::create_dir(&plugin).expect("create plugin");
+        let activation_path = temp.path().join("activation.json");
+        let other_activation = temp.path().join("other-activation.json");
+        fs::write(&activation_path, "{}").expect("write activation");
+        fs::write(&other_activation, "{}").expect("write other activation");
+        fs::write(
+            plugin.join(".mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "exo": {
+                        "command": "exo-mcp",
+                        "args": [],
+                        "env": {
+                            "EXO_DOGFOOD_ACTIVATION": other_activation
+                        }
+                    }
+                }
+            }))
+            .expect("serialize MCP config"),
+        )
+        .expect("write MCP config");
+        let binding = DogfoodActivationBinding {
+            activation_path: activation_path
+                .canonicalize()
+                .expect("canonical activation"),
+            pinned_mcp_config: plugin
+                .join(".mcp.json")
+                .canonicalize()
+                .expect("canonical MCP config"),
+        };
+
+        let identity = PluginIdentity::from_dir(
+            temp.path(),
+            &plugin,
+            &BinaryIdentity::current().expect("current binary"),
+            Some(&binding),
+        )
+        .expect("inspect plugin");
+
+        assert!(!identity.ok);
+        assert!(
+            identity.issue.as_deref().is_some_and(
+                |issue| issue.contains("expected") && issue.contains("cargo dogfood-exo")
+            )
+        );
+        assert!(identity.proxy_binary.is_none());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3057,7 +3225,7 @@ mod tests {
         fs::set_permissions(&proxy, permissions).expect("chmod fake proxy");
 
         let started = Instant::now();
-        let probe = proxy_health_probe("exo-mcp", &proxy);
+        let probe = proxy_health_probe("exo-mcp", &proxy, &BTreeMap::new());
 
         assert_eq!(probe.issue, None);
         assert!(
