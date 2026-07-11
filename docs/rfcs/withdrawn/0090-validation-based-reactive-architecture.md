@@ -2,6 +2,9 @@
 
 # RFC 90: Validation-Based Reactive Architecture
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0090: Validation-Based Reactive Architecture
 

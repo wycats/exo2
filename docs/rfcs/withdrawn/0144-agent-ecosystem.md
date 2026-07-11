@@ -2,6 +2,9 @@
 
 # RFC 144: Agent Ecosystem
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0144: Agent Ecosystem
 

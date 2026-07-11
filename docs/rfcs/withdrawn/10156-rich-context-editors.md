@@ -3,6 +3,10 @@
 
 # RFC 10156: Rich Context Editors
 
+- **Status**: Withdrawn
+- **Stage**: 4
+- **Reason**:
+
 ## Summary
 
 Provide a rich, interactive "Studio" editing experience for core context files (scoped axioms files in `axioms.*.toml`, plus `decisions.toml`, `plan.toml`) using VS Code's Custom Editor API.

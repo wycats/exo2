@@ -2,6 +2,9 @@
 
 # RFC 176: Sidebar Polish
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 00176: Sidebar Polish
 

@@ -2,6 +2,9 @@
 
 # RFC 155: Manual Test RFC
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0155: Manual Test RFC
 

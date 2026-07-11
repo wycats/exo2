@@ -2,6 +2,9 @@
 
 # RFC 12: North Star User Journey
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 ---
 status: provisional

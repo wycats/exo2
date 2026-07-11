@@ -2,6 +2,9 @@
 
 # RFC 201: ExoSpec Derive Macro: Inline CommandSpec Definition
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
 
 # RFC 0201: ExoSpec Derive Macro: Inline CommandSpec Definition
 

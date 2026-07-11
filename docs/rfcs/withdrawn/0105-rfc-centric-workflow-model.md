@@ -2,6 +2,9 @@
 
 # RFC 105: RFC-Centric Workflow Model
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
 
 # RFC 0105: RFC-Centric Workflow Model
 

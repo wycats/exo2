@@ -3,6 +3,10 @@
 
 # RFC 10115: Configurable TDD Runners
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 Make TDD/test runners configurable so `exo tdd` can support multiple ecosystems.

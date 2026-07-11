@@ -3,6 +3,10 @@
 
 # RFC 10150: Structured Context Criteria (TOML vs Markdown)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Problem
 
 The `docs/agent-context` directory currently contains a mix of TOML files (`plan.toml`, `axioms.*.toml`) and Markdown files (`walkthrough.md`, `task-list.md`). As we migrate more content to structured formats (like `modes.toml`), we need a clear set of criteria to decide when a piece of context should be **Structured (TOML)** versus **Narrative (Markdown)**.

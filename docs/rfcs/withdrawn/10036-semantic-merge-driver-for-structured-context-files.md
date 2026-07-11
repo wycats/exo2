@@ -4,6 +4,10 @@
 
 # RFC 10036: Semantic Merge Driver for Structured Context Files
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 Introduce a Git merge driver for Exosuit “structured context” files (initially TOML) that performs conservative semantic 3-way merges and, when conflicts remain, records them in a *parseable* conflict format (option 2) suitable for tooling.

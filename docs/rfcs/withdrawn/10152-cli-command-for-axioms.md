@@ -3,6 +3,10 @@
 
 # RFC 10152: CLI Command for Axioms
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Summary
 The `exo` CLI enforces a "READ-ONLY" policy on CLI-managed TOML files, instructing users/agents to use the CLI to modify them. Axioms are scoped across:
 

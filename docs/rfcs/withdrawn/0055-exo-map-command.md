@@ -2,7 +2,9 @@
 
 # RFC 55: exo map Command
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0055: exo map Command
 

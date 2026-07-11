@@ -2,7 +2,9 @@
 
 # RFC 227: Computed Phase Details: Unified Derived Root
 
-
+- **Status**: Withdrawn
+- **Stage**: 2
+- **Reason**:
 
 # RFC 00227: Computed Phase Details: Unified Derived Root
 

@@ -9,12 +9,14 @@
 use crate::ExoResult;
 use crate::context::{AgentContext, SqliteWriter};
 use crate::rfc::{
-    extract_anchor_ulid, extract_h1_title, extract_rfc_relationships, has_anchor, parse_rfc_number,
-    parse_slug, parse_stage, parse_status, strip_frontmatter,
+    backfill_rfc_lifecycle_metadata_content, extract_anchor_ulid, extract_h1_title,
+    extract_rfc_relationships, has_anchor, parse_rfc_number, parse_slug, parse_stage, parse_status,
+    retired_rfc_lifecycle_metadata_is_portable, retired_rfc_stage_from_document, strip_frontmatter,
 };
 use crate::upgrade::{Severity, UpgradePlugin, UpgradeReport, UpgradeStatus};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::WalkDir;
 
 const RFCS_DIR: &str = "docs/rfcs";
@@ -164,6 +166,60 @@ fn find_rfc_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
+    let retained_history_ref = "refs/remotes/private-history/HEAD";
+    let history_ref = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", retained_history_ref])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|output| output.status.success())
+        .then_some(retained_history_ref)
+        .unwrap_or("HEAD");
+    let Ok(output) = Command::new("git")
+        .args([
+            "log",
+            history_ref,
+            "--name-status",
+            "--format=",
+            "--diff-filter=R",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let change = fields.next()?;
+            let source = fields.next()?;
+            let destination = fields.next()?;
+            if !change.starts_with('R')
+                || !(destination.starts_with("docs/rfcs/withdrawn/")
+                    || destination.starts_with("docs/rfcs/archive/"))
+            {
+                return None;
+            }
+            let stage = source
+                .strip_prefix("docs/rfcs/stage-")?
+                .split('/')
+                .next()?
+                .parse::<u8>()
+                .ok()
+                .filter(|stage| *stage <= 4)?;
+            Some((destination.to_string(), stage))
+        })
+        .fold(HashMap::new(), |mut stages, (path, stage)| {
+            stages.entry(path).or_insert(stage);
+            stages
+        })
+}
+
 // ─── Plugin implementation ───────────────────────────────────────────
 
 impl UpgradePlugin for MigrateRfcMetadataPlugin {
@@ -221,15 +277,36 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             0
         };
 
+        let db_lifecycle_missing_from_disk = if db_path.exists() {
+            let rows = crate::context::SqliteLoader::open(&db_path)?
+                .load_rfcs()?
+                .into_iter()
+                .map(|record| (record.text_id.clone(), record))
+                .collect::<HashMap<_, _>>();
+            files
+                .iter()
+                .filter_map(|path| {
+                    let content = std::fs::read_to_string(path).ok()?;
+                    let ulid = extract_anchor_ulid(&content)?;
+                    rows.get(&ulid)?;
+                    let status = parse_status(path);
+                    (!retired_rfc_lifecycle_metadata_is_portable(&content, status)).then_some(())
+                })
+                .count()
+        } else {
+            0
+        };
+
         let total_needed = unanchored
             .max(db_missing)
-            .max(db_relationships_missing_from_disk);
+            .max(db_relationships_missing_from_disk)
+            .max(db_lifecycle_missing_from_disk);
 
         if total_needed == 0 {
             Ok(UpgradeStatus::NotNeeded)
         } else {
             Ok(UpgradeStatus::warning(format!(
-                "{total_needed} RFC(s) need metadata migration ({unanchored} unanchored, {db_missing} missing from DB, {db_relationships_missing_from_disk} DB relationship(s) missing from disk)"
+                "{total_needed} RFC(s) need metadata migration ({unanchored} unanchored, {db_missing} missing from DB, {db_relationships_missing_from_disk} DB relationship(s) missing from disk, {db_lifecycle_missing_from_disk} retired lifecycle record(s) missing from disk)"
             )))
         }
     }
@@ -260,6 +337,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             HashMap::new()
         };
         let writer = SqliteWriter::open(&db_path)?;
+        let historical_stages = historical_retired_stages(&context.root);
         let mut changes = Vec::new();
         let mut seen_ulids: HashSet<String> = HashSet::new();
 
@@ -413,12 +491,49 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             }
             seen_ulids.insert(ulid.clone());
 
+            let current_content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let portable_stage = if matches!(status, "withdrawn" | "archived") {
+                retired_rfc_stage_from_document(
+                    &current_content,
+                    historical_stages.get(&rel_path).copied(),
+                    existing_rfcs
+                        .get(&ulid)
+                        .map_or(stage, |record| record.stage),
+                )
+            } else {
+                stage
+            };
+            let lifecycle_reason = match status {
+                "withdrawn" => withdrawal_reason.as_deref(),
+                "archived" => archived_reason.as_deref(),
+                _ => None,
+            };
+            let materialized_content = backfill_rfc_lifecycle_metadata_content(
+                &current_content,
+                match status {
+                    "withdrawn" => "Withdrawn",
+                    "archived" => "Archived",
+                    _ => status,
+                },
+                portable_stage,
+                lifecycle_reason,
+            );
+            if matches!(status, "withdrawn" | "archived") && materialized_content != current_content
+            {
+                std::fs::write(path, materialized_content.as_bytes())
+                    .with_context(|| format!("Failed to rewrite {}", path.display()))?;
+                changes.push(format!(
+                    "MATERIALIZED {filename}: lifecycle metadata from SQLite"
+                ));
+            }
+
             // Upsert into SQLite
             writer.upsert_rfc(
                 &ulid,
                 rfc_number,
                 &title,
-                stage,
+                portable_stage,
                 status,
                 feature.as_deref(),
                 &slug,
@@ -433,6 +548,9 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
             changes.push(format!("MIGRATED {filename} → ulid:{ulid}"));
         }
+
+        drop(writer);
+        crate::rfc::reconcile_rfcs_with_project(&context.root, context.project.as_ref())?;
 
         if changes.is_empty() {
             Ok(UpgradeReport::no_changes(self.id()))
@@ -576,6 +694,125 @@ mod tests {
         assert!(matches!(
             MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
             UpgradeStatus::Needed { .. }
+        ));
+    }
+
+    #[test]
+    fn migration_materializes_retired_lifecycle_metadata_from_shared_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let active_dir = root.join("docs/rfcs/stage-3");
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        let active_path = active_dir.join("00001-retired.md");
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        std::fs::write(
+            &active_path,
+            format!("<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Draft\n\nBody.\n"),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "active RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            Command::new("git")
+                .args([
+                    "mv",
+                    "docs/rfcs/stage-3/00001-retired.md",
+                    "docs/rfcs/withdrawn/00001-retired.md",
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "withdraw RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let writer = SqliteWriter::open(&db_path).unwrap();
+        writer
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                0,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("The proposal was not implemented."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.contains("- **Status**: Withdrawn"));
+        assert!(!content.contains("- **Status**: Draft"));
+        assert!(content.contains("- **Stage**: 3"));
+        assert!(content.contains("- **Reason**: The proposal was not implemented."));
+        assert!(retired_rfc_lifecycle_metadata_is_portable(
+            &content,
+            "withdrawn"
+        ));
+
+        let row = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.stage, 2,
+            "shared metadata should continue to follow the committed canonical document"
+        );
+        assert_eq!(
+            row.withdrawal_reason.as_deref(),
+            Some("The proposal was not implemented.")
+        );
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            effective.record.stage, 3,
+            "the issuing workspace should see the backfilled last-active stage"
+        );
+        assert!(effective.provenance.differs_from_canonical);
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::NotNeeded
         ));
     }
 

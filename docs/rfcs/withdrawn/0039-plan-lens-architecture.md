@@ -2,7 +2,9 @@
 
 # RFC 39: Plan Lens Architecture (Withdrawn)
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0027w: Plan Lens Architecture (Withdrawn)
 

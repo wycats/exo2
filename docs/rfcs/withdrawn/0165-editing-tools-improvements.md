@@ -2,6 +2,9 @@
 
 # RFC 165: Editing Tools Improvements
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0165: Editing Tools Improvements
 

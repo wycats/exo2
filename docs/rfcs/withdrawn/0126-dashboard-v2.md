@@ -2,7 +2,9 @@
 
 # RFC 126: Dashboard V2
 
-
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
 
 # RFC 0126: Dashboard V2
 

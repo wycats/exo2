@@ -3,6 +3,10 @@
 
 # RFC 10141: The `exo` CLI
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 - **Superseded by**: RFC 10014
 
 

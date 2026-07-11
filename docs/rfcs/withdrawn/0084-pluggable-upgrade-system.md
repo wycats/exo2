@@ -2,6 +2,8 @@
 
 # RFC 84: Pluggable Upgrade System with Protocol Versioning
 
+- **Status**: Withdrawn
+- **Reason**:
 
 # RFC 0084: Pluggable Upgrade System with Protocol Versioning
 

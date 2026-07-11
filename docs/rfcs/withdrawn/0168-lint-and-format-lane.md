@@ -2,7 +2,9 @@
 
 # RFC 168: Lint and Format Lane
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC lint: Lint and Format Lane
 

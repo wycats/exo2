@@ -2,6 +2,9 @@
 
 # RFC 79: VS Code Surface Inventory
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0079: VS Code Surface Inventory
 

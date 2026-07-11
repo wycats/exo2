@@ -2,6 +2,9 @@
 
 # RFC 163: CWD Discipline & Wrong Directory Mitigation
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0163: CWD Discipline & Wrong Directory Mitigation
 

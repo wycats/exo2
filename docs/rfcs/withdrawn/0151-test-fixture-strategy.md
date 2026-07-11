@@ -2,6 +2,9 @@
 
 # RFC 151: Test Fixture Strategy
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn by RFC 10180 storage disposition: this proposal depends on retired file-backed phase context or direct editing/protection of legacy docs/agent-context current artifacts.
 
 # RFC 0151: Test Fixture Strategy
 

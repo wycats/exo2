@@ -3,6 +3,10 @@
 
 # RFC 10151: Refined Staged RFC Process
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Summary
 
 This RFC adapts the rigorous [TC39 Process](https://tc39.es/process-document/) for the Exosuit project. It defines a strict set of **Entrance Criteria**, **Exit Criteria**, and **Artifacts** for each stage of the RFC lifecycle. The goal is to replace "YOLO Mode" (unilateral agent decisions) with a "Consensus Mode" where the User (Committee) and Agent (Champion) collaborate through defined stage gates.

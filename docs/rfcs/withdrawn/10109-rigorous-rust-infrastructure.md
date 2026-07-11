@@ -3,6 +3,10 @@
 
 # RFC 10109: Rigorous Rust Infrastructure
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 Establish a robust, production-grade infrastructure for the `exosuit` Rust codebase (currently `tools/rfc-status` and future tools), mirroring the high standards set in the `locald` project.

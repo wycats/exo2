@@ -2,6 +2,8 @@
 
 # RFC 22: Unified Project State
 
+- **Stage**: 4
+- **Reason**: Superseded by RFC 10176 as the current SQLite-backed project-state model.
 
 # RFC 0022: Unified Project State
 

@@ -2,6 +2,9 @@
 
 # RFC 61: Ordering Syntax
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0061: Ordering Syntax
 

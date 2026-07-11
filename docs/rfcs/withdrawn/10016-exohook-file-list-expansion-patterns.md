@@ -2,6 +2,9 @@
 
 # RFC 10016: Exohook: File List Expansion Patterns
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 10016: Exohook: File List Expansion Patterns
 

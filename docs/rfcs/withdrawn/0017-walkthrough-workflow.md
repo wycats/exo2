@@ -2,6 +2,9 @@
 
 # RFC 17: Walkthrough Workflow
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # Walkthrough Editor Workflow
 

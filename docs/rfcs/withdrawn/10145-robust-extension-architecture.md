@@ -3,7 +3,10 @@
 
 # RFC 10145: Robust Extension Architecture
 
-- **Status**: Stage 3 (Candidate)
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 - **Created**: 2025-12-08
 - **Tags**: architecture, vscode, testing, reactivity
 

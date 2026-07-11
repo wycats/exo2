@@ -2,6 +2,9 @@
 
 # RFC 138: The Standard Bootstrap
 
+- **Status**: Withdrawn
+- **Stage**: 2
+- **Reason**: Withdrawn by RFC 10180 storage disposition: file-backed phase context, docs/agent-context/current artifacts, and docs/agent-context/archive phase snapshots are retired.
 
 # RFC 0138: The Standard Bootstrap
 

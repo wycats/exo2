@@ -2,7 +2,9 @@
 
 # RFC 72: Semantic Merge Driver for Structured Context Files
 
-
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
 
 # RFC 0072: Semantic Merge Driver for Structured Context Files
 

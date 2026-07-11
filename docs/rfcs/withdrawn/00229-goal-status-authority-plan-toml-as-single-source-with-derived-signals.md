@@ -2,6 +2,9 @@
 
 # RFC 229: Goal Status Authority: plan.toml as Single Source with Derived Signals
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
 
 # RFC 00229: Goal Status Authority: plan.toml as Single Source with Derived Signals
 

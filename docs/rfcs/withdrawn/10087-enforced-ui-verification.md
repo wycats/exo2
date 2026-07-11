@@ -3,6 +3,10 @@
 
 # RFC 10087: Enforced UI Verification
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn by RFC 10180 storage disposition: this proposal depends on retired file-backed phase context or direct editing/protection of legacy docs/agent-context current artifacts.
+
 ## Summary
 
 Add a mandatory `[verification]` section to the phase execution artifact

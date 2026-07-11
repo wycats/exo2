@@ -2,7 +2,9 @@
 
 # RFC 77: Structured IO CLI
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0077: Structured IO CLI
 

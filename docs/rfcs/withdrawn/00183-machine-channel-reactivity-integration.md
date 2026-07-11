@@ -2,6 +2,9 @@
 
 # RFC 183: Machine Channel Reactivity Integration
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # **Withdrawn**: Consolidated into RFC 00188 (Derived Roots & Reactive Caches)
 

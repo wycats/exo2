@@ -2,6 +2,9 @@
 
 # RFC 161: Code-Based MCP Runner
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0161: Code-Based MCP Runner
 

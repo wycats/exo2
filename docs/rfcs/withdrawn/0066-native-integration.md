@@ -2,7 +2,9 @@
 
 # RFC 66: Native Integration
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0066: Native Integration
 

@@ -2,14 +2,15 @@
 
 # RFC 116: Feedback System
 
-
+- **Status**: Archived
+- **Stage**: 4
+- **Reason**:
 
 # RFC 0116: Feedback System
 
 - **Superseded by**: RFC 0124
 
 
-**Status**: Draft
 **Phase**: 22.5
 
 ## 1. Overview

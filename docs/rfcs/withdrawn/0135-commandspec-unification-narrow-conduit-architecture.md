@@ -2,6 +2,9 @@
 
 # RFC 135: CommandSpec Unification (Narrow Conduit Architecture)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
 
 # RFC 0135: CommandSpec Unification (Narrow Conduit Architecture)
 

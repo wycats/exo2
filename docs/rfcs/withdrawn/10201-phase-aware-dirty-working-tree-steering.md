@@ -2,6 +2,10 @@
 
 # RFC 10201: Phase-Aware Dirty Working Tree Steering
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
+
 - **Superseded by**: RFC 0117
 
 ## Summary

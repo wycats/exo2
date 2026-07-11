@@ -3,6 +3,10 @@
 
 # RFC 10125: Reactive Architecture for VS Code Extensions
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 This RFC codifies the architectural patterns discovered during the implementation of the "Reactive VS Code Bindings" (Phase 43). It establishes a standard approach for bridging VS Code's imperative, event-driven API (Push) to Svelte 5's reactive signals (Pull).

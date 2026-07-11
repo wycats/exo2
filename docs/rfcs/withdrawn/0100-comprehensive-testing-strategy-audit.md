@@ -2,6 +2,9 @@
 
 # RFC 100: Comprehensive Testing Strategy & Audit
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0100: Comprehensive Testing Strategy & Audit
 

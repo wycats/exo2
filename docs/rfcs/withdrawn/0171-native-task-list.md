@@ -2,6 +2,9 @@
 
 # RFC 171: Native Task List Integration
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0171: Native Task List Integration
 

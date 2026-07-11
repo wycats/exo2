@@ -3,6 +3,10 @@
 
 # RFC 10052: Exohook: File Expansion Worked Examples
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 We want validation to be a first-class product surface, not a pile of scripts.

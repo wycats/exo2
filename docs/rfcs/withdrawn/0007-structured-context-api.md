@@ -2,6 +2,9 @@
 
 # RFC 7: Structured Context API
 
+- **Status**: Withdrawn
+- **Stage**: 4
+- **Reason**:
 
 # RFC 0007: Structured Context API
 

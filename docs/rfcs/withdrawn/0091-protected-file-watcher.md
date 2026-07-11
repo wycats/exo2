@@ -2,6 +2,7 @@
 
 # RFC 91: Protected File Watcher with Revert and Notice System
 
+- **Stage**: 0
 
 > **Status**: Withdrawn  
 > **Reason**: Superseded by RFC 0111: Agent Guidance Architecture  

@@ -2,6 +2,9 @@
 
 # RFC 5: Rich Context Editors
 
+- **Status**: Withdrawn
+- **Stage**: 4
+- **Reason**:
 
 # RFC 0005: Rich Context Editors
 

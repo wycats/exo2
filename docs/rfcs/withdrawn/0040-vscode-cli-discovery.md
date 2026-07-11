@@ -2,5 +2,8 @@
 
 # RFC 40: RFC 40
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 - **Superseded by**: RFC 0080

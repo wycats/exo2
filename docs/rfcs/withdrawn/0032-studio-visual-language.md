@@ -2,6 +2,9 @@
 
 # RFC 32: Studio Visual Language (SVL)
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0032: Studio Visual Language (SVL)
 
