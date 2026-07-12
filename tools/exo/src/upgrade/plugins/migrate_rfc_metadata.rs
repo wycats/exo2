@@ -262,14 +262,16 @@ fn document_matches_canonical(
     relative_path: &str,
 ) -> bool {
     let relative_path = relative_path.replace('\\', "/");
-    let in_worktree = Command::new("git")
+    let Ok(worktree_probe) = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
         .output()
-        .is_ok_and(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
-        });
-    if !in_worktree {
+    else {
+        return false;
+    };
+    if !worktree_probe.status.success()
+        || String::from_utf8_lossy(&worktree_probe.stdout).trim() != "true"
+    {
         return true;
     }
 
