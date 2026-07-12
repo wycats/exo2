@@ -256,23 +256,41 @@ fn historical_stage_for_path(stages: &HashMap<String, u8>, path: &str) -> Option
     stages.get(&path.replace('\\', "/")).copied()
 }
 
-fn document_matches_canonical(
-    root: &Path,
-    canonical_oid: Option<&str>,
-    relative_path: &str,
-) -> bool {
-    let relative_path = relative_path.replace('\\', "/");
+#[derive(Clone, Copy)]
+enum GitWorktreeMode {
+    Worktree,
+    WorkspaceFallback,
+    Unavailable,
+}
+
+fn git_worktree_mode(root: &Path) -> GitWorktreeMode {
     let Ok(worktree_probe) = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
         .output()
     else {
-        return false;
+        return GitWorktreeMode::Unavailable;
     };
-    if !worktree_probe.status.success()
-        || String::from_utf8_lossy(&worktree_probe.stdout).trim() != "true"
+    if worktree_probe.status.success()
+        && String::from_utf8_lossy(&worktree_probe.stdout).trim() == "true"
     {
-        return true;
+        GitWorktreeMode::Worktree
+    } else {
+        GitWorktreeMode::WorkspaceFallback
+    }
+}
+
+fn document_matches_canonical(
+    root: &Path,
+    worktree_mode: GitWorktreeMode,
+    canonical_oid: Option<&str>,
+    relative_path: &str,
+) -> bool {
+    let relative_path = relative_path.replace('\\', "/");
+    match worktree_mode {
+        GitWorktreeMode::WorkspaceFallback => return true,
+        GitWorktreeMode::Unavailable => return false,
+        GitWorktreeMode::Worktree => {}
     }
 
     let Some(canonical_oid) = canonical_oid else {
@@ -383,6 +401,9 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .then(|| crate::rfc::canonical_rfc_commit_oid(&context.root))
                 .transpose()?
                 .flatten();
+            let worktree_mode = needs_canonical_reason_check
+                .then(|| git_worktree_mode(&context.root))
+                .unwrap_or(GitWorktreeMode::Unavailable);
             files
                 .iter()
                 .filter_map(|path| {
@@ -412,6 +433,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                             .is_some_and(|relative| {
                                 document_matches_canonical(
                                     &context.root,
+                                    worktree_mode,
                                     canonical_oid.as_deref(),
                                     relative,
                                 )
@@ -473,6 +495,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
         let writer = SqliteWriter::open(&db_path)?;
         let historical_stages = historical_retired_stages(&context.root);
         let canonical_oid = crate::rfc::canonical_rfc_commit_oid(&context.root)?;
+        let worktree_mode = git_worktree_mode(&context.root);
         let mut changes = Vec::new();
         let mut seen_ulids: HashSet<String> = HashSet::new();
         let mut materialized_anchor = false;
@@ -508,8 +531,12 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let document_matched_head =
-                document_matches_canonical(&context.root, canonical_oid.as_deref(), &rel_path);
+            let document_matched_head = document_matches_canonical(
+                &context.root,
+                worktree_mode,
+                canonical_oid.as_deref(),
+                &rel_path,
+            );
             let frontmatter = (!already_anchored).then(|| parse_frontmatter(&file_content));
             let frontmatter_stage = frontmatter
                 .as_ref()
@@ -808,6 +835,7 @@ mod tests {
         let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
         assert!(!document_matches_canonical(
             root,
+            git_worktree_mode(root),
             canonical_oid.as_deref(),
             relative_path
         ));
@@ -841,6 +869,7 @@ mod tests {
         let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
         assert!(document_matches_canonical(
             root,
+            git_worktree_mode(root),
             canonical_oid.as_deref(),
             r"docs\rfcs\withdrawn\00001-retired.md"
         ));
@@ -856,6 +885,7 @@ mod tests {
 
         assert!(!document_matches_canonical(
             root,
+            git_worktree_mode(root),
             canonical_oid.as_deref(),
             relative_path
         ));
@@ -874,7 +904,12 @@ mod tests {
                 .success()
         );
 
-        assert!(document_matches_canonical(root, None, "docs/rfcs/00001.md"));
+        assert!(document_matches_canonical(
+            root,
+            git_worktree_mode(root),
+            None,
+            "docs/rfcs/00001.md"
+        ));
     }
 
     #[test]
