@@ -1773,7 +1773,8 @@ pub fn load_effective_rfcs(
 /// Public RFC read commands use this entry point so a valid canonical document
 /// can relink missing shared metadata before the response is composed. Internal
 /// derived-state callers can continue using [`load_effective_rfcs`] when they
-/// need the established read-only composition contract.
+/// need workspace observations refreshed without reconciling shared canonical
+/// metadata.
 #[allow(clippy::missing_errors_doc)]
 pub fn observe_effective_rfcs(
     root: &Path,
