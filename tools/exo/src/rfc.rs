@@ -3712,11 +3712,10 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
     let original_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let source_retired_status = file_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .filter(|name| matches!(*name, "withdrawn" | "archive"));
+    let source_retired_status = match parse_status(&file_path) {
+        status @ ("withdrawn" | "archived") => Some(status),
+        _ => None,
+    };
     let original_stage = if source_retired_status.is_some() {
         retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
     } else {
@@ -3792,11 +3791,10 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
     let original_content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let source_retired_status = file_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .filter(|name| matches!(*name, "withdrawn" | "archive"));
+    let source_retired_status = match parse_status(&file_path) {
+        status @ ("withdrawn" | "archived") => Some(status),
+        _ => None,
+    };
     let original_stage = if source_retired_status.is_some() {
         retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
     } else {
