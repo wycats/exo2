@@ -2,6 +2,9 @@
 
 # RFC 28: Studio UX Polish
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0028: Studio UX Polish
 

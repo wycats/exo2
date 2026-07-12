@@ -2,6 +2,9 @@
 
 # RFC 10199: Implicit Walkthrough via Task Logs
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 10199: Implicit Walkthrough via Task Logs
 

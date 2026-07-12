@@ -2,6 +2,9 @@
 
 # RFC 134: Structured IO (The Surgeon)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
 
 # RFC 0134: Structured IO (The Surgeon)
 

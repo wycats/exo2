@@ -2,6 +2,8 @@
 
 # RFC 124: Inbox System: Async Intent Channel
 
+- **Status**: Archived
+- **Reason**:
 
 # RFC 0124: Inbox System (Async Intent Channel)
 
@@ -13,7 +15,6 @@
 | **ID**         | 0124                                     |
 | **Title**      | Inbox System (Async Intent Channel)      |
 | **Stage**      | 3 (Candidate)                            |
-| **Status**     | Active                                   |
 | **Created**    | 2025-01-22                               |
 | **Updated**    | 2026-02-19                               |
 | **Author**     | Exosuit Team                             |

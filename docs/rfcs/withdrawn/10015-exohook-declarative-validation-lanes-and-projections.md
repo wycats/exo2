@@ -2,9 +2,9 @@
 
 # RFC 10015: Exohook: Declarative Validation Lanes and Projections
 
-
-
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 10015: Exohook: Declarative Validation Lanes and Projections
 

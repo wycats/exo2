@@ -2,6 +2,9 @@
 
 # RFC 129: Configurable TDD Runners
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**: The configurable TDD runner surface was never implemented in the current Exo command architecture. Future runner work should start as a fresh Stage 0/1 RFC grounded in current command-spec, workflow, and runner evidence.
 
 # RFC 0129: Configurable TDD Runners
 

@@ -3,6 +3,10 @@
 
 # RFC 10119: The Standard Bootstrap
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 This RFC defines the "Standard Bootstrap" state for all Exosuit projects and mandates that the `exo` CLI (specifically `exo init` and `exo update`) be the sole source of truth for establishing this state.

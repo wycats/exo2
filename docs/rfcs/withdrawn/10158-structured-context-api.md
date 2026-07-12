@@ -3,6 +3,10 @@
 
 # RFC 10158: Structured Context API
 
+- **Status**: Withdrawn
+- **Stage**: 4
+- **Reason**:
+
 ## Summary
 
 Define `exosuit-core` as a library for managing Agent Context as a structured database ("Markdown ORM").

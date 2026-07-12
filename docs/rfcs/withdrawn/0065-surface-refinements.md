@@ -2,7 +2,9 @@
 
 # RFC 65: Surface Refinements
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0065: Surface Refinements
 

@@ -3,6 +3,10 @@
 
 # RFC 10144: Reactive Bridge Protocol
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Summary
 
 Defines a standard protocol for synchronizing reactive state between the VS Code Extension Host (Svelte 5 Runes) and Webviews (Svelte 5 Stores/Runes) using a `Bridge` pattern.

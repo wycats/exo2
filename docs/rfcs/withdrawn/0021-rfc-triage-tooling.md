@@ -2,6 +2,9 @@
 
 # RFC 21: RFC Triage Tooling (The Gardener)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**: Stage 3 candidate describes exo rfc triage, which is not implemented in the current rfc command surface; preserve the review-report idea for a future RFC.
 
 # RFC: RFC Triage Tooling (The Gardener)
 

@@ -2,7 +2,9 @@
 
 # RFC 78: E2E Holodeck
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0078: E2E Holodeck
 

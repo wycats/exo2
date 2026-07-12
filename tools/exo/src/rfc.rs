@@ -709,6 +709,16 @@ fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
     Ok(CanonicalReconcileSource::PreserveShared)
 }
 
+pub(crate) fn canonical_rfc_commit_oid(root: &Path) -> Result<Option<String>> {
+    match canonical_reconcile_source(root)? {
+        CanonicalReconcileSource::Canonical(canonical) => Ok(Some(canonical.oid)),
+        CanonicalReconcileSource::WorkspaceFallback => {
+            Ok(resolve_canonical_ref(root, "HEAD")?.map(|canonical| canonical.oid))
+        }
+        CanonicalReconcileSource::PreserveShared => Ok(None),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static CANONICAL_SOURCE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3386,6 +3396,240 @@ fn update_declared_stage_marker(content: &str, stage: u8) -> String {
     out
 }
 
+fn format_rfc_metadata_marker(label: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("- **{label}**:")
+    } else {
+        format!("- **{label}**: {value}")
+    }
+}
+
+fn metadata_marker_is_replaced(line: &str, label: &str) -> bool {
+    let labels = if label == "Reason" {
+        &["Reason", "Withdrawal reason", "Archived reason"][..]
+    } else {
+        std::slice::from_ref(&label)
+    };
+    labels
+        .iter()
+        .any(|candidate| declared_metadata_value(line, candidate).declared)
+}
+
+fn upsert_rfc_metadata_markers(content: &str, markers: &[(&str, String)]) -> String {
+    if markers.is_empty() {
+        return content.to_string();
+    }
+
+    let mut rendered = String::new();
+    let mut inserted = false;
+    let mut skip_original_spacing = false;
+    let mut saw_h1 = false;
+    let mut in_fence = false;
+    let mut in_preamble = true;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !saw_h1 {
+            saw_h1 = line.starts_with("# ");
+            rendered.push_str(line);
+            rendered.push('\n');
+            if saw_h1 {
+                rendered.push('\n');
+                for (label, value) in markers {
+                    rendered.push_str(&format_rfc_metadata_marker(label, value));
+                    rendered.push('\n');
+                }
+                rendered.push('\n');
+                inserted = true;
+                skip_original_spacing = true;
+            }
+            continue;
+        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && trimmed.starts_with("## ") {
+            in_preamble = false;
+        }
+
+        if in_preamble
+            && !in_fence
+            && markers
+                .iter()
+                .any(|(label, _)| metadata_marker_is_replaced(line, label))
+        {
+            continue;
+        }
+
+        if skip_original_spacing && line.trim().is_empty() {
+            continue;
+        }
+        skip_original_spacing = false;
+
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+
+    if !inserted {
+        let mut prefixed = String::new();
+        let (leading_anchor, remaining_content) = content
+            .strip_prefix("<!-- exo:")
+            .and_then(|suffix| suffix.split_once('\n'))
+            .map_or((None, content), |(anchor_suffix, remaining)| {
+                (Some(format!("<!-- exo:{anchor_suffix}")), remaining)
+            });
+        if let Some(anchor) = leading_anchor {
+            prefixed.push_str(&anchor);
+            prefixed.push_str("\n\n");
+            if let Some(number) = extract_anchor_rfc_number(content) {
+                prefixed.push_str(&format!("# RFC {number}: RFC {number}\n\n"));
+            }
+        }
+        for (label, value) in markers {
+            prefixed.push_str(&format_rfc_metadata_marker(label, value));
+            prefixed.push('\n');
+        }
+        prefixed.push('\n');
+        prefixed.push_str(remaining_content.trim_start_matches('\n'));
+        return prefixed;
+    }
+
+    rendered
+}
+
+pub(crate) fn materialize_rfc_lifecycle_metadata_content(
+    content: &str,
+    status: &str,
+    stage: u8,
+    reason: Option<&str>,
+) -> String {
+    upsert_rfc_metadata_markers(
+        content,
+        &[
+            ("Status", status.to_string()),
+            ("Stage", stage.to_string()),
+            ("Reason", reason.unwrap_or_default().to_string()),
+        ],
+    )
+}
+
+pub(crate) fn backfill_rfc_lifecycle_metadata_content(
+    content: &str,
+    status: &str,
+    stage: u8,
+    reason: Option<&str>,
+) -> String {
+    let metadata = rfc_metadata_preamble(content);
+    let mut markers = Vec::new();
+
+    let specific_reason_label = if status.eq_ignore_ascii_case("Withdrawn") {
+        "Withdrawal reason"
+    } else {
+        "Archived reason"
+    };
+    let specific_reason = declared_metadata_value(&metadata, specific_reason_label);
+    let generic_reason = declared_metadata_value(&metadata, "Reason");
+    let available_reason = specific_reason
+        .value
+        .as_deref()
+        .or(generic_reason.value.as_deref())
+        .or(reason.filter(|value| !value.trim().is_empty()));
+    if let Some(value) = available_reason {
+        if specific_reason.declared && specific_reason.value.is_none() {
+            markers.push((specific_reason_label, value.to_string()));
+        }
+        if generic_reason.declared && generic_reason.value.is_none() {
+            markers.push(("Reason", value.to_string()));
+        }
+        if !specific_reason.declared && !generic_reason.declared {
+            markers.push(("Reason", value.to_string()));
+        }
+    } else if !specific_reason.declared && !generic_reason.declared {
+        markers.push(("Reason", String::new()));
+    }
+    if declared_metadata_value(&metadata, "Stage")
+        .value
+        .as_deref()
+        .and_then(parse_declared_stage)
+        .is_none()
+    {
+        markers.push(("Stage", stage.to_string()));
+    }
+    if declared_lifecycle_status(&metadata)
+        != Some(if status.eq_ignore_ascii_case("Withdrawn") {
+            "withdrawn"
+        } else {
+            "archived"
+        })
+    {
+        markers.push(("Status", status.to_string()));
+    }
+
+    markers.sort_by_key(|(label, _)| match *label {
+        "Status" => 0,
+        "Stage" => 1,
+        _ => 2,
+    });
+    upsert_rfc_metadata_markers(content, &markers)
+}
+
+pub(crate) fn retired_rfc_lifecycle_metadata_is_portable(content: &str, status: &str) -> bool {
+    if !matches!(status, "withdrawn" | "archived") {
+        return true;
+    }
+
+    let metadata = rfc_metadata_preamble(content);
+    declared_lifecycle_status(&metadata) == Some(status)
+        && declared_metadata_value(&metadata, "Stage")
+            .value
+            .as_deref()
+            .and_then(parse_declared_stage)
+            .is_some()
+        && first_declared_value(
+            declared_metadata_value(
+                &metadata,
+                if status == "withdrawn" {
+                    "Withdrawal reason"
+                } else {
+                    "Archived reason"
+                },
+            ),
+            Some(declared_metadata_value(&metadata, "Reason")),
+        )
+        .declared
+}
+
+pub(crate) fn retired_rfc_reason_from_document(content: &str, status: &str) -> Option<String> {
+    let metadata = rfc_metadata_preamble(content);
+    declared_metadata_value(
+        &metadata,
+        if status == "withdrawn" {
+            "Withdrawal reason"
+        } else {
+            "Archived reason"
+        },
+    )
+    .value
+    .or_else(|| declared_metadata_value(&metadata, "Reason").value)
+}
+
+fn write_rfc_lifecycle_metadata(
+    file_path: &Path,
+    status: &str,
+    stage: u8,
+    reason: Option<&str>,
+) -> Result<()> {
+    utils::edit_cli_managed_file(file_path, move |content| {
+        Ok(materialize_rfc_lifecycle_metadata_content(
+            content, status, stage, reason,
+        ))
+    })
+    .with_context(|| {
+        format!(
+            "Failed to write lifecycle metadata to {}",
+            file_path.display()
+        )
+    })
+}
+
 /// Promotes an RFC to the next stage.
 ///
 /// # Errors
@@ -3476,7 +3720,21 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
     let file_path = find_rfc_file(rfc_root, id)?;
     let workspace_root = workspace_root_from_rfc_root(path)?;
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
-    let original_stage = parse_stage(&file_path);
+    let original_content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    let source_retired_status = match parse_status(&file_path) {
+        status @ ("withdrawn" | "archived") => Some(status),
+        _ => None,
+    };
+    let original_stage = if source_retired_status.is_some() {
+        retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
+    } else {
+        parse_stage(&file_path)
+    };
+    let lifecycle_reason = reason.map(str::to_string).or_else(|| {
+        source_retired_status
+            .and_then(|status| retired_rfc_reason_from_document(&original_content, status))
+    });
 
     let withdrawn_dir = rfc_root.join("withdrawn");
     if !withdrawn_dir.exists() {
@@ -3491,22 +3749,35 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
     let new_path = withdrawn_dir.join(&filename);
 
     // Use git mv to preserve history
-    let status = std::process::Command::new("git")
-        .args(["mv", "--force"])
-        .arg(&file_path)
-        .arg(&new_path)
-        .current_dir(path)
-        .status();
+    if new_path != file_path {
+        let status = std::process::Command::new("git")
+            .args(["mv", "--force"])
+            .arg(&file_path)
+            .arg(&new_path)
+            .current_dir(path)
+            .status();
 
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            // Fallback to manual move if git mv fails
-            std::fs::rename(&file_path, &new_path)?;
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                // Fallback to manual move if git mv fails
+                std::fs::rename(&file_path, &new_path)?;
+            }
         }
     }
 
-    sync_rfc_withdrawal(workspace_root, &new_path, original_stage, reason)?;
+    write_rfc_lifecycle_metadata(
+        &new_path,
+        "Withdrawn",
+        original_stage,
+        lifecycle_reason.as_deref(),
+    )?;
+    sync_rfc_withdrawal(
+        workspace_root,
+        &new_path,
+        original_stage,
+        lifecycle_reason.as_deref(),
+    )?;
 
     Ok(new_path)
 }
@@ -3528,7 +3799,21 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
     let file_path = find_rfc_file(rfc_root, id)?;
     let workspace_root = workspace_root_from_rfc_root(path)?;
     ensure_no_rfc_identity_repair_debt(workspace_root, &file_path)?;
-    let original_stage = parse_stage(&file_path);
+    let original_content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    let source_retired_status = match parse_status(&file_path) {
+        status @ ("withdrawn" | "archived") => Some(status),
+        _ => None,
+    };
+    let original_stage = if source_retired_status.is_some() {
+        retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
+    } else {
+        parse_stage(&file_path)
+    };
+    let lifecycle_reason = reason.map(str::to_string).or_else(|| {
+        source_retired_status
+            .and_then(|status| retired_rfc_reason_from_document(&original_content, status))
+    });
 
     let archive_dir = rfc_root.join("archive");
     if !archive_dir.exists() {
@@ -3543,22 +3828,35 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
     let new_path = archive_dir.join(&filename);
 
     // Use git mv to preserve history
-    let status = std::process::Command::new("git")
-        .args(["mv", "--force"])
-        .arg(&file_path)
-        .arg(&new_path)
-        .current_dir(path)
-        .status();
+    if new_path != file_path {
+        let status = std::process::Command::new("git")
+            .args(["mv", "--force"])
+            .arg(&file_path)
+            .arg(&new_path)
+            .current_dir(path)
+            .status();
 
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            // Fallback to manual move if git mv fails
-            std::fs::rename(&file_path, &new_path)?;
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                // Fallback to manual move if git mv fails
+                std::fs::rename(&file_path, &new_path)?;
+            }
         }
     }
 
-    sync_rfc_archive(workspace_root, &new_path, original_stage, reason)?;
+    write_rfc_lifecycle_metadata(
+        &new_path,
+        "Archived",
+        original_stage,
+        lifecycle_reason.as_deref(),
+    )?;
+    sync_rfc_archive(
+        workspace_root,
+        &new_path,
+        original_stage,
+        lifecycle_reason.as_deref(),
+    )?;
 
     Ok(new_path)
 }
@@ -3854,15 +4152,19 @@ fn parse_rfc_document(
     let declared_status = declared_lifecycle_status(&metadata);
     let lifecycle_status_conflicts = declared_status.is_some_and(|declared| declared != status);
     let lifecycle_status_declared = declared_status.is_some_and(|declared| declared == status);
-    let stage_marker = declared_metadata_value(&metadata, "Stage");
+    let stage_marker = declared_metadata_value_with_yaml(&metadata, content, "Stage", "stage");
     let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
     let invalid_stage_marker = stage_marker.declared && declared_stage.is_none();
+    let legacy_stage = (status != "active" && !stage_marker.declared)
+        .then(|| legacy_stage_from_status(&metadata))
+        .flatten();
+    let resolved_stage = declared_stage.or(legacy_stage);
     let path_stage = parse_stage(path);
     let stage_marker_conflicts = status == "active"
         && declared_stage.is_some_and(|declared_stage| declared_stage != path_stage);
     let stage = if status == "active" {
         path_stage
-    } else if let Some(stage) = declared_stage {
+    } else if let Some(stage) = resolved_stage {
         stage
     } else if let Some(existing) = existing {
         existing.stage
@@ -3877,7 +4179,7 @@ fn parse_rfc_document(
         "legacy"
     };
 
-    let feature = declared_metadata_value_with_yaml(&metadata, "Feature", "feature");
+    let feature = declared_metadata_value_with_yaml(&metadata, content, "Feature", "feature");
     let reason = declared_metadata_value(&metadata, "Reason");
     let withdrawal_reason = first_declared_value(
         declared_metadata_value(&metadata, "Withdrawal reason"),
@@ -3957,6 +4259,93 @@ fn parse_declared_stage(value: &str) -> Option<u8> {
         .find_map(|part| part.parse::<u8>().ok().filter(|stage| *stage <= 4))
 }
 
+fn legacy_stage_from_status(metadata: &str) -> Option<u8> {
+    let value = declared_metadata_value(metadata, "Status").value?;
+    let normalized = value.to_ascii_lowercase();
+    if let Some(stage) = normalized.match_indices("stage").find_map(|(index, _)| {
+        normalized[index + "stage".len()..]
+            .trim_start_matches(|ch: char| {
+                ch.is_ascii_whitespace() || matches!(ch, ':' | '=' | '-')
+            })
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .filter(|part| !part.is_empty())
+            .and_then(|part| part.parse::<u8>().ok())
+            .filter(|stage| *stage <= 4)
+    }) {
+        return Some(stage);
+    }
+
+    if has_positive_lifecycle_keyword(&normalized, "stable") {
+        Some(4)
+    } else if has_positive_lifecycle_keyword(&normalized, "candidate")
+        || has_positive_lifecycle_keyword(&normalized, "implemented")
+    {
+        Some(3)
+    } else if has_positive_lifecycle_keyword(&normalized, "draft") {
+        Some(2)
+    } else if has_positive_lifecycle_keyword(&normalized, "proposal")
+        || has_positive_lifecycle_keyword(&normalized, "accepted")
+    {
+        Some(1)
+    } else if has_positive_lifecycle_keyword(&normalized, "idea")
+        || has_positive_lifecycle_keyword(&normalized, "strawman")
+    {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn has_positive_lifecycle_keyword(value: &str, keyword: &str) -> bool {
+    let words = value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().enumerate().any(|(index, word)| {
+        *word == keyword
+            && !words[index.saturating_sub(2)..index]
+                .iter()
+                .any(|word| matches!(*word, "not" | "never" | "no"))
+    })
+}
+
+pub(crate) fn retired_rfc_stage_from_document(
+    content: &str,
+    historical_stage: Option<u8>,
+    fallback: u8,
+) -> u8 {
+    let metadata = rfc_metadata_preamble(content);
+    let stage_marker = declared_metadata_value(&metadata, "Stage");
+    let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
+    if stage_marker.declared {
+        return declared_stage.or(historical_stage).unwrap_or(fallback);
+    }
+
+    historical_stage
+        .or_else(|| {
+            declared_metadata_value_with_yaml(&metadata, content, "Stage", "stage")
+                .value
+                .as_deref()
+                .and_then(parse_declared_stage)
+        })
+        .or_else(|| legacy_stage_from_status(&metadata))
+        .unwrap_or(fallback)
+}
+
+fn retired_rfc_stage_for_mutation(root: &Path, file_path: &Path, content: &str) -> Result<u8> {
+    let stored_stage = extract_anchor_ulid(content)
+        .map(|text_id| load_rfc_record_by_text_id(root, &text_id))
+        .transpose()?
+        .flatten()
+        .map(|record| record.stage);
+    Ok(retired_rfc_stage_from_document(
+        content,
+        stored_stage,
+        parse_stage(file_path),
+    ))
+}
+
 fn declared_metadata_value(content: &str, label: &str) -> DeclaredRfcValue {
     for line in content.lines() {
         let line = normalize_relationship_line(line);
@@ -3984,15 +4373,20 @@ fn declared_metadata_value(content: &str, label: &str) -> DeclaredRfcValue {
 }
 
 fn declared_metadata_value_with_yaml(
+    metadata: &str,
     content: &str,
     label: &str,
     yaml_key: &str,
 ) -> DeclaredRfcValue {
-    let markdown = declared_metadata_value(content, label);
+    let markdown = declared_metadata_value(metadata, label);
     if markdown.declared {
         return markdown;
     }
-    for line in content.lines() {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return DeclaredRfcValue::absent();
+    }
+    for line in lines.take_while(|line| line.trim() != "---") {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -4414,11 +4808,12 @@ fn sync_rfc_withdrawal(
     sync_parsed_relationships(&mut record, &parsed, false);
     record.text_id = parsed.text_id;
     record.title = parsed.title;
-    record.stage = record.stage.max(stage);
-    record.status = "withdrawn".to_string();
+    record.stage = parsed.stage.max(stage);
+    record.status = parsed.status;
     record.slug = parsed.slug;
     record.file_path = parsed.file_path;
     record.withdrawal_reason = reason.map(std::string::ToString::to_string);
+    record.archived_reason = None;
 
     persist_rfc_record(root, &record)
 }
@@ -4440,10 +4835,11 @@ fn sync_rfc_archive(root: &Path, file_path: &Path, stage: u8, reason: Option<&st
     sync_parsed_relationships(&mut record, &parsed, false);
     record.text_id = parsed.text_id;
     record.title = parsed.title;
-    record.stage = record.stage.max(stage);
-    record.status = "archived".to_string();
+    record.stage = parsed.stage.max(stage);
+    record.status = parsed.status;
     record.slug = parsed.slug;
     record.file_path = parsed.file_path;
+    record.withdrawal_reason = None;
     record.archived_reason = reason.map(std::string::ToString::to_string);
 
     persist_rfc_record(root, &record)
@@ -4906,6 +5302,13 @@ feature: Core
         assert_eq!(rfc.stage, 2);
         assert_eq!(rfc.feature, "Core");
         assert_eq!(rfc.number, "0001");
+    }
+
+    #[test]
+    fn retired_stage_reads_top_level_yaml_frontmatter() {
+        let content = "---\nstage: 3\n---\n\n# RFC 1: Retired\n\nBody.\n";
+
+        assert_eq!(retired_rfc_stage_from_document(content, None, 0), 3);
     }
 
     #[test]
@@ -5875,6 +6278,54 @@ This RFC supersedes:
     }
 
     #[test]
+    fn canonical_parser_flags_invalid_stage_marker_even_with_legacy_stage_hint() {
+        let parsed = parse_rfc_document(
+            "docs/rfcs/withdrawn/00129-legacy.md",
+            "<!-- exo:129 ulid:01legacy -->\n\n# RFC 129: Legacy\n\n**Status**: Withdrawn (Draft)\n**Stage**: not-a-number\n**Reason**: Retired.\n\n## Summary\n\nHistorical.\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.disk.stage, 0);
+        assert!(parsed.canonical_metadata_conflict);
+        assert_eq!(
+            retired_rfc_stage_from_document(
+                "# RFC 129: Legacy\n\n**Status**: Withdrawn (Draft)\n**Stage**: not-a-number\n",
+                None,
+                4,
+            ),
+            4,
+            "an invalid declared Stage marker must not fall through to legacy status wording"
+        );
+    }
+
+    #[test]
+    fn legacy_status_stage_parsing_ignores_successor_rfc_numbers() {
+        assert_eq!(
+            legacy_stage_from_status(
+                "**Status**: Withdrawn (superseded by RFC 00003; formerly Stage 1 Proposal)"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (superseded by RFC 00003)"),
+            None
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (not implemented)"),
+            None
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (unstable experiment)"),
+            None
+        );
+        assert_eq!(
+            legacy_stage_from_status("**Status**: Withdrawn (not stable)"),
+            None
+        );
+    }
+
+    #[test]
     fn canonical_metadata_preserves_undeclared_values_and_clears_declared_empty_values() {
         let existing = RfcRecord {
             text_id: "01overlay".to_string(),
@@ -6354,7 +6805,7 @@ This RFC supersedes:
             .load_rfc_by_number(1)
             .unwrap()
             .expect("expected RFC 1 row");
-        assert_eq!(row.stage, 0);
+        assert_eq!(row.stage, 4);
         assert_eq!(row.status, "archived");
         assert_eq!(row.file_path, archived_rel);
         assert_eq!(row.superseded_by.as_deref(), Some("00002"));
@@ -6824,7 +7275,7 @@ This RFC supersedes:
     }
 
     #[test]
-    fn test_withdraw_updates_sqlite_without_modifying_file_content() {
+    fn test_withdraw_materializes_portable_lifecycle_metadata() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
 
@@ -6855,7 +7306,11 @@ This RFC supersedes:
             .unwrap();
 
         let new_path = withdraw(&root.join("docs/rfcs"), "00001", Some("obsolete")).unwrap();
-        assert_eq!(fs::read_to_string(&new_path).unwrap(), original);
+        let content = fs::read_to_string(&new_path).unwrap();
+        assert!(content.contains("- **Status**: Withdrawn"));
+        assert!(content.contains("- **Stage**: 2"));
+        assert!(content.contains("- **Reason**: obsolete"));
+        assert!(content.contains("Body"));
 
         let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
         let row = loader.load_rfc_by_number(1).unwrap().unwrap();
@@ -6863,10 +7318,83 @@ This RFC supersedes:
         assert_eq!(row.stage, 2);
         assert_eq!(row.withdrawal_reason.as_deref(), Some("obsolete"));
         assert_eq!(row.file_path, "docs/rfcs/withdrawn/00001-withdraw-me.md");
+
+        let repeated_path = withdraw(&root.join("docs/rfcs"), "00001", None).unwrap();
+        assert_eq!(repeated_path, new_path);
+        assert_eq!(fs::read_to_string(&repeated_path).unwrap(), content);
+        let repeated = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.stage, 2);
+        assert_eq!(repeated.withdrawal_reason.as_deref(), Some("obsolete"));
+
+        let stale_alias_content = content.replace(
+            "- **Reason**: obsolete",
+            "- **Withdrawal reason**: stale reason\n- **Reason**: obsolete",
+        );
+        fs::write(&repeated_path, stale_alias_content).unwrap();
+        withdraw(&root.join("docs/rfcs"), "00001", Some("updated reason")).unwrap();
+        let updated_content = fs::read_to_string(&repeated_path).unwrap();
+        assert!(updated_content.contains("- **Reason**: updated reason"));
+        assert!(!updated_content.contains("Withdrawal reason"));
+        assert!(!updated_content.contains("stale reason"));
+        let updated = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.withdrawal_reason.as_deref(), Some("updated reason"));
     }
 
     #[test]
-    fn test_archive_updates_sqlite_without_modifying_file_content() {
+    fn repeated_withdraw_preserves_stored_stage_for_legacy_retired_rfc() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        fs::create_dir_all(&rfc_dir).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01retired -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Reason**: Obsolete.\n\nBody\n",
+        )
+        .unwrap();
+        SqliteWriter::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .upsert_rfc(
+                "01retired",
+                1,
+                "Retired",
+                4,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Obsolete."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        withdraw(&root.join("docs/rfcs"), "00001", None).unwrap();
+
+        let content = fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.contains("- **Stage**: 4"));
+        let row = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.stage, 4);
+    }
+
+    #[test]
+    fn test_archive_materializes_portable_lifecycle_metadata() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
 
@@ -6902,7 +7430,11 @@ This RFC supersedes:
             Some("shipped and replaced"),
         )
         .unwrap();
-        assert_eq!(fs::read_to_string(&new_path).unwrap(), original);
+        let content = fs::read_to_string(&new_path).unwrap();
+        assert!(content.contains("- **Status**: Archived"));
+        assert!(content.contains("- **Stage**: 3"));
+        assert!(content.contains("- **Reason**: shipped and replaced"));
+        assert!(content.contains("Body"));
 
         let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
         let row = loader.load_rfc_by_number(1).unwrap().unwrap();
@@ -6910,6 +7442,133 @@ This RFC supersedes:
         assert_eq!(row.stage, 3);
         assert_eq!(row.archived_reason.as_deref(), Some("shipped and replaced"));
         assert_eq!(row.file_path, "docs/rfcs/archive/00001-archive-me.md");
+
+        let repeated_path = archive(&root.join("docs/rfcs"), "00001", None).unwrap();
+        assert_eq!(repeated_path, new_path);
+        assert_eq!(fs::read_to_string(&repeated_path).unwrap(), content);
+        let repeated = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.stage, 3);
+        assert_eq!(
+            repeated.archived_reason.as_deref(),
+            Some("shipped and replaced")
+        );
+
+        let withdrawn_dir = root.join("docs/rfcs/withdrawn");
+        fs::create_dir_all(&withdrawn_dir).unwrap();
+        let withdrawn_path = withdrawn_dir.join("00001-archive-me.md");
+        fs::rename(&repeated_path, &withdrawn_path).unwrap();
+        write_rfc_lifecycle_metadata(
+            &withdrawn_path,
+            "Withdrawn",
+            3,
+            Some("shipped and replaced"),
+        )
+        .unwrap();
+        sync_rfc_withdrawal(root, &withdrawn_path, 3, Some("shipped and replaced")).unwrap();
+        let corrected_path = archive(&root.join("docs/rfcs"), "00001", None).unwrap();
+        assert_eq!(corrected_path, new_path);
+        let corrected_content = fs::read_to_string(&corrected_path).unwrap();
+        assert!(corrected_content.contains("- **Status**: Archived"));
+        assert!(corrected_content.contains("- **Stage**: 3"));
+        assert!(corrected_content.contains("- **Reason**: shipped and replaced"));
+        let corrected = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(corrected.stage, 3);
+        assert_eq!(
+            corrected.archived_reason.as_deref(),
+            Some("shipped and replaced")
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_materialization_is_preamble_scoped_and_idempotent() {
+        let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Active\n\n## Example\n\n```markdown\n- **Status**: Example\n- **Stage**: 4\n- **Reason**: Example only\n```\n";
+
+        let once = materialize_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+        let twice = materialize_rfc_lifecycle_metadata_content(&once, "Withdrawn", 1, None);
+
+        assert_eq!(once, twice);
+        assert!(once.contains("- **Status**: Withdrawn"));
+        assert!(once.contains("- **Stage**: 1"));
+        assert!(once.contains("- **Reason**:\n"));
+        assert!(once.contains("- **Status**: Example"));
+        assert!(once.contains("- **Stage**: 4"));
+        assert!(once.contains("- **Reason**: Example only"));
+        assert!(retired_rfc_lifecycle_metadata_is_portable(
+            &once,
+            "withdrawn"
+        ));
+    }
+
+    #[test]
+    fn lifecycle_metadata_materialization_preserves_leading_anchor_without_h1() {
+        let original = "<!-- exo:129 ulid:01runner -->\n\nHistorical body.\n";
+        let updated = materialize_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+
+        assert!(updated.starts_with("<!-- exo:129 ulid:01runner -->\n"));
+        assert!(updated.contains("# RFC 129: RFC 129"));
+        assert!(updated.contains("- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**:"));
+        assert_eq!(updated.matches("<!-- exo:").count(), 1);
+        assert_eq!(
+            updated,
+            materialize_rfc_lifecycle_metadata_content(&updated, "Withdrawn", 1, None)
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_fills_empty_reason_from_shared_evidence() {
+        let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Withdrawal reason**:\n\nBody.\n";
+
+        let updated = backfill_rfc_lifecycle_metadata_content(
+            original,
+            "Withdrawn",
+            1,
+            Some("The proposal was replaced."),
+        );
+
+        assert!(updated.contains("- **Withdrawal reason**: The proposal was replaced."));
+        assert!(!updated.contains("- **Withdrawal reason**:\n"));
+        assert_eq!(
+            updated,
+            backfill_rfc_lifecycle_metadata_content(
+                &updated,
+                "Withdrawn",
+                1,
+                Some("The proposal was replaced."),
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_preserves_intentional_empty_reason() {
+        let original = "<!-- exo:1 ulid:01archive -->\n\n# RFC 1: Archive Me\n\n- **Status**: Archived\n- **Stage**: 4\n- **Reason**:\n\nBody.\n";
+
+        assert_eq!(
+            original,
+            backfill_rfc_lifecycle_metadata_content(original, "Archived", 4, None)
+        );
+    }
+
+    #[test]
+    fn lifecycle_metadata_backfill_aligns_empty_reason_aliases() {
+        let original = "<!-- exo:1 ulid:01withdraw -->\n\n# RFC 1: Withdraw Me\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Withdrawal reason**:\n- **Reason**: The proposal was replaced.\n\nBody.\n";
+
+        let updated = backfill_rfc_lifecycle_metadata_content(original, "Withdrawn", 1, None);
+
+        assert_eq!(
+            retired_rfc_reason_from_document(original, "withdrawn").as_deref(),
+            Some("The proposal was replaced.")
+        );
+
+        assert!(updated.contains("- **Withdrawal reason**: The proposal was replaced."));
+        assert!(updated.contains("- **Reason**: The proposal was replaced."));
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 # RFC 54: The Context Inbox (Pull-Based Attention)
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0054: The Context Inbox
 

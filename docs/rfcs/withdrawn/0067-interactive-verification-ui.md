@@ -2,7 +2,9 @@
 
 # RFC 67: Interactive Verification UI
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0067: Interactive Verification UI
 

@@ -2,10 +2,12 @@
 
 # RFC 159: The `ai` Subcommand Pattern
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0159: The `ai` Subcommand Pattern
 
-**Status**: Stage 0 (Draft)
 **Context**: Tooling / DX
 **Created**: 2025-12-05
 

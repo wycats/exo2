@@ -2,6 +2,9 @@
 
 # RFC 52: The Agent Quality Loop
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0052: The Agent Quality Loop
 

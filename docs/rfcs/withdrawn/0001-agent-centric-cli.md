@@ -2,6 +2,9 @@
 
 # RFC 1: Agent-Centric CLI Design (The Conversationalist)
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0001: Agent-Centric CLI Design (The Conversationalist)
 

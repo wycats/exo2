@@ -2,6 +2,9 @@
 
 # RFC 150: Modes and Persona System Unification
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0150: Modes and Persona System Unification
 

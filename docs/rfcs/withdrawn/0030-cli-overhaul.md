@@ -2,7 +2,9 @@
 
 # RFC 30: CLI Overhaul & Alignment
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0030: CLI Overhaul & Alignment
 

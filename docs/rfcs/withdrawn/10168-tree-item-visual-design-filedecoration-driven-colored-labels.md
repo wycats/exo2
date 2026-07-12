@@ -3,5 +3,8 @@
 
 # RFC 10168: Tree Item Visual Design: FileDecoration-Driven Colored Labels
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
 
 Write your RFC content here.

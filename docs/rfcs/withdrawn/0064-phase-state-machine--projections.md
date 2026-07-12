@@ -2,6 +2,9 @@
 
 # RFC 64: Phase State Machine & Projections
 
+- **Status**: Withdrawn
+- **Stage**: 2
+- **Reason**:
 
 # RFC 0064: Phase State Machine & Projections
 

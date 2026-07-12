@@ -3,6 +3,10 @@
 
 # RFC 10028: Phase State Machine & Projections
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Withdrawn by RFC 10180 storage disposition: file-backed phase context, docs/agent-context/current artifacts, and docs/agent-context/archive phase snapshots are retired.
+
 ## Summary
 
 This RFC defines the canonical workflow model for Exosuit projects as a **phase-centric state machine** with explicit, deterministic steering for “where are we at?”. It also defines the **canonical vs projection** boundary: projection artifacts (notably `task-list.toml` and `walkthrough.toml`) are workflow-inconsistent and must trigger an **upgrade gate**.

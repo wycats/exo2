@@ -2,6 +2,8 @@
 
 # RFC 82: Exosuit VS Code Tool: Single Entry Point + Signed Capability Tickets + Steering-First Errors
 
+- **Stage**: 0
+- **Reason**:
 
 > **Status**: Withdrawn (superseded by RFC 0122)
 >

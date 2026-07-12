@@ -2,6 +2,9 @@
 
 # RFC 9: Dynamic Planning
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 ---
 status: provisional

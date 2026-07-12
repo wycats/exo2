@@ -2,6 +2,9 @@
 
 # RFC 10198: Walkthrough Workflow
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # Walkthrough Editor Workflow
 

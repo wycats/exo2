@@ -3,6 +3,10 @@
 
 # RFC 10120: Implementation Plan as Canonical Execution Artifact
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
+
 ## Summary
 
 Make `docs/agent-context/current/implementation-plan.toml` the canonical execution artifact for an active phase.

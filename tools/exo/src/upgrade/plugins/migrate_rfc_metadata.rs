@@ -9,12 +9,15 @@
 use crate::ExoResult;
 use crate::context::{AgentContext, SqliteWriter};
 use crate::rfc::{
-    extract_anchor_ulid, extract_h1_title, extract_rfc_relationships, has_anchor, parse_rfc_number,
-    parse_slug, parse_stage, parse_status, strip_frontmatter,
+    backfill_rfc_lifecycle_metadata_content, extract_anchor_ulid, extract_h1_title,
+    extract_rfc_relationships, has_anchor, parse_rfc_number, parse_slug, parse_stage, parse_status,
+    retired_rfc_lifecycle_metadata_is_portable, retired_rfc_reason_from_document,
+    retired_rfc_stage_from_document, strip_frontmatter,
 };
 use crate::upgrade::{Severity, UpgradePlugin, UpgradeReport, UpgradeStatus};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::WalkDir;
 
 const RFCS_DIR: &str = "docs/rfcs";
@@ -164,6 +167,152 @@ fn find_rfc_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
+    let retained_history_ref = "refs/remotes/private-history/HEAD";
+    let history_refs = [retained_history_ref, "HEAD"]
+        .into_iter()
+        .filter(|history_ref| {
+            Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", history_ref])
+                .current_dir(root)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .collect::<Vec<_>>();
+    if history_refs.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut command = Command::new("git");
+    command.arg("log").args(history_refs).args([
+        "--find-renames",
+        "--name-status",
+        "--format=",
+        "--diff-filter=R",
+        "--",
+        RFCS_DIR,
+    ]);
+    let Ok(output) = command.current_dir(root).output() else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    let mut stages = HashMap::new();
+    let mut retired_renames = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\t');
+        let Some(change) = fields.next() else {
+            continue;
+        };
+        let Some(source) = fields.next() else {
+            continue;
+        };
+        let Some(destination) = fields.next() else {
+            continue;
+        };
+        let source = source.replace('\\', "/");
+        let destination = destination.replace('\\', "/");
+        if !change.starts_with('R')
+            || !(destination.starts_with("docs/rfcs/withdrawn/")
+                || destination.starts_with("docs/rfcs/archive/"))
+        {
+            continue;
+        }
+        if let Some(stage) = source
+            .strip_prefix("docs/rfcs/stage-")
+            .and_then(|path| path.split('/').next())
+            .and_then(|stage| stage.parse::<u8>().ok())
+            .filter(|stage| *stage <= 4)
+        {
+            stages.entry(destination).or_insert(stage);
+        } else if source.starts_with("docs/rfcs/withdrawn/")
+            || source.starts_with("docs/rfcs/archive/")
+        {
+            retired_renames.push((source, destination));
+        }
+    }
+
+    for _ in 0..retired_renames.len() {
+        let mut changed = false;
+        for (source, destination) in &retired_renames {
+            if let Some(stage) = stages.get(source).copied()
+                && !stages.contains_key(destination)
+            {
+                stages.insert(destination.clone(), stage);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    stages
+}
+
+fn historical_stage_for_path(stages: &HashMap<String, u8>, path: &str) -> Option<u8> {
+    stages.get(&path.replace('\\', "/")).copied()
+}
+
+#[derive(Clone, Copy)]
+enum GitWorktreeMode {
+    Worktree,
+    WorkspaceFallback,
+    Unavailable,
+}
+
+fn git_worktree_mode(root: &Path) -> GitWorktreeMode {
+    let Ok(worktree_probe) = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+    else {
+        return GitWorktreeMode::Unavailable;
+    };
+    if worktree_probe.status.success()
+        && String::from_utf8_lossy(&worktree_probe.stdout).trim() == "true"
+    {
+        GitWorktreeMode::Worktree
+    } else {
+        GitWorktreeMode::WorkspaceFallback
+    }
+}
+
+fn document_matches_canonical(
+    root: &Path,
+    worktree_mode: GitWorktreeMode,
+    canonical_oid: Option<&str>,
+    relative_path: &str,
+) -> bool {
+    let relative_path = relative_path.replace('\\', "/");
+    match worktree_mode {
+        GitWorktreeMode::WorkspaceFallback => return true,
+        GitWorktreeMode::Unavailable => return false,
+        GitWorktreeMode::Worktree => {}
+    }
+
+    let Some(canonical_oid) = canonical_oid else {
+        return false;
+    };
+    let canonical_path = format!("{canonical_oid}:{relative_path}");
+    let tracked = Command::new("git")
+        .args(["cat-file", "-e", &canonical_path])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !tracked {
+        return false;
+    }
+
+    Command::new("git")
+        .args(["diff", "--quiet", canonical_oid, "--", &relative_path])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 // ─── Plugin implementation ───────────────────────────────────────────
 
 impl UpgradePlugin for MigrateRfcMetadataPlugin {
@@ -221,15 +370,99 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             0
         };
 
+        let db_lifecycle_missing_from_disk = if db_path.exists() {
+            let rows = crate::context::SqliteLoader::open(&db_path)?
+                .load_rfcs()?
+                .into_iter()
+                .map(|record| (record.text_id.clone(), record))
+                .collect::<HashMap<_, _>>();
+            let needs_canonical_reason_check = files.iter().any(|path| {
+                let Some(content) = std::fs::read_to_string(path).ok() else {
+                    return false;
+                };
+                let Some(ulid) = extract_anchor_ulid(&content) else {
+                    return false;
+                };
+                let Some(record) = rows.get(&ulid) else {
+                    return false;
+                };
+                let status = parse_status(path);
+                let shared_reason = match status {
+                    "withdrawn" => record.withdrawal_reason.as_deref(),
+                    "archived" => record.archived_reason.as_deref(),
+                    _ => return false,
+                };
+                retired_rfc_reason_from_document(&content, status)
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    && shared_reason.is_none()
+            });
+            let canonical_oid = needs_canonical_reason_check
+                .then(|| crate::rfc::canonical_rfc_commit_oid(&context.root))
+                .transpose()?
+                .flatten();
+            let worktree_mode = needs_canonical_reason_check
+                .then(|| git_worktree_mode(&context.root))
+                .unwrap_or(GitWorktreeMode::Unavailable);
+            files
+                .iter()
+                .filter_map(|path| {
+                    let content = std::fs::read_to_string(path).ok()?;
+                    let ulid = extract_anchor_ulid(&content)?;
+                    let record = rows.get(&ulid)?;
+                    let status = parse_status(path);
+                    let portable_status = match status {
+                        "withdrawn" => "Withdrawn",
+                        "archived" => "Archived",
+                        _ => return None,
+                    };
+                    let reason = match status {
+                        "withdrawn" => record.withdrawal_reason.as_deref(),
+                        "archived" => record.archived_reason.as_deref(),
+                        _ => None,
+                    };
+                    let disk_reason = retired_rfc_reason_from_document(&content, status);
+                    let db_missing_disk_reason = disk_reason
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                        && reason.is_none()
+                        && path
+                            .strip_prefix(&context.root)
+                            .ok()
+                            .and_then(Path::to_str)
+                            .is_some_and(|relative| {
+                                document_matches_canonical(
+                                    &context.root,
+                                    worktree_mode,
+                                    canonical_oid.as_deref(),
+                                    relative,
+                                )
+                            });
+                    (!retired_rfc_lifecycle_metadata_is_portable(&content, status)
+                        || db_missing_disk_reason
+                        || backfill_rfc_lifecycle_metadata_content(
+                            &content,
+                            portable_status,
+                            record.stage,
+                            reason,
+                        ) != content)
+                        .then_some(())
+                })
+                .count()
+        } else {
+            0
+        };
+
         let total_needed = unanchored
             .max(db_missing)
-            .max(db_relationships_missing_from_disk);
+            .max(db_relationships_missing_from_disk)
+            .max(db_lifecycle_missing_from_disk);
 
         if total_needed == 0 {
             Ok(UpgradeStatus::NotNeeded)
         } else {
             Ok(UpgradeStatus::warning(format!(
-                "{total_needed} RFC(s) need metadata migration ({unanchored} unanchored, {db_missing} missing from DB, {db_relationships_missing_from_disk} DB relationship(s) missing from disk)"
+                "{total_needed} RFC(s) need metadata migration ({unanchored} unanchored, {db_missing} missing from DB, {db_relationships_missing_from_disk} DB relationship(s) missing from disk, {db_lifecycle_missing_from_disk} retired lifecycle record(s) missing from disk)"
             )))
         }
     }
@@ -260,8 +493,12 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             HashMap::new()
         };
         let writer = SqliteWriter::open(&db_path)?;
+        let historical_stages = historical_retired_stages(&context.root);
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(&context.root)?;
+        let worktree_mode = git_worktree_mode(&context.root);
         let mut changes = Vec::new();
         let mut seen_ulids: HashSet<String> = HashSet::new();
+        let mut materialized_anchor = false;
 
         for path in &files {
             let file_content = match std::fs::read_to_string(path) {
@@ -293,7 +530,19 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .strip_prefix(&context.root)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
+            let document_matched_head = document_matches_canonical(
+                &context.root,
+                worktree_mode,
+                canonical_oid.as_deref(),
+                &rel_path,
+            );
+            let frontmatter = (!already_anchored).then(|| parse_frontmatter(&file_content));
+            let frontmatter_stage = frontmatter
+                .as_ref()
+                .and_then(|data| fm_string(data, "stage"))
+                .and_then(|stage| stage.parse::<u8>().ok())
+                .filter(|stage| *stage <= 4);
 
             // Parse metadata: from anchor (if already migrated) or from frontmatter
             let (
@@ -336,25 +585,34 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                         "MATERIALIZED {filename}: relationship metadata from SQLite"
                     ));
                 }
-                withdrawal_reason = existing.and_then(|record| record.withdrawal_reason.clone());
-                archived_reason = existing.and_then(|record| record.archived_reason.clone());
+                let disk_reason = document_matched_head
+                    .then(|| retired_rfc_reason_from_document(&file_content, status))
+                    .flatten();
+                withdrawal_reason = (status == "withdrawn")
+                    .then(|| disk_reason.clone())
+                    .flatten()
+                    .or_else(|| existing.and_then(|record| record.withdrawal_reason.clone()));
+                archived_reason = (status == "archived")
+                    .then_some(disk_reason)
+                    .flatten()
+                    .or_else(|| existing.and_then(|record| record.archived_reason.clone()));
                 consolidated_into = existing.and_then(|record| record.consolidated_into.clone());
             } else {
                 // Parse YAML frontmatter for metadata
-                let fm_data = parse_frontmatter(&file_content);
-                let fm_title = fm_string(&fm_data, "title");
-                let fm_ulid = fm_string(&fm_data, "ulid").and_then(|value| canonical_ulid(&value));
-                feature = fm_string(&fm_data, "feature");
-                superseded_by = fm_string(&fm_data, "superseded_by")
-                    .or_else(|| fm_string(&fm_data, "superseded-by"));
-                supersedes = fm_string(&fm_data, "supersedes");
+                let fm_data = frontmatter.as_ref().expect("unanchored RFC frontmatter");
+                let fm_title = fm_string(fm_data, "title");
+                let fm_ulid = fm_string(fm_data, "ulid").and_then(|value| canonical_ulid(&value));
+                feature = fm_string(fm_data, "feature");
+                superseded_by = fm_string(fm_data, "superseded_by")
+                    .or_else(|| fm_string(fm_data, "superseded-by"));
+                supersedes = fm_string(fm_data, "supersedes");
                 let relationships = extract_rfc_relationships(&file_content);
                 superseded_by = superseded_by.or(relationships.superseded_by);
                 supersedes = supersedes.or(relationships.supersedes);
                 withdrawal_reason =
-                    fm_string_any(&fm_data, &["withdrawal_reason", "withdrawn_reason"]);
-                archived_reason = fm_string(&fm_data, "archived_reason");
-                consolidated_into = fm_string(&fm_data, "consolidated_into");
+                    fm_string_any(fm_data, &["withdrawal_reason", "withdrawn_reason"]);
+                archived_reason = fm_string(fm_data, "archived_reason");
+                consolidated_into = fm_string(fm_data, "consolidated_into");
 
                 // Resolve ULID
                 ulid = if let Some(ref existing) = fm_ulid {
@@ -410,15 +668,66 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
                 std::fs::write(path, new_content.as_bytes())
                     .with_context(|| format!("Failed to rewrite {}", path.display()))?;
+                materialized_anchor = true;
             }
             seen_ulids.insert(ulid.clone());
+
+            let current_content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            if document_matched_head {
+                match status {
+                    "withdrawn" if withdrawal_reason.is_none() => {
+                        withdrawal_reason =
+                            retired_rfc_reason_from_document(&current_content, status);
+                    }
+                    "archived" if archived_reason.is_none() => {
+                        archived_reason =
+                            retired_rfc_reason_from_document(&current_content, status);
+                    }
+                    _ => {}
+                }
+            }
+            let portable_stage = if matches!(status, "withdrawn" | "archived") {
+                retired_rfc_stage_from_document(
+                    &current_content,
+                    historical_stage_for_path(&historical_stages, &rel_path).or(frontmatter_stage),
+                    existing_rfcs
+                        .get(&ulid)
+                        .map_or(stage, |record| record.stage),
+                )
+            } else {
+                stage
+            };
+            let lifecycle_reason = match status {
+                "withdrawn" => withdrawal_reason.as_deref(),
+                "archived" => archived_reason.as_deref(),
+                _ => None,
+            };
+            let materialized_content = backfill_rfc_lifecycle_metadata_content(
+                &current_content,
+                match status {
+                    "withdrawn" => "Withdrawn",
+                    "archived" => "Archived",
+                    _ => status,
+                },
+                portable_stage,
+                lifecycle_reason,
+            );
+            if matches!(status, "withdrawn" | "archived") && materialized_content != current_content
+            {
+                std::fs::write(path, materialized_content.as_bytes())
+                    .with_context(|| format!("Failed to rewrite {}", path.display()))?;
+                changes.push(format!(
+                    "MATERIALIZED {filename}: lifecycle metadata from SQLite"
+                ));
+            }
 
             // Upsert into SQLite
             writer.upsert_rfc(
                 &ulid,
                 rfc_number,
                 &title,
-                stage,
+                portable_stage,
                 status,
                 feature.as_deref(),
                 &slug,
@@ -432,6 +741,16 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
             .with_context(|| format!("Failed to upsert RFC {rfc_number} ({filename}), stage={stage}, status={status}"))?;
 
             changes.push(format!("MIGRATED {filename} → ulid:{ulid}"));
+        }
+
+        drop(writer);
+        // Observe newly written anchors before a canonical reconciliation can
+        // compare them with the pre-migration HEAD. Once the migrated document
+        // tree reaches the canonical ref, ordinary reconciliation advances the
+        // shared rows from that tree.
+        crate::rfc::load_effective_rfc_view(&context.root, context.project.as_ref())?;
+        if !materialized_anchor {
+            crate::rfc::reconcile_rfcs_with_project(&context.root, context.project.as_ref())?;
         }
 
         if changes.is_empty() {
@@ -477,6 +796,121 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use crate::context::{AgentContext, SQLITE_DB_PATH, SqliteLoader, SqliteWriter};
+
+    #[test]
+    fn untracked_document_does_not_match_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(root.join("README.md"), "canonical\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-qm", "initial"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let relative_path = "docs/rfcs/withdrawn/00001-local.md";
+        let path = root.join(relative_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "# RFC 1: Local\n").unwrap();
+
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
+        assert!(!document_matches_canonical(
+            root,
+            git_worktree_mode(root),
+            canonical_oid.as_deref(),
+            relative_path
+        ));
+    }
+
+    #[test]
+    fn feature_branch_document_does_not_match_canonical_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let relative_path = "docs/rfcs/withdrawn/00001-retired.md";
+        let path = root.join(relative_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# RFC 1: Retired\n\n- **Reason**: Canonical.\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
+        assert!(document_matches_canonical(
+            root,
+            git_worktree_mode(root),
+            canonical_oid.as_deref(),
+            r"docs\rfcs\withdrawn\00001-retired.md"
+        ));
+        std::fs::write(&path, "# RFC 1: Retired\n\n- **Reason**: Branch-only.\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qam", "branch RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(!document_matches_canonical(
+            root,
+            git_worktree_mode(root),
+            canonical_oid.as_deref(),
+            relative_path
+        ));
+    }
+
+    #[test]
+    fn bare_repository_uses_workspace_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(document_matches_canonical(
+            root,
+            git_worktree_mode(root),
+            None,
+            "docs/rfcs/00001.md"
+        ));
+    }
 
     #[test]
     fn anchored_rfc_preserves_db_only_metadata_when_another_rfc_is_missing() {
@@ -580,6 +1014,503 @@ mod tests {
     }
 
     #[test]
+    fn is_needed_detects_db_reason_missing_from_portable_lifecycle_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        std::fs::write(
+            rfc_dir.join("00001-retired.md"),
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**:\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical retired RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                1,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Substantive database reason."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+    }
+
+    #[test]
+    fn migration_imports_portable_disk_reason_missing_from_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        std::fs::write(
+            rfc_dir.join("00001-retired.md"),
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**: Portable disk reason.\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical retired RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                1,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let row = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.withdrawal_reason.as_deref(),
+            Some("Portable disk reason.")
+        );
+    }
+
+    #[test]
+    fn migration_keeps_dirty_workspace_reason_out_of_shared_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        std::fs::write(
+            &rfc_path,
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**: Canonical reason.\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical RFC"],
+            vec!["update-ref", "refs/remotes/private-history/HEAD", "HEAD"],
+            vec!["update-ref", "refs/remotes/upstream/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(
+            &rfc_path,
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**: Dirty workspace reason.\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                1,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Canonical reason."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let row = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.withdrawal_reason.as_deref(), Some("Canonical reason."));
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            effective.record.withdrawal_reason.as_deref(),
+            Some("Dirty workspace reason.")
+        );
+    }
+
+    #[test]
+    fn unanchored_migration_persists_body_only_retired_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        std::fs::write(
+            rfc_dir.join("00001-retired.md"),
+            "---\ntitle: Retired\nstage: 2\nulid: 01kq09x2d9y6gc9eg27jatcgvf\n---\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Reason**: Body-only reason.\n\nBody.\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "legacy retired RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let row = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.withdrawal_reason.as_deref(), Some("Body-only reason."));
+    }
+
+    #[test]
+    fn migration_materializes_retired_lifecycle_metadata_from_shared_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let active_dir = root.join("docs/rfcs/stage-3");
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        let active_path = active_dir.join("00001-retired.md");
+        let intermediate_path = rfc_dir.join("00001-retired-before-rename.md");
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        std::fs::write(
+            &active_path,
+            format!("<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Draft\n- **Reason**:\n\nBody.\n"),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "active RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            Command::new("git")
+                .args(["update-ref", "refs/remotes/private-history/HEAD", "HEAD"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "mv",
+                    "docs/rfcs/stage-3/00001-retired.md",
+                    "docs/rfcs/withdrawn/00001-retired-before-rename.md",
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(intermediate_path.exists());
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "withdraw RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "mv",
+                    "docs/rfcs/withdrawn/00001-retired-before-rename.md",
+                    "docs/rfcs/withdrawn/00001-retired.md",
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "rename retired RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["update-ref", "refs/remotes/origin/HEAD", "HEAD"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let writer = SqliteWriter::open(&db_path).unwrap();
+        writer
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                0,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("The proposal was not implemented."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.contains("- **Status**: Withdrawn"));
+        assert!(!content.contains("- **Status**: Draft"));
+        assert!(content.contains("- **Stage**: 3"));
+        assert!(content.contains("- **Reason**: The proposal was not implemented."));
+        assert!(retired_rfc_lifecycle_metadata_is_portable(
+            &content,
+            "withdrawn"
+        ));
+
+        let row = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.stage, 2,
+            "shared metadata should continue to follow the committed canonical document"
+        );
+        assert_eq!(
+            row.withdrawal_reason, None,
+            "shared metadata should honor the canonical document's explicit empty reason"
+        );
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            effective.record.stage, 3,
+            "the issuing workspace should see the backfilled last-active stage"
+        );
+        assert_eq!(
+            effective.record.withdrawal_reason.as_deref(),
+            Some("The proposal was not implemented."),
+            "the issuing workspace should see the materialized lifecycle reason"
+        );
+        assert!(effective.provenance.differs_from_canonical);
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::NotNeeded
+        ));
+    }
+
+    #[test]
+    fn migration_preserves_retired_stage_from_yaml_before_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+        let rfc_path = rfc_dir.join("00002-yaml-retired.md");
+        std::fs::write(
+            &rfc_path,
+            "---\ntitle: YAML Retired\nstage: 3\nulid: 01kq09x2d9y6gc9eg27jatcgvg\nwithdrawal_reason: Replaced.\n---\n\n# RFC 2: YAML Retired\n\nBody.\n",
+        )
+        .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        assert!(matches!(
+            MigrateRfcMetadataPlugin.is_needed(&context).unwrap(),
+            UpgradeStatus::Needed { .. }
+        ));
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(rfc_path).unwrap();
+        assert!(content.contains("- **Status**: Withdrawn"));
+        assert!(content.contains("- **Stage**: 3"));
+        assert!(content.contains("- **Reason**: Replaced."));
+    }
+
+    #[test]
+    fn historical_stage_lookup_normalizes_windows_paths() {
+        let stages = HashMap::from([("docs/rfcs/withdrawn/00001-retired.md".to_string(), 3)]);
+
+        assert_eq!(
+            historical_stage_for_path(&stages, r"docs\rfcs\withdrawn\00001-retired.md"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn historical_stage_recovery_enables_rename_detection_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let active_path = root.join("docs/rfcs/stage-3/00001-retired.md");
+        let retired_path = root.join("docs/rfcs/withdrawn/00001-retired.md");
+        std::fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+        std::fs::write(&active_path, "# RFC 1: Retired\n\nBody.\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "diff.renames", "false"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "active RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::create_dir_all(retired_path.parent().unwrap()).unwrap();
+        std::fs::rename(&active_path, &retired_path).unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "retire RFC"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        assert_eq!(
+            historical_retired_stages(root)
+                .get("docs/rfcs/withdrawn/00001-retired.md")
+                .copied(),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn anchored_rfc_migrates_relationship_metadata_from_disk() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -634,6 +1565,60 @@ mod tests {
         let loader = SqliteLoader::open(&db_path).unwrap();
         let row = loader.load_rfc_by_number(1).unwrap().unwrap();
         assert_eq!(row.supersedes.as_deref(), Some("00002, 00003"));
+    }
+
+    #[test]
+    fn unanchored_migration_keeps_the_migrated_workspace_anchor_addressable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/stage-1");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+        let rfc_path = rfc_dir.join("00001-proposal.md");
+        std::fs::write(
+            &rfc_path,
+            "---\ntitle: Proposal\nulid: 01kq2222222222222222222222\n---\n\n# RFC 00001: Proposal\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "legacy unanchored RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path).unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.starts_with("<!-- exo:1 ulid:01kq2222222222222222222222 -->"));
+        let shared = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.text_id, "01kq2222222222222222222222");
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.record.text_id, "01kq2222222222222222222222");
+        assert_eq!(
+            effective.record.file_path,
+            "docs/rfcs/stage-1/00001-proposal.md"
+        );
     }
 
     #[test]

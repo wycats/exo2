@@ -2,6 +2,9 @@
 
 # RFC 177: Goals and Tasks: Unified Work Item Model
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**:
 
 # RFC 00177: Goals and Tasks: Unified Work Item Model
 

@@ -3,6 +3,10 @@
 
 # RFC 10140: Staged RFC Process
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ---
 title: Migration to Staged RFC Process
 feature: Documentation

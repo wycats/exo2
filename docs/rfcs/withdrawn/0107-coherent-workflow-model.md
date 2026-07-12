@@ -2,6 +2,8 @@
 
 # RFC 107: Coherent Workflow Model
 
+- **Status**: Withdrawn
+- **Reason**: Withdrawn by RFC 10180 storage disposition: this proposal depends on retired file-backed phase context or direct editing/protection of legacy docs/agent-context current artifacts.
 
 # RFC 0107: Coherent Workflow Model
 
@@ -10,7 +12,6 @@
 | **ID**         | 10109                   |
 | **Title**      | Coherent Workflow Model |
 | **Stage**      | 1 (Proposal)            |
-| **Status**     | In Progress             |
 | **Created**    | 2026-01-23              |
 | **Updated**    | 2026-01-24              |
 | **Author**     | Exosuit Team            |

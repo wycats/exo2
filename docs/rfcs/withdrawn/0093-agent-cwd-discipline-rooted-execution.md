@@ -2,6 +2,9 @@
 
 # RFC 93: Agent CWD Discipline (Rooted Execution)
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0093: Agent CWD Discipline (Rooted Execution)
 

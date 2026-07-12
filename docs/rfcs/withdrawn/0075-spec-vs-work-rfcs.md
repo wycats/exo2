@@ -2,6 +2,9 @@
 
 # RFC 75: Distinguishing Spec vs. Work RFCs
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0075: Distinguishing Spec vs. Work RFCs
 

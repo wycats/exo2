@@ -2,6 +2,9 @@
 
 # RFC 213: Test Explorer Integration for Exohook
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 00213: Test Explorer Integration for Exohook
 

@@ -2,6 +2,9 @@
 
 # RFC 141: Exohook Streaming Progress Reporting
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
 
 # RFC 0141: Exohook Streaming Progress Reporting
 

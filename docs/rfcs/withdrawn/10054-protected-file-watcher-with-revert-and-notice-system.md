@@ -3,6 +3,10 @@
 
 # RFC 10054: Protected File Watcher with Revert and Notice System
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn by RFC 10180 storage disposition: this proposal depends on retired file-backed phase context or direct editing/protection of legacy docs/agent-context current artifacts.
+
 ## Summary
 
 CLI-managed files like `plan.toml` should not be edited directly. When an agent (or user) attempts to edit these files, the system should:

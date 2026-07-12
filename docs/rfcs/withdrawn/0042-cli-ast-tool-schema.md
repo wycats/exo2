@@ -2,7 +2,9 @@
 
 # RFC 42: CLI AST Tool Schema
 
-
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC 0042: CLI AST Tool Schema
 

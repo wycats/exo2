@@ -3,6 +3,10 @@
 
 # RFC 10138: Externalized Prompts
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Context & Problem
 
 Currently, the prompts used by the Exosuit extension (e.g., for the "Assess" button, or the system prompt for `@exosuit`) are hardcoded in the TypeScript source code. This has several drawbacks:

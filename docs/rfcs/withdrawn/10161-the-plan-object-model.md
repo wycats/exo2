@@ -3,7 +3,10 @@
 
 # RFC 10161: The Plan Object Model
 
-- **Status**: Stage 4 (Stable)
+- **Status**: Withdrawn
+- **Stage**: 4
+- **Reason**:
+
 - **Created**: 2025-05-20
 - **Implemented**: `packages/exosuit-core`
 - **Supersedes**: RFC 0011 (Dynamic Planning)

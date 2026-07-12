@@ -2,6 +2,9 @@
 
 # RFC 158: Structured Agent Command Discipline
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC: Structured Agent Command Discipline
 

@@ -2,6 +2,9 @@
 
 # RFC 160: CLI Steering & VS Code Integration
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**:
 
 # RFC: CLI Steering & VS Code Integration
 

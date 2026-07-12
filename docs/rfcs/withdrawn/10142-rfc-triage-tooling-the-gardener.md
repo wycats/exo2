@@ -3,6 +3,10 @@
 
 # RFC 10142: RFC Triage Tooling (The Gardener)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Summary
 
 This RFC proposes a set of CLI tools (`exo rfc triage`) and metadata standards to manage the lifecycle of Stage 0 (Strawman) RFCs. The goal is to prevent "Idea Rot" by enforcing a regular "Up or Out" decision process, ensuring that the `stage-0` directory remains a focused list of active proposals rather than a graveyard of abandoned thoughts.

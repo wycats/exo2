@@ -3,6 +3,10 @@
 
 # RFC 10148: RFC Lifecycle Management Tools (Authoring)
 
+- **Status**: Withdrawn
+- **Stage**: 3
+- **Reason**:
+
 ## Summary
 
 This RFC proposes a suite of CLI commands (`exo rfc new`, `exo rfc edit`, `exo rfc rename`) to handle the **Authoring** and **Modification** of RFCs. This establishes a strict protocol: **Agents MUST NOT edit RFC files directly.** They must use the `exo` tools to ensure schema validity, referential integrity, and correct file placement.
