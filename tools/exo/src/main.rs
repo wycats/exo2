@@ -539,7 +539,16 @@ fn dispatch_via_daemon_with_prompter(
         };
 
         let address = invocation_to_address(&invocation);
-        let input = invocation.to_json_input();
+        let mut input = invocation.to_json_input();
+        if invocation.namespace().is_empty()
+            && invocation.operation() == "update"
+            && let Some(input) = input.as_object_mut()
+        {
+            input.insert(
+                "__exo_transport".to_string(),
+                serde_json::json!({ "home": std::env::var("HOME").ok() }),
+            );
+        }
         let op = Op::Call(CallParams {
             address: address.clone(),
             input: input.clone(),
@@ -1764,11 +1773,16 @@ fn main() {
         .as_ref()
         .and_then(|project| project.as_ref().ok())
         .is_some_and(|project| exo::command::update::is_update_workspace(&cwd, Some(project)));
+    let has_update_daemon_workspace = update_project
+        .as_ref()
+        .and_then(|project| project.as_ref().ok())
+        .is_some_and(|project| project.workspace_root.is_some());
     let is_direct = is_direct
         || update_project
             .as_ref()
             .is_some_and(std::result::Result::is_err)
-        || (is_update_command(&args) && !is_admitted_update_workspace);
+        || (is_update_command(&args)
+            && (!is_admitted_update_workspace || !has_update_daemon_workspace));
 
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
@@ -1962,24 +1976,6 @@ fn main() {
 
     // Daemon mode: dispatch unless the command requires trusted direct CLI handling.
     if !is_direct {
-        if is_update_command(&args) {
-            let project = update_project
-                .as_ref()
-                .and_then(|project| project.as_ref().ok())
-                .expect("admitted update workspace has a resolved project");
-            let rt = tokio::runtime::Runtime::new().unwrap_or_else(|error| {
-                eprintln!("Failed to create tokio runtime: {error}");
-                std::process::exit(1);
-            });
-            match rt.block_on(exo::daemon::restart_daemon_with_report_for_project(
-                &cwd, project,
-            )) {
-                Ok(outcome) => drop(outcome),
-                Err(error) => {
-                    std::process::exit(render_daemon_ensure_error(format, &error));
-                }
-            }
-        }
         let exit_code = dispatch_via_daemon(&args, &cwd, format, workflow_confirmation);
         std::process::exit(exit_code);
     }

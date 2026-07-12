@@ -11,7 +11,7 @@ use crate::context::AgentContext;
 use crate::project::Project;
 use crate::upgrade::{UpgradeRegistry, UpgradeSummary};
 use anyhow::{Context as _, Result as ExoResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Root command: `exo update`.
@@ -24,11 +24,18 @@ impl UpdateCommand {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct UpdateAppliedReport {
     plugin_id: String,
     changes: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateHumanOutput {
+    applied_count: usize,
+    skipped_count: usize,
+    applied: Vec<UpdateAppliedReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,37 +72,49 @@ impl UpdateOutput {
     }
 }
 
-fn format_update_human_message(root: &std::path::Path, summary: &UpgradeSummary) -> String {
+fn format_update_human_output(
+    root: &Path,
+    applied_count: usize,
+    skipped_count: usize,
+    applied: &[UpdateAppliedReport],
+) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Updating Exosuit project in {}", root.display()));
 
-    if summary.applied_count > 0 {
+    if applied_count > 0 {
         lines.push(String::new());
-        lines.push(format!("Applied {} upgrade(s):", summary.applied_count));
-        for report in &summary.reports {
-            if report.applied {
-                lines.push(format!("  ✓ {}", report.plugin_id));
-                for change in &report.changes {
-                    lines.push(format!("    - {change}"));
-                }
-                for warning in &report.warnings {
-                    lines.push(format!("    ⚠ {warning}"));
-                }
+        lines.push(format!("Applied {applied_count} upgrade(s):"));
+        for report in applied {
+            lines.push(format!("  ✓ {}", report.plugin_id));
+            for change in &report.changes {
+                lines.push(format!("    - {change}"));
+            }
+            for warning in &report.warnings {
+                lines.push(format!("    ⚠ {warning}"));
             }
         }
     }
 
-    if summary.skipped_count > 0 && summary.applied_count > 0 {
+    if skipped_count > 0 && applied_count > 0 {
         lines.push(String::new());
         lines.push(format!(
-            "Skipped {} already up-to-date upgrade(s)",
-            summary.skipped_count
+            "Skipped {skipped_count} already up-to-date upgrade(s)"
         ));
     }
 
     lines.push(String::new());
     lines.push("Project updated successfully!".to_string());
     lines.join("\n")
+}
+
+pub(crate) fn format_update_human_data(root: &Path, data: &serde_json::Value) -> Option<String> {
+    let output = serde_json::from_value::<UpdateHumanOutput>(data.clone()).ok()?;
+    Some(format_update_human_output(
+        root,
+        output.applied_count,
+        output.skipped_count,
+        &output.applied,
+    ))
 }
 
 fn apply_upgrades(context: &mut AgentContext) -> ExoResult<UpgradeSummary> {
@@ -208,10 +227,15 @@ impl MutableCommand for UpdateCommand {
 
         match ctx.format {
             OutputFormat::Json => Ok(CommandOutput::data(output)),
-            OutputFormat::Human => Ok(CommandOutput::new(
-                output,
-                format_update_human_message(ctx.root, &summary),
-            )),
+            OutputFormat::Human => {
+                let message = format_update_human_output(
+                    ctx.root,
+                    output.applied_count,
+                    output.skipped_count,
+                    &output.applied,
+                );
+                Ok(CommandOutput::new(output, message))
+            }
         }
     }
 }
@@ -227,6 +251,15 @@ pub fn run_update(context: &mut AgentContext) -> Result<(), Box<dyn std::error::
     ensure_update_database(&context.root, context.project.as_ref())?;
     let summary = apply_upgrades(context)?;
     reload_after_upgrade(context)?;
-    println!("{}", format_update_human_message(&context.root, &summary));
+    let output = UpdateOutput::from_summary(&summary);
+    println!(
+        "{}",
+        format_update_human_output(
+            &context.root,
+            output.applied_count,
+            output.skipped_count,
+            &output.applied,
+        )
+    );
     Ok(())
 }

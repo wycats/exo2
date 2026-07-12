@@ -1932,6 +1932,26 @@ remote = "git@github.com:wycats/other-state.git"
 }
 
 #[test]
+fn ordinary_human_update_preserves_detailed_daemon_report() {
+    let fixture = basic_sidecar_fixture();
+    let _guard = DaemonPathGuard::new(&fixture.repo);
+
+    let output = exo_cmd(&fixture.repo, &fixture.home, &fixture.config_home)
+        .arg("update")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).expect("human update output is utf-8");
+
+    assert!(output.contains("Updating Exosuit project in"), "{output}");
+    assert!(output.contains("Applied "), "{output}");
+    assert!(output.contains("install-global-prompts-v1"), "{output}");
+    assert!(output.contains("Project updated successfully!"), "{output}");
+}
+
+#[test]
 fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     let temp = short_tempdir();
     let repo = temp.path().join("external-repo");
@@ -2013,31 +2033,31 @@ tasks = ["Legacy Goal"]
     let update = json_result(&update_output);
     let events = wait_for_daemon_operation(&diagnostics_path, "", "update");
     assert_has_daemon_operation(&events, "", "update");
-    let restarted_daemon_pid = std::fs::read_to_string(project_state_path(
+    let update_daemon_pid = std::fs::read_to_string(project_state_path(
         &sidecar_root,
         "external-test",
         &["runtime", "daemon.pid"],
     ))
-    .expect("read restarted sidecar daemon pid")
+    .expect("read sidecar daemon pid after update")
     .trim()
     .parse::<u64>()
-    .expect("restarted daemon pid is u64");
-    assert_ne!(
-        restarted_daemon_pid, daemon_pid,
-        "ordinary update should replace the daemon under the caller environment"
+    .expect("update daemon pid is u64");
+    assert_eq!(
+        update_daemon_pid, daemon_pid,
+        "ordinary update should preserve the active daemon writer"
     );
-    let restarted_owner: JsonValue = serde_json::from_str(
+    let update_owner: JsonValue = serde_json::from_str(
         &std::fs::read_to_string(sidecar_write_owner_marker_path(
             &sidecar_root,
             "external-test",
         ))
-        .expect("read restarted sidecar writer ownership"),
+        .expect("read sidecar writer ownership after update"),
     )
-    .expect("restarted sidecar writer ownership is json");
+    .expect("sidecar writer ownership after update is json");
     assert_eq!(
-        restarted_owner["pid"].as_u64(),
-        Some(restarted_daemon_pid),
-        "update should reacquire ownership through the replacement daemon"
+        update_owner["pid"].as_u64(),
+        Some(daemon_pid),
+        "update should retain ownership through the existing daemon writer"
     );
     assert!(
         caller_home
@@ -2047,7 +2067,7 @@ tasks = ["Legacy Goal"]
     );
     assert!(
         !home.join(".config/Code/User/prompts/exo").exists(),
-        "the replaced daemon's stale HOME should not receive update plugin output"
+        "the daemon's startup HOME should not receive update plugin output"
     );
     assert_eq!(
         update["post_write"]["sidecar_auto_persist"]["ok"], true,

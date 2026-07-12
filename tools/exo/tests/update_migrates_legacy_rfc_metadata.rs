@@ -25,6 +25,20 @@ fn git_init(root: &Path) {
     );
 }
 
+fn git_init_bare(root: &Path) {
+    let output = Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(root)
+        .output()
+        .expect("run git init --bare");
+
+    assert!(
+        output.status.success(),
+        "git init --bare failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn update_migrates_unanchored_rfc_after_tolerant_reconciliation() {
     let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
@@ -110,6 +124,26 @@ fn update_refuses_plain_git_repository_without_creating_exo_state() {
     assert!(!root.join(".exo/runtime").exists());
     assert!(!root.join(".exo/cache").exists());
     assert!(!root.join(".cache/exo.db").exists());
+}
+
+#[test]
+fn update_in_bare_repository_uses_direct_bootstrap_without_daemon_runtime() {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path().join("repo.git");
+    assert!(fs::create_dir_all(&root).is_ok());
+    git_init_bare(&root);
+    assert!(fs::write(root.join("exosuit.toml"), "").is_ok());
+
+    assert_cmd::cargo::cargo_bin_cmd!("exo")
+        .current_dir(&root)
+        .args(["--format", "json", "update"])
+        .assert()
+        .success();
+
+    assert!(
+        !temp.path().join(".exo/runtime").exists(),
+        "bare repository update must not start a daemon"
+    );
 }
 
 #[test]

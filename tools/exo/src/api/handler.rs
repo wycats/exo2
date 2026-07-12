@@ -119,6 +119,7 @@ fn log_command_event(
 /// The `summary` is a one-line description of the result.
 /// The `body` is a full markdown rendering of the result (for list commands, etc.).
 fn make_display(
+    workspace_root: &Path,
     namespace: &str,
     operation: &str,
     input: &JsonValue,
@@ -128,9 +129,8 @@ fn make_display(
         generate_display_message(namespace, operation, input, &invoke_result.data);
     let summary = generate_summary_from_data(namespace, operation, input, &invoke_result.data);
     let body = if namespace.is_empty() && operation == "update" {
-        invoke_result
-            .human_message
-            .clone()
+        crate::command::update::format_update_human_data(workspace_root, &invoke_result.data)
+            .or_else(|| invoke_result.human_message.clone())
             .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
     } else {
         generate_body_from_data(namespace, operation, &invoke_result.data)
@@ -141,6 +141,29 @@ fn make_display(
         summary,
         body,
     })
+}
+
+fn split_update_transport_input(
+    namespace: &str,
+    operation: &str,
+    input: &JsonValue,
+) -> (JsonValue, Option<Option<std::path::PathBuf>>) {
+    let mut command_input = input.clone();
+    if !namespace.is_empty() || operation != "update" {
+        return (command_input, None);
+    }
+
+    let transport = command_input
+        .as_object_mut()
+        .and_then(|input| input.remove("__exo_transport"));
+    let Some(transport) = transport else {
+        return (command_input, None);
+    };
+    let home = transport
+        .get("home")
+        .and_then(JsonValue::as_str)
+        .map(std::path::PathBuf::from);
+    (command_input, Some(home))
 }
 
 /// Generate a summary from the result data when no human message is available.
@@ -1974,13 +1997,15 @@ fn handle_call_with_namespace_operation(
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
 ) -> ResponseEnvelope {
+    let (command_input, caller_home) =
+        split_update_transport_input(namespace, operation, &params.input);
     // Build the new CommandSpec from registry for Invocation::from_json
     let registry = default_registry();
     let new_spec = NewCommandSpec::from_registry(&registry);
 
     // Route through new CommandSpec (primary path). Surface diagnostic errors.
     let route_start = Instant::now();
-    match Invocation::from_json(&params.input, namespace, operation, &new_spec) {
+    match Invocation::from_json(&command_input, namespace, operation, &new_spec) {
         Ok(invocation) => {
             diagnostics.record(
                 "request.route_end",
@@ -2107,7 +2132,11 @@ fn handle_call_with_namespace_operation(
                 "request.invoke_start",
                 json!({ "namespace": namespace, "operation": operation }),
             );
-            match invoke_command_box_json(&cmd_box, &transport) {
+            let invoke_result =
+                crate::templates::with_global_prompts_home_override(caller_home, || {
+                    invoke_command_box_json(&cmd_box, &transport)
+                });
+            match invoke_result {
                 Ok(invoke_result) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     diagnostics.record(
@@ -2121,7 +2150,13 @@ fn handle_call_with_namespace_operation(
                         }),
                     );
 
-                    let display = make_display(namespace, operation, &params.input, &invoke_result);
+                    let display = make_display(
+                        workspace_root,
+                        namespace,
+                        operation,
+                        &command_input,
+                        &invoke_result,
+                    );
                     let effect = invoke_result.effect;
 
                     if crate::post_write::should_log_command_event(namespace, operation) {
@@ -2145,7 +2180,7 @@ fn handle_call_with_namespace_operation(
                             agent_id_for_log.as_deref(),
                             namespace,
                             operation,
-                            &params.input,
+                            &command_input,
                             &invoke_result.data,
                             effect,
                             duration_ms,
@@ -2410,7 +2445,8 @@ fn handle_list(
                     effect: Effect::Pure,
                     trace: exosuit_storage::Trace::default(),
                 };
-                let display = make_display(namespace, operation, &input, &invoke_result);
+                let display =
+                    make_display(workspace_root, namespace, operation, &input, &invoke_result);
                 ok_with_steering(id, invoke_result.data, steering, display)
             }
             Err(error_response) => {
@@ -2857,24 +2893,39 @@ mod tests {
     use crate::steering::{SuggestedAction, WorkIntent};
 
     #[test]
-    fn update_display_preserves_detailed_human_report() {
-        let human_message = "Updating Exosuit project\n\nApplied 1 upgrade(s):\n  ✓ example";
+    fn update_display_renders_detailed_human_report_from_machine_data() {
         let invoke_result = CommandInvokeResult {
             data: json!({
                 "kind": "update",
                 "ok": true,
                 "applied_count": 1,
-                "skipped_count": 0,
+                "skipped_count": 2,
+                "applied": [{
+                    "plugin_id": "example",
+                    "changes": ["Changed example state"],
+                    "warnings": ["Example warning"]
+                }],
             }),
-            human_message: Some(human_message.to_string()),
+            human_message: None,
             effect: Effect::Write,
             trace: exosuit_storage::Trace::default(),
         };
 
-        let display = make_display("", "update", &json!({}), &invoke_result)
-            .expect("update display metadata");
+        let display = make_display(
+            Path::new("/workspace"),
+            "",
+            "update",
+            &json!({}),
+            &invoke_result,
+        )
+        .expect("update display metadata");
 
-        assert_eq!(display.body.as_deref(), Some(human_message));
+        assert_eq!(
+            display.body.as_deref(),
+            Some(
+                "Updating Exosuit project in /workspace\n\nApplied 1 upgrade(s):\n  ✓ example\n    - Changed example state\n    ⚠ Example warning\n\nSkipped 2 already up-to-date upgrade(s)\n\nProject updated successfully!"
+            )
+        );
     }
 
     #[test]
