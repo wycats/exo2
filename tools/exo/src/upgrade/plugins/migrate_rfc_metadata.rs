@@ -261,6 +261,7 @@ fn document_matches_canonical(
     canonical_oid: Option<&str>,
     relative_path: &str,
 ) -> bool {
+    let relative_path = relative_path.replace('\\', "/");
     let in_worktree = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
@@ -286,7 +287,7 @@ fn document_matches_canonical(
     }
 
     Command::new("git")
-        .args(["diff", "--quiet", canonical_oid, "--", relative_path])
+        .args(["diff", "--quiet", canonical_oid, "--", &relative_path])
         .current_dir(root)
         .status()
         .is_ok_and(|status| status.success())
@@ -835,6 +836,12 @@ mod tests {
                     .success()
             );
         }
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
+        assert!(document_matches_canonical(
+            root,
+            canonical_oid.as_deref(),
+            r"docs\rfcs\withdrawn\00001-retired.md"
+        ));
         std::fs::write(&path, "# RFC 1: Retired\n\n- **Reason**: Branch-only.\n").unwrap();
         assert!(
             Command::new("git")
@@ -845,7 +852,6 @@ mod tests {
                 .success()
         );
 
-        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
         assert!(!document_matches_canonical(
             root,
             canonical_oid.as_deref(),
