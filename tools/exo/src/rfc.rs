@@ -1768,6 +1768,22 @@ pub fn load_effective_rfcs(
     Ok(load_effective_rfc_view(root, project)?.records)
 }
 
+/// Reconcile canonical RFC metadata and return the issuing workspace's view.
+///
+/// Public RFC read commands use this entry point so a valid canonical document
+/// can relink missing shared metadata before the response is composed. Internal
+/// derived-state callers can continue using [`load_effective_rfcs`] when they
+/// need the established read-only composition contract.
+#[allow(clippy::missing_errors_doc)]
+pub fn observe_effective_rfcs(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<Vec<EffectiveRfcRecord>> {
+    Ok(observe_effective_rfc_view_with_project(root, project)?
+        .1
+        .records)
+}
+
 /// Load one complete effective RFC view for the issuing workspace.
 #[allow(clippy::missing_errors_doc)]
 pub fn load_effective_rfc_view(root: &Path, project: Option<&Project>) -> Result<EffectiveRfcView> {
@@ -1874,7 +1890,24 @@ pub fn load_effective_rfc_by_number(
     project: Option<&Project>,
     rfc_number: i64,
 ) -> Result<Option<EffectiveRfcRecord>> {
-    let mut matches = load_effective_rfcs(root, project)?
+    select_effective_rfc_by_number(load_effective_rfcs(root, project)?, rfc_number)
+}
+
+/// Reconcile canonical RFC metadata and resolve one RFC in the workspace view.
+#[allow(clippy::missing_errors_doc)]
+pub fn observe_effective_rfc_by_number(
+    root: &Path,
+    project: Option<&Project>,
+    rfc_number: i64,
+) -> Result<Option<EffectiveRfcRecord>> {
+    select_effective_rfc_by_number(observe_effective_rfcs(root, project)?, rfc_number)
+}
+
+fn select_effective_rfc_by_number(
+    records: Vec<EffectiveRfcRecord>,
+    rfc_number: i64,
+) -> Result<Option<EffectiveRfcRecord>> {
+    let mut matches = records
         .into_iter()
         .filter(|record| record.record.rfc_number == rfc_number)
         .collect::<Vec<_>>();
@@ -5677,6 +5710,146 @@ This RFC supersedes:
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn linked_worktree_withdrawal_becomes_canonical_without_stale_restore() {
+        let temp = TempDir::new().unwrap();
+        let main_root = temp.path().join("main");
+        let feature_root = temp.path().join("feature");
+        let fresh_root = temp.path().join("fresh");
+        let state_root = temp.path().join("sidecar-state");
+        fs::create_dir_all(main_root.join("docs/rfcs/stage-3")).unwrap();
+        fs::create_dir_all(state_root.join("cache")).unwrap();
+        init_git_repository(&main_root);
+
+        let active_path = main_root.join("docs/rfcs/stage-3/00129-runner.md");
+        fs::write(
+            &active_path,
+            "<!-- exo:129 ulid:01linkedrunner -->\n\n# RFC 129: Configurable Runner\n\n**Stage**: 3\n\n## Summary\n\nActive.\n",
+        )
+        .unwrap();
+        let active_oid = commit_all(&main_root, "active runner RFC");
+        publish_origin_main(&main_root, &active_oid);
+        run_git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/withdraw-runner",
+                feature_root.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let git_common_dir = main_root.join(".git");
+        let main_project = shared_sidecar_project(&main_root, &git_common_dir, &state_root);
+        let feature_project = shared_sidecar_project(&feature_root, &git_common_dir, &state_root);
+        SqliteWriter::open(main_project.db_path()).unwrap();
+        reconcile_rfcs_with_project(&main_root, Some(&main_project)).unwrap();
+
+        fs::create_dir_all(feature_root.join("docs/rfcs/withdrawn")).unwrap();
+        let withdrawn_path = feature_root.join("docs/rfcs/withdrawn/00129-runner.md");
+        fs::rename(
+            feature_root.join("docs/rfcs/stage-3/00129-runner.md"),
+            &withdrawn_path,
+        )
+        .unwrap();
+        fs::write(
+            &withdrawn_path,
+            "<!-- exo:129 ulid:01linkedrunner -->\n\n# RFC 129: Configurable Runner\n\n**Status**: Withdrawn\n**Stage**: 3\n**Reason**: The configurable runner surface was not implemented.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+
+        let feature_view = load_effective_rfc_by_number(&feature_root, Some(&feature_project), 129)
+            .unwrap()
+            .unwrap();
+        let main_view = load_effective_rfc_by_number(&main_root, Some(&main_project), 129)
+            .unwrap()
+            .unwrap();
+        let shared_before = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(feature_view.record.status, "withdrawn");
+        assert!(feature_view.provenance.differs_from_canonical);
+        assert_eq!(main_view.record.status, "active");
+        assert_eq!(shared_before.status, "active");
+
+        let withdrawn_oid = commit_all(&feature_root, "withdraw runner RFC");
+        publish_origin_main(&main_root, &withdrawn_oid);
+
+        reconcile_rfcs_with_project(&main_root, Some(&main_project)).unwrap();
+        let shared_after_restart = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared_after_restart.stage, 3);
+        assert_eq!(shared_after_restart.status, "withdrawn");
+        assert_eq!(
+            shared_after_restart.withdrawal_reason.as_deref(),
+            Some("The configurable runner surface was not implemented.")
+        );
+
+        let stale_main_view = load_effective_rfc_by_number(&main_root, Some(&main_project), 129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_main_view.record.status, "active");
+        assert!(stale_main_view.provenance.differs_from_canonical);
+        let shared_after_stale_read = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_after_stale_read.status, "withdrawn",
+            "a stale linked worktree view cannot restore older canonical metadata"
+        );
+
+        run_git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                fresh_root.to_str().unwrap(),
+                "refs/remotes/origin/main",
+            ],
+        );
+        let fresh_project = shared_sidecar_project(&fresh_root, &git_common_dir, &state_root);
+        let fresh_view = load_effective_rfc_by_number(&fresh_root, Some(&fresh_project), 129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh_view.record.status, "withdrawn");
+        assert!(!fresh_view.provenance.differs_from_canonical);
+
+        let loader = SqliteLoader::open(main_project.db_path()).unwrap();
+        let dumps = exosuit_storage::dump_tables(loader.database().connection()).unwrap();
+        let rfcs_dump = dumps
+            .iter()
+            .find_map(|(table, sql)| (table == "rfcs_data").then_some(sql))
+            .expect("portable RFC projection");
+        assert!(rfcs_dump.contains("The configurable runner surface was not implemented."));
+        for root in [&main_root, &feature_root, &fresh_root] {
+            assert!(
+                !rfcs_dump.contains(root.to_string_lossy().as_ref()),
+                "portable RFC projection must omit workspace root {}",
+                root.display()
+            );
+        }
+        for local_table in [
+            "rfc_workspace_snapshots_data",
+            "rfc_workspace_observations_data",
+            "rfc_workspace_diagnostics_data",
+        ] {
+            assert!(
+                dumps.iter().all(|(table, _)| table != local_table),
+                "portable dumps must omit {local_table}"
+            );
+        }
     }
 
     #[test]

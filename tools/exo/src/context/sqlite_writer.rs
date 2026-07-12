@@ -2460,6 +2460,133 @@ mod tests {
     }
 
     #[test]
+    fn failed_rfc_workspace_snapshot_replacement_preserves_previous_snapshot() -> Result<()> {
+        let writer = SqliteWriter::open_memory()?;
+        let workspace_root = "/tmp/exo-rfc-snapshot".to_string();
+        let initial_snapshot = RfcWorkspaceSnapshot {
+            workspace_root: workspace_root.clone(),
+            branch_name: Some("main".to_string()),
+            head_oid: "initial-head".to_string(),
+            document_digest: vec![1; 32],
+            canonical_ref: Some("refs/remotes/origin/main".to_string()),
+            canonical_oid: Some("initial-head".to_string()),
+            observed_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+        let initial_observation = RfcWorkspaceObservation {
+            workspace_root: workspace_root.clone(),
+            text_id: "01RFCINITIAL".to_string(),
+            rfc_number: 10196,
+            title: "Initial workspace view".to_string(),
+            stage: 2,
+            stage_source: "path".to_string(),
+            status: "active".to_string(),
+            feature: Some("sidecar".to_string()),
+            feature_declared: true,
+            slug: "initial-workspace-view".to_string(),
+            file_path: "docs/rfcs/stage-2/10196-initial.md".to_string(),
+            superseded_by: None,
+            superseded_by_declared: false,
+            supersedes: None,
+            supersedes_declared: false,
+            withdrawal_reason: None,
+            withdrawal_reason_declared: false,
+            archived_reason: None,
+            archived_reason_declared: false,
+            consolidated_into: None,
+            consolidated_into_declared: false,
+            branch_name: Some("main".to_string()),
+            head_oid: "initial-head".to_string(),
+            observed_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+        let initial_diagnostic = RfcWorkspaceDiagnostic {
+            workspace_root: workspace_root.clone(),
+            file_path: "docs/rfcs/stage-2/duplicate.md".to_string(),
+            diagnostic_code: "initial_diagnostic".to_string(),
+            text_id: Some("01RFCINITIAL".to_string()),
+            rfc_number: Some(10196),
+            message: "Initial diagnostic".to_string(),
+            observed_at: "2026-07-12T00:00:00Z".to_string(),
+        };
+        writer.replace_rfc_workspace_snapshot(
+            &initial_snapshot,
+            std::slice::from_ref(&initial_observation),
+            std::slice::from_ref(&initial_diagnostic),
+        )?;
+        let initial_counters = [
+            rowset_counter(
+                writer.database().connection(),
+                "rfc_workspace_snapshots_data",
+            )?,
+            rowset_counter(
+                writer.database().connection(),
+                "rfc_workspace_observations_data",
+            )?,
+            rowset_counter(
+                writer.database().connection(),
+                "rfc_workspace_diagnostics_data",
+            )?,
+        ];
+
+        let replacement_snapshot = RfcWorkspaceSnapshot {
+            branch_name: Some("feature/rfc-overlays".to_string()),
+            head_oid: "replacement-head".to_string(),
+            document_digest: vec![2; 32],
+            canonical_oid: Some("replacement-head".to_string()),
+            observed_at: "2026-07-12T01:00:00Z".to_string(),
+            ..initial_snapshot.clone()
+        };
+        let mut conflicting_observation = initial_observation.clone();
+        conflicting_observation.title = "Conflicting replacement".to_string();
+        conflicting_observation.file_path = "docs/rfcs/stage-2/conflict.md".to_string();
+        conflicting_observation.head_oid = "replacement-head".to_string();
+        conflicting_observation.observed_at = "2026-07-12T01:00:00Z".to_string();
+
+        let error = writer
+            .replace_rfc_workspace_snapshot(
+                &replacement_snapshot,
+                &[conflicting_observation.clone(), conflicting_observation],
+                &[],
+            )
+            .expect_err("duplicate observations should fail replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to insert RFC workspace observation"),
+            "unexpected replacement error: {error:#}"
+        );
+
+        let conn = writer.database().connection();
+        let retained_head: String = conn.query_row(
+            "SELECT head_oid FROM rfc_workspace_snapshots_data WHERE workspace_root = ?1",
+            [&workspace_root],
+            |row| row.get(0),
+        )?;
+        let retained_title: String = conn.query_row(
+            "SELECT title FROM rfc_workspace_observations_data WHERE workspace_root = ?1",
+            [&workspace_root],
+            |row| row.get(0),
+        )?;
+        let retained_diagnostic: String = conn.query_row(
+            "SELECT message FROM rfc_workspace_diagnostics_data WHERE workspace_root = ?1",
+            [&workspace_root],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_head, initial_snapshot.head_oid);
+        assert_eq!(retained_title, initial_observation.title);
+        assert_eq!(retained_diagnostic, initial_diagnostic.message);
+        assert_eq!(
+            [
+                rowset_counter(conn, "rfc_workspace_snapshots_data")?,
+                rowset_counter(conn, "rfc_workspace_observations_data")?,
+                rowset_counter(conn, "rfc_workspace_diagnostics_data")?,
+            ],
+            initial_counters,
+            "failed replacement should roll back reactive rowset revisions"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_add_and_remove_epoch() -> Result<()> {
         let w = SqliteWriter::open_memory()?;
         let conn = w.database().connection();

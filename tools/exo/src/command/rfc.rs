@@ -591,7 +591,7 @@ impl Command for RfcList {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let all_rfcs = rfc::load_effective_rfcs(ctx.root, ctx.project)?;
+        let all_rfcs = rfc::observe_effective_rfcs(ctx.root, ctx.project)?;
 
         let filtered: Vec<_> = match self.stage {
             Some(s) => all_rfcs
@@ -731,7 +731,7 @@ impl Command for RfcShow {
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
         let rfc_number = parse_rfc_number(&self.id)?;
-        let effective = rfc::load_effective_rfc_by_number(ctx.root, ctx.project, rfc_number)?
+        let effective = rfc::observe_effective_rfc_by_number(ctx.root, ctx.project, rfc_number)?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "RFC {} not found. Use `exo rfc list` to see available RFCs.",
@@ -912,7 +912,7 @@ impl Command for RfcStatus {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let view = rfc::load_effective_rfc_view(ctx.root, ctx.project)?;
+        let view = rfc::observe_effective_rfc_view_with_project(ctx.root, ctx.project)?.1;
         let repairs =
             rfc::detect_rfc_repair_candidates_with_records(ctx.root, &view.repair_records)?;
         let workspace_diagnostics = view.workspace_diagnostics;
