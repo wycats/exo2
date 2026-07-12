@@ -89,6 +89,30 @@ fn update_refuses_non_workspace_without_creating_database() {
 }
 
 #[test]
+fn update_refuses_plain_git_repository_without_creating_exo_state() {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path();
+    git_init(root);
+
+    let assert = assert_cmd::cargo::cargo_bin_cmd!("exo")
+        .current_dir(root)
+        .args(["--format", "json", "update"])
+        .assert()
+        .failure();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("no exosuit.toml") || stderr.contains("no exosuit.toml"),
+        "expected workspace guard error, stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!root.join(".exo/runtime").exists());
+    assert!(!root.join(".exo/cache").exists());
+    assert!(!root.join(".cache/exo.db").exists());
+}
+
+#[test]
 fn run_update_resolves_project_before_choosing_database() {
     let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
     let root = temp.path();

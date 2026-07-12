@@ -127,7 +127,14 @@ fn make_display(
     let invocation_message =
         generate_display_message(namespace, operation, input, &invoke_result.data);
     let summary = generate_summary_from_data(namespace, operation, input, &invoke_result.data);
-    let body = generate_body_from_data(namespace, operation, &invoke_result.data);
+    let body = if namespace.is_empty() && operation == "update" {
+        invoke_result
+            .human_message
+            .clone()
+            .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
+    } else {
+        generate_body_from_data(namespace, operation, &invoke_result.data)
+    };
 
     Some(Display {
         invocation_message,
@@ -2848,6 +2855,27 @@ mod tests {
     use crate::api::protocol::{HelpParams, Op, RequestEnvelope};
     use crate::command_reference::ExoCommandReference;
     use crate::steering::{SuggestedAction, WorkIntent};
+
+    #[test]
+    fn update_display_preserves_detailed_human_report() {
+        let human_message = "Updating Exosuit project\n\nApplied 1 upgrade(s):\n  ✓ example";
+        let invoke_result = CommandInvokeResult {
+            data: json!({
+                "kind": "update",
+                "ok": true,
+                "applied_count": 1,
+                "skipped_count": 0,
+            }),
+            human_message: Some(human_message.to_string()),
+            effect: Effect::Write,
+            trace: exosuit_storage::Trace::default(),
+        };
+
+        let display = make_display("", "update", &json!({}), &invoke_result)
+            .expect("update display metadata");
+
+        assert_eq!(display.body.as_deref(), Some(human_message));
+    }
 
     #[test]
     fn daemon_writer_request_uses_resolved_worktree_root() {

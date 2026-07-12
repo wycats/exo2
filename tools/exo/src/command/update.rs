@@ -111,12 +111,17 @@ fn has_sql_projection_files(root: &Path, project: Option<&Project>) -> bool {
     })
 }
 
-fn ensure_update_workspace(root: &Path, project: Option<&Project>) -> ExoResult<()> {
+/// Return whether the workspace has enough existing Exo state to be updated.
+#[must_use]
+pub fn is_update_workspace(root: &Path, project: Option<&Project>) -> bool {
     let db_path = crate::context::db_path(root, project);
-    if db_path.exists()
+    db_path.exists()
         || root.join("exosuit.toml").exists()
         || has_sql_projection_files(root, project)
-    {
+}
+
+fn ensure_update_workspace(root: &Path, project: Option<&Project>) -> ExoResult<()> {
+    if is_update_workspace(root, project) {
         return Ok(());
     }
 

@@ -1760,10 +1760,15 @@ fn main() {
         }
     };
     let update_project = is_update_command(&args).then(|| Project::resolve(&cwd));
+    let is_admitted_update_workspace = update_project
+        .as_ref()
+        .and_then(|project| project.as_ref().ok())
+        .is_some_and(|project| exo::command::update::is_update_workspace(&cwd, Some(project)));
     let is_direct = is_direct
         || update_project
             .as_ref()
-            .is_some_and(std::result::Result::is_err);
+            .is_some_and(std::result::Result::is_err)
+        || (is_update_command(&args) && !is_admitted_update_workspace);
 
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
@@ -1957,6 +1962,24 @@ fn main() {
 
     // Daemon mode: dispatch unless the command requires trusted direct CLI handling.
     if !is_direct {
+        if is_update_command(&args) {
+            let project = update_project
+                .as_ref()
+                .and_then(|project| project.as_ref().ok())
+                .expect("admitted update workspace has a resolved project");
+            let rt = tokio::runtime::Runtime::new().unwrap_or_else(|error| {
+                eprintln!("Failed to create tokio runtime: {error}");
+                std::process::exit(1);
+            });
+            match rt.block_on(exo::daemon::restart_daemon_with_report_for_project(
+                &cwd, project,
+            )) {
+                Ok(outcome) => drop(outcome),
+                Err(error) => {
+                    std::process::exit(render_daemon_ensure_error(format, &error));
+                }
+            }
+        }
         let exit_code = dispatch_via_daemon(&args, &cwd, format, workflow_confirmation);
         std::process::exit(exit_code);
     }

@@ -1923,6 +1923,7 @@ fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     let temp = short_tempdir();
     let repo = temp.path().join("external-repo");
     let home = temp.path().join("home");
+    let caller_home = temp.path().join("caller-home");
     let config_home = temp.path().join("config");
     let sidecar_root = temp.path().join("sidecars");
     let diagnostics_path = temp.path().join("sidecar-update-daemon.ndjson");
@@ -1980,13 +1981,14 @@ tasks = ["Legacy Goal"]
         &["runtime", "daemon.pid"],
     ))
     .expect("read sidecar daemon pid");
+    let daemon_pid = daemon_pid.trim().parse::<u64>().expect("daemon pid is u64");
     assert_eq!(
         owner["pid"].as_u64(),
-        daemon_pid.trim().parse::<u64>().ok(),
+        Some(daemon_pid),
         "normal write should establish ownership through the sidecar daemon writer lane"
     );
 
-    let update_output = exo_cmd(&repo, &home, &config_home)
+    let update_output = exo_cmd(&repo, &caller_home, &config_home)
         .env("EXO_DAEMON_DIAGNOSTICS", "1")
         .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
         .args(["--format", "json", "update"])
@@ -1998,6 +2000,42 @@ tasks = ["Legacy Goal"]
     let update = json_result(&update_output);
     let events = wait_for_daemon_operation(&diagnostics_path, "", "update");
     assert_has_daemon_operation(&events, "", "update");
+    let restarted_daemon_pid = std::fs::read_to_string(project_state_path(
+        &sidecar_root,
+        "external-test",
+        &["runtime", "daemon.pid"],
+    ))
+    .expect("read restarted sidecar daemon pid")
+    .trim()
+    .parse::<u64>()
+    .expect("restarted daemon pid is u64");
+    assert_ne!(
+        restarted_daemon_pid, daemon_pid,
+        "ordinary update should replace the daemon under the caller environment"
+    );
+    let restarted_owner: JsonValue = serde_json::from_str(
+        &std::fs::read_to_string(sidecar_write_owner_marker_path(
+            &sidecar_root,
+            "external-test",
+        ))
+        .expect("read restarted sidecar writer ownership"),
+    )
+    .expect("restarted sidecar writer ownership is json");
+    assert_eq!(
+        restarted_owner["pid"].as_u64(),
+        Some(restarted_daemon_pid),
+        "update should reacquire ownership through the replacement daemon"
+    );
+    assert!(
+        caller_home
+            .join(".config/Code/User/prompts/exo/coherence.prompt.md")
+            .exists(),
+        "update plugins should observe the caller's HOME"
+    );
+    assert!(
+        !home.join(".config/Code/User/prompts/exo").exists(),
+        "the replaced daemon's stale HOME should not receive update plugin output"
+    );
     assert_eq!(
         update["post_write"]["sidecar_auto_persist"]["ok"], true,
         "ordinary update should complete its sidecar checkpoint: {update:#}"

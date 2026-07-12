@@ -1692,6 +1692,15 @@ pub async fn restart_daemon_with_report(
     restart_daemon_paths_with_report(paths).await
 }
 
+/// Force-restart the daemon for an explicitly resolved project.
+pub async fn restart_daemon_with_report_for_project(
+    workspace_path: &Path,
+    project: &Project,
+) -> std::io::Result<DaemonEnsureOutcome> {
+    let paths = paths_for_workspace_project(workspace_path, project)?;
+    restart_daemon_paths_with_report(paths).await
+}
+
 /// Ensure a daemon for an explicitly resolved project.
 pub async fn ensure_daemon_with_report_for_project(
     workspace_path: &Path,
