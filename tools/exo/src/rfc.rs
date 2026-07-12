@@ -3718,7 +3718,7 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
         .and_then(|name| name.to_str())
         .filter(|name| matches!(*name, "withdrawn" | "archive"));
     let original_stage = if source_retired_status.is_some() {
-        retired_rfc_stage_from_document(&original_content, None, parse_stage(&file_path))
+        retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
     } else {
         parse_stage(&file_path)
     };
@@ -3798,7 +3798,7 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
         .and_then(|name| name.to_str())
         .filter(|name| matches!(*name, "withdrawn" | "archive"));
     let original_stage = if source_retired_status.is_some() {
-        retired_rfc_stage_from_document(&original_content, None, parse_stage(&file_path))
+        retired_rfc_stage_for_mutation(workspace_root, &file_path, &original_content)?
     } else {
         parse_stage(&file_path)
     };
@@ -4323,6 +4323,19 @@ pub(crate) fn retired_rfc_stage_from_document(
         })
         .or_else(|| legacy_stage_from_status(&metadata))
         .unwrap_or(fallback)
+}
+
+fn retired_rfc_stage_for_mutation(root: &Path, file_path: &Path, content: &str) -> Result<u8> {
+    let stored_stage = extract_anchor_ulid(content)
+        .map(|text_id| load_rfc_record_by_text_id(root, &text_id))
+        .transpose()?
+        .flatten()
+        .map(|record| record.stage);
+    Ok(retired_rfc_stage_from_document(
+        content,
+        stored_stage,
+        parse_stage(file_path),
+    ))
 }
 
 fn declared_metadata_value(content: &str, label: &str) -> DeclaredRfcValue {
@@ -7313,6 +7326,51 @@ This RFC supersedes:
             .unwrap()
             .unwrap();
         assert_eq!(updated.withdrawal_reason.as_deref(), Some("updated reason"));
+    }
+
+    #[test]
+    fn repeated_withdraw_preserves_stored_stage_for_legacy_retired_rfc() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        fs::create_dir_all(&rfc_dir).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01retired -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Reason**: Obsolete.\n\nBody\n",
+        )
+        .unwrap();
+        SqliteWriter::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .upsert_rfc(
+                "01retired",
+                1,
+                "Retired",
+                4,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Obsolete."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        withdraw(&root.join("docs/rfcs"), "00001", None).unwrap();
+
+        let content = fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.contains("- **Stage**: 4"));
+        let row = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.stage, 4);
     }
 
     #[test]

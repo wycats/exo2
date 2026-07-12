@@ -277,8 +277,8 @@ fn document_matches_head(root: &Path, relative_path: &str) -> bool {
     let tracked = Command::new("git")
         .args(["ls-files", "--error-unmatch", "--", relative_path])
         .current_dir(root)
-        .status()
-        .is_ok_and(|status| status.success());
+        .output()
+        .is_ok_and(|output| output.status.success());
     if !tracked {
         return false;
     }
@@ -609,6 +609,19 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
             let current_content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?;
+            if document_matched_head {
+                match status {
+                    "withdrawn" if withdrawal_reason.is_none() => {
+                        withdrawal_reason =
+                            retired_rfc_reason_from_document(&current_content, status);
+                    }
+                    "archived" if archived_reason.is_none() => {
+                        archived_reason =
+                            retired_rfc_reason_from_document(&current_content, status);
+                    }
+                    _ => {}
+                }
+            }
             let portable_stage = if matches!(status, "withdrawn" | "archived") {
                 retired_rfc_stage_from_document(
                     &current_content,
@@ -1052,6 +1065,46 @@ mod tests {
             effective.record.withdrawal_reason.as_deref(),
             Some("Dirty workspace reason.")
         );
+    }
+
+    #[test]
+    fn unanchored_migration_persists_body_only_retired_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        std::fs::write(
+            rfc_dir.join("00001-retired.md"),
+            "---\ntitle: Retired\nstage: 2\nulid: 01kq09x2d9y6gc9eg27jatcgvf\n---\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Reason**: Body-only reason.\n\nBody.\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "legacy retired RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let row = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.withdrawal_reason.as_deref(), Some("Body-only reason."));
     }
 
     #[test]
