@@ -307,7 +307,6 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
     fn is_needed(&self, context: &AgentContext) -> ExoResult<UpgradeStatus> {
         let files = find_rfc_files(&context.root);
-        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(&context.root)?;
         let unanchored = files
             .iter()
             .filter(|path| std::fs::read_to_string(path).is_ok_and(|content| !has_anchor(&content)))
@@ -354,6 +353,31 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .into_iter()
                 .map(|record| (record.text_id.clone(), record))
                 .collect::<HashMap<_, _>>();
+            let needs_canonical_reason_check = files.iter().any(|path| {
+                let Some(content) = std::fs::read_to_string(path).ok() else {
+                    return false;
+                };
+                let Some(ulid) = extract_anchor_ulid(&content) else {
+                    return false;
+                };
+                let Some(record) = rows.get(&ulid) else {
+                    return false;
+                };
+                let status = parse_status(path);
+                let shared_reason = match status {
+                    "withdrawn" => record.withdrawal_reason.as_deref(),
+                    "archived" => record.archived_reason.as_deref(),
+                    _ => return false,
+                };
+                retired_rfc_reason_from_document(&content, status)
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    && shared_reason.is_none()
+            });
+            let canonical_oid = needs_canonical_reason_check
+                .then(|| crate::rfc::canonical_rfc_commit_oid(&context.root))
+                .transpose()?
+                .flatten();
             files
                 .iter()
                 .filter_map(|path| {
