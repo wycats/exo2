@@ -709,6 +709,16 @@ fn canonical_reconcile_source(root: &Path) -> Result<CanonicalReconcileSource> {
     Ok(CanonicalReconcileSource::PreserveShared)
 }
 
+pub(crate) fn canonical_rfc_commit_oid(root: &Path) -> Result<Option<String>> {
+    match canonical_reconcile_source(root)? {
+        CanonicalReconcileSource::Canonical(canonical) => Ok(Some(canonical.oid)),
+        CanonicalReconcileSource::WorkspaceFallback => {
+            Ok(resolve_canonical_ref(root, "HEAD")?.map(|canonical| canonical.oid))
+        }
+        CanonicalReconcileSource::PreserveShared => Ok(None),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static CANONICAL_SOURCE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

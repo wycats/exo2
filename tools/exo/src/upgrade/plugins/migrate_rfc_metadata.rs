@@ -256,7 +256,11 @@ fn historical_stage_for_path(stages: &HashMap<String, u8>, path: &str) -> Option
     stages.get(&path.replace('\\', "/")).copied()
 }
 
-fn document_matches_head(root: &Path, relative_path: &str) -> bool {
+fn document_matches_canonical(
+    root: &Path,
+    canonical_oid: Option<&str>,
+    relative_path: &str,
+) -> bool {
     let in_worktree = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
@@ -266,17 +270,12 @@ fn document_matches_head(root: &Path, relative_path: &str) -> bool {
         return true;
     }
 
-    let head_exists = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-        .current_dir(root)
-        .status()
-        .is_ok_and(|status| status.success());
-    if !head_exists {
-        return true;
-    }
-
+    let Some(canonical_oid) = canonical_oid else {
+        return false;
+    };
+    let canonical_path = format!("{canonical_oid}:{relative_path}");
     let tracked = Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--", relative_path])
+        .args(["cat-file", "-e", &canonical_path])
         .current_dir(root)
         .output()
         .is_ok_and(|output| output.status.success());
@@ -285,7 +284,7 @@ fn document_matches_head(root: &Path, relative_path: &str) -> bool {
     }
 
     Command::new("git")
-        .args(["diff", "--quiet", "HEAD", "--", relative_path])
+        .args(["diff", "--quiet", canonical_oid, "--", relative_path])
         .current_dir(root)
         .status()
         .is_ok_and(|status| status.success())
@@ -308,6 +307,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
     fn is_needed(&self, context: &AgentContext) -> ExoResult<UpgradeStatus> {
         let files = find_rfc_files(&context.root);
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(&context.root)?;
         let unanchored = files
             .iter()
             .filter(|path| std::fs::read_to_string(path).is_ok_and(|content| !has_anchor(&content)))
@@ -380,7 +380,13 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                             .strip_prefix(&context.root)
                             .ok()
                             .and_then(Path::to_str)
-                            .is_some_and(|relative| document_matches_head(&context.root, relative));
+                            .is_some_and(|relative| {
+                                document_matches_canonical(
+                                    &context.root,
+                                    canonical_oid.as_deref(),
+                                    relative,
+                                )
+                            });
                     (!retired_rfc_lifecycle_metadata_is_portable(&content, status)
                         || db_missing_disk_reason
                         || backfill_rfc_lifecycle_metadata_content(
@@ -437,6 +443,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
         };
         let writer = SqliteWriter::open(&db_path)?;
         let historical_stages = historical_retired_stages(&context.root);
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(&context.root)?;
         let mut changes = Vec::new();
         let mut seen_ulids: HashSet<String> = HashSet::new();
         let mut materialized_anchor = false;
@@ -472,7 +479,8 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let document_matched_head = document_matches_head(&context.root, &rel_path);
+            let document_matched_head =
+                document_matches_canonical(&context.root, canonical_oid.as_deref(), &rel_path);
             let frontmatter = (!already_anchored).then(|| parse_frontmatter(&file_content));
             let frontmatter_stage = frontmatter
                 .as_ref()
@@ -768,7 +776,55 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "# RFC 1: Local\n").unwrap();
 
-        assert!(!document_matches_head(root, relative_path));
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
+        assert!(!document_matches_canonical(
+            root,
+            canonical_oid.as_deref(),
+            relative_path
+        ));
+    }
+
+    #[test]
+    fn feature_branch_document_does_not_match_canonical_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let relative_path = "docs/rfcs/withdrawn/00001-retired.md";
+        let path = root.join(relative_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# RFC 1: Retired\n\n- **Reason**: Canonical.\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(&path, "# RFC 1: Retired\n\n- **Reason**: Branch-only.\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qam", "branch RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let canonical_oid = crate::rfc::canonical_rfc_commit_oid(root).unwrap();
+        assert!(!document_matches_canonical(
+            root,
+            canonical_oid.as_deref(),
+            relative_path
+        ));
     }
 
     #[test]
@@ -887,14 +943,23 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical retired RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
 
         let db_path = root.join(SQLITE_DB_PATH);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -939,14 +1004,23 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical retired RFC"],
+            vec!["update-ref", "refs/remotes/origin/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
 
         let db_path = root.join(SQLITE_DB_PATH);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
