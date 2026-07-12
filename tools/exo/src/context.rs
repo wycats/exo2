@@ -1154,6 +1154,24 @@ impl AgentContext {
         })
     }
 
+    /// Hydrate portable SQL state and load context without reconciling RFCs.
+    ///
+    /// RFC read commands use this before entering their writer-lane
+    /// reconciliation so a fresh clone imports its existing projection without
+    /// publishing RFC metadata outside the command boundary.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn load_hydrated_with_project(root: PathBuf, project: Option<Project>) -> ExoResult<Self> {
+        let loader = Self::open_sqlite_loader(&root, project.as_ref())?;
+        let plan = loader
+            .load_state()
+            .with_context(|| "Failed to load state from SQLite database")?;
+        Ok(Self {
+            root,
+            project,
+            plan,
+        })
+    }
+
     /// Hydrate and reconcile the project database before a request-scoped
     /// transaction begins. This keeps projection import and RFC cache
     /// publication outside any command transaction that may roll back.
@@ -1804,6 +1822,36 @@ status = "pending"
             projection_dir.join("epochs.sql").exists(),
             "current projection files should still be written"
         );
+    }
+
+    #[test]
+    fn hydrated_context_imports_projection_without_reconciling_rfcs() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".cache")).expect("create cache dir");
+        std::fs::create_dir_all(root.join("docs/rfcs/stage-1")).expect("create RFC dir");
+
+        let db_path = db_path(root, None);
+        let writer = SqliteWriter::open(&db_path).expect("open sqlite writer");
+        writer
+            .add_epoch("Hydrated Epoch", Some("hydrated-epoch"), &[])
+            .expect("add projected epoch");
+        drop(writer);
+        write_sql_dump_with_project_result(root, None).expect("write SQL projection");
+        std::fs::remove_file(&db_path).expect("remove initialized database");
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+        std::fs::write(
+            root.join("docs/rfcs/stage-1/00001-malformed.md"),
+            "# RFC 1: Missing Anchor\n",
+        )
+        .expect("write malformed RFC");
+
+        let context = AgentContext::load_hydrated_with_project(root.to_path_buf(), None)
+            .expect("hydrate context without RFC reconciliation");
+        assert_eq!(context.plan.epochs.len(), 1);
+        assert_eq!(context.plan.epochs[0].title, "Hydrated Epoch");
     }
 
     #[test]

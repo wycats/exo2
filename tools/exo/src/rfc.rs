@@ -1924,14 +1924,18 @@ pub fn observe_effective_rfc_by_number(
     project: Option<&Project>,
     rfc_number: i64,
 ) -> Result<Option<EffectiveRfcRecord>> {
-    let transaction =
-        exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))?;
-    let record =
-        select_effective_rfc_by_number(observe_effective_rfcs(root, project)?, rfc_number)?;
-    if record.is_some() {
-        transaction.commit()?;
-    }
-    Ok(record)
+    with_reconcile_lock(root, project, || {
+        let transaction =
+            exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))?;
+        let source = canonical_reconcile_source(root)?;
+        reconcile_and_refresh_locked(root, project, &source, true)?;
+        let view = compose_effective_rfc_view_locked(root, project, &source)?;
+        let record = select_effective_rfc_by_number(view.records, rfc_number)?;
+        if record.is_some() {
+            transaction.commit()?;
+        }
+        Ok(record)
+    })
 }
 
 fn select_effective_rfc_by_number(
@@ -6175,6 +6179,71 @@ This RFC supersedes:
             .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap()
             .unwrap();
+        worker.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn observed_lookup_takes_reconcile_lock_before_database_transaction() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-lock-order.md"),
+            "<!-- exo:1 ulid:01lockorder -->\n\n# RFC 1: Lock Order\n\n## Summary\n\nLocked.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical lock-order RFC");
+        publish_origin_main(root, &canonical_oid);
+        let db_path = root.join(SQLITE_DB_PATH);
+        SqliteWriter::open(&db_path).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = observe_effective_rfc_by_number(&thread_root, None, 999)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+
+            let writer = SqliteWriter::open(&db_path).unwrap();
+            writer
+                .add_axiom(
+                    "lock-order-probe",
+                    "workflow",
+                    "database remains writable",
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "lookup should wait on the reconcile lock before opening its transaction"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
         worker.unwrap().join().unwrap();
     }
 

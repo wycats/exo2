@@ -1370,6 +1370,16 @@ fn is_update_command(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("update"))
 }
 
+fn is_rfc_reconcile_read(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("rfc"), Some("list" | "show" | "status"))
+    )
+}
+
 fn command_loads_request_context(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("status"))
         || matches!(
@@ -1379,13 +1389,7 @@ fn command_loads_request_context(args: &[String]) -> bool {
             ),
             (Some("task"), Some("list"))
         )
-        || matches!(
-            (
-                args.first().map(String::as_str),
-                args.get(1).map(String::as_str)
-            ),
-            (Some("rfc"), Some("list" | "show" | "status"))
-        )
+        || is_rfc_reconcile_read(args)
 }
 
 fn attach_post_write_report(
@@ -1422,7 +1426,24 @@ fn load_context_or_exit(
     is_machine_protocol: bool,
     cwd: PathBuf,
 ) -> AgentContext {
-    match AgentContext::load(cwd) {
+    load_context_result_or_exit(format, is_machine_protocol, AgentContext::load(cwd))
+}
+
+fn load_hydrated_context_or_exit(format: OutputFormat, cwd: PathBuf) -> AgentContext {
+    let project = Project::resolve(&cwd).ok();
+    load_context_result_or_exit(
+        format,
+        false,
+        AgentContext::load_hydrated_with_project(cwd, project),
+    )
+}
+
+fn load_context_result_or_exit(
+    format: OutputFormat,
+    is_machine_protocol: bool,
+    result: anyhow::Result<AgentContext>,
+) -> AgentContext {
+    match result {
         Ok(context) => context,
         Err(e) => {
             let original_command = original_command_for_guidance();
@@ -1990,7 +2011,9 @@ fn main() {
     // Direct mode: load context and execute locally.
     // Project bootstrap operations tell callers where Exo state should live or
     // repair stale policy, so they must not require existing Exo state first.
-    let context = if is_project_bootstrap_read(&args)
+    let context = if is_rfc_reconcile_read(&args) {
+        load_hydrated_context_or_exit(format, cwd)
+    } else if is_project_bootstrap_read(&args)
         || is_sidecar_bootstrap_context_command(&args)
         || is_update_command(&args)
         || command_loads_request_context(&args)

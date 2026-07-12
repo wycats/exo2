@@ -1865,6 +1865,51 @@ async fn atomic_request_hydrates_projection_before_rollback(backend: &str) {
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
+async fn daemon_rfc_read_hydrates_projection_before_reconciliation(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let db_path = project.db_path();
+    let writer = exo::context::SqliteWriter::open(&db_path).expect("open project writer");
+    writer
+        .add_epoch(
+            "Projected RFC Read Epoch",
+            Some("projected-rfc-read-epoch"),
+            &[],
+        )
+        .expect("add projected epoch");
+    drop(writer);
+    exo::context::write_sql_dump_with_project_result(&workspace, Some(&project))
+        .expect("write SQL projection");
+    std::fs::remove_file(&db_path).expect("remove initialized project database");
+    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+    let stream = exo::daemon::ensure_daemon(&workspace)
+        .await
+        .expect("spawn daemon");
+    let response = send_machine_request_with_timeout(
+        stream,
+        r#"{"protocol_version":1,"id":"rfc-read-after-hydration","op":{"kind":"call","params":{"address":{"kind":"operation","path":["rfc","status"]},"input":{}}}}"#,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert_eq!(response["status"], "ok", "{response}");
+    assert_db_has_epoch(&db_path, "Projected RFC Read Epoch");
+    let epochs_projection =
+        std::fs::read_to_string(workspace.join("docs/agent-context/epochs.sql"))
+            .expect("read persisted epochs projection");
+    assert!(
+        epochs_projection.contains("Projected RFC Read Epoch"),
+        "RFC reconciliation must preserve hydrated portable state"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
 async fn daemon_replays_recorded_write_outcome_after_client_disconnect(backend: &str) {
     assert_eq!(backend, "sqlite");
     let dir = TempDir::new().unwrap();
