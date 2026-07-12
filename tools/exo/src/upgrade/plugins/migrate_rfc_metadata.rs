@@ -265,7 +265,9 @@ fn document_matches_canonical(
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
         .output()
-        .is_ok_and(|output| output.status.success());
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        });
     if !in_worktree {
         return true;
     }
@@ -849,6 +851,22 @@ mod tests {
             canonical_oid.as_deref(),
             relative_path
         ));
+    }
+
+    #[test]
+    fn bare_repository_uses_workspace_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(document_matches_canonical(root, None, "docs/rfcs/00001.md"));
     }
 
     #[test]

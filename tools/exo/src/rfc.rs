@@ -4152,7 +4152,7 @@ fn parse_rfc_document(
     let declared_status = declared_lifecycle_status(&metadata);
     let lifecycle_status_conflicts = declared_status.is_some_and(|declared| declared != status);
     let lifecycle_status_declared = declared_status.is_some_and(|declared| declared == status);
-    let stage_marker = declared_metadata_value_with_yaml(&metadata, "Stage", "stage");
+    let stage_marker = declared_metadata_value_with_yaml(&metadata, content, "Stage", "stage");
     let declared_stage = stage_marker.value.as_deref().and_then(parse_declared_stage);
     let invalid_stage_marker = stage_marker.declared && declared_stage.is_none();
     let legacy_stage = (status != "active" && !stage_marker.declared)
@@ -4179,7 +4179,7 @@ fn parse_rfc_document(
         "legacy"
     };
 
-    let feature = declared_metadata_value_with_yaml(&metadata, "Feature", "feature");
+    let feature = declared_metadata_value_with_yaml(&metadata, content, "Feature", "feature");
     let reason = declared_metadata_value(&metadata, "Reason");
     let withdrawal_reason = first_declared_value(
         declared_metadata_value(&metadata, "Withdrawal reason"),
@@ -4324,7 +4324,7 @@ pub(crate) fn retired_rfc_stage_from_document(
 
     historical_stage
         .or_else(|| {
-            declared_metadata_value_with_yaml(&metadata, "Stage", "stage")
+            declared_metadata_value_with_yaml(&metadata, content, "Stage", "stage")
                 .value
                 .as_deref()
                 .and_then(parse_declared_stage)
@@ -4373,15 +4373,20 @@ fn declared_metadata_value(content: &str, label: &str) -> DeclaredRfcValue {
 }
 
 fn declared_metadata_value_with_yaml(
+    metadata: &str,
     content: &str,
     label: &str,
     yaml_key: &str,
 ) -> DeclaredRfcValue {
-    let markdown = declared_metadata_value(content, label);
+    let markdown = declared_metadata_value(metadata, label);
     if markdown.declared {
         return markdown;
     }
-    for line in content.lines() {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return DeclaredRfcValue::absent();
+    }
+    for line in lines.take_while(|line| line.trim() != "---") {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -5297,6 +5302,13 @@ feature: Core
         assert_eq!(rfc.stage, 2);
         assert_eq!(rfc.feature, "Core");
         assert_eq!(rfc.number, "0001");
+    }
+
+    #[test]
+    fn retired_stage_reads_top_level_yaml_frontmatter() {
+        let content = "---\nstage: 3\n---\n\n# RFC 1: Retired\n\nBody.\n";
+
+        assert_eq!(retired_rfc_stage_from_document(content, None, 0), 3);
     }
 
     #[test]
