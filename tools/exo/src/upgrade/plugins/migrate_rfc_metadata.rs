@@ -185,6 +185,7 @@ fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
 
     let mut command = Command::new("git");
     command.arg("log").args(history_refs).args([
+        "--find-renames",
         "--name-status",
         "--format=",
         "--diff-filter=R",
@@ -1300,6 +1301,52 @@ mod tests {
 
         assert_eq!(
             historical_stage_for_path(&stages, r"docs\rfcs\withdrawn\00001-retired.md"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn historical_stage_recovery_enables_rename_detection_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let active_path = root.join("docs/rfcs/stage-3/00001-retired.md");
+        let retired_path = root.join("docs/rfcs/withdrawn/00001-retired.md");
+        std::fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+        std::fs::write(&active_path, "# RFC 1: Retired\n\nBody.\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "diff.renames", "false"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "active RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::create_dir_all(retired_path.parent().unwrap()).unwrap();
+        std::fs::rename(&active_path, &retired_path).unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "retire RFC"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        assert_eq!(
+            historical_retired_stages(root)
+                .get("docs/rfcs/withdrawn/00001-retired.md")
+                .copied(),
             Some(3)
         );
     }
