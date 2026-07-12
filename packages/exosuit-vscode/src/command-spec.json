@@ -2439,7 +2439,7 @@
           "name": "list",
           "description": "Reconcile and list RFCs with optional stage filter",
           "effect": "write",
-          "recovery_class": "replayable_read",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2577,7 +2577,7 @@
           "name": "show",
           "description": "Reconcile and show RFC details by ID",
           "effect": "write",
-          "recovery_class": "replayable_read",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": [
             {
@@ -2595,7 +2595,7 @@
           "name": "status",
           "description": "Reconcile and show RFC status grouped by stage",
           "effect": "write",
-          "recovery_class": "replayable_read",
+          "recovery_class": "external_at_most_once",
           "needs_upgrade_gate": true,
           "args": []
         },

@@ -1,8 +1,8 @@
 //! RFC namespace commands.
 //!
-//! - `rfc list`: Reconcile and list RFCs (Write, replayable)
-//! - `rfc show`: Reconcile and show RFC details (Write, replayable)
-//! - `rfc status`: Reconcile and show RFC status (Write, replayable)
+//! - `rfc list`: Reconcile and list RFCs (Write)
+//! - `rfc show`: Reconcile and show RFC details (Write)
+//! - `rfc status`: Reconcile and show RFC status (Write)
 //! - `rfc pipeline`: Show RFC pipeline for the active phase (Pure)
 //! - `rfc create`: Create a new RFC (Write)
 //! - `rfc edit`: Edit an existing RFC (Write)
@@ -18,7 +18,7 @@ use super::traits::{
     Command, CommandBox, CommandContext, CommandOutput, MutableCommand, MutableCommandContext,
     OutputFormat,
 };
-use crate::api::protocol::{Effect, ErrorCode, RecoveryClass};
+use crate::api::protocol::{Effect, ErrorCode};
 use crate::context::AgentContext;
 use crate::context::sqlite_loader::{RfcRecord, SqliteLoader};
 use crate::failure::ExoFailure;
@@ -598,10 +598,6 @@ impl Command for RfcList {
         Effect::Write
     }
 
-    fn recovery_class(&self) -> RecoveryClass {
-        RecoveryClass::ReplayableRead
-    }
-
     fn default_steering(&self) -> Vec<SuggestedAction> {
         default_rfc_steering()
     }
@@ -724,10 +720,6 @@ impl Command for RfcShow {
 
     fn effect(&self) -> Effect {
         Effect::Write
-    }
-
-    fn recovery_class(&self) -> RecoveryClass {
-        RecoveryClass::ReplayableRead
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -925,10 +917,6 @@ impl Command for RfcStatus {
 
     fn effect(&self) -> Effect {
         Effect::Write
-    }
-
-    fn recovery_class(&self) -> RecoveryClass {
-        RecoveryClass::ReplayableRead
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -2043,6 +2031,7 @@ impl Command for RfcPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::protocol::RecoveryClass;
 
     #[test]
     fn test_rfc_list_metadata() {
@@ -2050,7 +2039,7 @@ mod tests {
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "list");
         assert_eq!(cmd.effect(), Effect::Write);
-        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
     }
 
     #[test]
@@ -2113,7 +2102,7 @@ mod tests {
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "show");
         assert_eq!(cmd.effect(), Effect::Write);
-        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
         assert_eq!(cmd.id, "0085");
     }
 
@@ -2123,7 +2112,7 @@ mod tests {
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "status");
         assert_eq!(cmd.effect(), Effect::Write);
-        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
     }
 
     #[test]

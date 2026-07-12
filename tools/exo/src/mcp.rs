@@ -1081,6 +1081,7 @@ fn invocation_uses_lightweight_context(invocation: &Invocation) -> bool {
         ("sidecar", "bootstrap" | "discover" | "init" | "link" | "setup" | "status" | "unlink") => {
             true
         }
+        ("rfc", "list" | "show" | "status") => true,
         _ => false,
     }
 }
@@ -2209,6 +2210,9 @@ mod tests {
             "project repair --apply",
             "sidecar bootstrap --key demo",
             "sidecar status",
+            "rfc list",
+            "rfc show 10196",
+            "rfc status",
             "task --help",
         ] {
             let compiled = compile_exo_run_input(input(command), "t1".to_string())

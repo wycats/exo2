@@ -50,17 +50,21 @@ struct ReconcileKey {
     root: PathBuf,
     project_id: Option<String>,
     db_path: PathBuf,
-    canonical_oid: Option<String>,
+    source_version: Option<String>,
 }
 
 impl ReconcileKey {
-    fn new(root: &Path, project: Option<&Project>, source: &CanonicalReconcileSource) -> Self {
-        Self {
+    fn new(
+        root: &Path,
+        project: Option<&Project>,
+        source: &CanonicalReconcileSource,
+    ) -> Result<Self> {
+        Ok(Self {
             root: normalize_key_path(root),
             project_id: project.map(|project| project.id.as_str().to_string()),
             db_path: normalize_key_path(&crate::context::db_path(root, project)),
-            canonical_oid: canonical_reconcile_cache_oid(source),
-        }
+            source_version: reconcile_source_cache_version(root, source)?,
+        })
     }
 }
 
@@ -641,11 +645,30 @@ pub fn reconcile_rfcs(root: &Path) -> Result<ReconcileResult> {
     reconcile_rfcs_with_project(root, project.as_ref())
 }
 
-fn canonical_reconcile_cache_oid(source: &CanonicalReconcileSource) -> Option<String> {
+fn reconcile_source_cache_version(
+    root: &Path,
+    source: &CanonicalReconcileSource,
+) -> Result<Option<String>> {
     match source {
-        CanonicalReconcileSource::Canonical(canonical) => Some(canonical.oid.clone()),
-        CanonicalReconcileSource::WorkspaceFallback => Some("workspace-fallback".to_string()),
-        CanonicalReconcileSource::PreserveShared => None,
+        CanonicalReconcileSource::Canonical(canonical) => Ok(Some(canonical.oid.clone())),
+        CanonicalReconcileSource::WorkspaceFallback => {
+            let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
+                .into_iter()
+                .map(|path| {
+                    let relative_path = relative_workspace_path(root, &path);
+                    let bytes = std::fs::read(&path)
+                        .with_context(|| format!("Failed to read {}", path.display()))?;
+                    Ok((relative_path, bytes))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            documents.sort_by(|left, right| left.0.cmp(&right.0));
+            let digest = workspace_document_digest(&documents)
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            Ok(Some(format!("workspace-fallback:{digest}")))
+        }
+        CanonicalReconcileSource::PreserveShared => Ok(None),
     }
 }
 
@@ -971,7 +994,7 @@ fn reconcile_and_refresh_locked(
     source: &CanonicalReconcileSource,
     reconcile_shared: bool,
 ) -> Result<ReconcileResult> {
-    let key = ReconcileKey::new(root, project, source);
+    let key = ReconcileKey::new(root, project, source)?;
     let publish_reconciled_key = can_publish_reconciled_key(root, project)?;
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let should_reconcile = {
@@ -986,7 +1009,7 @@ fn reconcile_and_refresh_locked(
         ReconcileResult::default()
     };
     refresh_workspace_rfc_snapshot(root, project, source)?;
-    if should_reconcile && key.canonical_oid.is_some() && publish_reconciled_key {
+    if should_reconcile && key.source_version.is_some() && publish_reconciled_key {
         let mut reconciled_keys = reconciled_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1901,7 +1924,14 @@ pub fn observe_effective_rfc_by_number(
     project: Option<&Project>,
     rfc_number: i64,
 ) -> Result<Option<EffectiveRfcRecord>> {
-    select_effective_rfc_by_number(observe_effective_rfcs(root, project)?, rfc_number)
+    let transaction =
+        exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))?;
+    let record =
+        select_effective_rfc_by_number(observe_effective_rfcs(root, project)?, rfc_number)?;
+    if record.is_some() {
+        transaction.commit()?;
+    }
+    Ok(record)
 }
 
 fn select_effective_rfc_by_number(
@@ -5612,6 +5642,105 @@ This RFC supersedes:
     }
 
     #[test]
+    fn missing_observed_rfc_rolls_back_canonical_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-transactional-show.md"),
+            "<!-- exo:1 ulid:01transactionalshow -->\n\n# RFC 1: Transactional Show\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical show RFC");
+        publish_origin_main(root, &canonical_oid);
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        assert!(
+            observe_effective_rfc_by_number(root, None, 999)
+                .unwrap()
+                .is_none()
+        );
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        assert!(
+            loader.load_rfc_by_number(1).unwrap().is_none(),
+            "a failed lookup must not commit canonical reconciliation"
+        );
+        assert!(
+            loader
+                .load_rfc_workspace_snapshot(&slash_path_string(&normalize_key_path(root)))
+                .unwrap()
+                .is_none(),
+            "a failed lookup must roll back its workspace snapshot"
+        );
+
+        let found = observe_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .expect("canonical RFC should relink on a successful lookup");
+        assert_eq!(found.record.title, "Transactional Show");
+        assert!(loader.load_rfc_by_number(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn workspace_fallback_reconciles_each_observed_read() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-fallback.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01fallbackread -->\n\n# RFC 1: First Fallback View\n\n## Summary\n\nFirst.\n",
+        )
+        .unwrap();
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01fallbackread",
+                1,
+                "Seeded Fallback View",
+                1,
+                "active",
+                None,
+                "fallback",
+                "docs/rfcs/stage-1/00001-fallback.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let first = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(first[0].record.title, "First Fallback View");
+        assert_eq!(
+            SqliteLoader::open(root.join(SQLITE_DB_PATH))
+                .unwrap()
+                .load_rfc_by_number(1)
+                .unwrap()
+                .unwrap()
+                .title,
+            "First Fallback View"
+        );
+
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01fallbackread -->\n\n# RFC 1: Second Fallback View\n\n## Summary\n\nSecond.\n",
+        )
+        .unwrap();
+        let second = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(second[0].record.title, "Second Fallback View");
+        let shared = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.title, "Second Fallback View");
+    }
+
+    #[test]
     fn linked_worktrees_compose_distinct_rfc_views_over_shared_canonical_state() {
         let temp = TempDir::new().unwrap();
         let main_root = temp.path().join("main");
@@ -7150,7 +7279,11 @@ This RFC supersedes:
         .unwrap();
 
         let second = reconcile_rfcs_once_with_project(root, None).unwrap();
-        assert_eq!(second, ReconcileResult::default());
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.unchanged, 2);
+
+        let unchanged = reconcile_rfcs_once_with_project(root, None).unwrap();
+        assert_eq!(unchanged, ReconcileResult::default());
 
         let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
         let rows = loader.load_rfcs().unwrap();

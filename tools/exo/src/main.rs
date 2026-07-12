@@ -1379,6 +1379,13 @@ fn command_loads_request_context(args: &[String]) -> bool {
             ),
             (Some("task"), Some("list"))
         )
+        || matches!(
+            (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str)
+            ),
+            (Some("rfc"), Some("list" | "show" | "status"))
+        )
 }
 
 fn attach_post_write_report(
@@ -3039,6 +3046,12 @@ mod tests {
             "task".to_string(),
             "list".to_string(),
         ]));
+        for operation in ["list", "show", "status"] {
+            assert!(command_loads_request_context(&[
+                "rfc".to_string(),
+                operation.to_string(),
+            ]));
+        }
         assert!(!command_loads_request_context(&[
             "task".to_string(),
             "start".to_string(),
