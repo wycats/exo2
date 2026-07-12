@@ -1729,6 +1729,18 @@ async fn daemon_and_direct_rfc_views_follow_the_issuing_linked_worktree(backend:
     });
     let linked_response = send_machine_request(linked_stream, &linked_request.to_string()).await;
 
+    assert_eq!(linked_response["effect"], "write", "{linked_response}");
+    assert_eq!(
+        linked_response["result"]["post_write"]["sql_dump_written"], true,
+        "reconciling RFC reads should persist their canonical mutation"
+    );
+    let projection_path = linked.join("docs/agent-context/rfcs.sql");
+    let projection = std::fs::read_to_string(&projection_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", projection_path.display()));
+    assert!(projection.contains("01daemonworkspace"));
+    assert!(projection.contains("Workspace View"));
+    assert!(!projection.contains(linked.to_string_lossy().as_ref()));
+
     let direct = test_support::exo_cmd(&linked)
         .args(["--format", "json", "rfc", "show", "00001"])
         .assert()

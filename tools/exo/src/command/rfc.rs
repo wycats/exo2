@@ -1,8 +1,8 @@
 //! RFC namespace commands.
 //!
-//! - `rfc list`: List RFCs with optional stage filter (Pure)
-//! - `rfc show`: Show RFC details by ID (Pure)
-//! - `rfc status`: Show RFC status grouped by stage (Pure)
+//! - `rfc list`: Reconcile and list RFCs (Write, replayable)
+//! - `rfc show`: Reconcile and show RFC details (Write, replayable)
+//! - `rfc status`: Reconcile and show RFC status (Write, replayable)
 //! - `rfc pipeline`: Show RFC pipeline for the active phase (Pure)
 //! - `rfc create`: Create a new RFC (Write)
 //! - `rfc edit`: Edit an existing RFC (Write)
@@ -18,7 +18,7 @@ use super::traits::{
     Command, CommandBox, CommandContext, CommandOutput, MutableCommand, MutableCommandContext,
     OutputFormat,
 };
-use crate::api::protocol::{Effect, ErrorCode};
+use crate::api::protocol::{Effect, ErrorCode, RecoveryClass};
 use crate::context::AgentContext;
 use crate::context::sqlite_loader::{RfcRecord, SqliteLoader};
 use crate::failure::ExoFailure;
@@ -331,19 +331,31 @@ fn rfc_matches_stage_filter(record: &RfcRecord, filter: Option<u8>) -> bool {
 #[derive(Debug, exospec::ExoSpec)]
 #[exo(namespace = "rfc", description = "RFC management commands")]
 pub enum RfcCommands {
-    #[exo(effect = "pure", description = "List RFCs with optional stage filter")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and list RFCs with optional stage filter"
+    )]
     List {
         #[exo(long, optional, description = "Filter by RFC stage (0-4)")]
         stage: Option<i64>,
     },
 
-    #[exo(effect = "pure", description = "Show RFC details by ID")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and show RFC details by ID"
+    )]
     Show {
         #[exo(positional, description = "The RFC ID to show")]
         id: String,
     },
 
-    #[exo(effect = "pure", description = "Show RFC status grouped by stage")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and show RFC status grouped by stage"
+    )]
     Status,
 
     #[exo(effect = "write", upgrade_gate, description = "Create a new RFC")]
@@ -583,7 +595,11 @@ impl Command for RfcList {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
+    }
+
+    fn recovery_class(&self) -> RecoveryClass {
+        RecoveryClass::ReplayableRead
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -707,7 +723,11 @@ impl Command for RfcShow {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
+    }
+
+    fn recovery_class(&self) -> RecoveryClass {
+        RecoveryClass::ReplayableRead
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -904,7 +924,11 @@ impl Command for RfcStatus {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
+    }
+
+    fn recovery_class(&self) -> RecoveryClass {
+        RecoveryClass::ReplayableRead
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -2025,7 +2049,8 @@ mod tests {
         let cmd = RfcList::new(None);
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "list");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
     }
 
     #[test]
@@ -2087,7 +2112,8 @@ mod tests {
         let cmd = RfcShow::new("0085");
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "show");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
         assert_eq!(cmd.id, "0085");
     }
 
@@ -2096,7 +2122,8 @@ mod tests {
         let cmd = RfcStatus::new();
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "status");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ReplayableRead);
     }
 
     #[test]
