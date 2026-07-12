@@ -169,26 +169,29 @@ fn find_rfc_files(root: &Path) -> Vec<PathBuf> {
 
 fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
     let retained_history_ref = "refs/remotes/private-history/HEAD";
-    let history_ref = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", retained_history_ref])
-        .current_dir(root)
-        .output()
-        .is_ok_and(|output| output.status.success())
-        .then_some(retained_history_ref)
-        .unwrap_or("HEAD");
-    let Ok(output) = Command::new("git")
-        .args([
-            "log",
-            history_ref,
-            "--name-status",
-            "--format=",
-            "--diff-filter=R",
-            "--",
-            RFCS_DIR,
-        ])
-        .current_dir(root)
-        .output()
-    else {
+    let history_refs = [retained_history_ref, "HEAD"]
+        .into_iter()
+        .filter(|history_ref| {
+            Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", history_ref])
+                .current_dir(root)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .collect::<Vec<_>>();
+    if history_refs.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut command = Command::new("git");
+    command.arg("log").args(history_refs).args([
+        "--name-status",
+        "--format=",
+        "--diff-filter=R",
+        "--",
+        RFCS_DIR,
+    ]);
+    let Ok(output) = command.current_dir(root).output() else {
         return HashMap::new();
     };
     if !output.status.success() {
@@ -426,6 +429,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
         let historical_stages = historical_retired_stages(&context.root);
         let mut changes = Vec::new();
         let mut seen_ulids: HashSet<String> = HashSet::new();
+        let mut materialized_anchor = false;
 
         for path in &files {
             let file_content = match std::fs::read_to_string(path) {
@@ -458,6 +462,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            let document_matched_head = document_matches_head(&context.root, &rel_path);
             let frontmatter = (!already_anchored).then(|| parse_frontmatter(&file_content));
             let frontmatter_stage = frontmatter
                 .as_ref()
@@ -506,7 +511,9 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
                         "MATERIALIZED {filename}: relationship metadata from SQLite"
                     ));
                 }
-                let disk_reason = retired_rfc_reason_from_document(&file_content, status);
+                let disk_reason = document_matched_head
+                    .then(|| retired_rfc_reason_from_document(&file_content, status))
+                    .flatten();
                 withdrawal_reason = (status == "withdrawn")
                     .then(|| disk_reason.clone())
                     .flatten()
@@ -587,6 +594,7 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
 
                 std::fs::write(path, new_content.as_bytes())
                     .with_context(|| format!("Failed to rewrite {}", path.display()))?;
+                materialized_anchor = true;
             }
             seen_ulids.insert(ulid.clone());
 
@@ -649,7 +657,14 @@ impl UpgradePlugin for MigrateRfcMetadataPlugin {
         }
 
         drop(writer);
-        crate::rfc::reconcile_rfcs_with_project(&context.root, context.project.as_ref())?;
+        // Observe newly written anchors before a canonical reconciliation can
+        // compare them with the pre-migration HEAD. Once the migrated document
+        // tree reaches the canonical ref, ordinary reconciliation advances the
+        // shared rows from that tree.
+        crate::rfc::load_effective_rfc_view(&context.root, context.project.as_ref())?;
+        if !materialized_anchor {
+            crate::rfc::reconcile_rfcs_with_project(&context.root, context.project.as_ref())?;
+        }
 
         if changes.is_empty() {
             Ok(UpgradeReport::no_changes(self.id()))
@@ -912,6 +927,87 @@ mod tests {
     }
 
     #[test]
+    fn migration_keeps_dirty_workspace_reason_out_of_shared_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/withdrawn");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+
+        let anchored_ulid = "01kq09x2d9y6gc9eg27jatcgvf";
+        let rfc_path = rfc_dir.join("00001-retired.md");
+        std::fs::write(
+            &rfc_path,
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**: Canonical reason.\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "canonical RFC"],
+            vec!["update-ref", "refs/remotes/private-history/HEAD", "HEAD"],
+            vec!["update-ref", "refs/remotes/upstream/HEAD", "HEAD"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(
+            &rfc_path,
+            format!(
+                "<!-- exo:1 ulid:{anchored_ulid} -->\n\n# RFC 1: Retired\n\n- **Status**: Withdrawn\n- **Stage**: 1\n- **Reason**: Dirty workspace reason.\n\nBody.\n"
+            ),
+        )
+        .unwrap();
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .upsert_rfc(
+                anchored_ulid,
+                1,
+                "Retired",
+                1,
+                "withdrawn",
+                None,
+                "retired",
+                "docs/rfcs/withdrawn/00001-retired.md",
+                None,
+                None,
+                Some("Canonical reason."),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let row = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.withdrawal_reason.as_deref(), Some("Canonical reason."));
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            effective.record.withdrawal_reason.as_deref(),
+            Some("Dirty workspace reason.")
+        );
+    }
+
+    #[test]
     fn migration_materializes_retired_lifecycle_metadata_from_shared_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -945,6 +1041,14 @@ mod tests {
                     .success()
             );
         }
+        assert!(
+            Command::new("git")
+                .args(["update-ref", "refs/remotes/private-history/HEAD", "HEAD"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
         assert!(
             Command::new("git")
                 .args([
@@ -981,6 +1085,14 @@ mod tests {
         assert!(
             Command::new("git")
                 .args(["commit", "-qm", "rename retired RFC"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["update-ref", "refs/remotes/origin/HEAD", "HEAD"])
                 .current_dir(root)
                 .status()
                 .unwrap()
@@ -1147,6 +1259,60 @@ mod tests {
         let loader = SqliteLoader::open(&db_path).unwrap();
         let row = loader.load_rfc_by_number(1).unwrap().unwrap();
         assert_eq!(row.supersedes.as_deref(), Some("00002, 00003"));
+    }
+
+    #[test]
+    fn unanchored_migration_keeps_the_migrated_workspace_anchor_addressable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let rfc_dir = root.join("docs/rfcs/stage-1");
+        std::fs::create_dir_all(&rfc_dir).unwrap();
+        let rfc_path = rfc_dir.join("00001-proposal.md");
+        std::fs::write(
+            &rfc_path,
+            "---\ntitle: Proposal\nulid: 01kq2222222222222222222222\n---\n\n# RFC 00001: Proposal\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "legacy unanchored RFC"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let db_path = root.join(SQLITE_DB_PATH);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path).unwrap();
+
+        let mut context = AgentContext::new_for_testing(root.to_path_buf());
+        MigrateRfcMetadataPlugin.apply(&mut context).unwrap();
+
+        let content = std::fs::read_to_string(&rfc_path).unwrap();
+        assert!(content.starts_with("<!-- exo:1 ulid:01kq2222222222222222222222 -->"));
+        let shared = SqliteLoader::open(&db_path)
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.text_id, "01kq2222222222222222222222");
+        let effective = crate::rfc::load_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.record.text_id, "01kq2222222222222222222222");
+        assert_eq!(
+            effective.record.file_path,
+            "docs/rfcs/stage-1/00001-proposal.md"
+        );
     }
 
     #[test]
