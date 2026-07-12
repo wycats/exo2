@@ -274,6 +274,15 @@ fn document_matches_head(root: &Path, relative_path: &str) -> bool {
         return true;
     }
 
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", relative_path])
+        .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !tracked {
+        return false;
+    }
+
     Command::new("git")
         .args(["diff", "--quiet", "HEAD", "--", relative_path])
         .current_dir(root)
@@ -709,6 +718,44 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use crate::context::{AgentContext, SQLITE_DB_PATH, SqliteLoader, SqliteWriter};
+
+    #[test]
+    fn untracked_document_does_not_match_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(root.join("README.md"), "canonical\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-qm", "initial"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let relative_path = "docs/rfcs/withdrawn/00001-local.md";
+        let path = root.join(relative_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "# RFC 1: Local\n").unwrap();
+
+        assert!(!document_matches_head(root, relative_path));
+    }
 
     #[test]
     fn anchored_rfc_preserves_db_only_metadata_when_another_rfc_is_missing() {
