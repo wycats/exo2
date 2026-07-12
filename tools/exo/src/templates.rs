@@ -309,17 +309,52 @@ fn write_if_changed(path: &std::path::Path, contents: &str) -> Result<bool, std:
     Ok(true)
 }
 
+// Request-scoped override used by daemon-routed CLI updates.
+thread_local! {
+    static GLOBAL_PROMPTS_HOME_OVERRIDE: std::cell::RefCell<Option<Option<std::path::PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct GlobalPromptsHomeOverrideGuard(Option<Option<std::path::PathBuf>>);
+
+impl Drop for GlobalPromptsHomeOverrideGuard {
+    fn drop(&mut self) {
+        GLOBAL_PROMPTS_HOME_OVERRIDE.with(|home| {
+            home.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn with_global_prompts_home_override<T>(
+    home: Option<Option<std::path::PathBuf>>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let previous = GLOBAL_PROMPTS_HOME_OVERRIDE.with(|current| current.replace(home));
+    let _guard = GlobalPromptsHomeOverrideGuard(previous);
+    operation()
+}
+
 /// Install global prompts to the user's VS Code prompts directory.
 /// Path: `~/.config/Code/User/prompts/exo/`
 pub fn install_global_prompts() -> Result<usize, std::io::Error> {
-    let home = std::env::var("HOME").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "HOME environment variable not set",
-        )
-    })?;
+    let home =
+        GLOBAL_PROMPTS_HOME_OVERRIDE.with(|override_home| match &*override_home.borrow() {
+            Some(Some(home)) => Ok(home.clone()),
+            Some(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HOME environment variable not set for update caller",
+            )),
+            None => std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "HOME environment variable not set",
+                    )
+                }),
+        })?;
 
-    let global_prompts_dir = std::path::PathBuf::from(home).join(".config/Code/User/prompts/exo");
+    let global_prompts_dir = home.join(".config/Code/User/prompts/exo");
     std::fs::create_dir_all(&global_prompts_dir)?;
 
     let mut written = 0usize;

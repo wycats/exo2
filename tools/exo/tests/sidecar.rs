@@ -516,6 +516,30 @@ fn wait_for_diagnostics_event(path: &Path, name: &str) -> Vec<JsonValue> {
     }
 }
 
+fn wait_for_daemon_operation(path: &Path, namespace: &str, operation: &str) -> Vec<JsonValue> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if path.exists() {
+            let events = read_diagnostics_events(path);
+            if events.iter().any(|event| {
+                event.get("event").and_then(JsonValue::as_str) == Some("request.invoke_end")
+                    && event.get("namespace").and_then(JsonValue::as_str) == Some(namespace)
+                    && event.get("operation").and_then(JsonValue::as_str) == Some(operation)
+                    && event.get("status").and_then(JsonValue::as_str) == Some("ok")
+            }) {
+                return events;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if path.exists() {
+        read_diagnostics_events(path)
+    } else {
+        Vec::new()
+    }
+}
+
 fn assert_has_daemon_operation(events: &[JsonValue], namespace: &str, operation: &str) {
     assert!(
         events.iter().any(|event| {
@@ -806,17 +830,30 @@ fn spawned_stale_exo_pid_hash_start_id_and_path(
     permissions.set_mode(0o755);
     std::fs::set_permissions(&stale_exo, permissions).expect("chmod stale exo");
 
-    let child = Command::new(&stale_exo)
-        .args(["--direct", "mcp", "worker"])
-        .current_dir(repo)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("EXO_NO_REEXEC", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn stale exo worker");
+    let mut executable_busy_retries = 0;
+    let child = loop {
+        match Command::new(&stale_exo)
+            .args(["--direct", "mcp", "worker"])
+            .current_dir(repo)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("EXO_NO_REEXEC", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && executable_busy_retries < 20 =>
+            {
+                executable_busy_retries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("spawn stale exo worker: {error}"),
+        }
+    };
     let pid = child.id();
     let hash = process_executable_blake3(pid);
     let start_id = process_start_identity(pid);
@@ -1895,14 +1932,41 @@ remote = "git@github.com:wycats/other-state.git"
 }
 
 #[test]
-fn update_imports_legacy_plan_toml_into_sidecar_state() {
+fn ordinary_human_update_preserves_detailed_daemon_report() {
+    let fixture = basic_sidecar_fixture();
+    let _guard = DaemonPathGuard::new(&fixture.repo);
+
+    let output = exo_cmd(&fixture.repo, &fixture.home, &fixture.config_home)
+        .arg("update")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).expect("human update output is utf-8");
+
+    assert!(output.contains("Updating Exosuit project in"), "{output}");
+    assert!(output.contains("Applied "), "{output}");
+    assert!(output.contains("install-global-prompts-v1"), "{output}");
+    assert!(output.contains("Project updated successfully!"), "{output}");
+}
+
+#[test]
+fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     let temp = short_tempdir();
     let repo = temp.path().join("external-repo");
     let home = temp.path().join("home");
+    let caller_home = temp.path().join("caller-home");
     let config_home = temp.path().join("config");
     let sidecar_root = temp.path().join("sidecars");
+    let diagnostics_path = temp.path().join("sidecar-update-daemon.ndjson");
     std::fs::create_dir_all(repo.join("docs/agent-context")).expect("create agent-context dir");
+    std::fs::create_dir_all(&sidecar_root).expect("create sidecar root");
     git_init(&repo);
+    git_init(&sidecar_root);
+    std::fs::write(sidecar_root.join("README.md"), "sidecar\n").expect("write readme");
+    git_success(&sidecar_root, &["add", "README.md"]);
+    git_success(&sidecar_root, &["commit", "-m", "Initial sidecar"]);
     std::fs::write(
         repo.join("docs/agent-context/plan.toml"),
         r#"[[epochs]]
@@ -1924,15 +1988,96 @@ tasks = ["Legacy Goal"]
     )
     .expect("write legacy axiom dump");
     link_sidecar(&repo, &home, &config_home, &sidecar_root);
+    let _guard = DaemonPathGuard::new(&repo);
 
-    let update_output = exo_cmd(&repo, &home, &config_home)
-        .args(["--direct", "--format", "json", "update"])
+    exo_cmd(&repo, &home, &config_home)
+        .env("EXO_DAEMON_DIAGNOSTICS", "1")
+        .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
+        .args(["--format", "json", "idea", "add", "Acquire Sidecar Writer"])
+        .assert()
+        .success();
+    assert!(
+        sidecar_write_owner_marker_path(&sidecar_root, "external-test").exists(),
+        "normal daemon write should acquire sidecar writer ownership"
+    );
+    let owner: JsonValue = serde_json::from_str(
+        &std::fs::read_to_string(sidecar_write_owner_marker_path(
+            &sidecar_root,
+            "external-test",
+        ))
+        .expect("read sidecar writer ownership"),
+    )
+    .expect("sidecar writer ownership is json");
+    let daemon_pid = std::fs::read_to_string(project_state_path(
+        &sidecar_root,
+        "external-test",
+        &["runtime", "daemon.pid"],
+    ))
+    .expect("read sidecar daemon pid");
+    let daemon_pid = daemon_pid.trim().parse::<u64>().expect("daemon pid is u64");
+    assert_eq!(
+        owner["pid"].as_u64(),
+        Some(daemon_pid),
+        "normal write should establish ownership through the sidecar daemon writer lane"
+    );
+
+    let update_output = exo_cmd(&repo, &caller_home, &config_home)
+        .env("EXO_DAEMON_DIAGNOSTICS", "1")
+        .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
+        .args(["--format", "json", "update"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
     let update = json_result(&update_output);
+    let events = wait_for_daemon_operation(&diagnostics_path, "", "update");
+    assert_has_daemon_operation(&events, "", "update");
+    let update_daemon_pid = std::fs::read_to_string(project_state_path(
+        &sidecar_root,
+        "external-test",
+        &["runtime", "daemon.pid"],
+    ))
+    .expect("read sidecar daemon pid after update")
+    .trim()
+    .parse::<u64>()
+    .expect("update daemon pid is u64");
+    assert_eq!(
+        update_daemon_pid, daemon_pid,
+        "ordinary update should preserve the active daemon writer"
+    );
+    let update_owner: JsonValue = serde_json::from_str(
+        &std::fs::read_to_string(sidecar_write_owner_marker_path(
+            &sidecar_root,
+            "external-test",
+        ))
+        .expect("read sidecar writer ownership after update"),
+    )
+    .expect("sidecar writer ownership after update is json");
+    assert_eq!(
+        update_owner["pid"].as_u64(),
+        Some(daemon_pid),
+        "update should retain ownership through the existing daemon writer"
+    );
+    assert!(
+        caller_home
+            .join(".config/Code/User/prompts/exo/coherence.prompt.md")
+            .exists(),
+        "update plugins should observe the caller's HOME"
+    );
+    assert!(
+        !home.join(".config/Code/User/prompts/exo").exists(),
+        "the daemon's startup HOME should not receive update plugin output"
+    );
+    assert_eq!(
+        update["post_write"]["sidecar_auto_persist"]["ok"], true,
+        "ordinary update should complete its sidecar checkpoint: {update:#}"
+    );
+    assert_eq!(
+        update["post_write"]["sidecar_auto_persist"]["committed"], true,
+        "ordinary update should commit its sidecar checkpoint: {update:#}"
+    );
+    assert_no_work_repo_daemon_runtime(&repo);
     let applied = update["applied"].as_array().expect("applied is array");
     assert!(
         applied

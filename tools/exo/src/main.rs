@@ -539,7 +539,16 @@ fn dispatch_via_daemon_with_prompter(
         };
 
         let address = invocation_to_address(&invocation);
-        let input = invocation.to_json_input();
+        let mut input = invocation.to_json_input();
+        if invocation.namespace().is_empty()
+            && invocation.operation() == "update"
+            && let Some(input) = input.as_object_mut()
+        {
+            input.insert(
+                "__exo_transport".to_string(),
+                serde_json::json!({ "home": std::env::var("HOME").ok() }),
+            );
+        }
         let op = Op::Call(CallParams {
             address: address.clone(),
             input: input.clone(),
@@ -1740,8 +1749,7 @@ fn main() {
     let is_direct = has_direct_flag
         || std::env::var_os(TASK_DIRECT_MODE_ENV).is_some()
         || is_project_bootstrap_read(&args)
-        || is_sidecar_bootstrap_context_command(&args)
-        || is_update_command(&args);
+        || is_sidecar_bootstrap_context_command(&args);
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("exo {}", env!("CARGO_PKG_VERSION"));
@@ -1760,6 +1768,21 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let update_project = is_update_command(&args).then(|| Project::resolve(&cwd));
+    let is_admitted_update_workspace = update_project
+        .as_ref()
+        .and_then(|project| project.as_ref().ok())
+        .is_some_and(|project| exo::command::update::is_update_workspace(&cwd, Some(project)));
+    let has_update_daemon_workspace = update_project
+        .as_ref()
+        .and_then(|project| project.as_ref().ok())
+        .is_some_and(|project| project.workspace_root.is_some());
+    let is_direct = is_direct
+        || update_project
+            .as_ref()
+            .is_some_and(std::result::Result::is_err)
+        || (is_update_command(&args)
+            && (!is_admitted_update_workspace || !has_update_daemon_workspace));
 
     match args.first().map(String::as_str) {
         Some("json") if args.get(1).map(String::as_str) == Some("server") => {
@@ -1965,7 +1988,11 @@ fn main() {
         || is_update_command(&args)
         || command_loads_request_context(&args)
     {
-        let project = Project::resolve(&cwd).ok();
+        let project = if is_update_command(&args) {
+            update_project.and_then(std::result::Result::ok)
+        } else {
+            Project::resolve(&cwd).ok()
+        };
         AgentContext {
             root: cwd,
             project,
