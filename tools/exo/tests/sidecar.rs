@@ -830,17 +830,30 @@ fn spawned_stale_exo_pid_hash_start_id_and_path(
     permissions.set_mode(0o755);
     std::fs::set_permissions(&stale_exo, permissions).expect("chmod stale exo");
 
-    let child = Command::new(&stale_exo)
-        .args(["--direct", "mcp", "worker"])
-        .current_dir(repo)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("EXO_NO_REEXEC", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn stale exo worker");
+    let mut executable_busy_retries = 0;
+    let child = loop {
+        match Command::new(&stale_exo)
+            .args(["--direct", "mcp", "worker"])
+            .current_dir(repo)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("EXO_NO_REEXEC", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && executable_busy_retries < 20 =>
+            {
+                executable_busy_retries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("spawn stale exo worker: {error}"),
+        }
+    };
     let pid = child.id();
     let hash = process_executable_blake3(pid);
     let start_id = process_start_identity(pid);
