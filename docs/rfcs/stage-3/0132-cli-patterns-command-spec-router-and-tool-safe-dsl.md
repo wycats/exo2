@@ -4,11 +4,13 @@
 
 ## Summary
 
-Exo presents one command language across its CLI, machine channel, MCP server,
-and VS Code extension. Commands are described by a machine-readable
-`CommandSpec`, compiled into typed `Invocation` values, and dispatched through
-the same command implementations regardless of the frontend that supplied the
-input.
+Exo presents one command vocabulary and typed execution model across its CLI,
+machine channel, MCP server, and VS Code extension. Commands are described by a
+machine-readable `CommandSpec`, compiled into typed `Invocation` values, and
+dispatched through the same command implementations regardless of the frontend
+that supplied the input. Each frontend adapts its native input to that shared
+contract; the CLI, MCP, and VS Code adapters do not need identical parsers to
+name the same operations and reach the same execution path.
 
 The command language is CLI-shaped because verb-first paths, options, and
 positionals provide a familiar interface for people and language models. The
@@ -65,10 +67,13 @@ name, required or optional status, repeatability, and any default or enumerated
 values.
 
 Compilation produces typed values rather than leaving every input as an
-uninterpreted string. The common value model includes booleans, integers,
-floats, strings, paths, JSON values, enums, and arrays. Type errors therefore
-belong to command compilation, where Exo can report the offending argument and
-the expected form.
+uninterpreted string. A `CommandSpec` argument can declare a boolean, integer,
+float, string, path, JSON, or enumerated value. JSON enters the compiled
+`TypedValue` model as raw JSON text and is decoded when the invocation is
+projected back into structured data. Repeatability is an argument property,
+rather than a separate array-valued argument type. Type errors therefore belong
+to command compilation, where Exo can report the offending argument and the
+expected form.
 
 ### Effects and recovery
 
@@ -122,25 +127,36 @@ Those arguments are validated against the same `CommandSpec` and converted
 into the same typed invocation model.
 
 Structured requests carry protocol identity, request identity, workspace
-context, confirmation data, and recovery metadata outside the command
-arguments. This keeps transport and lifecycle concerns explicit while
-preserving the command's public argument contract.
+context, confirmation data, and agent identity outside the command arguments.
+Clients do not declare an operation's recovery class. Exo derives effect and
+recovery behavior from the registered `CommandSpec` and the built command, so a
+request cannot weaken the server's execution policy. This keeps transport and
+lifecycle concerns explicit while preserving the command's public argument
+contract.
 
-### Tool-safe command text
+### Tool-facing command text
 
-`exo-run` accepts a compact command string because CLI-shaped text is an
-effective interface for language models. Its tokenizer supports command words,
-options, positionals, quoting, escaping, and explicit placeholder values for
-content supplied independently from command text.
+The MCP and VS Code `exo-run` tools accept compact, CLI-shaped command text
+because command paths, options, and positionals are an effective interface for
+language models. Both surfaces substitute explicit placeholder values as data
+and ultimately submit a structured operation to Exo's machine channel.
 
-The tokenizer treats all input as data. Environment assignments, command
-substitution, pipelines, redirects, and control operators produce explicit
-unsupported-input diagnostics. Placeholder values are inserted as argument
-tokens rather than evaluated as program text.
+MCP uses Exo's Rust command-text compiler. That compiler handles quoting and
+escaping, removes global presentation options before operation validation, and
+rejects environment assignments, command substitution, pipelines, redirects,
+and control operators with explicit unsupported-input diagnostics.
 
-The command-text frontend is deliberately smaller than a shell language. Its
-scope is one safe Exo invocation; project workflows and process composition use
-their dedicated Exo surfaces.
+The VS Code extension currently uses an extension-local tokenizer and router to
+construct the structured machine request. The machine channel still validates
+the resolved operation and arguments against `CommandSpec`, but the adapter does
+not yet provide every MCP parsing behavior or diagnostic. In particular, global
+presentation options and shell-like tokens can surface as ordinary argument
+errors instead of MCP's specialized diagnostics.
+
+Neither adapter executes command text as a shell program. Their scope is one
+Exo invocation; project workflows and process composition use their dedicated
+Exo surfaces. Converging the adapters on one command-text compiler remains an
+implementation refinement within this boundary.
 
 ## Diagnostics
 
@@ -151,8 +167,10 @@ concrete suggestions.
 Diagnostics answer the likely mistake. Unknown namespaces and operations can
 offer nearby names. Unknown flags can show the accepted flags for the resolved
 operation. Missing or invalid values can identify the argument and expected
-type. Shell operators can explain that `exo-run` is a command transport rather
-than a shell.
+type. The Rust argv and MCP command-text compilers can explain that `exo-run` is
+a command transport rather than a shell. Other adapters preserve the structured
+command failure even when they do not yet provide the same specialized
+diagnostic.
 
 Human CLI output and machine responses may render these diagnostics
 differently, but both preserve the same underlying failure and repair
@@ -217,9 +235,11 @@ current design keeps structured execution while allowing CLI-shaped input.
 ## Current Status
 
 The shared command model is implemented. Exo generates a command specification
-from its registered command definitions, compiles argv and structured inputs
-into typed invocations, rejects shell operators, emits structured diagnostics,
-and projects the inventory into help, machine-channel, and editor artifacts.
+from its registered command definitions and compiles argv and structured inputs
+into typed invocations. The CLI and MCP command-text paths reject shell
+operators and emit specialized diagnostics; the VS Code adapter constructs a
+structured request locally and relies on machine-channel validation. Exo
+projects the shared inventory into help, machine-channel, and editor artifacts.
 
 Stage 3 reflects that implemented contract. Further work may improve individual
 diagnostics, artifact ergonomics, or command authoring, and those refinements preserve the

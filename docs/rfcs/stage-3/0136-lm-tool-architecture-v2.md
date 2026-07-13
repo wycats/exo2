@@ -59,26 +59,34 @@ Examples include:
 status
 task list
 task complete build-release --log $1
-rfc show 0136 --format json
+rfc show 0136
 ```
 
-The command string is tokenized as tool-safe command text, compiled against the
-current CommandSpec, and dispatched as structured data. Help and structured
-diagnostics make the operation inventory discoverable while the public tool
-surface stays compact.
+The MCP tool tokenizes this text with Exo's Rust command-text compiler, removes
+global presentation options before operation validation, rejects shell syntax,
+and compiles the result against the current `CommandSpec`. The VS Code tool uses
+an extension-local tokenizer and router to construct the structured machine
+request. Its request still enters the same typed invocation and execution
+machinery, while its parsing errors and treatment of global options currently
+differ from MCP.
 
-Both the VS Code tool and MCP tool use this contract. The transports differ in
-registration and process topology, but they submit the same command language
-to Exo's machine-facing execution path.
+The two transports therefore share command paths, placeholder substitution,
+machine-channel validation, effect classification, and structured responses.
+Their registration, process topology, and command-text adapters remain distinct.
+Help and diagnostics make the operation inventory discoverable while the public
+tool surface stays compact.
 
 ### Extension-native tools
 
 The extension publishes four tools whose data originates in the editor rather
 than Exo project state.
 
-`exo-diagnostics` reads editor diagnostics. `exo-logs` exposes extension
-logs. `exo-ai-chat-history` reads stored chat context. `exo-ping` reports the
-identity and health of the extension-to-Exo connection.
+`exo-diagnostics` reads editor diagnostics. `exo-logs` exposes extension logs.
+`exo-ai-chat-history` reads stored chat context. `exo-ping` reports the loaded
+extension's build and process identity and confirms that its language-model tool
+registration is functioning. It is intentionally independent of Exo and the
+daemon, so a successful ping does not establish that `exo-run` can reach the
+project runtime.
 
 These tools are curated capabilities with editor-local sources of truth. The
 boundary keeps additional extension features subject to deliberate product
@@ -104,9 +112,11 @@ manifest.
 
 ## Execution and Safety
 
-The transport compiles a requested command before dispatch. Compilation
-determines the operation, validates its arguments, and reads its effect and
-recovery class from the command specification.
+MCP compiles a requested command before dispatch. VS Code constructs a
+structured call with its local adapter, after which the machine channel resolves
+the operation and validates its arguments. In both paths, Exo derives effect and
+recovery class from the command specification and built command rather than from
+client-supplied recovery metadata.
 
 Pure operations can be repeated. Project-state mutations use the daemon's
 writer lane and durable outcome contract. External operations retain
@@ -211,7 +221,8 @@ same declared set. The Exo MCP server advertises only `exo-run`.
 CommandSpec-generated tool metadata remains an informational projection, and
 tests enforce the curated manifest and MCP transport behavior.
 
-Stage 3 reflects the deployed contract while leaving room to improve help,
-descriptions, and client presentation. Additional public tools or toolsets
-would require new evidence that their persistent visibility improves model
-behavior enough to justify expanding the surface.
+Stage 3 reflects the deployed contract while leaving room to converge the MCP
+and VS Code command-text adapters and improve help, descriptions, and client
+presentation. Additional public tools or toolsets would require new evidence
+that their persistent visibility improves model behavior enough to justify
+expanding the surface.
