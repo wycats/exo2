@@ -7,7 +7,7 @@
 
 ## Summary
 
-Exo projects share durable operational state across linked worktrees. RFC documents remain ordinary Git documents, so every worktree observes the RFC corpus at its own branch, commit, index, and working tree.
+Exo projects share durable operational state across linked worktrees. RFC documents remain ordinary Git documents, so every worktree observes the RFC corpus at its own branch, commit, and working tree.
 
 RFC metadata therefore has two coordinated views:
 
@@ -35,7 +35,7 @@ The two-view model gives each fact a stable owner. Shared state follows accepted
 2. **Workspace reads follow the current checkout.** A branch sees committed checkout content, working-tree modifications, and newly created RFC documents immediately. Changes that exist only in the Git index remain outside the workspace snapshot.
 3. **Merge is the publication boundary.** Workspace document changes remain local observations until the canonical ref contains them.
 4. **Absence is scoped evidence.** A missing workspace document changes that workspace's visibility. Canonical absence preserves an established shared row until an explicit lifecycle decision replaces it.
-5. **RFC documents carry portable lifecycle meaning.** Git plus the stable anchor reconstructs stage, status, reasons, feature, consolidation metadata, and relationships.
+5. **Declared RFC metadata carries portable lifecycle meaning.** Git plus the stable anchor reconstructs stage, status, declared reasons, feature, consolidation metadata, and relationships. Undeclared compatibility values can remain SQLite-backed until a managed lifecycle operation or migration materializes them.
 6. **Stable anchors define identity.** File paths and RFC numbers can change through managed operations; the anchor ULID joins workspace and canonical records.
 7. **Canonical reconciliation is local and deterministic.** It reads refs already present in the Git common directory and leaves network synchronization to the user.
 8. **Reconciliation preserves the last committed view.** Git, parse, identity, and transaction failures keep previously committed state available and surface scoped evidence.
@@ -96,7 +96,7 @@ Canonical blobs and workspace files use one parser with two inputs:
 
 The parser reads ordinary metadata from the preamble between the H1 and the first level-two heading and ignores fenced code examples. It supports compact metadata, list rows, and metadata table rows. Relationship parsing is broader: established sentence-style relationship markers on any non-fenced line in the document can affect `supersedes` and `superseded_by`. Managed edits preserve a recognized source form and use a compact metadata block as the fallback.
 
-Active documents derive stage from `docs/rfcs/stage-N/`. Withdrawn and archived documents carry their last active stage, explicit status, and reason in Markdown. A supersession relationship changes the effective read status to superseded while preserving the stored lifecycle status.
+Active documents derive stage from `docs/rfcs/stage-N/`. Withdrawn and archived documents carry their last active stage, explicit status, and reason in Markdown. For an active RFC, a supersession relationship changes the effective read status to superseded while preserving the stored lifecycle status. Withdrawn and archived RFCs retain their retired read status even when they declare a superseding RFC.
 
 Each optional field records whether the workspace document declared it. A declared value, including an intentional empty value, supplies the workspace or canonical field. An undeclared compatibility field inherits established shared metadata. Managed lifecycle operations materialize the fields they own, steadily increasing document authority.
 
@@ -109,7 +109,7 @@ Canonical reconciliation performs one coherent pass under the cross-process RFC 
 3. parse candidates in memory;
 4. classify malformed paths, duplicate anchors, and lifecycle conflicts;
 5. upsert each independent valid candidate through the reactive `rfcs` surface in one SQLite transaction;
-6. establish or advance the canonical baseline.
+6. establish the one-time canonical baseline when it is absent.
 
 A valid anchored canonical document creates or relinks its shared row automatically. Canonical title, stage, lifecycle, path, feature, declared reasons, consolidation metadata, and declared relationships replace older shared values. Canonical absence preserves an established row. Explicit withdrawal, archive, supersession, and consolidation metadata express retirement and relationships portably.
 
@@ -159,13 +159,13 @@ Portable lifecycle operations materialize their meaning in Markdown:
 
 - promote moves the file to `stage-N`;
 - withdraw and archive preserve the last active stage, move the file to its retired collection, and write status, stage, and reason;
-- supersede writes reciprocal relationship markers;
+- ID-addressed supersede writes reciprocal relationship markers; explicit `--path` supersede writes `Superseded by` only on the selected document;
 - rename preserves stable identity while changing the path;
 - repair updates the managed anchor, number, or path identity selected by the repair operation.
 
-`Feature` is portable when Markdown declares it or the lifecycle migration materializes it. A feature-only `rfc edit --feature` currently updates SQLite metadata without writing a `Feature` marker, so canonical Git reconstruction does not preserve that change until the document is updated.
+`Feature` is portable when Markdown declares it or the lifecycle migration materializes it. `rfc create --feature` and a feature-only `rfc edit --feature` currently update SQLite or workspace-observation metadata without writing a `Feature` marker, so canonical Git reconstruction does not preserve that value until the document is updated.
 
-Consolidation metadata is part of the parser, effective view, shared row, migration, and portable projection. A dedicated managed `rfc consolidate` command remains future work; current consolidation decisions can be represented through managed RFC editing.
+Consolidation metadata is part of the parser, effective view, shared row, migration, and portable projection. Creating or changing `Consolidated into` through managed editing is not yet a supported mutation because edit synchronization preserves the established SQLite compatibility value. A dedicated `rfc consolidate` command or consolidation-aware edit synchronization remains future work.
 
 A mutation succeeds when its file operation and workspace refresh succeed. If refresh fails after the file edit, Exo reports the path and leaves the Git change available for retry while shared canonical metadata remains governed by the canonical ref.
 
