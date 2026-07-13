@@ -27,11 +27,6 @@
     "configuration": {
       "title": "Exosuit",
       "properties": {
-        "exosuit.exoBinaryDir": {
-          "type": "string",
-          "default": "",
-          "description": "Directory containing exo toolchain binaries (exo, exohistory, exohook). Accepts an absolute path, a path relative to the workspace root (e.g. ./target/debug), or ${workspaceFolder}/target/debug. When empty (default), binaries are resolved via PATH. Changes take effect on the next CLI invocation without restarting VS Code."
-        },
         "exosuit.experimental": {
           "type": "boolean",
           "default": false,

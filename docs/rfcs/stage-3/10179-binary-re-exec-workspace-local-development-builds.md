@@ -1,193 +1,241 @@
 <!-- exo:10179 ulid:01kmzxbcy0d4qbhef6h56zxe0d -->
 
-
 # RFC 10179: Binary Re-exec: Workspace-Local Development Builds
 
 ## Summary
 
-When an exo-family binary (`exo`, `exohistory`, `exohook`) starts, it checks `exosuit.toml` for a `[dev] binary_dir` setting. If a different binary exists at that path, it re-execs to it. This ensures that a single system-installed binary always delegates to the workspace-local build, eliminating stale binary drift.
-
-## Motivation
-
-During development, the installed `exo` binary (in `~/.cargo/bin/`) becomes stale relative to the workspace's `target/debug/exo`. This causes subtle bugs:
-
-- The daemon spawns using the PATH binary, which may have a different SQLite loader, different command set, or different protocol version than the code being developed
-- Previous workarounds (copying binaries to `~/.proto/bin/`, symlinking, adding `cargo install` to build scripts) create maintenance burden and fail silently when forgotten
-- The VS Code extension had `exosuit.exoBinaryDir` in `.vscode/settings.json`, but the CLI didn't know about it — the extension and CLI resolved different binaries
-
-The re-exec pattern solves this at the root: one binary on PATH, workspace config determines which build actually runs.
-
-## Design
-
-### Configuration
-
-In `exosuit.toml` (committed to git):
+An Exo development workspace may select its local toolchain build in
+`exosuit.toml`:
 
 ```toml
 [dev]
 binary_dir = "target/debug"
 ```
 
-This is the expected, documented behavior for working in this workspace: you get the local build, not the global one.
+This setting is the shared selection input for Exo's Rust entry points, daemon
+lifecycle, and VS Code integration. An exo-family binary launched from outside
+the workspace delegates to the selected build by replacing its process. The VS
+Code extension can start a build selected from the same setting directly.
+Before any client reuses a daemon, Rust lifecycle authority verifies that the
+daemon belongs to the expected workspace and executable instance.
 
-### Re-exec Protocol
+Together, these behaviors let a checked-out workspace run the code it just
+built while retaining a stable command on `PATH` and a project-scoped daemon.
 
-When any exo-family binary starts (before any argument parsing):
+## Motivation
 
-1. Check `EXO_NO_REEXEC` — if set, skip (loop prevention layer 1)
-2. Find the workspace root (walk up from cwd looking for `exosuit.toml`)
-3. Read `exosuit.toml`, check for `[dev] binary_dir`
-4. If set, construct the candidate path: `{workspace_root}/{binary_dir}/{binary_name}`
-5. Verify the candidate is not the currently executing binary (loop prevention layer 2)
-6. If the candidate exists, is a file, and passes security checks:
-   - Re-exec via `std::os::unix::process::CommandExt::exec`
-   - Pass all original arguments unchanged
-   - Set `EXO_NO_REEXEC=1` in the environment (loop prevention layer 3)
+Exo development crosses several process boundaries. A shell starts `exo`; the
+CLI may connect to a long-lived daemon; the VS Code extension keeps multiple
+socket lanes open; MCP can add another persistent worker. A freshly compiled
+workspace binary is useful only when every boundary converges on it.
 
-### Loop Prevention (Multi-Layer)
+Relying on installation discipline makes that convergence fragile. A developer
+can build `target/debug/exo` while `~/.cargo/bin/exo` still contains an older
+command registry, storage loader, or protocol implementation. Copying binaries,
+maintaining symlinks, or teaching each client its own override moves the same
+problem into several independent configuration surfaces.
 
-Three independent layers prevent infinite re-exec loops:
+The workspace already carries the relevant intent: this checkout is being
+developed with this local build directory. RFC 10179 makes that intent the
+shared selection input and assigns freshness enforcement to the process layer
+best able to provide it.
 
-1. **Env var gate**: `EXO_NO_REEXEC=1` is set before re-exec and checked on entry
-2. **Self-check**: Compare `std::env::current_exe()` (canonicalized) against the candidate path — if they're the same file, skip
-3. **Env var on exec**: The re-exec'd process inherits `EXO_NO_REEXEC=1`, so even if the self-check fails (e.g., symlink resolution differences), the env var catches it
+## Guide-Level Explanation
 
-### Shared Crate: `exo-reexec`
+When a developer runs an exo-family command from a configured workspace, the
+launcher searches the current directory and its ancestors for `exosuit.toml`.
+If `[dev].binary_dir` names a valid local build containing the same executable,
+the running process delegates to that binary before parsing arguments. A normal
+system installation can therefore remain on `PATH`; entering a configured
+workspace is enough to select its development build.
 
-The re-exec logic is extracted into a small shared crate (`crates/exo-reexec` or similar) so that `exo`, `exohistory`, and `exohook` all share the same implementation. Bug fixes apply to all binaries. Future binaries get re-exec support by adding one dependency and one function call at the top of `main()`.
+The same setting applies when VS Code starts an Exo process. The extension
+reads the workspace configuration and starts the selected binary directly when
+it is available. Binary selection is a property of the workspace rather than
+an editor preference, so terminals, MCP clients, and the extension share one
+durable input without duplicating a user setting. The Rust selector currently
+applies stricter path validation than the extension; the precise difference is
+described below.
 
-### Daemon Freshness
+The daemon adds a second freshness boundary. It is long-lived, so selecting the
+right client executable does not establish that an existing daemon is current.
+Before reusing a daemon connection, `daemon ensure` compares the recorded
+workspace and executable identity with the current client and probes the exact
+daemon instance. A matching, responsive daemon is reused. A stale or
+unresponsive instance is identified, replaced, and reconnected through its
+project runtime endpoint.
 
-Daemon freshness is enforced at the Rust lifecycle boundary rather than by
-statting or re-executing from every request:
+Long-lived extension clients treat a changed daemon instance as a lifecycle
+transition. They discard their socket lanes, reconnect through `daemon ensure`,
+and invalidate cached state before serving later requests. Rebuilding Exo thus
+converges on the new workspace binary at the next ensured interaction without
+placing filesystem checks on the daemon request handler itself.
 
-1. The daemon records its executable identity, instance ID, PID, and
-   process-start identity when it starts.
-2. Before a client reuses a daemon connection, `daemon ensure` compares the
-   recorded executable/workspace identity with the current binary and performs
-   a bounded probe for that exact instance.
-3. A stale or unresponsive instance is identity-verified, terminated, and
-   replaced. The client connects to the ensured socket and receives the new
-   instance ID.
-4. Long-lived clients discard every socket lane and invalidate cached state
-   whenever ensure reports a different daemon instance.
+## Reference-Level Explanation
 
-This keeps binary freshness off the request hot path while preserving the
-development contract: after a workspace-local build changes, the next ensured
-tool request replaces the stale runtime and continues through the fresh binary.
+### Workspace configuration
 
-### Extension Integration
+The selection root is the nearest ancestor of the current working directory
+that contains `exosuit.toml`. In a normal Exo checkout this is the workspace
+root described by RFC 10184. The current configuration key is
+`[dev].binary_dir`.
 
-The VS Code extension's `exosuit.exoBinaryDir` setting is **removed** (not deprecated — we are the only user). The extension calls `exo` on PATH; the re-exec protocol selects the workspace-local CLI, and Rust `daemon ensure` selects and repairs the daemon instance. This unifies binary resolution for CLI, daemon, and extension into one mechanism.
+For Rust process replacement, `binary_dir` is a relative path. The selector
+joins the configuration root, the configured directory, and the current
+executable's file name. It accepts the candidate only when the path exists as a
+file and its canonical path remains inside the canonical configuration root.
+The Rust selector ignores absolute paths and candidates that escape the
+workspace.
 
-### Security
+When no valid workspace candidate exists, the current Rust process continues.
+The VS Code resolver follows the same workspace-first ordering, then honors
+`EXO_BIN` for `exo` when present, and finally falls back to the executable name
+on `PATH`. Its current workspace-candidate check computes
+`path.join(workspaceRoot, binaryDir, name)` and tests only whether the resulting
+path exists. It does not yet reject absolute values explicitly or canonicalize
+the candidate to enforce workspace containment. A value containing parent
+traversal can therefore select an extension-side candidate that the Rust
+selector rejects. Matching the Rust validation contract is remaining
+stabilization work.
 
-The `binary_dir` value comes from `exosuit.toml`, which is a workspace file. Same trust model as `.envrc` (direnv).
+This repository keeps the development policy in its root `exosuit.toml`:
 
-For the initial implementation, `binary_dir` is restricted to relative paths resolved within the workspace root. This is a simplicity constraint, not a security boundary — a future follow-up may support absolute paths (e.g., a global `exosuit.toml` pointing at a specific checkout's `target/debug/`) once the use case is validated.
-
-## Implementation
-
-### `find_workspace_root()`
-
-Walk up from `cwd` looking for `exosuit.toml`:
-
-```rust
-pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join("exosuit.toml").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
-}
+```toml
+[dev]
+binary_dir = "target/debug"
 ```
 
-**Stage 4 criteria**: Also check for `.config/exosuit.toml` if the config layout moves under the RFC 10184 project/workspace directory model.
+RFC 10184 separates workspace configuration from project identity and state
+placement. Repo, shadow, and sidecar state policies therefore share this binary
+selection behavior. A future configuration-layout RFC may add another
+discovery location; `.config/exosuit.toml` is not part of the current contract.
 
-### `[dev]` section in `ExosuitConfig`
+### Process replacement
 
-```rust
-#[derive(Debug, Deserialize, Default)]
-pub struct DevConfig {
-    pub binary_dir: Option<String>,
-}
-```
+The shared `exo-reexec` crate implements startup delegation for `exo`,
+`exo-mcp`, `exohook`, and `exohistory`. Each entry point calls
+`maybe_reexec()` before argument parsing or runtime initialization.
 
-Add `pub dev: Option<DevConfig>` to `ExosuitConfig`.
+On Unix, delegation uses process replacement. The selected binary receives the
+original arguments and inherits the process environment with
+`EXO_NO_REEXEC=1`. Two checks prevent recursive delegation:
 
-### Re-exec Logic (in `exo-reexec` crate)
+1. A process carrying `EXO_NO_REEXEC` continues without another selection.
+2. A candidate whose canonical path equals the current executable continues in
+   place.
 
-```rust
-pub fn maybe_reexec() {
-    if std::env::var("EXO_NO_REEXEC").is_ok() {
-        return;
-    }
+The environment marker is process-local loop prevention. It does not choose a
+binary or persist workspace policy.
 
-    let cwd = std::env::current_dir().ok();
-    let Some(root) = cwd.as_ref().and_then(|cwd| find_workspace_root(cwd)) else {
-        return;
-    };
+### Daemon executable authority
 
-    let config = match ExosuitConfig::load(&root) {
-        Ok(config) => config,
-        Err(_) => return,
-    };
+There is one daemon runtime endpoint per project state root. Its runtime
+identity records:
 
-    let Some(binary_dir) = config.dev.as_ref().and_then(|d| d.binary_dir.as_ref()) else {
-        return;
-    };
+- the workspace root that established the daemon;
+- the executable path and filesystem identity;
+- the daemon instance ID;
+- the PID and process-start identity.
 
-    // Security: reject absolute paths
-    if Path::new(binary_dir).is_absolute() {
-        return;
-    }
+`daemon ensure` connects to the project endpoint and performs a bounded probe
+for the recorded instance. It reuses the connection only when the workspace
+and executable identity are current and the probe succeeds. Otherwise, the
+lifecycle code verifies the observed process identity before terminating stale
+runtime state and spawning the selected executable.
 
-    let binary_name = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_os_string()));
-    let Some(name) = binary_name else { return };
+This rule also applies across linked worktrees. RFC 10184 gives linked
+worktrees one project state root and runtime endpoint, while each worktree is a
+distinct workspace. An ensure from a different worktree or development build
+may replace the daemon attached to that shared endpoint. The replacement keeps
+project state shared while making the active runtime's workspace and executable
+authority explicit.
 
-    let candidate = root.join(binary_dir).join(&name);
+### VS Code integration
 
-    if !candidate.exists() || !candidate.is_file() {
-        return;
-    }
+The active extension machine channel is `DaemonChannelServer`. It resolves the
+workspace-local `exo` candidate from `exosuit.toml` when starting lifecycle
+commands. Before reusing a live primary or read socket, it invokes Rust daemon
+ensure again.
 
-    // Security: verify candidate is within workspace root
-    let Ok(canonical_candidate) = candidate.canonicalize() else { return };
-    if !canonical_candidate.starts_with(&root) {
-        return;
-    }
+When ensure reports a replacement or a different instance ID, the extension
+closes every connection lane, advances its connection generation, reconnects
+to the ensured endpoint, and invalidates `TraceCache`. Requests issued after
+the transition observe the replacement daemon rather than a connection or
+cached view retained from the previous executable.
 
-    // Loop prevention: don't re-exec to ourselves
-    if let Ok(current) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-        if current == canonical_candidate {
-            return;
-        }
-    }
+The extension does not expose a separate binary-directory setting. The
+workspace file is the durable selection surface; Rust daemon lifecycle remains
+the authority for deciding whether an existing process can be reused.
 
-    // Re-exec
-    use std::os::unix::process::CommandExt;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let err = std::process::Command::new(&candidate)
-        .args(&args)
-        .env("EXO_NO_REEXEC", "1")
-        .exec();
-    eprintln!("exo: re-exec to {} failed: {err}", candidate.display());
-}
-```
+## Implementation Status
 
-### Cleanup
+The Stage 3 contract is implemented in the following layers:
 
-- Remove `~/.proto/bin/exo` (stale copy from previous agent session)
-- Remove `cargo install` from `scripts/dev/dogfood-extension.sh`
-- Remove the symlink `~/.proto/bin/exo → ~/.cargo/bin/exo`
-- Add `[dev] binary_dir = "target/debug"` to `exosuit.toml`
-- Remove `exosuit.exoBinaryDir` VS Code setting and all code that reads it
+- `crates/exo-reexec` provides workspace discovery, candidate validation, loop
+  prevention, and Unix process replacement.
+- The `exo`, `exo-mcp`, `exohook`, and `exohistory` entry points invoke the
+  shared selector before normal startup.
+- Rust daemon lifecycle records executable and instance identity, performs the
+  bounded probe, and replaces stale or wedged instances.
+- The VS Code `DaemonChannelServer` resolves the same workspace-local binary,
+  re-enters daemon ensure before socket reuse, and resets connections and cache
+  state when the daemon instance changes.
+
+The repository's broader daemon and extension suites exercise lifecycle
+replacement and reconnection. Focused process-replacement coverage inside
+`exo-reexec` remains useful hardening work.
+
+## Drawbacks
+
+Workspace-local selection deliberately trusts executable configuration checked
+into the workspace. This resembles other development-environment mechanisms:
+entering an unfamiliar checkout can select code from that checkout. Candidate
+containment limits accidental path escape, while repository trust remains the
+meaningful security boundary.
+
+Selection also favors continuity when configuration is absent or invalid. The
+current binary keeps running, which preserves command availability but can
+make a missing local build less obvious. Diagnostics that explain why a
+candidate was skipped would improve this experience.
+
+Linked worktrees can select different development builds while sharing one
+project daemon endpoint. Identity-aware replacement keeps execution correct,
+but alternating between those worktrees can restart the daemon more often.
+
+## Alternatives
+
+### Editor-specific binary configuration
+
+A VS Code setting can point the extension at a build, but terminals, MCP, and
+other editors would still select independently. The workspace file gives every
+client the same durable input and keeps editor configuration focused on editor
+behavior.
+
+### Reinstall after every build
+
+Installing or copying each successful build makes the global binary current,
+but it turns a local compile into a machine-wide mutation and relies on every
+build path remembering the installation step. Workspace selection keeps local
+development local.
+
+### Filesystem watching in each client
+
+Clients can watch a binary and restart their own subprocesses when it changes.
+That approach does not establish whether the shared daemon is the expected
+instance. Central daemon identity and bounded probing provide one lifecycle
+decision that all clients can observe.
 
 ## Stage 4 Criteria
 
-- Windows support: `CommandExt::exec` is Unix-only. Windows would need `Command::spawn` + `std::process::exit`.
-- `.config/exosuit.toml` support in `find_workspace_root()` if adopted under RFC 10184.
+RFC 10179 can advance to Stable when the supported-platform contract and its
+verification are complete. The remaining criteria are:
+
+- define and implement Windows behavior equivalent to Unix process
+  replacement;
+- apply the Rust selector's relative-path and canonical-containment rules in
+  the VS Code resolver, with focused parity tests;
+- add focused tests for workspace discovery, candidate containment, loop
+  prevention, and process delegation in `exo-reexec`;
+- add user-facing diagnostics for skipped or invalid configured candidates;
+- incorporate any future configuration location only after the project and
+  workspace configuration model adopts it.
