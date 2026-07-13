@@ -69,11 +69,11 @@ values.
 Compilation produces typed values rather than leaving every input as an
 uninterpreted string. A `CommandSpec` argument can declare a boolean, integer,
 float, string, path, JSON, or enumerated value. JSON enters the compiled
-`TypedValue` model as raw JSON text and is decoded when the invocation is
-projected back into structured data. Repeatability is an argument property,
-rather than a separate array-valued argument type. Type errors therefore belong
-to command compilation, where Exo can report the offending argument and the
-expected form.
+`TypedValue` model as raw JSON text. When the invocation is projected back into
+structured data, Exo parses valid JSON and preserves text that does not parse as
+a string value. Repeatability is an argument property, rather than a separate
+array-valued argument type. Type errors therefore belong to command compilation,
+where Exo can report the offending argument and the expected form.
 
 ### Effects and recovery
 
@@ -144,7 +144,9 @@ and ultimately submit a structured operation to Exo's machine channel.
 MCP uses Exo's Rust command-text compiler. That compiler handles quoting and
 escaping, removes global presentation options before operation validation, and
 rejects environment assignments, command substitution, pipelines, redirects,
-and control operators with explicit unsupported-input diagnostics.
+and control operators before invocation compilation. Tokenizer-level rejections
+return an `InvalidInput` error whose message names the unsupported syntax; they
+do not currently include the structured compilation-diagnostics payload.
 
 The VS Code extension currently uses an extension-local tokenizer and router to
 construct the structured machine request. The machine channel still validates
@@ -167,10 +169,10 @@ concrete suggestions.
 Diagnostics answer the likely mistake. Unknown namespaces and operations can
 offer nearby names. Unknown flags can show the accepted flags for the resolved
 operation. Missing or invalid values can identify the argument and expected
-type. The Rust argv and MCP command-text compilers can explain that `exo-run` is
-a command transport rather than a shell. Other adapters preserve the structured
-command failure even when they do not yet provide the same specialized
-diagnostic.
+type. The Rust argv compiler can represent shell-operator failures as structured
+diagnostics. MCP rejects shell syntax earlier with an `InvalidInput` message,
+while other adapters preserve the command failure without necessarily providing
+the same diagnostic shape.
 
 Human CLI output and machine responses may render these diagnostics
 differently, but both preserve the same underlying failure and repair
@@ -237,9 +239,10 @@ current design keeps structured execution while allowing CLI-shaped input.
 The shared command model is implemented. Exo generates a command specification
 from its registered command definitions and compiles argv and structured inputs
 into typed invocations. The CLI and MCP command-text paths reject shell
-operators and emit specialized diagnostics; the VS Code adapter constructs a
-structured request locally and relies on machine-channel validation. Exo
-projects the shared inventory into help, machine-channel, and editor artifacts.
+operators: CLI emits structured diagnostics, while MCP returns a tokenizer-level
+`InvalidInput` message. The VS Code adapter constructs a structured request
+locally and relies on machine-channel validation. Exo projects the shared
+inventory into help, machine-channel, and editor artifacts.
 
 Stage 3 reflects that implemented contract. Further work may improve individual
 diagnostics, artifact ergonomics, or command authoring, and those refinements preserve the

@@ -7,10 +7,10 @@
 ## Summary
 
 Exo exposes a deliberately small language-model tool surface over its complete
-command system. Project operations enter through `exo-run`, a universal,
-CLI-shaped transport backed by CommandSpec and the machine channel. A small set
-of extension-native tools remains separate for information that only the editor
-can provide.
+command system. Every project operation is reachable through `exo-run`, a
+universal, CLI-shaped transport backed by CommandSpec and the machine channel. A
+small set of curated extension tools remains separate for capabilities that
+benefit from dedicated model visibility.
 
 The VS Code extension contributes exactly five public tools:
 `exo-ai-chat-history`, `exo-diagnostics`, `exo-logs`, `exo-ping`, and
@@ -38,20 +38,23 @@ effects, diagnostics, confirmation, and recovery. The model-facing architecture
 uses that language directly. One project tool can reach the complete operation
 set while preserving the same semantics available to CLI users.
 
-Some useful information belongs to the editor rather than the project command
-language. Diagnostics, extension logs, and chat history depend on VS Code APIs
-and extension-local state. Keeping those capabilities as explicit native tools
-makes the boundary understandable: `exo-run` works on the project; native
-tools report on the editor and agent environment.
+Some useful capabilities deserve dedicated extension tools. Diagnostics,
+extension logs, and extension identity come directly from the VS Code process.
+Chat history is an Exo command, and the extension provides a curated wrapper
+that routes to `exo ai chat-history` through the machine channel. Keeping these
+capabilities explicit gives models focused schemas for common environmental and
+context-recovery work while `exo-run` remains the universal project surface.
 
 ## The Public Tool Surface
 
 ### Project operations
 
 `exo-run` is the public entry point for Exo project work. It accepts a command
-string without the leading `exo`, optional placeholder values, and the
-confirmation data required by operations that cross a workflow or execution
-boundary.
+string without the leading `exo` and optional placeholder values. Both
+transports accept workflow-completion confirmation data. MCP also accepts the
+hidden execution-approval ticket used by confirm-required external operations;
+the VS Code tool schema does not currently expose that execution-confirmation
+field.
 
 Examples include:
 
@@ -76,29 +79,32 @@ Their registration, process topology, and command-text adapters remain distinct.
 Help and diagnostics make the operation inventory discoverable while the public
 tool surface stays compact.
 
-### Extension-native tools
+### Curated extension tools
 
-The extension publishes four tools whose data originates in the editor rather
-than Exo project state.
+The extension publishes four focused tools alongside `exo-run`.
 
-`exo-diagnostics` reads editor diagnostics. `exo-logs` exposes extension logs.
-`exo-ai-chat-history` reads stored chat context. `exo-ping` reports the loaded
-extension's build and process identity and confirms that its language-model tool
-registration is functioning. It is intentionally independent of Exo and the
-daemon, so a successful ping does not establish that `exo-run` can reach the
-project runtime.
+`exo-diagnostics` reads editor diagnostics, and `exo-logs` exposes extension
+logs. `exo-ai-chat-history` is a curated wrapper over the machine-channel
+operation `exo ai chat-history`; it provides a focused schema and presentation
+for recovering conversation context without creating a second source of truth.
+`exo-ping` reports the loaded extension's build and process identity and
+confirms that its language-model tool registration is functioning. It is
+intentionally independent of Exo and the daemon, so a successful ping does not
+establish that `exo-run` can reach the project runtime.
 
-These tools are curated capabilities with editor-local sources of truth. The
-boundary keeps additional extension features subject to deliberate product
-evaluation. A new native tool needs a clear editor-local source of truth and a
-capability that benefits from direct model visibility.
+These tools are curated capabilities whose authority remains either in the
+editor environment or in an existing Exo operation. The boundary keeps
+additional extension features subject to deliberate product evaluation. A new
+curated tool needs a clear source contract and a capability that benefits from
+direct model visibility.
 
 ## Command Discovery
 
 The model discovers project operations through the same hierarchy as a CLI
 user. General help describes root operations and namespaces. Namespace and
-operation help reveal accepted arguments and effects. Failed compilation
-returns structured diagnostics and suggestions.
+operation help reveal accepted arguments and effects. `CommandSpec` compilation
+can return structured diagnostics and suggestions; tokenizer-level failures keep
+the transport-specific shape described by RFC 0132.
 
 This help ladder provides progressive disclosure without introducing a second
 grouping system. Names such as `task`, `goal`, `phase`, and `rfc` remain
@@ -120,9 +126,11 @@ client-supplied recovery metadata.
 
 Pure operations can be repeated. Project-state mutations use the daemon's
 writer lane and durable outcome contract. External operations retain
-at-most-once behavior unless Exo has durable completion proof. Commands that
-require confirmation return a structured preview or workflow confirmation
-request before the client resubmits the authorized operation.
+at-most-once behavior unless Exo has durable completion proof. Workflow
+completion commands can return confirmation data that both transports resubmit.
+Confirm-required external operations return an execution ticket that MCP can
+resubmit through its `auth` input; the current VS Code schema stops at the
+confirmation response.
 
 A stable request identity follows a call through proxying and reconnects so
 completed outcomes can be replayed without repeating the mutation. Workspace
@@ -135,9 +143,8 @@ the command and daemon layers.
 
 ## VS Code Registration
 
-The extension manifest is the declarative public inventory. Runtime activation
-registers implementations only for tools present in that inventory. Registration is therefore limited to the tools in the declarative public
-inventory.
+The extension manifest is the declarative public inventory, and runtime
+activation registers implementations only for tools present there.
 
 The repository's synchronization check enforces the curated five-tool list and
 removes `languageModelToolSets` declarations. Generated package-tool output remains available for auditing, separate from
@@ -157,7 +164,7 @@ tool is not a shell runner.
 MCP tool calls compile into the same machine request model used by other
 clients. Worker classification determines effects and confirmation needs before
 execution, and the response preserves Exo's structured result, steering,
-diagnostics, and recovery identity.
+command-compilation diagnostics when present, and recovery identity.
 
 An MCP host therefore learns one transport schema while retaining access to the
 full current CommandSpec. Adding an Exo operation makes it available through `exo-run` without a new
@@ -175,8 +182,8 @@ RFC 10163 proposed reducing the model-facing surface to CLI delegation; the
 architecture here records the implemented result.
 
 These boundaries allow the command inventory to grow without expanding the
-tool picker. They also allow editor-native tools to evolve without becoming
-project commands.
+tool picker. They also allow curated wrappers and editor-sourced tools to evolve
+without changing the universal command surface.
 
 ## Drawbacks
 
@@ -186,10 +193,10 @@ familiar command hierarchy, help, examples, and structured diagnostics. This is
 a deliberate exchange: command discovery happens when needed instead of
 charging every request for the full inventory.
 
-The VS Code inventory extends MCP's single project tool with editor-local
-capabilities. Documentation distinguishes the common project transport from
-the extension's environmental tools rather than referring to a single
-undifferentiated tool count.
+The VS Code inventory extends MCP's single project tool with focused schemas for
+editor-sourced capabilities and selected Exo operations. Documentation
+distinguishes the universal project transport from this curated extension layer
+rather than referring to a single undifferentiated tool count.
 
 Curation also requires judgment. Command metadata can be generated
 mechanically, while deciding that a capability deserves permanent visibility
