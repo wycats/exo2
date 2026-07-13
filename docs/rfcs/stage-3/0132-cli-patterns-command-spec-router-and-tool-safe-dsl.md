@@ -70,8 +70,9 @@ Compilation produces typed values rather than leaving every input as an
 uninterpreted string. A `CommandSpec` argument can declare a boolean, integer,
 float, string, path, JSON, or enumerated value. JSON enters the compiled
 `TypedValue` model as raw JSON text. When the invocation is projected back into
-structured data, Exo parses valid JSON and preserves text that does not parse as
-a string value. Repeatability is an argument property, rather than a separate
+structured data, Exo attempts to parse that text as JSON. Successful parsing
+yields the structured JSON value; parsing failure yields a string containing the
+original text. Repeatability is an argument property, rather than a separate
 array-valued argument type. Type errors therefore belong to command compilation,
 where Exo can report the offending argument and the expected form.
 
