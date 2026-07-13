@@ -8,11 +8,12 @@
 
 Exo exposes a deliberately small language-model tool surface over its complete
 command system. `exo-run` is the shared, CLI-shaped project-tool surface backed
-by CommandSpec and the machine channel. MCP reaches the complete current command
-inventory through that surface. VS Code presents the same tool shape and
-execution contract while its extension-local command-text adapter retains known
-coverage gaps. A small set of curated extension tools remains separate for
-capabilities that benefit from dedicated model visibility.
+by CommandSpec and the machine channel. MCP can address the complete current
+command inventory when an operation's inputs fit the tool request. VS Code
+presents the same tool shape and execution contract while its extension-local
+command-text adapter retains known coverage gaps. A small set of curated
+extension tools remains separate for capabilities that benefit from dedicated
+model visibility.
 
 The VS Code extension contributes exactly five public tools:
 `exo-ai-chat-history`, `exo-diagnostics`, `exo-logs`, `exo-ping`, and
@@ -37,10 +38,12 @@ CLI.
 
 Exo already has a command language with namespaces, help, typed arguments,
 effects, diagnostics, confirmation, and recovery. The model-facing architecture
-uses that language directly. The MCP project tool reaches the complete operation
-set while preserving the same semantics available to CLI users. VS Code uses the
-same project-tool surface and machine execution model while its local parser
-converges on equivalent command coverage.
+uses that language directly. The MCP project tool reaches operations whose
+inputs can be carried by its request schema while preserving the same execution
+semantics available to CLI users. Process-stdin-backed operations such as root
+`write <path>` require a dedicated content channel before they become usable
+through MCP. VS Code uses the same project-tool surface and machine execution
+model while its local parser converges on equivalent command coverage.
 
 Some useful capabilities deserve dedicated extension tools. Diagnostics,
 extension logs, and extension identity come directly from the VS Code process.
@@ -57,8 +60,7 @@ context-recovery work while `exo-run` remains the primary project surface.
 string without the leading `exo` and optional placeholder values. Both
 transports accept workflow-completion confirmation data. MCP also accepts the
 hidden execution-approval ticket used by confirm-required external operations;
-the VS Code tool schema does not currently expose that execution-confirmation
-field.
+the VS Code tool schema does not currently expose that `auth` field.
 
 Examples include:
 
@@ -78,16 +80,21 @@ machinery, while its parsing errors and treatment of global options currently
 differ from MCP.
 
 The adapter difference also affects command coverage. The current VS Code root
-command table recognizes `status` and `version`, but omits root `write <path>`;
-that command is therefore misrouted as a namespaced operation. This is an
-implemented adapter gap within the shared architecture, rather than a separate
-command contract.
+command table recognizes `status` and the stale name `version`, while omitting
+the implemented root operation `write <path>`. A positional root write is
+therefore misrouted as a namespaced operation, and `version` reaches the machine
+channel as an unknown root operation. The adapter also fixes a namespaced
+operation at one token, so multi-token command paths such as `docs links check`
+and `phase execution tasks` do not compose into the dotted operations accepted
+by the Rust compiler. These are implemented adapter gaps within the shared
+architecture, rather than separate command contracts.
 
-The two transports therefore share command paths, placeholder substitution,
-machine-channel validation, effect classification, and structured responses.
-Their registration, process topology, and command-text adapters remain distinct.
-Help and diagnostics make the operation inventory discoverable while the public
-tool surface stays compact.
+The two transports therefore share the command-address model, placeholder
+substitution, machine-channel validation, effect classification, and structured
+responses. Their registration, process topology, command-text adapters, and
+currently reachable command paths remain distinct. Help and diagnostics make
+the operation inventory discoverable while the public tool surface stays
+compact.
 
 ### Curated extension tools
 
@@ -177,8 +184,10 @@ execution, and the response preserves Exo's structured result, steering,
 command-compilation diagnostics when present, and recovery identity.
 
 An MCP host therefore learns one transport schema while retaining access to the
-full current CommandSpec. Adding an Exo operation makes it available through
-`exo-run` without a new MCP tool declaration.
+current CommandSpec wherever the operation's inputs fit that schema. Adding an
+Exo operation makes its command path available through `exo-run` without a new
+MCP tool declaration; operations that depend on process-only inputs need an
+explicit transport representation before the path is usable.
 
 ## Relationship to the Command Architecture
 

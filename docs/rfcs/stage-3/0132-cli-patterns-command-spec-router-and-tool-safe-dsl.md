@@ -190,10 +190,12 @@ inherit its authority.
 A projection may intentionally expose only part of the inventory. In
 particular, RFC 0136 keeps the public language-model tool list small even though
 the generated command artifact describes the full Exo operation set. MCP
-`exo-run` provides complete command coverage. The VS Code tool uses the same
-machine contract while its local command-text adapter continues to converge on
-that coverage. The public tool manifest stays deliberately curated in both
-cases.
+`exo-run` can address the complete CommandSpec inventory when an operation's
+inputs fit the tool request. Process-stdin-backed operations such as root
+`write <path>` remain outside its usable contract until the transport provides
+a dedicated content channel. The VS Code tool uses the same machine contract
+while its local command-text adapter continues to converge on that coverage.
+The public tool manifest stays deliberately curated in both cases.
 
 Generated artifacts are checked against the Rust command inventory so that
 clients can detect drift. Command authority and effect classification remain
