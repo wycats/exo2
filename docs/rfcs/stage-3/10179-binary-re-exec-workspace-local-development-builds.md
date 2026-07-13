@@ -90,12 +90,13 @@ workspace.
 When no valid workspace candidate exists, the current Rust process continues.
 The VS Code resolver follows the same workspace-first ordering, then honors
 `EXO_BIN` for `exo` when present, and finally falls back to the executable name
-on `PATH`. Its current workspace-candidate check joins the configured string to
-the workspace root and tests only whether the resulting path exists. It does
-not yet reject absolute values explicitly or canonicalize the candidate to
-enforce workspace containment. A value containing parent traversal can
-therefore select an extension-side candidate that the Rust selector rejects.
-Matching the Rust validation contract is remaining stabilization work.
+on `PATH`. Its current workspace-candidate check computes
+`path.join(workspaceRoot, binaryDir, name)` and tests only whether the resulting
+path exists. It does not yet reject absolute values explicitly or canonicalize
+the candidate to enforce workspace containment. A value containing parent
+traversal can therefore select an extension-side candidate that the Rust
+selector rejects. Matching the Rust validation contract is remaining
+stabilization work.
 
 This repository keeps the development policy in its root `exosuit.toml`:
 
