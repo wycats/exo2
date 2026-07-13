@@ -12,12 +12,12 @@ An Exo development workspace may select its local toolchain build in
 binary_dir = "target/debug"
 ```
 
-This setting establishes one workspace-local binary selection policy for Exo's
-Rust entry points, daemon lifecycle, and VS Code integration. An exo-family
-binary launched from outside the workspace delegates to the selected build by
-replacing its process. The VS Code extension can start the same selected binary
-directly. Before any client reuses a daemon, Rust lifecycle authority verifies
-that the daemon belongs to the expected workspace and executable instance.
+This setting is the shared selection input for Exo's Rust entry points, daemon
+lifecycle, and VS Code integration. An exo-family binary launched from outside
+the workspace delegates to the selected build by replacing its process. The VS
+Code extension can start a build selected from the same setting directly.
+Before any client reuses a daemon, Rust lifecycle authority verifies that the
+daemon belongs to the expected workspace and executable instance.
 
 Together, these behaviors let a checked-out workspace run the code it just
 built while retaining a stable command on `PATH` and a project-scoped daemon.
@@ -49,11 +49,13 @@ the running process delegates to that binary before parsing arguments. A normal
 system installation can therefore remain on `PATH`; entering a configured
 workspace is enough to select its development build.
 
-The same policy applies when VS Code starts an Exo process. The extension reads
-the workspace configuration and starts the selected binary directly when it is
-available. Binary selection is a property of the workspace rather than an
-editor preference, so terminals, MCP clients, and the extension agree without
-duplicating a user setting.
+The same setting applies when VS Code starts an Exo process. The extension
+reads the workspace configuration and starts the selected binary directly when
+it is available. Binary selection is a property of the workspace rather than
+an editor preference, so terminals, MCP clients, and the extension share one
+durable input without duplicating a user setting. The Rust selector currently
+applies stricter path validation than the extension; the precise difference is
+described below.
 
 The daemon adds a second freshness boundary. It is long-lived, so selecting the
 right client executable does not establish that an existing daemon is current.
@@ -78,16 +80,22 @@ that contains `exosuit.toml`. In a normal Exo checkout this is the workspace
 root described by RFC 10184. The current configuration key is
 `[dev].binary_dir`.
 
-`binary_dir` is a relative path. The selector joins the configuration root,
-the configured directory, and the current executable's file name. It accepts
-the candidate only when the path exists as a file and its canonical path remains
-inside the canonical configuration root. Absolute paths and candidates that
-escape the workspace are ignored.
+For Rust process replacement, `binary_dir` is a relative path. The selector
+joins the configuration root, the configured directory, and the current
+executable's file name. It accepts the candidate only when the path exists as a
+file and its canonical path remains inside the canonical configuration root.
+The Rust selector ignores absolute paths and candidates that escape the
+workspace.
 
-When no valid workspace candidate exists, the current process continues. The
-VS Code resolver follows the same workspace-first policy, then honors `EXO_BIN`
-for `exo` when present, and finally falls back to the executable name on
-`PATH`.
+When no valid workspace candidate exists, the current Rust process continues.
+The VS Code resolver follows the same workspace-first ordering, then honors
+`EXO_BIN` for `exo` when present, and finally falls back to the executable name
+on `PATH`. Its current workspace-candidate check joins the configured string to
+the workspace root and tests only whether the resulting path exists. It does
+not yet reject absolute values explicitly or canonicalize the candidate to
+enforce workspace containment. A value containing parent traversal can
+therefore select an extension-side candidate that the Rust selector rejects.
+Matching the Rust validation contract is remaining stabilization work.
 
 This repository keeps the development policy in its root `exosuit.toml`:
 
@@ -223,6 +231,8 @@ verification are complete. The remaining criteria are:
 
 - define and implement Windows behavior equivalent to Unix process
   replacement;
+- apply the Rust selector's relative-path and canonical-containment rules in
+  the VS Code resolver, with focused parity tests;
 - add focused tests for workspace discovery, candidate containment, loop
   prevention, and process delegation in `exo-reexec`;
 - add user-facing diagnostics for skipped or invalid configured candidates;
