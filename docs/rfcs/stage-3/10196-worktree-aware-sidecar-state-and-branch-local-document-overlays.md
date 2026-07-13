@@ -83,7 +83,7 @@ Exo resolves one canonical RFC document tree from refs already present in the re
 
 The resolver returns the symbolic ref and peeled commit OID. Canonical reconciliation reads tree entries and blobs from that commit without checking it out.
 
-Multiple eligible non-origin remote HEADs and detached multi-worktree repositories preserve shared state because they provide no unique publication ref. A workspace with no usable Git history uses workspace fallback reconciliation. Fallback observations use the workspace document digest as their reconcile version, so each new request sees document changes while one observation pass reuses the same document bytes for invalidation and snapshot refresh.
+Multiple eligible non-origin remote HEADs and detached multi-worktree repositories preserve shared state because they provide no unique publication ref. A workspace with no usable Git history uses workspace fallback reconciliation. Fallback observations use the workspace document digest as their reconcile version, so each new request sees filesystem document changes. When fallback reconciliation runs, it performs its own filesystem scan before workspace snapshot refresh; a later request observes any change that occurs between those scans.
 
 Snapshots with no canonical source expose empty canonical ref and OID provenance. A dedicated human-facing publication-waiting diagnostic remains a future refinement.
 
@@ -107,17 +107,19 @@ Canonical reconciliation performs one coherent pass under the cross-process RFC 
 1. resolve and peel the canonical ref;
 2. enumerate managed RFC paths and read their blobs;
 3. parse candidates in memory;
-4. classify malformed paths, duplicate anchors, numeric ambiguity, and lifecycle conflicts;
+4. classify malformed paths, duplicate anchors, and lifecycle conflicts;
 5. upsert each independent valid candidate through the reactive `rfcs` surface in one SQLite transaction;
 6. establish or advance the canonical baseline.
 
 A valid anchored canonical document creates or relinks its shared row automatically. Canonical title, stage, lifecycle, path, feature, declared reasons, consolidation metadata, and declared relationships replace older shared values. Canonical absence preserves an established row. Explicit withdrawal, archive, supersession, and consolidation metadata express retirement and relationships portably.
 
-Conflicting identity groups preserve their prior shared rows and produce repair evidence. Independent valid RFCs continue through the same pass. Git object and transaction failures preserve the prior committed canonical view. A successful no-op leaves row digests and rowset counters unchanged.
+Malformed or conflicting canonical candidates and duplicate-anchor groups are skipped while independent valid RFCs continue through the same pass. Existing rows whose anchored documents remain present are preserved. Canonical reconciliation does not persist a public diagnostic for skipped candidates; current-workspace parsing and identity conflicts appear in workspace diagnostics.
+
+Distinct anchors that claim the same RFC number can both reconcile. Numeric lookup reports the resulting ambiguity rather than quarantining either record. Git object and transaction failures preserve the prior committed canonical view. A successful no-op leaves row digests and rowset counters unchanged.
 
 ## Workspace Snapshot Refresh
 
-Workspace refresh reads the issuing checkout, including staged, unstaged, renamed, deleted, and untracked RFC candidates. It builds observations and diagnostics before replacing the workspace snapshot in one transaction.
+Workspace refresh reads managed RFC documents from the issuing checkout's filesystem, including tracked modifications, visible renames and deletions, and untracked candidates. It does not inspect index-only Git blobs; staged content is observed when the same content is present in the working tree. Exo builds observations and diagnostics before replacing the workspace snapshot in one transaction.
 
 The replacement transaction:
 
@@ -128,7 +130,7 @@ The replacement transaction:
 
 The observation key is `(workspace_root, text_id)`, and repository-relative path is unique within a snapshot. Branch name can be absent for detached HEAD. The resolved commit or `unborn` marker supplies `head_oid`.
 
-Exo reuses a snapshot when branch, HEAD, document digest, canonical ref, and canonical OID all match. A branch or HEAD change with identical RFC bytes refreshes provenance. A changed workspace fallback request performs one fresh document collection and shares those bytes between reconcile invalidation and snapshot refresh.
+Exo reuses a snapshot when branch, HEAD, document digest, canonical ref, and canonical OID all match. A branch or HEAD change with identical RFC bytes refreshes provenance. A changed workspace fallback request recomputes the filesystem document digest; fallback shared reconciliation and snapshot refresh can perform separate scans, and the next request converges on any mid-pass filesystem change.
 
 A failed replacement retains the previous snapshot, observations, diagnostics, and reactive revision state.
 
@@ -147,11 +149,11 @@ The public read commands travel through the daemon writer lane and successful re
 
 Numeric lookup succeeds when one effective anchor owns the requested number. Ambiguity names the matching paths and anchors. A missing or ambiguous public `rfc show` rolls back the request's reconciliation and workspace refresh, keeping canonical SQLite and portable projection aligned.
 
-Human output identifies meaningful overlay differences. JSON adds `document_source`, workspace and canonical presence, branch and commit provenance, canonical ref and commit provenance, and `differs_from_canonical`. Absolute workspace roots remain local storage details.
+Human output identifies meaningful overlay differences. JSON entries from `rfc list` and `rfc status` include `document_source`, workspace and canonical presence, and `differs_from_canonical`. `rfc show` additionally includes workspace branch and commit provenance plus canonical ref and commit provenance. Status diagnostics retain their scoped workspace root.
 
 ## Managed RFC Mutations
 
-Managed create, edit, promote, withdraw, archive, supersede, rename, and repair operations edit Markdown in the issuing workspace and refresh that workspace's observations before returning.
+Managed create and ID-addressed edit, promote, withdraw, archive, supersede, rename, and repair operations edit Markdown in the issuing workspace and refresh that workspace's observations before returning. Explicit `--path` edit and supersede operations target the supplied existing absolute or workspace-relative path; the current command contract treats an absolute path as trusted input and does not confine it to the issuing workspace.
 
 Portable lifecycle operations materialize their meaning in Markdown:
 
@@ -206,23 +208,25 @@ Opening the shared database from another worktree refreshes that workspace's obs
 | --- | --- |
 | Canonical ref ambiguous in a multi-worktree repository | Preserve shared rows and refresh the issuing workspace |
 | Workspace has no usable Git history | Reconcile from the workspace document digest |
-| Canonical Git object or parse pass fails | Preserve the prior canonical view and return scoped evidence |
+| Canonical Git object access fails | Preserve the prior canonical view and return the error |
+| Canonical document is malformed, lifecycle-conflicting, or part of a duplicate-anchor group | Skip the affected candidate, preserve an existing anchored row, and continue independent valid candidates; no persisted canonical diagnostic is emitted |
+| Distinct canonical anchors claim one RFC number | Reconcile both records and report ambiguity when that number is read |
 | Valid canonical RFC is missing from SQLite | Insert or relink automatically |
 | RFC is absent from the current workspace | Keep the shared row and report workspace absence |
 | RFC is absent from the canonical tree | Keep the established shared row |
-| Anchor, path, lifecycle, or numeric identity conflicts | Preserve affected prior rows and report scoped repair evidence |
+| Current-workspace parse, anchor, path, or lifecycle conflict | Record a workspace diagnostic and keep canonical shared state available |
 | Workspace snapshot replacement fails | Roll back the replacement and retain prior observations and revisions |
 | Public RFC lookup is absent or ambiguous | Roll back request reconciliation and return the lookup error |
 | Sidecar finalization fails after a successful command | Keep committed SQLite state and report retryable persistence debt |
 | Request workspace belongs to another project or state root | Reject before document access |
 
-Repair reminders retain their canonical or workspace provenance. One workspace never receives an instruction that would rewrite another workspace's branch.
+Workspace repair diagnostics retain their workspace provenance. Skipped canonical candidates do not currently create persisted repair reminders. One workspace never receives an instruction that would rewrite another workspace's branch.
 
 ## Security and Privacy
 
-The daemon validates request workspaces against project identity and state root before accessing documents. Workspace scanning accepts managed RFC paths rooted in the validated workspace.
+The daemon validates request workspaces against project identity and state root before accessing documents. Workspace scanning accepts managed RFC paths rooted in the validated workspace. Explicit absolute `--path` mutations are a trusted-input escape hatch and can address a document outside that root.
 
-Machine-local snapshots stay in local SQLite because they contain absolute paths and local Git observations. CLI, MCP, and JSON responses can expose request-scoped branch names, ref names, and commit OIDs while omitting absolute roots. Portable projections, dumps, sidecar commits, and shared logs contain shared RFC state only.
+Machine-local snapshots stay in local SQLite because they contain absolute paths and local Git observations. `rfc show` JSON can expose request-scoped branch names, ref names, and commit OIDs. `rfc status` diagnostics serialize their machine-local `workspace_root`, so callers with access to that diagnostic surface can observe an absolute path. Portable projections, dumps, sidecar commits, and shared logs contain shared RFC state only.
 
 Canonical reconciliation reads Git tree entries and blobs. It executes no repository code and accepts managed repository-relative RFC paths.
 
