@@ -152,6 +152,7 @@ specific contracts and implementations.
 | [RFC 10181: Shared Perception](rfcs/stage-2/10181-shared-perception-inbox-as-a-steering-channel.md) | Defines scoped feedback and observations delivered through inbox and steering. |
 | [RFC 10165: Reactive SQLite](rfcs/stage-3/10165-reactive-sqlite-virtual-table-integration-with-revision-algebra.md) | Defines how state observations and mutations support trace validation. |
 | [RFC 10200: CLI-Shaped MCP Transport](rfcs/stage-1/10200-cli-shaped-exo-run-mcp-transport.md) | Defines the common Exo command language exposed to MCP-capable clients. |
+| [RFC 10202: Lane-Centered Workbench Adoption](rfcs/stage-1/10202-lane-centered-workbench-adoption.md) | Adopts the lane-centered product direction and defines the first create, focus, and resume proof. |
 
 Two existing RFCs need explicit alignment as the lane design advances:
 

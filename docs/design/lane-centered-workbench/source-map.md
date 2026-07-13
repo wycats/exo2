@@ -177,11 +177,13 @@ The design package intentionally leaves these as future implementation questions
 - browser workbench architecture;
 - cross-lane conflict detection;
 - lane close / outcome review operation shape;
-- sidecar sync conflict UX;
-- how and when to ratify the design package through the RFC process.
+- sidecar sync conflict UX.
 
 ## Recommended consolidation posture
 
 Do not rewrite RFC history. Keep RFCs as durable history and create a current architecture layer that says what the system believes now.
 
-The lane-centered package should eventually be referenced by a small adoption RFC or current manual page, but it should not be flattened into another large RFC that duplicates this folder.
+[RFC 10202: Lane-Centered Workbench Adoption](../../rfcs/stage-1/10202-lane-centered-workbench-adoption.md)
+records the adoption decision and first proof. This package remains the detailed
+product, system, interaction, and implementation authority rather than being
+flattened into the RFC.

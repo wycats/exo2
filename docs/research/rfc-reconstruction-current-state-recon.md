@@ -52,20 +52,20 @@ Stage 0/1/2 drift is converted into reviewed future-work or historical records.
 
 ## Corpus Inventory
 
-The public tree currently contains 334 Markdown files under `docs/rfcs/**`.
+The public tree currently contains 335 Markdown files under `docs/rfcs/**`.
 Two of those are support files (`README.md` and `0000-template.md`), leaving
-332 managed RFC records.
+333 managed RFC records.
 
 | Status Directory | Managed Records |
 | --- | ---: |
-| `stage-0` | 90 |
-| `stage-1` | 71 |
+| `stage-0` | 89 |
+| `stage-1` | 72 |
 | `stage-2` | 12 |
-| `stage-3` | 16 |
+| `stage-3` | 17 |
 | `stage-4` | 25 |
 | `archive` | 3 |
 | `withdrawn` | 115 |
-| **Total managed records** | **332** |
+| **Total managed records** | **333** |
 
 The current managed corpus still has broad title duplication, but numeric ID
 ambiguity is now narrow.
@@ -74,7 +74,7 @@ ambiguity is now narrow.
 | --- | --- | --- |
 | Duplicate numeric IDs | One remaining group: `0060` has active prompt-patterns and withdrawn dirty-tree steering records. | The clear-survivor numeric collision work landed; do not run ID-only lifecycle operations for `0060` until the prompt-patterns survivor is reviewed. |
 | Duplicate title families | 96 duplicate-title families affecting 193 managed RFC records. | Most remaining duplicate work is title/family consolidation rather than command-surface ambiguity. |
-| Stage 3/4 records | 41 managed records: 16 Stage 3 and 25 Stage 4. | This remains the first reconstruction surface because these records claim implemented or stable status. |
+| Stage 3/4 records | 42 managed records: 17 Stage 3 and 25 Stage 4. | This remains the first reconstruction surface because these records claim implemented or stable status. |
 | Archived records | `0022`, `0116`, and `0124` are archived. | `0022` is now completed project-state replacement history, not pending work. |
 | Withdrawn records | 115 records, including `0021`, `0129`, and the `0114` phase archive/current-file family. | Withdrawal work has removed several stale command/file-surface claims from the active corpus. |
 
@@ -127,7 +127,7 @@ processed.
 | 5 | Resolve remaining numeric ID collision `0060`. | It is the only remaining duplicate numeric ID and still makes ID-only RFC operations unsafe for that number. | Review whether `stage-1/0060-prompt-patterns-promptspec-resourcespec-and-cross-spec-interpolation.md` remains the `0060` survivor, then repair `withdrawn/0060-phase-aware-dirty-working-tree-steering.md` as a duplicate/historical record behind canonical dirty-tree RFC `0117`. |
 | 6 | Process high-value Stage 3 drift. | `0129` is withdrawn; `0132`, `0136`, `10170`, and `10179` still need trimming or stabilization decisions. | Continue with `10179` stabilization cleanup, then pair `0132`/`0136`, then trim/stabilize `10170`. |
 | 7 | Consolidate Stage 0/1 duplicate-title families. | 96 duplicate-title families remain, mostly future-work/history cleanup. | Batch by topic family after the Stage 3/4 surface is coherent. |
-| 8 | Decide lane adoption RFC shape. | The lane-centered package is current design direction but not yet an RFC adoption record. | Small adoption RFC or manual/current-architecture note after initial lane implementation planning starts. |
+| 8 | Develop RFC `10202`, Lane-Centered Workbench Adoption, toward Stage 2. | The Stage 1 proposal adopts the lane-centered package as current design direction, preserves the package as detailed authority, and defines the first create, focus, and resume proof. | Resolve the implementation-ready schema, command, persistence, migration, validation, and UI contracts through a separately approved Stage 2 refinement. |
 
 ## Boundary With Public-Readiness Work
 
