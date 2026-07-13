@@ -45,22 +45,29 @@ static SUPERSEDED_BY_TARGET_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock
 });
 static RECONCILED_RFC_KEYS: OnceLock<Mutex<HashSet<ReconcileKey>>> = OnceLock::new();
 
+type WorkspaceRfcDocuments = Vec<(String, Vec<u8>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReconcileKey {
     root: PathBuf,
     project_id: Option<String>,
     db_path: PathBuf,
-    canonical_oid: Option<String>,
+    source_version: Option<String>,
 }
 
 impl ReconcileKey {
-    fn new(root: &Path, project: Option<&Project>, source: &CanonicalReconcileSource) -> Self {
-        Self {
+    fn new(
+        root: &Path,
+        project: Option<&Project>,
+        source: &CanonicalReconcileSource,
+        workspace_documents: Option<&[(String, Vec<u8>)]>,
+    ) -> Result<Self> {
+        Ok(Self {
             root: normalize_key_path(root),
             project_id: project.map(|project| project.id.as_str().to_string()),
             db_path: normalize_key_path(&crate::context::db_path(root, project)),
-            canonical_oid: canonical_reconcile_cache_oid(source),
-        }
+            source_version: reconcile_source_cache_version(source, workspace_documents)?,
+        })
     }
 }
 
@@ -641,11 +648,22 @@ pub fn reconcile_rfcs(root: &Path) -> Result<ReconcileResult> {
     reconcile_rfcs_with_project(root, project.as_ref())
 }
 
-fn canonical_reconcile_cache_oid(source: &CanonicalReconcileSource) -> Option<String> {
+fn reconcile_source_cache_version(
+    source: &CanonicalReconcileSource,
+    workspace_documents: Option<&[(String, Vec<u8>)]>,
+) -> Result<Option<String>> {
     match source {
-        CanonicalReconcileSource::Canonical(canonical) => Some(canonical.oid.clone()),
-        CanonicalReconcileSource::WorkspaceFallback => Some("workspace-fallback".to_string()),
-        CanonicalReconcileSource::PreserveShared => None,
+        CanonicalReconcileSource::Canonical(canonical) => Ok(Some(canonical.oid.clone())),
+        CanonicalReconcileSource::WorkspaceFallback => {
+            let documents = workspace_documents
+                .context("Workspace RFC documents are required for fallback reconciliation")?;
+            let digest = workspace_document_digest(documents)
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            Ok(Some(format!("workspace-fallback:{digest}")))
+        }
+        CanonicalReconcileSource::PreserveShared => Ok(None),
     }
 }
 
@@ -722,6 +740,7 @@ pub(crate) fn canonical_rfc_commit_oid(root: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 thread_local! {
     static CANONICAL_SOURCE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WORKSPACE_RFC_DOCUMENT_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -732,6 +751,16 @@ fn reset_canonical_source_observation_count() {
 #[cfg(test)]
 fn canonical_source_observation_count() -> usize {
     CANONICAL_SOURCE_OBSERVATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_workspace_rfc_document_load_count() {
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn workspace_rfc_document_load_count() -> usize {
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(std::cell::Cell::get)
 }
 
 fn resolve_canonical_ref(root: &Path, ref_name: &str) -> Result<Option<CanonicalGitRef>> {
@@ -971,7 +1000,10 @@ fn reconcile_and_refresh_locked(
     source: &CanonicalReconcileSource,
     reconcile_shared: bool,
 ) -> Result<ReconcileResult> {
-    let key = ReconcileKey::new(root, project, source);
+    let workspace_documents = matches!(source, CanonicalReconcileSource::WorkspaceFallback)
+        .then(|| load_workspace_rfc_documents(root))
+        .transpose()?;
+    let key = ReconcileKey::new(root, project, source, workspace_documents.as_deref())?;
     let publish_reconciled_key = can_publish_reconciled_key(root, project)?;
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let should_reconcile = {
@@ -985,8 +1017,13 @@ fn reconcile_and_refresh_locked(
     } else {
         ReconcileResult::default()
     };
-    refresh_workspace_rfc_snapshot(root, project, source)?;
-    if should_reconcile && key.canonical_oid.is_some() && publish_reconciled_key {
+    refresh_workspace_rfc_snapshot_with_documents(
+        root,
+        project,
+        source,
+        workspace_documents.as_deref(),
+    )?;
+    if should_reconcile && key.source_version.is_some() && publish_reconciled_key {
         let mut reconciled_keys = reconciled_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1442,6 +1479,23 @@ fn workspace_document_digest(documents: &[(String, Vec<u8>)]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn load_workspace_rfc_documents(root: &Path) -> Result<WorkspaceRfcDocuments> {
+    #[cfg(test)]
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(|count| count.set(count.get() + 1));
+
+    let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
+        .into_iter()
+        .map(|path| {
+            let relative_path = relative_workspace_path(root, &path);
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok((relative_path, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    documents.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(documents)
+}
+
 fn workspace_observation_from_parsed(
     workspace_root: &str,
     branch_name: Option<&str>,
@@ -1501,6 +1555,15 @@ fn refresh_workspace_rfc_snapshot(
     project: Option<&Project>,
     source: &CanonicalReconcileSource,
 ) -> Result<()> {
+    refresh_workspace_rfc_snapshot_with_documents(root, project, source, None)
+}
+
+fn refresh_workspace_rfc_snapshot_with_documents(
+    root: &Path,
+    project: Option<&Project>,
+    source: &CanonicalReconcileSource,
+    workspace_documents: Option<&[(String, Vec<u8>)]>,
+) -> Result<()> {
     let db_path = crate::context::db_path(root, project);
     let loader = SqliteLoader::open(&db_path)
         .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
@@ -1516,17 +1579,14 @@ fn refresh_workspace_rfc_snapshot(
         .into_iter()
         .map(|record| (record.text_id.clone(), record))
         .collect::<HashMap<_, _>>();
-    let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
-        .into_iter()
-        .map(|path| {
-            let relative_path = relative_workspace_path(root, &path);
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            Ok((relative_path, bytes))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    documents.sort_by(|left, right| left.0.cmp(&right.0));
-    let document_digest = workspace_document_digest(&documents);
+    let owned_documents = workspace_documents
+        .is_none()
+        .then(|| load_workspace_rfc_documents(root))
+        .transpose()?;
+    let documents = workspace_documents
+        .or(owned_documents.as_deref())
+        .context("Workspace RFC documents are required for snapshot refresh")?;
+    let document_digest = workspace_document_digest(documents);
 
     let previous_snapshot = loader.load_rfc_workspace_snapshot(&workspace_root)?;
     if previous_snapshot.as_ref().is_some_and(|snapshot| {
@@ -1555,7 +1615,7 @@ fn refresh_workspace_rfc_snapshot(
     };
     let mut diagnostics = Vec::new();
     let mut parsed_documents = Vec::new();
-    for (relative_path, bytes) in &documents {
+    for (relative_path, bytes) in documents {
         let Ok(content) = String::from_utf8(bytes.clone()) else {
             diagnostics.push(RfcWorkspaceDiagnostic {
                 workspace_root: workspace_root.clone(),
@@ -1768,6 +1828,23 @@ pub fn load_effective_rfcs(
     Ok(load_effective_rfc_view(root, project)?.records)
 }
 
+/// Reconcile canonical RFC metadata and return the issuing workspace's view.
+///
+/// Public RFC read commands use this entry point so a valid canonical document
+/// can relink missing shared metadata before the response is composed. Internal
+/// derived-state callers can continue using [`load_effective_rfcs`] when they
+/// need workspace observations refreshed without reconciling shared canonical
+/// metadata.
+#[allow(clippy::missing_errors_doc)]
+pub fn observe_effective_rfcs(
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<Vec<EffectiveRfcRecord>> {
+    Ok(observe_effective_rfc_view_with_project(root, project)?
+        .1
+        .records)
+}
+
 /// Load one complete effective RFC view for the issuing workspace.
 #[allow(clippy::missing_errors_doc)]
 pub fn load_effective_rfc_view(root: &Path, project: Option<&Project>) -> Result<EffectiveRfcView> {
@@ -1874,7 +1951,35 @@ pub fn load_effective_rfc_by_number(
     project: Option<&Project>,
     rfc_number: i64,
 ) -> Result<Option<EffectiveRfcRecord>> {
-    let mut matches = load_effective_rfcs(root, project)?
+    select_effective_rfc_by_number(load_effective_rfcs(root, project)?, rfc_number)
+}
+
+/// Reconcile canonical RFC metadata and resolve one RFC in the workspace view.
+#[allow(clippy::missing_errors_doc)]
+pub fn observe_effective_rfc_by_number(
+    root: &Path,
+    project: Option<&Project>,
+    rfc_number: i64,
+) -> Result<Option<EffectiveRfcRecord>> {
+    with_reconcile_lock(root, project, || {
+        let transaction =
+            exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))?;
+        let source = canonical_reconcile_source(root)?;
+        reconcile_and_refresh_locked(root, project, &source, true)?;
+        let view = compose_effective_rfc_view_locked(root, project, &source)?;
+        let record = select_effective_rfc_by_number(view.records, rfc_number)?;
+        if record.is_some() {
+            transaction.commit()?;
+        }
+        Ok(record)
+    })
+}
+
+fn select_effective_rfc_by_number(
+    records: Vec<EffectiveRfcRecord>,
+    rfc_number: i64,
+) -> Result<Option<EffectiveRfcRecord>> {
+    let mut matches = records
         .into_iter()
         .filter(|record| record.record.rfc_number == rfc_number)
         .collect::<Vec<_>>();
@@ -5578,6 +5683,108 @@ This RFC supersedes:
     }
 
     #[test]
+    fn missing_observed_rfc_rolls_back_canonical_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-transactional-show.md"),
+            "<!-- exo:1 ulid:01transactionalshow -->\n\n# RFC 1: Transactional Show\n\n## Summary\n\nCanonical.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical show RFC");
+        publish_origin_main(root, &canonical_oid);
+        SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+
+        assert!(
+            observe_effective_rfc_by_number(root, None, 999)
+                .unwrap()
+                .is_none()
+        );
+        let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
+        assert!(
+            loader.load_rfc_by_number(1).unwrap().is_none(),
+            "a failed lookup must not commit canonical reconciliation"
+        );
+        assert!(
+            loader
+                .load_rfc_workspace_snapshot(&slash_path_string(&normalize_key_path(root)))
+                .unwrap()
+                .is_none(),
+            "a failed lookup must roll back its workspace snapshot"
+        );
+
+        let found = observe_effective_rfc_by_number(root, None, 1)
+            .unwrap()
+            .expect("canonical RFC should relink on a successful lookup");
+        assert_eq!(found.record.title, "Transactional Show");
+        assert!(loader.load_rfc_by_number(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn workspace_fallback_reconciles_each_observed_read() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        let rfc_path = root.join("docs/rfcs/stage-1/00001-fallback.md");
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01fallbackread -->\n\n# RFC 1: First Fallback View\n\n## Summary\n\nFirst.\n",
+        )
+        .unwrap();
+        let writer = SqliteWriter::open(root.join(SQLITE_DB_PATH)).unwrap();
+        writer
+            .upsert_rfc(
+                "01fallbackread",
+                1,
+                "Seeded Fallback View",
+                1,
+                "active",
+                None,
+                "fallback",
+                "docs/rfcs/stage-1/00001-fallback.md",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        reset_workspace_rfc_document_load_count();
+        let first = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(workspace_rfc_document_load_count(), 1);
+        assert_eq!(first[0].record.title, "First Fallback View");
+        assert_eq!(
+            SqliteLoader::open(root.join(SQLITE_DB_PATH))
+                .unwrap()
+                .load_rfc_by_number(1)
+                .unwrap()
+                .unwrap()
+                .title,
+            "First Fallback View"
+        );
+
+        fs::write(
+            &rfc_path,
+            "<!-- exo:1 ulid:01fallbackread -->\n\n# RFC 1: Second Fallback View\n\n## Summary\n\nSecond.\n",
+        )
+        .unwrap();
+        let second = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(workspace_rfc_document_load_count(), 2);
+        assert_eq!(second[0].record.title, "Second Fallback View");
+        let shared = SqliteLoader::open(root.join(SQLITE_DB_PATH))
+            .unwrap()
+            .load_rfc_by_number(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.title, "Second Fallback View");
+    }
+
+    #[test]
     fn linked_worktrees_compose_distinct_rfc_views_over_shared_canonical_state() {
         let temp = TempDir::new().unwrap();
         let main_root = temp.path().join("main");
@@ -5677,6 +5884,146 @@ This RFC supersedes:
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn linked_worktree_withdrawal_becomes_canonical_without_stale_restore() {
+        let temp = TempDir::new().unwrap();
+        let main_root = temp.path().join("main");
+        let feature_root = temp.path().join("feature");
+        let fresh_root = temp.path().join("fresh");
+        let state_root = temp.path().join("sidecar-state");
+        fs::create_dir_all(main_root.join("docs/rfcs/stage-3")).unwrap();
+        fs::create_dir_all(state_root.join("cache")).unwrap();
+        init_git_repository(&main_root);
+
+        let active_path = main_root.join("docs/rfcs/stage-3/00129-runner.md");
+        fs::write(
+            &active_path,
+            "<!-- exo:129 ulid:01linkedrunner -->\n\n# RFC 129: Configurable Runner\n\n**Stage**: 3\n\n## Summary\n\nActive.\n",
+        )
+        .unwrap();
+        let active_oid = commit_all(&main_root, "active runner RFC");
+        publish_origin_main(&main_root, &active_oid);
+        run_git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/withdraw-runner",
+                feature_root.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let git_common_dir = main_root.join(".git");
+        let main_project = shared_sidecar_project(&main_root, &git_common_dir, &state_root);
+        let feature_project = shared_sidecar_project(&feature_root, &git_common_dir, &state_root);
+        SqliteWriter::open(main_project.db_path()).unwrap();
+        reconcile_rfcs_with_project(&main_root, Some(&main_project)).unwrap();
+
+        fs::create_dir_all(feature_root.join("docs/rfcs/withdrawn")).unwrap();
+        let withdrawn_path = feature_root.join("docs/rfcs/withdrawn/00129-runner.md");
+        fs::rename(
+            feature_root.join("docs/rfcs/stage-3/00129-runner.md"),
+            &withdrawn_path,
+        )
+        .unwrap();
+        fs::write(
+            &withdrawn_path,
+            "<!-- exo:129 ulid:01linkedrunner -->\n\n# RFC 129: Configurable Runner\n\n**Status**: Withdrawn\n**Stage**: 3\n**Reason**: The configurable runner surface was not implemented.\n\n## Summary\n\nHistorical.\n",
+        )
+        .unwrap();
+
+        let feature_view = load_effective_rfc_by_number(&feature_root, Some(&feature_project), 129)
+            .unwrap()
+            .unwrap();
+        let main_view = load_effective_rfc_by_number(&main_root, Some(&main_project), 129)
+            .unwrap()
+            .unwrap();
+        let shared_before = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(feature_view.record.status, "withdrawn");
+        assert!(feature_view.provenance.differs_from_canonical);
+        assert_eq!(main_view.record.status, "active");
+        assert_eq!(shared_before.status, "active");
+
+        let withdrawn_oid = commit_all(&feature_root, "withdraw runner RFC");
+        publish_origin_main(&main_root, &withdrawn_oid);
+
+        reconcile_rfcs_with_project(&main_root, Some(&main_project)).unwrap();
+        let shared_after_restart = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared_after_restart.stage, 3);
+        assert_eq!(shared_after_restart.status, "withdrawn");
+        assert_eq!(
+            shared_after_restart.withdrawal_reason.as_deref(),
+            Some("The configurable runner surface was not implemented.")
+        );
+
+        let stale_main_view = load_effective_rfc_by_number(&main_root, Some(&main_project), 129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_main_view.record.status, "active");
+        assert!(stale_main_view.provenance.differs_from_canonical);
+        let shared_after_stale_read = SqliteLoader::open(main_project.db_path())
+            .unwrap()
+            .load_rfc_by_number(129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_after_stale_read.status, "withdrawn",
+            "a stale linked worktree view cannot restore older canonical metadata"
+        );
+
+        run_git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                fresh_root.to_str().unwrap(),
+                "refs/remotes/origin/main",
+            ],
+        );
+        let fresh_project = shared_sidecar_project(&fresh_root, &git_common_dir, &state_root);
+        let fresh_view = load_effective_rfc_by_number(&fresh_root, Some(&fresh_project), 129)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh_view.record.status, "withdrawn");
+        assert!(!fresh_view.provenance.differs_from_canonical);
+
+        let loader = SqliteLoader::open(main_project.db_path()).unwrap();
+        let dumps = exosuit_storage::dump_tables(loader.database().connection()).unwrap();
+        let rfcs_dump = dumps
+            .iter()
+            .find_map(|(table, sql)| (table == "rfcs_data").then_some(sql))
+            .expect("portable RFC projection");
+        assert!(rfcs_dump.contains("The configurable runner surface was not implemented."));
+        for root in [&main_root, &feature_root, &fresh_root] {
+            assert!(
+                !rfcs_dump.contains(root.to_string_lossy().as_ref()),
+                "portable RFC projection must omit workspace root {}",
+                root.display()
+            );
+        }
+        for local_table in [
+            "rfc_workspace_snapshots_data",
+            "rfc_workspace_observations_data",
+            "rfc_workspace_diagnostics_data",
+        ] {
+            assert!(
+                dumps.iter().all(|(table, _)| table != local_table),
+                "portable dumps must omit {local_table}"
+            );
+        }
     }
 
     #[test]
@@ -5872,6 +6219,71 @@ This RFC supersedes:
             .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap()
             .unwrap();
+        worker.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn observed_lookup_takes_reconcile_lock_before_database_transaction() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("docs/rfcs/stage-1")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        init_git_repository(root);
+        fs::write(
+            root.join("docs/rfcs/stage-1/00001-lock-order.md"),
+            "<!-- exo:1 ulid:01lockorder -->\n\n# RFC 1: Lock Order\n\n## Summary\n\nLocked.\n",
+        )
+        .unwrap();
+        let canonical_oid = commit_all(root, "canonical lock-order RFC");
+        publish_origin_main(root, &canonical_oid);
+        let db_path = root.join(SQLITE_DB_PATH);
+        SqliteWriter::open(&db_path).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread_root = root.to_path_buf();
+        let mut worker = None;
+
+        with_reconcile_lock(root, None, || {
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = observe_effective_rfc_by_number(&thread_root, None, 999)
+                    .map_err(|error| format!("{error:#}"));
+                finished_tx.send(result).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+
+            let writer = SqliteWriter::open(&db_path).unwrap();
+            writer
+                .add_axiom(
+                    "lock-order-probe",
+                    "workflow",
+                    "database remains writable",
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "lookup should wait on the reconcile lock before opening its transaction"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
         worker.unwrap().join().unwrap();
     }
 
@@ -6976,7 +7388,11 @@ This RFC supersedes:
         .unwrap();
 
         let second = reconcile_rfcs_once_with_project(root, None).unwrap();
-        assert_eq!(second, ReconcileResult::default());
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.unchanged, 2);
+
+        let unchanged = reconcile_rfcs_once_with_project(root, None).unwrap();
+        assert_eq!(unchanged, ReconcileResult::default());
 
         let loader = SqliteLoader::open(root.join(SQLITE_DB_PATH)).unwrap();
         let rows = loader.load_rfcs().unwrap();

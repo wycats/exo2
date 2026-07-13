@@ -2437,10 +2437,10 @@
         },
         "list": {
           "name": "list",
-          "description": "List RFCs with optional stage filter",
-          "effect": "pure",
-          "recovery_class": "replayable_read",
-          "needs_upgrade_gate": false,
+          "description": "Reconcile and list RFCs with optional stage filter",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": true,
           "args": [
             {
               "id": "stage",
@@ -2575,10 +2575,10 @@
         },
         "show": {
           "name": "show",
-          "description": "Show RFC details by ID",
-          "effect": "pure",
-          "recovery_class": "replayable_read",
-          "needs_upgrade_gate": false,
+          "description": "Reconcile and show RFC details by ID",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": true,
           "args": [
             {
               "id": "id",
@@ -2593,10 +2593,10 @@
         },
         "status": {
           "name": "status",
-          "description": "Show RFC status grouped by stage",
-          "effect": "pure",
-          "recovery_class": "replayable_read",
-          "needs_upgrade_gate": false,
+          "description": "Reconcile and show RFC status grouped by stage",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": true,
           "args": []
         },
         "supersede": {

@@ -1656,6 +1656,127 @@ async fn daemon_request_uses_the_issuing_linked_worktree(backend: &str) {
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
+async fn daemon_and_direct_rfc_views_follow_the_issuing_linked_worktree(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("primary");
+    let linked = dir.path().join("linked");
+    std::fs::create_dir(&primary).unwrap();
+    git_init(&primary);
+    test_support::exo_init_with_storage(&primary, backend);
+    std::fs::create_dir_all(primary.join("docs/rfcs/stage-1")).unwrap();
+    std::fs::write(
+        primary.join("docs/rfcs/stage-1/00001-workspace-view.md"),
+        "<!-- exo:1 ulid:01daemonworkspace -->\n\n# RFC 1: Workspace View\n\n**Stage**: 1\n\n## Summary\n\nActive.\n",
+    )
+    .unwrap();
+    git_commit_all(&primary);
+    run_git_ok(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-rfc-view",
+            linked.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(linked.join("docs/rfcs/withdrawn")).unwrap();
+    std::fs::rename(
+        linked.join("docs/rfcs/stage-1/00001-workspace-view.md"),
+        linked.join("docs/rfcs/withdrawn/00001-workspace-view.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        linked.join("docs/rfcs/withdrawn/00001-workspace-view.md"),
+        "<!-- exo:1 ulid:01daemonworkspace -->\n\n# RFC 1: Workspace View\n\n**Status**: Withdrawn\n**Stage**: 1\n**Reason**: This linked-worktree proposal is complete.\n\n## Summary\n\nHistorical.\n",
+    )
+    .unwrap();
+    git_commit_all(&linked);
+
+    let _guard = DaemonGuard::new(&primary);
+    let primary_stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("primary should spawn daemon");
+    let primary_request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "primary-rfc-view",
+        "workspace_root": primary.canonicalize().expect("canonical primary worktree"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["rfc", "show"] },
+                "input": { "id": "00001" }
+            }
+        }
+    });
+    let primary_response = send_machine_request(primary_stream, &primary_request.to_string()).await;
+
+    let linked_stream = exo::daemon::connect_to_daemon(&linked)
+        .await
+        .expect("linked worktree should connect to shared daemon");
+    let linked_request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "linked-rfc-view",
+        "workspace_root": linked.canonicalize().expect("canonical linked worktree"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["rfc", "show"] },
+                "input": { "id": "00001" }
+            }
+        }
+    });
+    let linked_response = send_machine_request(linked_stream, &linked_request.to_string()).await;
+
+    assert_eq!(linked_response["effect"], "write", "{linked_response}");
+    assert_eq!(
+        linked_response["result"]["post_write"]["sql_dump_written"], true,
+        "reconciling RFC reads should persist their canonical mutation"
+    );
+    let projection_path = linked.join("docs/agent-context/rfcs.sql");
+    let projection = std::fs::read_to_string(&projection_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", projection_path.display()));
+    assert!(projection.contains("01daemonworkspace"));
+    assert!(projection.contains("Workspace View"));
+    assert!(!projection.contains(linked.to_string_lossy().as_ref()));
+
+    let direct = test_support::exo_cmd(&linked)
+        .args(["--format", "json", "rfc", "show", "00001"])
+        .assert()
+        .success();
+    let direct_response: serde_json::Value = serde_json::from_slice(&direct.get_output().stdout)
+        .expect("direct RFC response should be valid JSON");
+
+    assert_eq!(primary_response["status"], "ok", "{primary_response}");
+    assert_eq!(primary_response["result"]["status"], "active");
+    assert_eq!(primary_response["result"]["workspace_presence"], "present");
+    assert_eq!(linked_response["status"], "ok", "{linked_response}");
+    assert_eq!(linked_response["result"]["status"], "withdrawn");
+    assert_eq!(
+        linked_response["result"]["withdrawal_reason"],
+        "This linked-worktree proposal is complete."
+    );
+    for field in [
+        "id",
+        "stage",
+        "status",
+        "filename",
+        "withdrawal_reason",
+        "document_source",
+        "workspace_presence",
+        "canonical_presence",
+        "differs_from_canonical",
+    ] {
+        assert_eq!(
+            linked_response["result"][field], direct_response["result"][field],
+            "daemon and direct RFC views should agree for field {field}"
+        );
+    }
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
 async fn daemon_rejects_request_workspace_from_another_project(backend: &str) {
     assert_eq!(backend, "sqlite");
     let primary_dir = TempDir::new().unwrap();
@@ -1740,6 +1861,51 @@ async fn atomic_request_hydrates_projection_before_rollback(backend: &str) {
         "rolled-back request must not report a committed write: {failed}"
     );
     assert_db_has_epoch(&db_path, "Projected Epoch");
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_rfc_read_hydrates_projection_before_reconciliation(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let db_path = project.db_path();
+    let writer = exo::context::SqliteWriter::open(&db_path).expect("open project writer");
+    writer
+        .add_epoch(
+            "Projected RFC Read Epoch",
+            Some("projected-rfc-read-epoch"),
+            &[],
+        )
+        .expect("add projected epoch");
+    drop(writer);
+    exo::context::write_sql_dump_with_project_result(&workspace, Some(&project))
+        .expect("write SQL projection");
+    std::fs::remove_file(&db_path).expect("remove initialized project database");
+    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+    let stream = exo::daemon::ensure_daemon(&workspace)
+        .await
+        .expect("spawn daemon");
+    let response = send_machine_request_with_timeout(
+        stream,
+        r#"{"protocol_version":1,"id":"rfc-read-after-hydration","op":{"kind":"call","params":{"address":{"kind":"operation","path":["rfc","status"]},"input":{}}}}"#,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert_eq!(response["status"], "ok", "{response}");
+    assert_db_has_epoch(&db_path, "Projected RFC Read Epoch");
+    let epochs_projection =
+        std::fs::read_to_string(workspace.join("docs/agent-context/epochs.sql"))
+            .expect("read persisted epochs projection");
+    assert!(
+        epochs_projection.contains("Projected RFC Read Epoch"),
+        "RFC reconciliation must preserve hydrated portable state"
+    );
 }
 
 #[test_matrix(["sqlite"])]

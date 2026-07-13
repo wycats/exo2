@@ -1737,6 +1737,10 @@ fn should_use_daemon_writer_lane(
         && matches!(effect, Effect::Write | Effect::Exec)
 }
 
+fn command_requires_database_hydration(namespace: &str, operation: &str) -> bool {
+    namespace == "rfc" && matches!(operation, "list" | "show" | "status")
+}
+
 fn daemon_writer_request_workspace<'a>(
     handler_workspace: &'a Path,
     project_workspace: Option<&'a Path>,
@@ -2090,6 +2094,16 @@ fn handle_call_with_namespace_operation(
                     workflow_confirmation.as_ref(),
                     diagnostics,
                 );
+            }
+
+            if runtime == HandlerRuntime::SidecarWriter
+                && command_requires_database_hydration(namespace, operation)
+                && let Err(error) = crate::context::AgentContext::load_hydrated_with_project(
+                    workspace_root.to_path_buf(),
+                    project.cloned(),
+                )
+            {
+                return command_construction_error_to_response(id, error);
             }
 
             let expected_ticket = ticket_for_exec_call(&params.address, &params.input);

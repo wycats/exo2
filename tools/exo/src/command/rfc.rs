@@ -1,8 +1,8 @@
 //! RFC namespace commands.
 //!
-//! - `rfc list`: List RFCs with optional stage filter (Pure)
-//! - `rfc show`: Show RFC details by ID (Pure)
-//! - `rfc status`: Show RFC status grouped by stage (Pure)
+//! - `rfc list`: Reconcile and list RFCs (Write)
+//! - `rfc show`: Reconcile and show RFC details (Write)
+//! - `rfc status`: Reconcile and show RFC status (Write)
 //! - `rfc pipeline`: Show RFC pipeline for the active phase (Pure)
 //! - `rfc create`: Create a new RFC (Write)
 //! - `rfc edit`: Edit an existing RFC (Write)
@@ -331,19 +331,31 @@ fn rfc_matches_stage_filter(record: &RfcRecord, filter: Option<u8>) -> bool {
 #[derive(Debug, exospec::ExoSpec)]
 #[exo(namespace = "rfc", description = "RFC management commands")]
 pub enum RfcCommands {
-    #[exo(effect = "pure", description = "List RFCs with optional stage filter")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and list RFCs with optional stage filter"
+    )]
     List {
         #[exo(long, optional, description = "Filter by RFC stage (0-4)")]
         stage: Option<i64>,
     },
 
-    #[exo(effect = "pure", description = "Show RFC details by ID")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and show RFC details by ID"
+    )]
     Show {
         #[exo(positional, description = "The RFC ID to show")]
         id: String,
     },
 
-    #[exo(effect = "pure", description = "Show RFC status grouped by stage")]
+    #[exo(
+        effect = "write",
+        upgrade_gate,
+        description = "Reconcile and show RFC status grouped by stage"
+    )]
     Status,
 
     #[exo(effect = "write", upgrade_gate, description = "Create a new RFC")]
@@ -583,7 +595,7 @@ impl Command for RfcList {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -591,7 +603,7 @@ impl Command for RfcList {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let all_rfcs = rfc::load_effective_rfcs(ctx.root, ctx.project)?;
+        let all_rfcs = rfc::observe_effective_rfcs(ctx.root, ctx.project)?;
 
         let filtered: Vec<_> = match self.stage {
             Some(s) => all_rfcs
@@ -707,7 +719,7 @@ impl Command for RfcShow {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -731,7 +743,7 @@ impl Command for RfcShow {
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
         let rfc_number = parse_rfc_number(&self.id)?;
-        let effective = rfc::load_effective_rfc_by_number(ctx.root, ctx.project, rfc_number)?
+        let effective = rfc::observe_effective_rfc_by_number(ctx.root, ctx.project, rfc_number)?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "RFC {} not found. Use `exo rfc list` to see available RFCs.",
@@ -904,7 +916,7 @@ impl Command for RfcStatus {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Pure
+        Effect::Write
     }
 
     fn default_steering(&self) -> Vec<SuggestedAction> {
@@ -912,7 +924,7 @@ impl Command for RfcStatus {
     }
 
     fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
-        let view = rfc::load_effective_rfc_view(ctx.root, ctx.project)?;
+        let view = rfc::observe_effective_rfc_view_with_project(ctx.root, ctx.project)?.1;
         let repairs =
             rfc::detect_rfc_repair_candidates_with_records(ctx.root, &view.repair_records)?;
         let workspace_diagnostics = view.workspace_diagnostics;
@@ -2019,13 +2031,15 @@ impl Command for RfcPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::protocol::RecoveryClass;
 
     #[test]
     fn test_rfc_list_metadata() {
         let cmd = RfcList::new(None);
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "list");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
     }
 
     #[test]
@@ -2087,7 +2101,8 @@ mod tests {
         let cmd = RfcShow::new("0085");
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "show");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
         assert_eq!(cmd.id, "0085");
     }
 
@@ -2096,7 +2111,8 @@ mod tests {
         let cmd = RfcStatus::new();
         assert_eq!(cmd.namespace(), "rfc");
         assert_eq!(cmd.operation(), "status");
-        assert_eq!(cmd.effect(), Effect::Pure);
+        assert_eq!(cmd.effect(), Effect::Write);
+        assert_eq!(cmd.recovery_class(), RecoveryClass::ExternalAtMostOnce);
     }
 
     #[test]
