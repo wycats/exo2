@@ -45,6 +45,8 @@ static SUPERSEDED_BY_TARGET_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock
 });
 static RECONCILED_RFC_KEYS: OnceLock<Mutex<HashSet<ReconcileKey>>> = OnceLock::new();
 
+type WorkspaceRfcDocuments = Vec<(String, Vec<u8>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReconcileKey {
     root: PathBuf,
@@ -58,12 +60,13 @@ impl ReconcileKey {
         root: &Path,
         project: Option<&Project>,
         source: &CanonicalReconcileSource,
+        workspace_documents: Option<&[(String, Vec<u8>)]>,
     ) -> Result<Self> {
         Ok(Self {
             root: normalize_key_path(root),
             project_id: project.map(|project| project.id.as_str().to_string()),
             db_path: normalize_key_path(&crate::context::db_path(root, project)),
-            source_version: reconcile_source_cache_version(root, source)?,
+            source_version: reconcile_source_cache_version(source, workspace_documents)?,
         })
     }
 }
@@ -646,23 +649,15 @@ pub fn reconcile_rfcs(root: &Path) -> Result<ReconcileResult> {
 }
 
 fn reconcile_source_cache_version(
-    root: &Path,
     source: &CanonicalReconcileSource,
+    workspace_documents: Option<&[(String, Vec<u8>)]>,
 ) -> Result<Option<String>> {
     match source {
         CanonicalReconcileSource::Canonical(canonical) => Ok(Some(canonical.oid.clone())),
         CanonicalReconcileSource::WorkspaceFallback => {
-            let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
-                .into_iter()
-                .map(|path| {
-                    let relative_path = relative_workspace_path(root, &path);
-                    let bytes = std::fs::read(&path)
-                        .with_context(|| format!("Failed to read {}", path.display()))?;
-                    Ok((relative_path, bytes))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            documents.sort_by(|left, right| left.0.cmp(&right.0));
-            let digest = workspace_document_digest(&documents)
+            let documents = workspace_documents
+                .context("Workspace RFC documents are required for fallback reconciliation")?;
+            let digest = workspace_document_digest(documents)
                 .into_iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
@@ -745,6 +740,7 @@ pub(crate) fn canonical_rfc_commit_oid(root: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 thread_local! {
     static CANONICAL_SOURCE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WORKSPACE_RFC_DOCUMENT_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -755,6 +751,16 @@ fn reset_canonical_source_observation_count() {
 #[cfg(test)]
 fn canonical_source_observation_count() -> usize {
     CANONICAL_SOURCE_OBSERVATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_workspace_rfc_document_load_count() {
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn workspace_rfc_document_load_count() -> usize {
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(std::cell::Cell::get)
 }
 
 fn resolve_canonical_ref(root: &Path, ref_name: &str) -> Result<Option<CanonicalGitRef>> {
@@ -994,7 +1000,10 @@ fn reconcile_and_refresh_locked(
     source: &CanonicalReconcileSource,
     reconcile_shared: bool,
 ) -> Result<ReconcileResult> {
-    let key = ReconcileKey::new(root, project, source)?;
+    let workspace_documents = matches!(source, CanonicalReconcileSource::WorkspaceFallback)
+        .then(|| load_workspace_rfc_documents(root))
+        .transpose()?;
+    let key = ReconcileKey::new(root, project, source, workspace_documents.as_deref())?;
     let publish_reconciled_key = can_publish_reconciled_key(root, project)?;
     let reconciled_keys = RECONCILED_RFC_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let should_reconcile = {
@@ -1008,7 +1017,12 @@ fn reconcile_and_refresh_locked(
     } else {
         ReconcileResult::default()
     };
-    refresh_workspace_rfc_snapshot(root, project, source)?;
+    refresh_workspace_rfc_snapshot_with_documents(
+        root,
+        project,
+        source,
+        workspace_documents.as_deref(),
+    )?;
     if should_reconcile && key.source_version.is_some() && publish_reconciled_key {
         let mut reconciled_keys = reconciled_keys
             .lock()
@@ -1465,6 +1479,23 @@ fn workspace_document_digest(documents: &[(String, Vec<u8>)]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn load_workspace_rfc_documents(root: &Path) -> Result<WorkspaceRfcDocuments> {
+    #[cfg(test)]
+    WORKSPACE_RFC_DOCUMENT_LOADS.with(|count| count.set(count.get() + 1));
+
+    let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
+        .into_iter()
+        .map(|path| {
+            let relative_path = relative_workspace_path(root, &path);
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok((relative_path, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    documents.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(documents)
+}
+
 fn workspace_observation_from_parsed(
     workspace_root: &str,
     branch_name: Option<&str>,
@@ -1524,6 +1555,15 @@ fn refresh_workspace_rfc_snapshot(
     project: Option<&Project>,
     source: &CanonicalReconcileSource,
 ) -> Result<()> {
+    refresh_workspace_rfc_snapshot_with_documents(root, project, source, None)
+}
+
+fn refresh_workspace_rfc_snapshot_with_documents(
+    root: &Path,
+    project: Option<&Project>,
+    source: &CanonicalReconcileSource,
+    workspace_documents: Option<&[(String, Vec<u8>)]>,
+) -> Result<()> {
     let db_path = crate::context::db_path(root, project);
     let loader = SqliteLoader::open(&db_path)
         .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
@@ -1539,17 +1579,14 @@ fn refresh_workspace_rfc_snapshot(
         .into_iter()
         .map(|record| (record.text_id.clone(), record))
         .collect::<HashMap<_, _>>();
-    let mut documents = walk_rfc_markdown_files(&root.join(RFCS_DIR))
-        .into_iter()
-        .map(|path| {
-            let relative_path = relative_workspace_path(root, &path);
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            Ok((relative_path, bytes))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    documents.sort_by(|left, right| left.0.cmp(&right.0));
-    let document_digest = workspace_document_digest(&documents);
+    let owned_documents = workspace_documents
+        .is_none()
+        .then(|| load_workspace_rfc_documents(root))
+        .transpose()?;
+    let documents = workspace_documents
+        .or(owned_documents.as_deref())
+        .context("Workspace RFC documents are required for snapshot refresh")?;
+    let document_digest = workspace_document_digest(documents);
 
     let previous_snapshot = loader.load_rfc_workspace_snapshot(&workspace_root)?;
     if previous_snapshot.as_ref().is_some_and(|snapshot| {
@@ -1578,7 +1615,7 @@ fn refresh_workspace_rfc_snapshot(
     };
     let mut diagnostics = Vec::new();
     let mut parsed_documents = Vec::new();
-    for (relative_path, bytes) in &documents {
+    for (relative_path, bytes) in documents {
         let Ok(content) = String::from_utf8(bytes.clone()) else {
             diagnostics.push(RfcWorkspaceDiagnostic {
                 workspace_root: workspace_root.clone(),
@@ -5717,7 +5754,9 @@ This RFC supersedes:
             )
             .unwrap();
 
+        reset_workspace_rfc_document_load_count();
         let first = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(workspace_rfc_document_load_count(), 1);
         assert_eq!(first[0].record.title, "First Fallback View");
         assert_eq!(
             SqliteLoader::open(root.join(SQLITE_DB_PATH))
@@ -5735,6 +5774,7 @@ This RFC supersedes:
         )
         .unwrap();
         let second = observe_effective_rfcs(root, None).unwrap();
+        assert_eq!(workspace_rfc_document_load_count(), 2);
         assert_eq!(second[0].record.title, "Second Fallback View");
         let shared = SqliteLoader::open(root.join(SQLITE_DB_PATH))
             .unwrap()
