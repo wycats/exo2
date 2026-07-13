@@ -2,6 +2,8 @@
 
 # RFC 10202: Lane-Centered Workbench Adoption
 
+**Feature**: lane-centered-workbench
+
 ## Summary
 
 Exo adopts the lane-centered workbench as its product model for concurrent agentic work. A workbench lane is the durable identity of one stream of change: the intent that started it, the workspace activity that advances it, the goals and observations that describe it, the review artifacts that assess it, and the outcome that closes it.
