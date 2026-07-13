@@ -15,16 +15,20 @@ This RFC documents the current development workflow for the Exosuit VS Code exte
 
 ## Current Architecture
 
-### CLI Binary Auto-Restart
+### CLI and Daemon Freshness
 
-The `MachineChannelServer` watches the `exo` binary for changes and automatically restarts when it detects a recompilation:
+RFC 10179 defines the current development-binary contract. A workspace selects
+its local Exo toolchain through `[dev].binary_dir` in `exosuit.toml`. Rust
+entry points re-exec to that build when necessary, while the VS Code extension
+resolves the same workspace-local binary directly.
 
-- Configured via `exosuit.exoBinaryDir` setting (default: `${workspaceFolder}/target/release`)
-- Uses `fs.watchFile` with 1-second polling to detect atomic replacements (cargo writes temp file then renames)
-- 500ms debounce to handle multiple touches during a single build
-- Restart counter is reset (not counted as a crash)
-
-**Key insight**: CLI changes do NOT require a window reload — just `cargo build --release -p exo`.
+The active machine channel is daemon-backed. Before it reuses a socket, the
+extension invokes Rust `daemon ensure`, which compares the daemon's recorded
+workspace and executable identity with the selected binary and probes the exact
+instance. A stale daemon is replaced, and the extension reconnects its socket
+lanes and invalidates cached state. CLI changes therefore become available on
+the next ensured request after rebuilding the configured workspace binary;
+they do not require a VS Code window reload.
 
 ### Extension Build Pipeline
 
@@ -145,7 +149,7 @@ Currently using `tsc -b` for typechecking. Could improve with:
 
 ## References
 
-- `packages/exosuit-vscode/src/agent/lmtool/MachineChannelServer.ts` — Binary watching implementation
+- `packages/exosuit-vscode/src/machine-channel/DaemonChannelServer.ts` — Daemon lifecycle and reconnect behavior
 - `packages/exosuit-vscode/src/exoBin.ts` — Binary resolution logic
 - `packages/exosuit-vscode/vite.config.mts` — Webview build config
 - `packages/exosuit-vscode/vite.extension.config.mts` — Extension bundle config
