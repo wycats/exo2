@@ -7,10 +7,12 @@
 ## Summary
 
 Exo exposes a deliberately small language-model tool surface over its complete
-command system. Every project operation is reachable through `exo-run`, a
-universal, CLI-shaped transport backed by CommandSpec and the machine channel. A
-small set of curated extension tools remains separate for capabilities that
-benefit from dedicated model visibility.
+command system. `exo-run` is the shared, CLI-shaped project-tool surface backed
+by CommandSpec and the machine channel. MCP reaches the complete current command
+inventory through that surface. VS Code presents the same tool shape and
+execution contract while its extension-local command-text adapter retains known
+coverage gaps. A small set of curated extension tools remains separate for
+capabilities that benefit from dedicated model visibility.
 
 The VS Code extension contributes exactly five public tools:
 `exo-ai-chat-history`, `exo-diagnostics`, `exo-logs`, `exo-ping`, and
@@ -35,15 +37,17 @@ CLI.
 
 Exo already has a command language with namespaces, help, typed arguments,
 effects, diagnostics, confirmation, and recovery. The model-facing architecture
-uses that language directly. One project tool can reach the complete operation
-set while preserving the same semantics available to CLI users.
+uses that language directly. The MCP project tool reaches the complete operation
+set while preserving the same semantics available to CLI users. VS Code uses the
+same project-tool surface and machine execution model while its local parser
+converges on equivalent command coverage.
 
 Some useful capabilities deserve dedicated extension tools. Diagnostics,
 extension logs, and extension identity come directly from the VS Code process.
 Chat history is an Exo command, and the extension provides a curated wrapper
 that routes to `exo ai chat-history` through the machine channel. Keeping these
 capabilities explicit gives models focused schemas for common environmental and
-context-recovery work while `exo-run` remains the universal project surface.
+context-recovery work while `exo-run` remains the primary project surface.
 
 ## The Public Tool Surface
 
@@ -72,6 +76,12 @@ an extension-local tokenizer and router to construct the structured machine
 request. Its request still enters the same typed invocation and execution
 machinery, while its parsing errors and treatment of global options currently
 differ from MCP.
+
+The adapter difference also affects command coverage. The current VS Code root
+command table recognizes `status` and `version`, but omits root `write <path>`;
+that command is therefore misrouted as a namespaced operation. This is an
+implemented adapter gap within the shared architecture, rather than a separate
+command contract.
 
 The two transports therefore share command paths, placeholder substitution,
 machine-channel validation, effect classification, and structured responses.
@@ -147,8 +157,8 @@ The extension manifest is the declarative public inventory, and runtime
 activation registers implementations only for tools present there.
 
 The repository's synchronization check enforces the curated five-tool list and
-removes `languageModelToolSets` declarations. Generated package-tool output remains available for auditing, separate from
-the public manifest.
+removes `languageModelToolSets` declarations. Generated package-tool output
+remains available for auditing, separate from the public manifest.
 
 This distinction resolves an older source of drift. Declarative metadata and
 runtime registration still have different jobs, but they agree on which tools
@@ -167,8 +177,8 @@ execution, and the response preserves Exo's structured result, steering,
 command-compilation diagnostics when present, and recovery identity.
 
 An MCP host therefore learns one transport schema while retaining access to the
-full current CommandSpec. Adding an Exo operation makes it available through `exo-run` without a new
-MCP tool declaration.
+full current CommandSpec. Adding an Exo operation makes it available through
+`exo-run` without a new MCP tool declaration.
 
 ## Relationship to the Command Architecture
 
@@ -183,11 +193,11 @@ architecture here records the implemented result.
 
 These boundaries allow the command inventory to grow without expanding the
 tool picker. They also allow curated wrappers and editor-sourced tools to evolve
-without changing the universal command surface.
+without changing the primary command surface.
 
 ## Drawbacks
 
-A universal project tool gives the model less schema-level guidance for an
+A single project tool gives the model less schema-level guidance for an
 individual operation than a dedicated tool would. Exo compensates with a
 familiar command hierarchy, help, examples, and structured diagnostics. This is
 a deliberate exchange: command discovery happens when needed instead of
@@ -195,7 +205,7 @@ charging every request for the full inventory.
 
 The VS Code inventory extends MCP's single project tool with focused schemas for
 editor-sourced capabilities and selected Exo operations. Documentation
-distinguishes the universal project transport from this curated extension layer
+distinguishes the shared project transport from this curated extension layer
 rather than referring to a single undifferentiated tool count.
 
 Curation also requires judgment. Command metadata can be generated

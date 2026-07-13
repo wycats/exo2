@@ -55,9 +55,10 @@ operation name. Namespaced operations use paths such as `task complete` or
 `rfc show`; root operations use a single name such as `status`.
 
 The address identifies both executable behavior and its specification. The
-specification records the operation's description, arguments, effect,
-recovery class, upgrade requirements, and language-model guidance. Every frontend reads those properties from the shared specification and uses
-the same operation catalog.
+specification records the operation's description, arguments, effect, recovery
+class, upgrade requirements, and language-model guidance. Rust frontends read
+those properties directly, while editor clients consume generated projections
+of the same operation catalog.
 
 ### Arguments
 
@@ -84,8 +85,8 @@ atomic project-state mutations, and external at-most-once work.
 
 These declarations are part of the command contract. Daemon routing,
 confirmation, outcome recovery, post-write persistence, and client guidance
-all consume them. A frontend may change how an operation is presented while preserving the
-operation's declared effect.
+all consume them. A frontend may change how an operation is presented while
+preserving the operation's declared effect.
 
 ## From Specification to Invocation
 
@@ -183,12 +184,16 @@ information.
 
 The command specification supports several derived views: help and command
 references, JSON artifacts for editor clients, machine-channel classification,
-and language-model metadata. These are projections of the command language and inherit its authority.
+and language-model metadata. These are projections of the command language and
+inherit its authority.
 
 A projection may intentionally expose only part of the inventory. In
 particular, RFC 0136 keeps the public language-model tool list small even though
-the generated command artifact describes the full Exo operation set. `exo-run` provides complete command coverage while the public tool manifest
-stays deliberately curated.
+the generated command artifact describes the full Exo operation set. MCP
+`exo-run` provides complete command coverage. The VS Code tool uses the same
+machine contract while its local command-text adapter continues to converge on
+that coverage. The public tool manifest stays deliberately curated in both
+cases.
 
 Generated artifacts are checked against the Rust command inventory so that
 clients can detect drift. Command authority and effect classification remain
@@ -246,5 +251,5 @@ locally and relies on machine-channel validation. Exo projects the shared
 inventory into help, machine-channel, and editor artifacts.
 
 Stage 3 reflects that implemented contract. Further work may improve individual
-diagnostics, artifact ergonomics, or command authoring, and those refinements preserve the
-command-language boundary recorded here.
+diagnostics, artifact ergonomics, or command authoring, and those refinements
+preserve the command-language boundary recorded here.
