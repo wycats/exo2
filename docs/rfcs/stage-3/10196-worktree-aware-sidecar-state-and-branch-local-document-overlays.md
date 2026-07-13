@@ -32,7 +32,7 @@ The two-view model gives each fact a stable owner. Shared state follows accepted
 ## Design Principles
 
 1. **Shared metadata follows accepted Git history.** The canonical RFC view comes from the locally known default-branch ref.
-2. **Workspace reads follow the current checkout.** A branch sees its committed, staged, unstaged, and newly created RFC documents immediately.
+2. **Workspace reads follow the current checkout.** A branch sees committed checkout content, working-tree modifications, and newly created RFC documents immediately. Changes that exist only in the Git index remain outside the workspace snapshot.
 3. **Merge is the publication boundary.** Workspace document changes remain local observations until the canonical ref contains them.
 4. **Absence is scoped evidence.** A missing workspace document changes that workspace's visibility. Canonical absence preserves an established shared row until an explicit lifecycle decision replaces it.
 5. **RFC documents carry portable lifecycle meaning.** Git plus the stable anchor reconstructs stage, status, reasons, feature, consolidation metadata, and relationships.
@@ -46,7 +46,7 @@ A feature worktree sees its RFC changes as soon as Exo observes the edited docum
 
 After the change merges and the locally known default-branch ref advances, the next public RFC read reconciles the merged document state into shared SQLite. Successful write-side finalization then regenerates the portable SQL projection and checkpoints sidecar state according to project policy.
 
-When a checkout lacks an RFC that exists canonically, Exo still returns the shared RFC and marks its workspace presence as absent. A workspace-only RFC remains readable in that workspace and is marked unpublished. Human output calls out relevant overlay differences, while JSON carries additive provenance fields.
+When a checkout lacks an RFC that exists canonically, Exo still returns the shared RFC and marks its workspace presence as absent. A workspace-only RFC remains readable in that workspace and is marked unpublished. `rfc show` human output calls out relevant overlay differences, while JSON read surfaces carry additive source and provenance fields according to their response shape.
 
 ## State Model
 
@@ -94,7 +94,7 @@ Canonical blobs and workspace files use one parser with two inputs:
 - repository-relative path determines the active stage or retired collection;
 - document bytes determine anchor identity, number, title, feature, relationships, reasons, consolidation metadata, and explicit lifecycle markers.
 
-The parser reads metadata from the preamble between the H1 and the first level-two heading and ignores fenced code examples. It supports compact metadata, list rows, metadata table rows, and established sentence-style relationship markers. Managed edits preserve a recognized source form and use a compact metadata block as the fallback.
+The parser reads ordinary metadata from the preamble between the H1 and the first level-two heading and ignores fenced code examples. It supports compact metadata, list rows, and metadata table rows. Relationship parsing is broader: established sentence-style relationship markers on any non-fenced line in the document can affect `supersedes` and `superseded_by`. Managed edits preserve a recognized source form and use a compact metadata block as the fallback.
 
 Active documents derive stage from `docs/rfcs/stage-N/`. Withdrawn and archived documents carry their last active stage, explicit status, and reason in Markdown. A supersession relationship changes the effective read status to superseded while preserving the stored lifecycle status.
 
@@ -149,20 +149,21 @@ The public read commands travel through the daemon writer lane and successful re
 
 Numeric lookup succeeds when one effective anchor owns the requested number. Ambiguity names the matching paths and anchors. A missing or ambiguous public `rfc show` rolls back the request's reconciliation and workspace refresh, keeping canonical SQLite and portable projection aligned.
 
-Human output identifies meaningful overlay differences. JSON entries from `rfc list` and `rfc status` include `document_source`, workspace and canonical presence, and `differs_from_canonical`. `rfc show` additionally includes workspace branch and commit provenance plus canonical ref and commit provenance. Status diagnostics retain their scoped workspace root.
+`rfc show` human output identifies meaningful overlay differences; human `rfc list` and `rfc status` remain lifecycle summaries. JSON entries from `rfc list` and `rfc status` include `document_source`, workspace and canonical presence, and `differs_from_canonical`. `rfc show` additionally includes workspace branch and commit provenance plus canonical ref and commit provenance. Status diagnostics retain their scoped workspace root.
 
 ## Managed RFC Mutations
 
-Managed create and ID-addressed edit, promote, withdraw, archive, supersede, rename, and repair operations edit Markdown in the issuing workspace and refresh that workspace's observations before returning. Explicit `--path` edit and supersede operations target the supplied existing absolute or workspace-relative path; the current command contract treats an absolute path as trusted input and does not confine it to the issuing workspace.
+Managed create and ID-addressed edit, promote, withdraw, archive, supersede, rename, and repair operations edit Markdown in the issuing workspace and refresh that workspace's observations before returning. Explicit `--path` edit and supersede operations target the supplied existing absolute path or the path formed by joining a relative value to the workspace root. The command contract treats both forms as trusted input: it does not canonicalize or confine them, so a relative path containing parent traversal can also escape the issuing workspace.
 
 Portable lifecycle operations materialize their meaning in Markdown:
 
 - promote moves the file to `stage-N`;
 - withdraw and archive preserve the last active stage, move the file to its retired collection, and write status, stage, and reason;
 - supersede writes reciprocal relationship markers;
-- feature edits write `Feature`;
 - rename preserves stable identity while changing the path;
 - repair updates the managed anchor, number, or path identity selected by the repair operation.
+
+`Feature` is portable when Markdown declares it or the lifecycle migration materializes it. A feature-only `rfc edit --feature` currently updates SQLite metadata without writing a `Feature` marker, so canonical Git reconstruction does not preserve that change until the document is updated.
 
 Consolidation metadata is part of the parser, effective view, shared row, migration, and portable projection. A dedicated managed `rfc consolidate` command remains future work; current consolidation decisions can be represented through managed RFC editing.
 
@@ -224,7 +225,7 @@ Workspace repair diagnostics retain their workspace provenance. Skipped canonica
 
 ## Security and Privacy
 
-The daemon validates request workspaces against project identity and state root before accessing documents. Workspace scanning accepts managed RFC paths rooted in the validated workspace. Explicit absolute `--path` mutations are a trusted-input escape hatch and can address a document outside that root.
+The daemon validates request workspaces against project identity and state root before accessing documents. Workspace scanning accepts managed RFC paths rooted in the validated workspace. Explicit `--path` mutations are a trusted-input escape hatch: absolute paths can address any existing document, and root-joined relative paths can escape through parent traversal.
 
 Machine-local snapshots stay in local SQLite because they contain absolute paths and local Git observations. `rfc show` JSON can expose request-scoped branch names, ref names, and commit OIDs. `rfc status` diagnostics serialize their machine-local `workspace_root`, so callers with access to that diagnostic surface can observe an absolute path. Portable projections, dumps, sidecar commits, and shared logs contain shared RFC state only.
 
