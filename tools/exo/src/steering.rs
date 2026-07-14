@@ -281,7 +281,7 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
 
     match parts.as_slice() {
         ["exo", "status"] => exo_run("status"),
-        ["exo", "plan", "show"] => exo_run("plan show"),
+        ["exo", "plan", "show"] => exo_run("plan review"),
         ["exo", "phase", "start", phase_id] => {
             if is_placeholder(phase_id) {
                 None
@@ -2252,6 +2252,13 @@ mod tests {
             Some((
                 "exo-run".to_string(),
                 serde_json::json!({ "command": "status" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo plan show"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "plan review" }),
             ))
         );
         assert_eq!(
