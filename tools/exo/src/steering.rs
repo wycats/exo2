@@ -281,8 +281,11 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
 
     match parts.as_slice() {
         ["exo", "status"] => exo_run("status"),
+        ["exo", "plan", "review"] => exo_run(exo_command),
         ["exo", "plan", "show"] => exo_run("plan review"),
-        ["exo", "phase", "start", phase_id] => {
+        ["exo", "phase", "status", ..] => exo_run(exo_command),
+        ["exo", "phase", "start"] => exo_run(exo_command),
+        ["exo", "phase", "start", phase_id, ..] => {
             if is_placeholder(phase_id) {
                 None
             } else {
@@ -319,10 +322,8 @@ fn is_placeholder_argument(value: &str) -> bool {
 }
 
 fn is_placeholder(value: &str) -> bool {
-    matches!(
-        value,
-        "<id>" | "..." | "\"...\"" | "<message>" | "\"<message>\""
-    )
+    let value = value.trim_matches(|character| character == '"' || character == '\'');
+    value == "..." || (value.starts_with('<') && value.ends_with('>'))
 }
 
 /// Summary of an RFC being advanced by the current phase.
@@ -2262,11 +2263,36 @@ mod tests {
             ))
         );
         assert_eq!(
+            tool_suggestion_for_command("exo plan review"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "plan review" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase status --full"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase status --full" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase start"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase start" }),
+            ))
+        );
+        assert_eq!(
             tool_suggestion_for_command("exo phase start phase-1"),
             Some((
                 "exo-run".to_string(),
                 serde_json::json!({ "command": "phase start phase-1" }),
             ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase start <phase-id>"),
+            None
         );
         assert_eq!(
             tool_suggestion_for_command("exo\tphase start phase-1"),
