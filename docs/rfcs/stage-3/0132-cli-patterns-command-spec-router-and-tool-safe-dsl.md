@@ -1,471 +1,257 @@
 <!-- exo:132 ulid:01kmzxbcxn3jzfdsy1bf14z4dm -->
 
-# RFC 132: CLI Patterns: Command Spec, Router, and Tool-Safe DSL
-
-
 # RFC 0132: CLI Patterns: Command Spec, Router, and Tool-Safe DSL
 
 ## Summary
 
-Define a Rust-first, generic "CLI Patterns" crate that treats a CLI as a _command specification_ (the law) and treats parsing as a _compiler_ from CLI-shaped inputs into a typed `Invocation` AST plus structured diagnostics.
+Exo presents one command vocabulary and typed execution model across its CLI,
+machine channel, MCP server, and VS Code extension. Commands are described by a
+machine-readable `CommandSpec`, compiled into typed `Invocation` values, and
+dispatched through the same command implementations regardless of the frontend
+that supplied the input. Each frontend adapts its native input to that shared
+contract; the CLI, MCP, and VS Code adapters do not need identical parsers to
+name the same operations and reach the same execution path.
 
-This enables:
+The command language is CLI-shaped because verb-first paths, options, and
+positionals provide a familiar interface for people and language models. The
+language evaluates one Exo invocation as data. Its grammar covers Exo command
+structure while leaving shell operators, expansion, pipelines, and ambient
+process behavior to dedicated process tools. Structured
+frontends can provide argument values directly and reach the same invocation
+model without reconstructing command text.
 
-- A safe execution model (`argv` + explicit `stdin/env/cwd`, never a shell)
-- An LLM-friendly tool surface (presence-based JSON "CLI AST" and/or a tiny bash-like DSL frontend)
-- First-class steering diagnostics (prompt-like errors + concrete suggestions), driven by the same command spec
-- Multiple projections from one source of truth: CLI runner/help, VS Code LM tool schema, docs, completion
-
-This RFC is Stage 1: it establishes the direction, core types, invariants, and an initial DSL grammar sketch.
+This RFC records the implemented command-surface contract. RFC 0085 defines the
+runtime Command trait architecture. RFC 0125 defines the capability and machine
+channel beneath external clients. RFC 0136 defines how the command surface is
+presented to language models. RFC 00233 develops the inline ExoSpec authoring
+model that supplies command metadata.
 
 ## Motivation
 
-Exosuit needs a tool interface that preserves the advantages of CLI cognition (verb-first, flags, subcommands) without inheriting the hazards and ambiguity of shell evaluation.
+A project command is more than a function call. It has a public name, an
+argument grammar, an effect, a recovery policy, help text, diagnostics, and a
+structured result. When each frontend defines those properties independently,
+the CLI, editor, and agent surfaces become different products with similar
+spelling.
 
-Key tensions:
+Exo instead treats command semantics as shared project infrastructure. A command
+added to the Rust implementation enters a common inventory. The CLI can compile
+argv against that inventory, machine clients can submit structured values, help
+can describe the accepted shape, and model-facing transports can classify the
+operation before execution. The result is one behavioral contract with several
+presentations.
 
-- **Ergonomics vs. Safety**: Shell syntax is ergonomic but unsafe/ambiguous; pure JSON is safe but can drift away from how humans/LLMs naturally express commands.
-- **One Source of Truth**: Today, CLI parsing, tool schemas, docs, and steering live in different places and can diverge.
-- **Agent-First Recovery**: Agents need errors that _teach recovery_ (structured, local, actionable), not just "invalid input".
+The same structure also provides a safety boundary. Agents benefit from concise
+CLI-shaped commands, and Exo provides them through tokenization and typed
+compilation. Keeping command text inside a small grammar makes effects visible,
+errors local, and retries governable.
 
-This RFC proposes a core, reusable crate that lets projects define commands once and derive everything else.
+## The Command Model
 
-## Detailed Design
+### Command identity
 
-### Terminology
+An operation has a stable address consisting of an optional namespace and an
+operation name. Namespaced operations use paths such as `task complete` or
+`rfc show`; root operations use a single name such as `status`.
 
-- **Command Spec**: A reflectable, machine-checkable description of the command tree (subcommands, flags, args, types, constraints).
-- **Invocation AST**: A generic, typed representation of a specific command invocation after routing + parsing.
-- **Frontend**: A surface syntax that can be compiled into an Invocation (e.g. argv tokens, tool JSON, tiny DSL).
-- **Projection/Backend**: A derived output from the command spec (help text, JSON schema, completion, etc.).
-- **Idiom**: A declared equivalence between common shell idioms and safe command/flag patterns (e.g. `head`, `grep`, `2>&1`). Idioms power _suggestions_, not silent rewrites.
+The address identifies both executable behavior and its specification. The
+specification records the operation's description, arguments, effect, recovery
+class, upgrade requirements, and language-model guidance. Rust frontends read
+those properties directly, while editor clients consume generated projections
+of the same operation catalog.
 
-### Core Principle: Spec is Law; Parsers are Compilers
+### Arguments
 
-This crate treats the CLI as a well-defined language:
+The command specification distinguishes flags, options, and positional
+arguments. Each argument has a stable name, accepted value type, optional short
+name, required or optional status, repeatability, and any default or enumerated
+values.
 
-- **Law**: The command spec is the authoritative definition.
-- **Compiler**: Parsing produces (1) a typed `Invocation` and (2) structured diagnostics/suggestions.
-- **No Shell**: The compiler never evaluates shell operators, expansions, or pipelines.
+Compilation produces typed values rather than leaving every input as an
+uninterpreted string. A `CommandSpec` argument can declare a boolean, integer,
+float, string, path, JSON, or enumerated value. JSON enters the compiled
+`TypedValue` model as raw JSON text. When the invocation is projected back into
+structured data, Exo attempts to parse that text as JSON. Successful parsing
+yields the structured JSON value; parsing failure yields a string containing the
+original text. Repeatability is an argument property, rather than a separate
+array-valued argument type. Type errors therefore belong to command compilation,
+where Exo can report the offending argument and the expected form.
 
-This aligns with Exosuit axioms:
+### Effects and recovery
 
-- **Agent-First Tooling**: diagnostics are prompts; errors are recoverable.
-- **Tooling Independence**: core logic lives in the workspace/Rust core; editors are projections.
-- **Generative over Descriptive**: one mental model (spec → compile → execute/projection) replaces a list of ad-hoc rules.
+Every operation declares whether it is pure, writes project state, or performs
+an external effect. Recovery metadata further distinguishes replayable reads,
+atomic project-state mutations, and external at-most-once work.
 
-### Core Data Model (Rust)
+These declarations are part of the command contract. Daemon routing,
+confirmation, outcome recovery, post-write persistence, and client guidance
+all consume them. A frontend may change how an operation is presented while
+preserving the operation's declared effect.
 
-This RFC is intentionally data-first. Traits exist for execution/extensibility, but the authoritative shape is reflectable.
+## From Specification to Invocation
 
-#### `CommandSpec`
+The implemented pipeline has three semantic steps:
 
-A command spec describes a tree of commands.
-
-- Each command has:
-  - `name` (the token the user types)
-  - `about` (short help)
-  - `args` (flags/options/positionals)
-  - `children` (subcommands)
-  - constraints (mutual exclusivity, required args, defaults)
-  - optional idioms (see below)
-
-#### Argument Shapes
-
-Three canonical forms:
-
-- **Flag**: boolean presence (`--verbose`)
-- **Option**: key/value (`--limit 20`, `--limit=20`)
-- **Positional**: ordered values (`exo list tasks` where `tasks` is a positional)
-
-Arguments are identified by stable IDs (not just names) so diagnostics and projections can remain stable across renames.
-
-#### Value Model
-
-Values are typed _at parse time_.
-
-- `Value` is an enum of primitives (initial set):
-  - `Bool`, `Int`, `Float`, `String`, `Path`, `Json`, `Enum(Symbol)`
-- Parsing uses a pluggable `ValueParser` trait.
-
-This keeps errors local: a bad `--limit` is a type error, not a downstream runtime error.
-
-#### Span / Source Metadata
-
-To support rich diagnostics across different frontends, parsing preserves a full-fidelity source model:
-
-- Original input (string or token array) is captured as a `Source` handle
-- Tokens carry:
-  - token index
-  - byte spans (when originating from a string frontend)
-  - normalized vs original lexeme (for repairs)
-
-The guiding rule: _store more metadata than you need_ so future UX can improve without changing the semantic core.
-
-### Invocation AST
-
-The parsed output is a generic representation, not Exosuit-specific.
-
-A minimal shape:
-
-- `Invocation { path, args, occurrences }`
-  - `path`: the resolved command path (`["list", "tasks"]`)
-  - `args`: map from `ArgId` → typed `Value`
-  - `occurrences`: map from `ArgId` → count (for repeatable flags)
-
-This AST can be:
-
-- lowered into `argv` for execution
-- serialized into tool JSON (presence-based CLI AST)
-- used to generate structured summaries
-
-### Diagnostics + Steering
-
-Diagnostics are a first-class output, designed to guide an agent.
-
-A diagnostic includes:
-
-- `code`: stable identifier (`unknown-flag`, `unsupported-shell-feature`, `missing-required-arg`)
-- `message`: human/agent facing summary
-- `span`: where it occurred
-- `context`: structured fields (expected flags, command path)
-- `suggestions`: concrete fixes (if available)
-
-#### Idioms as Declarative Suggestion Hooks
-
-The command spec may declare idioms such as:
-
-- `Idiom::Head { limit_arg: ArgId }`
-- `Idiom::Grep { pattern_arg: ArgId }`
-- `Idiom::StderrToStdout { capture_arg: ArgId }`
-
-When the frontend input contains shell-like operators (`| head`, `2>&1`), the compiler:
-
-1. Emits `unsupported-shell-feature`
-2. If an idiom mapping exists _in the active command context_, emits a suggestion:
-   - "Pipelines are not supported; use `--limit` instead" (only when declared)
-
-Normative rule: idioms produce **suggestions**, not automatic rewrites, unless the mapping is explicitly defined as lossless.
-
-### Namespace Organization Guidelines
-
-When organizing commands in a CommandSpec tree:
-
-1. **Top-level namespaces** represent major functional areas
-   - Examples: `phase`, `plan`, `rfc`, `task`, `impl`
-   - These map naturally to LM tool boundaries
-
-2. **Intermediate namespaces** group related operations
-   - Examples: `feedback.thread`, `docs.links`
-   - Use sparingly; prefer 1-2 levels of nesting
-
-3. **Leaf operations** perform atomic actions
-   - Examples: `phase.start`, `rfc.create`, `task.complete`
-   - Each leaf declares its effect (pure/write/exec)
-
-#### Naming Conventions
-
-- **Namespaces**: lowercase singular nouns (`phase`, `task`, `rfc`)
-- **Operations**: lowercase verbs (`start`, `create`, `list`, `update`)
-- **Multi-word identifiers**: hyphenated (`add-task`, `update-status`)
-- **Argument IDs**: stable identifiers that survive renames
-
-#### Effect Consistency
-
-Operations within a namespace may have different effects, but should be semantically related:
-
-- ✅ `phase` namespace with `status` (pure) and `start`/`finish` (exec)
-- ✅ `rfc` namespace with `list`/`show` (pure) and `create`/`promote` (write)
-- ❌ Mixing unrelated domains in one namespace
-
-#### LM Tool Mapping Considerations
-
-When the CommandSpec will be projected to LM tools:
-
-1. **Keep tool count low**: OpenAI recommends fewer than 20 functions
-2. **Use method-based dispatch**: Group operations by namespace into single tools
-3. **Preserve type safety**: Use enums for method parameters
-4. **Enable discovery**: Help ladder allows progressive disclosure
-
-Example tool projection from CommandSpec:
-
-```
-CommandSpec:
-  phase/
-    start (exec)
-    finish (exec)
-    status (pure)
-
-LM Tool:
-  exo_phase_ops { method: "start"|"finish"|"status", id?: string }
+```text
+command definition -> CommandSpec -> Invocation -> Command
 ```
 
-### Tool Projection Strategy (RFC 0136)
-
-When projecting CommandSpec namespaces to LM tools, follow [RFC 0136: LM Tool Architecture v2](0136-lm-tool-architecture-v2.md) for the three-tier taxonomy.
-
-#### Namespace → Tool Category Mapping
-
-| CommandSpec Pattern                | Tool Category         | Projection                              |
-| ---------------------------------- | --------------------- | --------------------------------------- |
-| Leaf with `effect=pure`, zero args | Zero-arg orientation  | Direct tool (e.g., `exo-status`)        |
-| Namespace with multiple operations | Method-based dispatch | Enum-based tool (e.g., `exo-phase-ops`) |
-| High-frequency `effect=write` leaf | Convenience zero-arg  | Wrapper tool (e.g., `exo-idea`)         |
-
-#### Zero-Arg Operation Detection in CommandSpec
-
-An operation qualifies for zero-arg orientation if:
-
-```toml
-[[commands]]
-name = "status"
-effect = "pure"              # Must be pure (no side effects)
-about = "Project health summary"
-
-# All arguments optional or have defaults:
-[[commands.args]]
-name = "format"
-type = "enum"
-default = "json"
-optional = true
-```
-
-**Projection**: This becomes `exo_status` tool with no required parameters.
-
-#### Method-Based Dispatch in CommandSpec
-
-A namespace qualifies for method-based dispatch if it contains multiple related operations:
-
-```toml
-[[commands]]
-name = "phase"
-about = "Phase lifecycle operations"
-
-[[commands.children]]
-name = "start"
-effect = "exec"
-
-[[commands.children]]
-name = "finish"
-effect = "exec"
-
-[[commands.children]]
-name = "status"
-effect = "pure"
-```
-
-**Projection**: This becomes `exo_phase_ops` tool with:
-
-```json
-{
-  "method": { "enum": ["start", "finish", "status"] }
-}
-```
-
-#### Effect Annotations Guide Tool Design
-
-| Effect  | Requires Confirmation      | Response Pattern               |
-| ------- | -------------------------- | ------------------------------ |
-| `pure`  | Never                      | State + steering               |
-| `write` | Always (unless overridden) | Success + undo info + steering |
-| `exec`  | Always                     | Status + next steps + steering |
-
-The tool projection layer reads these annotations from CommandSpec to auto-generate confirmation requirements.
-
-### Routing Layer (clap-like, spec-driven)
-
-Routing resolves tokens to a command path:
-
-- first token chooses a child command
-- subsequent tokens are consumed as:
-  - subcommand names (when unambiguous)
-  - flags/options
-  - positionals
-
-Routing must be deterministic:
-
-- ambiguity is an error with a diagnostic listing the competing interpretations
-- unknown subcommands/flags trigger suggestion diagnostics (edit distance / prefix match)
-
-### Frontends
-
-This crate supports multiple input frontends that compile into the same Invocation.
-
-#### Frontend A: Token Array
-
-Input is a token array (argv-like) with no quoting ambiguity.
-
-This is the simplest and safest model for tools.
-
-#### Frontend B: Tool JSON (Presence-Based CLI AST)
-
-A tool JSON surface mirrors CLI subcommands:
-
-- `{ "list": { "kind": "tasks", "limit": 20 } }`
-
-This is a serialization of an invocation AST into JSON.
-
-#### Frontend C: Tiny bash-like DSL (string)
-
-A minimal shell-looking DSL is allowed only as a frontend that compiles deterministically.
-
-- It is _not_ POSIX shell.
-- It rejects shell operators and expansions.
-- It supports conservative repairs for LLM-typical syntax errors.
-
-### DSL Grammar Sketch (EBNF)
-
-The DSL is designed to "vibe" like a shell while being far smaller.
-
-```
-input        := ws? command ws? EOF
-command      := word (ws+ word)*
-
-word         := bare | single_quoted | double_quoted | interpolation
-
-bare         := bare_char+
-
-single_quoted := "'" sq_char* "'"
-# No escapes inside single quotes.
-
-double_quoted := '"' dq_part* '"'
-# double quotes allow a limited escape set and interpolation.
-
-dq_part      := dq_char | escape | interpolation
-escape       := "\\" ("\\" | "\"" | "n" | "t")
-
-interpolation := "$" ident
-ident        := ident_start ident_continue*
-ident_start  := [A-Za-z_]
-ident_continue := [A-Za-z0-9_]
-
-ws           := (" " | "\t" | "\n" | "\r")+
-```
-
-#### DSL Semantics
-
-- The compiler produces a token array.
-- `$name` interpolation is _single-token substitution_:
-  - it must be provided explicitly by the caller via `vars[name]`
-  - otherwise it is a diagnostic error
-- The following are **always errors** (with steering):
-  - backticks, `$(`, `${...}`, `;`, `&&`, `||`, `|`, `<`, `>`, `2>&1`
-
-#### Conservative Repairs (Normative)
-
-The DSL frontend may apply only repairs that do not change intent:
-
-- normalize Unicode quotes to ASCII quotes
-- if input ends inside an open quote, close it at EOF
-- treat newlines as whitespace outside quotes
-- normalize `--flag=value` and `--flag value` equivalently
-
-Any other malformed syntax produces a diagnostic without guessing.
-
-### Projections / Backends
-
-From the same command spec, we derive:
-
-- **CLI runner**: native parsing via the router + execution via handlers
-- **Tool schema**: JSON Schema for the presence-based tool input
-- **Help text**: `--help` output from spec
-- **Completion**: (future) completions generated from spec
-- **Transitional clap backend** (optional): generate a clap program from `CommandSpec` for migration/testing
-
-### Execution API Surface
-
-The spec should be independent from execution.
-
-A minimal interface:
-
-- `compile(frontend_input) -> Result<Invocation, Diagnostics>`
-- `lower(invocation) -> SpawnSpec { argv, stdin, env, cwd }`
-- `execute(invocation, host) -> Result<ExitStatus, CommandError>` (host-defined)
-
-Execution uses `spawn(argv)`; never a shell.
-
-### Implementation Target: Command Trait (RFC 0085)
-
-The `CommandSpec` vision is implemented through the `Command` trait architecture defined in [RFC 0085](../stage-3/0085-command-trait-architecture.md) (Stage 3: Candidate).
-
-The trait provides the runtime execution target:
-
-```rust
-pub trait Command: Send + Sync {
-    fn namespace(&self) -> &'static str;
-    fn operation(&self) -> &'static str;
-    fn effect(&self) -> Effect;
-    fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput>;
-}
-```
-
-**Relationship to CommandSpec**:
-
-1. **CommandSpec is derived from trait implementations**: The `CommandRegistry` can be introspected to generate `CommandSpec` automatically, ensuring spec and implementation cannot diverge.
-
-2. **Effect annotations flow from trait to spec**: Each `Command::effect()` implementation provides the effect metadata required by RFC 0125's capability tree.
-
-3. **Namespace/operation structure matches addressing**: The trait's `namespace()` + `operation()` directly maps to the capability tree's addressing model (`["phase", "start"]`).
-
-4. **Diagnostics and steering are unified**: The `Command::default_steering()` method provides the suggestions referenced in the diagnostics model.
-
-### Customer Zero: Exosuit Adoption
-
-- **Phase 0** (RFC 0085, complete): `Command` trait architecture implemented, existing handlers migrated to trait-based commands.
-- **Phase 1**: Generate `CommandSpec` from `CommandRegistry` introspection.
-- **Phase 2**: Route/parse in the CLI using the new router (with clap backend optional).
-- **Phase 3**: Unify steering diagnostics across CLI + VS Code tool by sharing diagnostic codes and suggestion rules.
+Inline `ExoSpec` definitions and the command registry produce the
+`CommandSpec`. The specification is an ordered, serializable description of
+root operations, namespaces, operations, arguments, and metadata.
+
+A frontend compiles its input against that specification. Successful
+compilation produces an `Invocation` containing the resolved command address,
+typed arguments, occurrence counts, and source information. Dispatch then
+constructs the corresponding command and runs it through the shared execution
+and response machinery.
+
+This separation matters. Parsing answers what the input means. Command
+execution applies that meaning to a project. Help, schema generation, and
+classification can inspect the first two layers without executing the third.
+
+## Frontends
+
+### CLI argv
+
+The CLI compiler accepts ordinary argv tokens. It resolves the command address,
+parses long and short options, assigns positional values, applies defaults, and
+validates required arguments and value types.
+
+Global presentation options such as `--format` are handled without becoming
+operation arguments. The compiled invocation then enters the same dispatcher
+used by structured clients.
+
+### Structured machine requests
+
+Machine-channel clients identify an operation and provide structured arguments.
+Those arguments are validated against the same `CommandSpec` and converted
+into the same typed invocation model.
+
+Structured requests carry protocol identity, request identity, workspace
+context, confirmation data, and agent identity outside the command arguments.
+Clients do not declare an operation's recovery class. Exo derives effect and
+recovery behavior from the registered `CommandSpec` and the built command, so a
+request cannot weaken the server's execution policy. This keeps transport and
+lifecycle concerns explicit while preserving the command's public argument
+contract.
+
+### Tool-facing command text
+
+The MCP and VS Code `exo-run` tools accept compact, CLI-shaped command text
+because command paths, options, and positionals are an effective interface for
+language models. Both surfaces substitute explicit placeholder values as data
+and ultimately submit a structured operation to Exo's machine channel.
+
+MCP uses Exo's Rust command-text compiler. That compiler handles quoting and
+escaping, removes global presentation options before operation validation, and
+rejects environment assignments, command substitution, pipelines, redirects,
+and control operators before invocation compilation. Tokenizer-level rejections
+return an `InvalidInput` error whose message names the unsupported syntax; they
+do not currently include the structured compilation-diagnostics payload.
+
+The VS Code extension currently uses an extension-local tokenizer and router to
+construct the structured machine request. The machine channel still validates
+the resolved operation and arguments against `CommandSpec`, but the adapter does
+not yet provide every MCP parsing behavior or diagnostic. In particular, global
+presentation options and shell-like tokens can surface as ordinary argument
+errors instead of MCP's specialized diagnostics.
+
+Neither adapter executes command text as a shell program. Their scope is one
+Exo invocation; project workflows and process composition use their dedicated
+Exo surfaces. Converging the adapters on one command-text compiler remains an
+implementation refinement within this boundary.
+
+## Diagnostics
+
+Compilation failures produce structured diagnostics. A diagnostic has a stable
+code, a message, source location when available, contextual values, and
+concrete suggestions.
+
+Diagnostics answer the likely mistake. Unknown namespaces and operations can
+offer nearby names. Unknown flags can show the accepted flags for the resolved
+operation. Missing or invalid values can identify the argument and expected
+type. The Rust argv compiler can represent shell-operator failures as structured
+diagnostics. MCP rejects shell syntax earlier with an `InvalidInput` message,
+while other adapters preserve the command failure without necessarily providing
+the same diagnostic shape.
+
+Human CLI output and machine responses may render these diagnostics
+differently, but both preserve the same underlying failure and repair
+information.
+
+## Projections
+
+The command specification supports several derived views: help and command
+references, JSON artifacts for editor clients, machine-channel classification,
+and language-model metadata. These are projections of the command language and
+inherit its authority.
+
+A projection may intentionally expose only part of the inventory. In
+particular, RFC 0136 keeps the public language-model tool list small even though
+the generated command artifact describes the full Exo operation set. MCP
+`exo-run` can address the complete CommandSpec inventory when an operation's
+inputs fit the tool request. Process-stdin-backed operations such as root
+`write <path>` remain outside its usable contract until the transport provides
+a dedicated content channel. The VS Code tool uses the same machine contract
+while its local command-text adapter continues to converge on that coverage.
+The public tool manifest stays deliberately curated in both cases.
+
+Generated artifacts are checked against the Rust command inventory so that
+clients can detect drift. Command authority and effect classification remain
+with the Rust command definitions.
+
+## Compatibility and Evolution
+
+Command paths and argument names are user-facing compatibility surfaces.
+Renaming or removing them affects CLI users, model prompts, recorded command
+text, and machine clients. Additive metadata and new projections can evolve
+without changing command behavior, while semantic changes require the command
+implementation and its specification to move together.
+
+The inline ExoSpec model continues to reduce authoring duplication. That
+migration preserves the architectural boundary in this RFC: however a command
+is authored, the effective `CommandSpec` remains the contract consumed by
+compilation and projection.
 
 ## Drawbacks
 
-- Replacing clap is non-trivial: help UX, parsing edge cases, and completion require careful work.
-- A DSL frontend increases scope; keeping it minimal and deterministic is essential.
-- Declared idioms must be curated to avoid "suggestion spam" or misleading hints.
+A shared specification concentrates correctness requirements. Incorrect
+argument or effect metadata can influence every frontend at once, so parity and
+artifact checks are part of the implementation rather than optional tooling.
+
+The tool-safe grammar expresses one Exo operation at a time. Process
+composition uses dedicated execution surfaces, while project workflow lives in
+Exo's commands and state model.
+
+Generated inventory and interface curation solve different problems. Public
+surfaces still need deliberate product judgment, which is why RFC 0136 owns
+language-model presentation separately.
 
 ## Alternatives
 
-- **Stay on clap + custom tool schema**: simpler short term, but divergence persists.
-- **Pure JSON only**: safest, but loses CLI-shaped cognition and increases translation errors.
-- **Raw cmdline string**: ambiguous; reintroduces quoting and temptation toward shell semantics.
-- **Adopt nushell syntax**: richer types but imports an entire language surface and expectations (pipelines).
+Keeping independent CLI, editor, and agent command definitions would let each
+surface optimize locally, but it would preserve the drift this architecture is
+designed to remove.
 
-## Unresolved Questions
+Accepting shell command strings would provide familiar composition at the cost
+of hidden effects, platform-dependent parsing, quoting hazards, and a much
+larger security boundary.
 
-- Exact stability/versioning guarantees for diagnostic codes (needed for crates.io consumers).
-- The minimal initial set of `Value` primitives and how JSON/path parsing should behave.
-- How aggressively to suggest corrections (edit distance thresholds).
-- Whether the clap backend is required for initial migration or purely optional.
+Exposing only structured JSON would be safe but would discard the concise,
+discoverable CLI language that people and models already understand. The
+current design keeps structured execution while allowing CLI-shaped input.
 
-## Future Possibilities
+## Current Status
 
-- Proc-macro DSL for ergonomically declaring `CommandSpec`.
-- Pipelines as data (safe, spec-driven transforms) rather than shell pipelines.
-- Richer value types (bytes, duration, glob, regex) with explicit parsers.
-- Auto-generated docs/manual sections derived from spec (codification).
+The shared command model is implemented. Exo generates a command specification
+from its registered command definitions and compiles argv and structured inputs
+into typed invocations. The CLI and MCP command-text paths reject shell
+operators: CLI emits structured diagnostics, while MCP returns a tokenizer-level
+`InvalidInput` message. The VS Code adapter constructs a structured request
+locally and relies on machine-channel validation. Exo projects the shared
+inventory into help, machine-channel, and editor artifacts.
 
----
-
-## Implementation Note: Inline Spec Definition (2026-02-02, updated 2026-02-05)
-
-The "CommandSpec is derived from trait implementations" approach described in the "Implementation Target" section is being **superseded** by **Inline Spec Definition** via the `ExoSpec` derive macro.
-
-### What Changed
-
-The original plan was:
-
-1. Define commands via `Command` trait implementations
-2. Generate `CommandSpec` from `CommandRegistry` introspection at runtime
-
-The new approach instead:
-
-1. Defines CommandSpec **inline** using Clap annotations + `#[exo(...)]` custom attributes
-2. Extracts CommandSpec at **compile time** via the `ExoSpec` proc-macro
-3. Eliminates the need for separate `Command::args()` trait implementations
-
-### Impact on This RFC
-
-- **Section "Implementation Target: Command Trait"**: The relationship described remains accurate for _execution_, but CommandSpec metadata will come from inline attributes rather than trait introspection.
-- **Section "Customer Zero: Exosuit Adoption"**: Phase 1 ("Generate CommandSpec from CommandRegistry introspection") is replaced by proc-macro extraction.
-- **Section "Future Possibilities"**: "Proc-macro DSL for ergonomically declaring CommandSpec" is the ExoSpec macro.
-
-**See Also**: [RFC 00233: ExoSpec — Unified Command Definition](../stage-1/00233-exospec-unified-command-definition-and-the-end-of-dual-source-drift.md) for the consolidated design and migration plan. (Supersedes the earlier RFC 0201 which covered only the macro design.)
+Stage 3 reflects that implemented contract. Further work may improve individual
+diagnostics, artifact ergonomics, or command authoring, and those refinements
+preserve the command-language boundary recorded here.

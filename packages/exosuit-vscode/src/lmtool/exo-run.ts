@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import { exoMachineChannel } from "../agent/lmtool/machineChannel";
 import { getLogger } from "../logging";
-import { getOperation } from "./command-spec.types";
+import { getOperation, getRootOperation } from "./command-spec.types";
 import {
   MACHINE_CHANNEL_PROTOCOL_VERSION,
   WORKFLOW_COMPLETION_CONFIRMATION_KIND,
@@ -174,9 +174,14 @@ function buildHelpRequest(path: string[]): MachineChannelRequestEnvelope {
   if (path.length === 0) {
     address = { kind: "root" };
   } else if (path.length === 1) {
-    address = { kind: "namespace", path };
+    address = getRootOperation(path[0])
+      ? { kind: "operation", path }
+      : { kind: "namespace", path };
   } else {
-    address = { kind: "operation", path };
+    address = {
+      kind: "operation",
+      path: [path[0], path.slice(1).join(".")],
+    };
   }
 
   return {

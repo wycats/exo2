@@ -270,75 +270,62 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
     if parts.len() < 2 || parts[0] != "exo" {
         return None;
     }
+    let exo_command = trimmed.strip_prefix("exo")?.trim_start();
+
+    let exo_run = |command: &str| {
+        Some((
+            "exo-run".to_string(),
+            serde_json::json!({ "command": command }),
+        ))
+    };
 
     match parts.as_slice() {
-        ["exo", "status"] => Some(("exo-status".to_string(), serde_json::json!({}))),
-        ["exo", "plan", "show"] => Some(("exo-plan".to_string(), serde_json::json!({}))),
-        ["exo", "phase", "start", phase_id] => {
+        ["exo", "status"] => exo_run("status"),
+        ["exo", "plan", "review"] => exo_run(exo_command),
+        ["exo", "plan", "show"] => exo_run("plan review"),
+        ["exo", "phase", "status", ..] => exo_run(exo_command),
+        ["exo", "phase", "start"] => exo_run(exo_command),
+        ["exo", "phase", "start", phase_id, ..] => {
             if is_placeholder(phase_id) {
                 None
             } else {
-                Some((
-                    "exo-phase-start".to_string(),
-                    serde_json::json!({ "id": phase_id }),
-                ))
+                exo_run(exo_command)
             }
         }
         ["exo", "task", "complete", task_id] => {
             if is_placeholder(task_id) {
                 None
             } else {
-                Some((
-                    "exo-task-complete".to_string(),
-                    serde_json::json!({ "id": task_id }),
-                ))
+                exo_run(exo_command)
             }
         }
         ["exo", "phase", "finish", ..] => {
-            let message = extract_message_arg(&parts[3..]);
-            match message {
-                Some(msg) if !is_placeholder(&msg) => Some((
-                    "exo-phase-finish".to_string(),
-                    serde_json::json!({ "message": msg }),
-                )),
-                _ => Some(("exo-phase-finish".to_string(), serde_json::json!({}))),
+            if parts[3..]
+                .iter()
+                .any(|value| is_placeholder_argument(value))
+            {
+                exo_run("phase finish")
+            } else {
+                exo_run(exo_command)
             }
         }
         _ => None,
     }
 }
 
-fn extract_message_arg(tokens: &[&str]) -> Option<String> {
-    let mut iter = tokens.iter();
-    while let Some(token) = iter.next() {
-        if *token == "--message" || *token == "-m" {
-            if let Some(value) = iter.next() {
-                return Some(strip_wrapping_quotes(value));
-            }
-        } else if let Some(value) = token.strip_prefix("--message=") {
-            return Some(strip_wrapping_quotes(value));
-        }
-    }
-    None
-}
-
-fn strip_wrapping_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
-        {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
+fn is_placeholder_argument(value: &str) -> bool {
+    let value = value
+        .split_once('=')
+        .map_or(value, |(_, argument)| argument)
+        .trim_matches(|character| character == '"' || character == '\'');
+    is_placeholder(value)
 }
 
 fn is_placeholder(value: &str) -> bool {
+    let value = value.trim_matches(|character| character == '"' || character == '\'');
     matches!(
         value,
-        "<id>" | "..." | "\"...\"" | "<message>" | "\"<message>\""
+        "..." | "<id>" | "<message>" | "<phase-id>" | "<summary>" | "<title>"
     )
 }
 
@@ -2235,7 +2222,7 @@ const fn promotion_requirements(current: u8, target: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{promotion_requirements, summarize_surfaced_intents};
+    use super::{promotion_requirements, summarize_surfaced_intents, tool_suggestion_for_command};
     use crate::context::{Goal, PhaseKind};
     use crate::inbox::{InboxIntent, InboxPriority, InboxSource, SurfacedIntent};
 
@@ -2260,6 +2247,112 @@ mod tests {
     #[test]
     fn promotion_requirements_for_stage_3_to_4() {
         assert_eq!(promotion_requirements(3, 4), "Manual must be updated");
+    }
+
+    #[test]
+    fn steering_projects_supported_commands_through_exo_run() {
+        assert_eq!(
+            tool_suggestion_for_command("exo status"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "status" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo plan show"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "plan review" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo plan review"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "plan review" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase status --full"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase status --full" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase start"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase start" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase start phase-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase start phase-1" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase start <phase-id>"),
+            None
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message <init>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish --message <init>" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo\tphase start phase-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase start phase-1" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo task complete task-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "task complete task-1" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo   task complete task-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "task complete task-1" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message <message>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message=<message>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message=\"<message>\""),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo\tphase finish --message done"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish --message done" }),
+            ))
+        );
     }
 
     #[test]

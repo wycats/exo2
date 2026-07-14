@@ -197,8 +197,8 @@ Every productive session follows the **SOAR** cycle:
 
 | Phase      | Question                                    | Tools                                                 |
 | ---------- | ------------------------------------------- | ----------------------------------------------------- |
-| **Status** | Where am I? What's the delta from plan?     | `exo-status`, `exo-phase`, `exo-run("task list")`     |
-| **Orient** | What are my options? What should I do next? | `exo-steering`, `exo-context`, `exo-run("goal list")` |
+| **Status** | Where am I? What's the delta from plan?     | `exo-run("status")`, `exo-run("phase status")`, `exo-run("task list")` |
+| **Orient** | What are my options? What should I do next? | `exo-run("status")`, `exo-run("goal list")`, `exo-run("inbox list")`   |
 | **Act**    | Execute the chosen action                   | `exo-run("task ...")`, code edits                     |
 | **Review** | Did it work? What did we learn?             | Verification, `exo-run("verify")`, human judgment     |
 
