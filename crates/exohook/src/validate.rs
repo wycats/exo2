@@ -1698,7 +1698,7 @@ pub(crate) fn validate_v3_hook(
     for (idx, check_ref) in checks.iter().enumerate() {
         let check_id = match check_ref {
             CheckRefV3::Ref(name) => name.clone(),
-            CheckRefV3::Inline(_) => format!("inline-{idx}"),
+            CheckRefV3::Inline(_) => format!("{workflow_name}-inline-{idx}"),
         };
         let check = resolve_check_ref(check_ref, &config)?;
         if category.is_some_and(|category| check.category != category) {
@@ -1996,7 +1996,7 @@ pub fn validate_v3_workflow(
     for (idx, check_ref) in workflow.checks.iter().enumerate() {
         let check_id = match check_ref {
             CheckRefV3::Ref(name) => name.clone(),
-            CheckRefV3::Inline(_) => format!("inline-{idx}"),
+            CheckRefV3::Inline(_) => format!("{workflow_name}-inline-{idx}"),
         };
         let check = resolve_check_ref(check_ref, &config)?;
         if category.is_some_and(|category| check.category != category) {
