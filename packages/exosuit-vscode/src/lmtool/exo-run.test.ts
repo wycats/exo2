@@ -151,4 +151,51 @@ describe("exo-run workflow confirmation", () => {
       },
     });
   });
+
+  it.each(["status", "write"])(
+    "addresses root operation help for %s",
+    async (operation) => {
+      const tool = createExoRunTool();
+
+      await tool.invoke(
+        {
+          input: { command: `help ${operation}` },
+          toolInvocationToken: undefined,
+        } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+        {} as never,
+      );
+
+      const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+        | MachineChannelRequestEnvelope
+        | undefined;
+      expect(request?.op).toEqual({
+        kind: "help",
+        params: {
+          address: { kind: "operation", path: [operation] },
+        },
+      });
+    },
+  );
+
+  it("keeps single-segment namespace help as a namespace address", async () => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command: "help task" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toEqual({
+      kind: "help",
+      params: {
+        address: { kind: "namespace", path: ["task"] },
+      },
+    });
+  });
 });
