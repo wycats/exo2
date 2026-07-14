@@ -296,7 +296,10 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
             }
         }
         ["exo", "phase", "finish", ..] => {
-            if parts[3..].iter().any(|value| is_placeholder(value)) {
+            if parts[3..]
+                .iter()
+                .any(|value| is_placeholder_argument(value))
+            {
                 exo_run("phase finish")
             } else {
                 exo_run(trimmed.strip_prefix("exo ")?)
@@ -304,6 +307,14 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
         }
         _ => None,
     }
+}
+
+fn is_placeholder_argument(value: &str) -> bool {
+    let value = value
+        .split_once('=')
+        .map_or(value, |(_, argument)| argument)
+        .trim_matches(|character| character == '"' || character == '\'');
+    is_placeholder(value)
 }
 
 fn is_placeholder(value: &str) -> bool {
@@ -2258,6 +2269,20 @@ mod tests {
         );
         assert_eq!(
             tool_suggestion_for_command("exo phase finish --message <message>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message=<message>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message=\"<message>\""),
             Some((
                 "exo-run".to_string(),
                 serde_json::json!({ "command": "phase finish" }),

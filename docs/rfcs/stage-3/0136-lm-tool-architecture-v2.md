@@ -84,9 +84,11 @@ command table recognizes `status` and the stale name `version`, while omitting
 the implemented root operation `write <path>`. A positional root write is
 therefore misrouted as a namespaced operation, and `version` reaches the machine
 channel as an unknown root operation. The adapter also fixes a namespaced
-operation at one token, so multi-token command paths such as `docs links check`
-and `phase execution tasks` do not compose into the dotted operations accepted
-by the Rust compiler. These are implemented adapter gaps within the shared
+operation at one token during call and preview routing, so invocations such as
+`docs links check` and `phase execution tasks` do not compose into the dotted
+operations accepted by the Rust compiler. Help routing joins the operation tail
+into its dotted name, so those paths remain discoverable through commands such
+as `help docs links check`. These are implemented adapter gaps within the shared
 architecture, rather than separate command contracts.
 
 The two transports therefore share the command-address model, placeholder
