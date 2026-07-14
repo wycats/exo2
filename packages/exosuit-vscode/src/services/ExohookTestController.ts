@@ -85,6 +85,27 @@ type ItemMeta = {
   filters?: string[];
 };
 
+type CheckCategory = "observe" | "mutate";
+type ValidationMode = "manual" | "continuous";
+
+export function includesCheckInValidation(
+  mode: ValidationMode,
+  category?: CheckCategory,
+): boolean {
+  return mode === "manual" || category !== "mutate";
+}
+
+export function exohookValidateArgs(
+  lane: string,
+  mode: ValidationMode = "manual",
+): string[] {
+  const args = ["validate", lane, "--format=jsonl"];
+  if (mode === "continuous") {
+    args.push("--category", "observe");
+  }
+  return args;
+}
+
 const logger = getLogger("extension");
 const INITIAL_DISCOVERY_DELAY_MS = 5_000;
 
@@ -349,6 +370,7 @@ export class ExohookTestController implements vscode.Disposable {
   private async runOnce(
     request: vscode.TestRunRequest,
     token: vscode.CancellationToken,
+    mode: ValidationMode = "manual",
   ): Promise<void> {
     if (!this.hasLoadedItems() && !token.isCancellationRequested) {
       await this.refresh();
@@ -362,11 +384,11 @@ export class ExohookTestController implements vscode.Disposable {
 
     for (const lane of lanes) {
       if (token.isCancellationRequested) {
-        this.skipLane(run, lane);
+        this.skipLane(run, lane, mode);
         continue;
       }
 
-      await this.runLane(lane, run, token);
+      await this.runLane(lane, run, token, mode);
     }
 
     run.end();
@@ -385,8 +407,8 @@ export class ExohookTestController implements vscode.Disposable {
     request: vscode.TestRunRequest,
     token: vscode.CancellationToken,
   ): Promise<void> {
-    // Initial full run
-    await this.runOnce(request, token);
+    // Continuous validation observes workspace state without mutating it.
+    await this.runOnce(request, token, "continuous");
     if (token.isCancellationRequested) {
       return;
     }
@@ -444,10 +466,10 @@ export class ExohookTestController implements vscode.Disposable {
       const run = this.controller.createTestRun(request);
       for (const lane of lanes) {
         if (token.isCancellationRequested) {
-          this.skipLane(run, lane);
+          this.skipLane(run, lane, "continuous");
           continue;
         }
-        await this.runLane(lane, run, token);
+        await this.runLane(lane, run, token, "continuous");
       }
       run.end();
       this.publishValidationSnapshot();
@@ -530,9 +552,10 @@ export class ExohookTestController implements vscode.Disposable {
     lane: string,
     run: vscode.TestRun,
     token: vscode.CancellationToken,
+    mode: ValidationMode = "manual",
   ): Promise<void> {
     const suiteItem = this.suiteItems.get(lane);
-    const laneChecks = this.getLaneChecks(lane);
+    const laneChecks = this.getLaneChecks(lane, mode);
     const completed = new Set<string>();
     let suiteCompleted = false;
     let cancelled = false;
@@ -551,7 +574,7 @@ export class ExohookTestController implements vscode.Disposable {
 
     const child = spawn(
       this.resolveExohookBin(),
-      ["validate", lane, "--format=jsonl"],
+      exohookValidateArgs(lane, mode),
       {
         cwd: this.workspaceRoot,
         stdio: ["ignore", "pipe", "pipe"],
@@ -791,9 +814,13 @@ export class ExohookTestController implements vscode.Disposable {
     }
   }
 
-  private skipLane(run: vscode.TestRun, lane: string): void {
+  private skipLane(
+    run: vscode.TestRun,
+    lane: string,
+    mode: ValidationMode = "manual",
+  ): void {
     // Only skip leaf check items — never call run.* on suite items
-    for (const checkItem of this.getLaneChecks(lane)) {
+    for (const checkItem of this.getLaneChecks(lane, mode)) {
       run.skipped(checkItem);
     }
   }
@@ -854,10 +881,17 @@ export class ExohookTestController implements vscode.Disposable {
     // TODO: validation summary needs a new home (not old ReactiveStateRegistry)
   }
 
-  private getLaneChecks(lane: string): vscode.TestItem[] {
+  private getLaneChecks(
+    lane: string,
+    mode: ValidationMode = "manual",
+  ): vscode.TestItem[] {
     const items: vscode.TestItem[] = [];
     for (const [key, item] of this.checkItems) {
-      if (key.startsWith(`${lane}::`)) {
+      const meta = this.itemMeta.get(item.id);
+      if (
+        key.startsWith(`${lane}::`) &&
+        includesCheckInValidation(mode, meta?.category)
+      ) {
         items.push(item);
       }
     }
