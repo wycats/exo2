@@ -270,6 +270,7 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
     if parts.len() < 2 || parts[0] != "exo" {
         return None;
     }
+    let exo_command = trimmed.strip_prefix("exo")?.trim_start();
 
     let exo_run = |command: &str| {
         Some((
@@ -285,14 +286,14 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
             if is_placeholder(phase_id) {
                 None
             } else {
-                exo_run(trimmed.strip_prefix("exo ")?)
+                exo_run(exo_command)
             }
         }
         ["exo", "task", "complete", task_id] => {
             if is_placeholder(task_id) {
                 None
             } else {
-                exo_run(trimmed.strip_prefix("exo ")?)
+                exo_run(exo_command)
             }
         }
         ["exo", "phase", "finish", ..] => {
@@ -302,7 +303,7 @@ fn tool_suggestion_for_command(command: &str) -> Option<(String, serde_json::Val
             {
                 exo_run("phase finish")
             } else {
-                exo_run(trimmed.strip_prefix("exo ")?)
+                exo_run(exo_command)
             }
         }
         _ => None,
@@ -2261,7 +2262,21 @@ mod tests {
             ))
         );
         assert_eq!(
+            tool_suggestion_for_command("exo\tphase start phase-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase start phase-1" }),
+            ))
+        );
+        assert_eq!(
             tool_suggestion_for_command("exo task complete task-1"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "task complete task-1" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo   task complete task-1"),
             Some((
                 "exo-run".to_string(),
                 serde_json::json!({ "command": "task complete task-1" }),
@@ -2286,6 +2301,13 @@ mod tests {
             Some((
                 "exo-run".to_string(),
                 serde_json::json!({ "command": "phase finish" }),
+            ))
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo\tphase finish --message done"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish --message done" }),
             ))
         );
     }
