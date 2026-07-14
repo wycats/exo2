@@ -1651,6 +1651,7 @@ pub(crate) fn validate_v3_hook(
     format: OutputFormat,
     verbose: bool,
     color: ColorMode,
+    category: Option<CheckCategory>,
 ) -> Result<()> {
     let use_color = colors_enabled(color);
 
@@ -1700,6 +1701,9 @@ pub(crate) fn validate_v3_hook(
             CheckRefV3::Inline(_) => format!("inline-{idx}"),
         };
         let check = resolve_check_ref(check_ref, &config)?;
+        if category.is_some_and(|category| check.category != category) {
+            continue;
+        }
 
         let label = check.label.as_deref().unwrap_or(&check_id);
 
@@ -1949,6 +1953,7 @@ pub fn validate_v3_workflow(
     format: OutputFormat,
     verbose: bool,
     color: ColorMode,
+    category: Option<CheckCategory>,
 ) -> Result<()> {
     let use_color = colors_enabled(color);
 
@@ -1994,6 +1999,9 @@ pub fn validate_v3_workflow(
             CheckRefV3::Inline(_) => format!("inline-{idx}"),
         };
         let check = resolve_check_ref(check_ref, &config)?;
+        if category.is_some_and(|category| check.category != category) {
+            continue;
+        }
         let label = check.label.as_deref().unwrap_or(&check_id);
 
         let workdir = if let Some(cwd) = check.cwd.as_deref() {

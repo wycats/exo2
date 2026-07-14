@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 use crate::config::{
-    ExecutionContext, HookType, canonical_doc_baseline, canonicalize_doc_if_needed,
+    CheckCategory, ExecutionContext, HookType, canonical_doc_baseline, canonicalize_doc_if_needed,
     extract_inline_checks, get_check_table_mut, hooks_config_path, insert_check_run, insert_lane,
     migrate_v2_to_v3, read_hooks_doc, remove_check, remove_lane, remove_override, set_check_field,
     set_default_field, set_lane_field, set_override_field, set_override_field_canonical,
@@ -80,6 +80,10 @@ enum Commands {
         /// Print what would run, without executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Run only checks in this category (v3 configuration only)
+        #[arg(long, value_enum)]
+        category: Option<CheckCategoryArg>,
     },
 
     /// Run a named workflow (defined in [workflow.*])
@@ -138,6 +142,21 @@ enum Commands {
         #[command(subcommand)]
         command: CiCommands,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CheckCategoryArg {
+    Observe,
+    Mutate,
+}
+
+impl From<CheckCategoryArg> for CheckCategory {
+    fn from(category: CheckCategoryArg) -> Self {
+        match category {
+            CheckCategoryArg::Observe => Self::Observe,
+            CheckCategoryArg::Mutate => Self::Mutate,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -333,12 +352,20 @@ fn main() -> Result<()> {
             format,
             verbose,
             color,
+            category,
         } => {
             let Some(lane) = lane else {
                 // Early return for lane listing (no actual validation)
                 return show_lane_listing(color, None);
             };
-            validate(&lane, dry_run, format, verbose, color)
+            validate(
+                &lane,
+                dry_run,
+                format,
+                verbose,
+                color,
+                category.map(Into::into),
+            )
         }
         Commands::Run {
             workflow,
@@ -348,7 +375,15 @@ fn main() -> Result<()> {
             color,
         } => {
             let config_path = hooks_config_path()?;
-            validate_v3_workflow(&config_path, &workflow, dry_run, format, verbose, color)
+            validate_v3_workflow(
+                &config_path,
+                &workflow,
+                dry_run,
+                format,
+                verbose,
+                color,
+                None,
+            )
         }
         Commands::Discover { format, lane } => discover::discover(format, lane.as_deref()),
         Commands::Hooks {
@@ -484,6 +519,7 @@ fn validate(
     format: OutputFormat,
     verbose: bool,
     color: ColorMode,
+    category: Option<CheckCategory>,
 ) -> Result<()> {
     // Prefer config-driven behavior when `.config/exo/hooks.toml` exists.
     let config_path = hooks_config_path()?;
@@ -501,12 +537,32 @@ fn validate(
                     format,
                     verbose,
                     color,
+                    category,
                 );
             }
             // V3 workflow lane (dev, coherence, gate, ci, etc.)
-            return validate_v3_workflow(&config_path, lane, dry_run, format, verbose, color);
+            return validate_v3_workflow(
+                &config_path,
+                lane,
+                dry_run,
+                format,
+                verbose,
+                color,
+                category,
+            );
+        }
+        if category.is_some() {
+            return Err(anyhow!(
+                "--category requires a version 3 exohook configuration"
+            ));
         }
         return validate_from_config(&config_path, lane, dry_run, format, verbose, color);
+    }
+
+    if category.is_some() {
+        return Err(anyhow!(
+            "--category requires a version 3 exohook configuration"
+        ));
     }
 
     // Temporary bootstrap: wire a couple of lanes directly to the current

@@ -85,6 +85,19 @@ type ItemMeta = {
   filters?: string[];
 };
 
+type ValidationMode = "manual" | "continuous";
+
+export function exohookValidateArgs(
+  lane: string,
+  mode: ValidationMode = "manual",
+): string[] {
+  const args = ["validate", lane, "--format=jsonl"];
+  if (mode === "continuous") {
+    args.push("--category", "observe");
+  }
+  return args;
+}
+
 const logger = getLogger("extension");
 const INITIAL_DISCOVERY_DELAY_MS = 5_000;
 
@@ -349,6 +362,7 @@ export class ExohookTestController implements vscode.Disposable {
   private async runOnce(
     request: vscode.TestRunRequest,
     token: vscode.CancellationToken,
+    mode: ValidationMode = "manual",
   ): Promise<void> {
     if (!this.hasLoadedItems() && !token.isCancellationRequested) {
       await this.refresh();
@@ -366,7 +380,7 @@ export class ExohookTestController implements vscode.Disposable {
         continue;
       }
 
-      await this.runLane(lane, run, token);
+      await this.runLane(lane, run, token, mode);
     }
 
     run.end();
@@ -385,8 +399,8 @@ export class ExohookTestController implements vscode.Disposable {
     request: vscode.TestRunRequest,
     token: vscode.CancellationToken,
   ): Promise<void> {
-    // Initial full run
-    await this.runOnce(request, token);
+    // Continuous validation observes workspace state without mutating it.
+    await this.runOnce(request, token, "continuous");
     if (token.isCancellationRequested) {
       return;
     }
@@ -447,7 +461,7 @@ export class ExohookTestController implements vscode.Disposable {
           this.skipLane(run, lane);
           continue;
         }
-        await this.runLane(lane, run, token);
+        await this.runLane(lane, run, token, "continuous");
       }
       run.end();
       this.publishValidationSnapshot();
@@ -530,6 +544,7 @@ export class ExohookTestController implements vscode.Disposable {
     lane: string,
     run: vscode.TestRun,
     token: vscode.CancellationToken,
+    mode: ValidationMode = "manual",
   ): Promise<void> {
     const suiteItem = this.suiteItems.get(lane);
     const laneChecks = this.getLaneChecks(lane);
@@ -551,7 +566,7 @@ export class ExohookTestController implements vscode.Disposable {
 
     const child = spawn(
       this.resolveExohookBin(),
-      ["validate", lane, "--format=jsonl"],
+      exohookValidateArgs(lane, mode),
       {
         cwd: this.workspaceRoot,
         stdio: ["ignore", "pipe", "pipe"],

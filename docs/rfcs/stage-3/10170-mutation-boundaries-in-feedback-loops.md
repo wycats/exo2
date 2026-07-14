@@ -1,264 +1,244 @@
 <!-- exo:10170 ulid:01kmzxbcy5rxzf5523p5j8scpy -->
 
-
 # RFC 10170: Mutation Boundaries in Feedback Loops
 
 ## Summary
 
-This RFC defines a principled model for handling the interaction between **observation** (running checks, gathering diagnostics) and **mutation** (editing files, running fixes) in the Exosuit feedback loop. Feedback loops involving both observation and mutation require explicit **atomicity boundaries** to ensure observations reflect stable state.
+Exohook distinguishes checks that observe a workspace from checks that mutate
+it. That distinction lets each execution context choose an appropriate safety
+boundary: continuous validation runs observation checks, explicit validation
+may run the complete lane, and staged mutation can restage its results under a
+containment policy.
+
+This RFC defines that contract. It also places Exohook validation in Exo's
+larger feedback model without making validation responsible for steering,
+diagnostic presentation, or workflow review. Those systems meet at stable
+results rather than sharing one execution mechanism.
 
 ## Motivation
 
-### The Problem
+A validation result describes a particular workspace state. A formatter,
+codemod, or generator creates a new state. Treating both operations as generic
+"checks" obscures when a result remains trustworthy and when an execution may
+change files.
 
-The Exosuit system involves multiple feedback loops:
+This matters most in feedback loops. An editor can run validation every time a
+file is saved, a Git hook can validate the staged snapshot, and an explicit
+command can apply repairs before a commit. Each loop needs a different answer
+to the same question: is this execution observing the current state, or is it
+producing the next one?
 
-1. **Exohook validation**: Checks run on file changes, producing pass/fail results
-2. **Diagnostic reporting**: LSP-style diagnostics with optional quick fixes
-3. **Agent steering**: The agent updates tasks/goals/phases, receives steering feedback
-4. **Continuous run**: Auto-revalidation on file save
+Exohook answers that question in configuration. A check declares its category,
+and the invocation context decides which categories to run and whether a
+mutating result should be restaged. The declaration is durable enough for the
+CLI, JSONL protocol, and VS Code integration to agree on the same behavior.
 
-These loops have a fundamental tension:
+## Guide-Level Explanation
 
-- **Observation should be idempotent** — running a check twice on the same state should give the same result
-- **Mutation creates new state** — which invalidates prior observations
-- **Some checks ARE mutations** — formatters, auto-fixers, code generators
-- **Quick fixes are mutations triggered by observations** — clicking a diagnostic fix edits files
+### Declaring Check Behavior
 
-Without explicit boundaries, we get race conditions and confusion:
-
-- Agent reads check results while checks are still running
-- Continuous run triggers mid-edit, producing spurious failures
-- A formatting check runs, changes files, invalidates other checks' results
-- Quick fix applied while diagnostics are stale
-
-### The Human IDE Analogy
-
-Humans deal with this intuitively in IDEs:
-
-- Save file → linter runs → see red squiggles
-- Click "quick fix" → file edited → linter re-runs
-- Don't click quick fix while linter is still running
-
-The IDE enforces some atomicity (quick fix waits for diagnostics to settle), and humans self-regulate (don't frantically click while updating). Agents need explicit rules for what humans do implicitly.
-
-### The Contextual Injection Philosophy
-
-A key Exosuit design principle: **tools should be designed so that using them naturally produces steering as a side effect**.
-
-The agent doesn't need to remember "check for guidance"—it just follows sensible workflow patterns (report progress, update tasks, run checks), and contextual information flows in organically. This is why:
-
-- **`exo` tools return steering**: Running `exo status` or `exo task complete` doesn't just update state—it returns contextual guidance about what to do next.
-- **Exohook exists**: Validation checks are a sensible workflow step that agents will follow because the pattern is simple. But now they're getting rich, contextual information about project health without a "giant dump in an instruction file."
-- **Test Explorer integration matters**: It creates an IDE-native representation that can be projected into agent perception through the same contextual mechanisms.
-- **Shared perception**: Users have already configured their IDEs to present rich information contextually. Exosuit can project that user perception into the agent's "consciousness" as part of normal flows.
-
-**Mutation boundaries aren't just about preventing bad states**—they're about creating natural pause points where contextual information can flow. A commit point is a moment where the agent will naturally interact with a tool, and that tool can provide rich context about what just happened and what should happen next.
-
-## Design
-
-### Check Categories
-
-Checks should declare their **mutation behavior**:
+Version 3 Exohook checks declare a `category`:
 
 ```toml
-[checks.lint]
-command = "eslint --max-warnings 0 {{files}}"
-category = "observe"  # Pure observation, no file changes
-
-[checks.format]
-command = "prettier --write {{files}}"
-category = "mutate"   # Changes files as primary purpose
-
-[checks.typecheck]
-command = "tsc --noEmit"
+[check.lint]
+command = "eslint --max-warnings 0"
 category = "observe"
 
-[checks.codegen]
-command = "prisma generate"
+[check.format]
+command = "prettier --write ."
 category = "mutate"
+fix_command = "prettier --write ."
 ```
 
-| Category  | Idempotent | Mutates Files | Safe in Continuous Run |
-| --------- | ---------- | ------------- | ---------------------- |
-| `observe` | Yes        | No            | Yes                    |
-| `mutate`  | No         | Yes           | No                     |
+An `observe` check reads project state and reports a result. Linters, type
+checkers, and tests normally belong in this category. `observe` is the default,
+so existing checks retain observation semantics when they omit the field.
 
-In `CheckV3`, the `category` field replaces the legacy `fix` field.
+A `mutate` check may change project files. Formatters, codemods, and generators
+belong in this category. A `fix_command` is valid only for a mutate check,
+which keeps the repair path attached to an explicit mutation declaration.
 
-`category` describes what the check _does_, not when it should run. A `mutate` check still runs in pre-commit hooks; the category just informs the system that it modifies files, enabling proper concurrency guards and invalidation. The workflow-level `fix_policy` controls when auto-fix runs and is orthogonal to `category`.
+The category describes behavior rather than scheduling. A workflow may include
+both categories. The caller chooses whether it wants an observation pass or an
+explicit full-lane execution.
 
-### The Observe-Decide-Mutate (ODM) Loop
+### Continuous And Explicit Validation
 
-All feedback loops follow this pattern:
+Continuous validation is an observation loop. VS Code invokes:
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐             │
-│  │ OBSERVE │───▶│ DECIDE  │───▶│ MUTATE  │─────────────┘
-│  └─────────┘    └─────────┘    └─────────┘
-│       │              │              │
-│       ▼              ▼              ▼
-│   Run checks    Review results   Edit files
-│   Gather diags  Choose action    Run fixes
-│   Read state    Plan next step   Update artifacts
-│                                         │
-│                                         ▼
-│                                  ┌─────────────┐
-│                                  │ COMMIT POINT│
-│                                  │ (stable)    │
-│                                  └─────────────┘
-└─────────────────────────────────────────────────────────┘
+```text
+exohook validate <lane> --format=jsonl --category observe
 ```
 
-**Key principle**: Steering and observation should happen at **commit points**, not mid-mutation.
+for both the initial continuous pass and save-triggered reruns. Exohook applies
+the category selector before fileset discovery and command planning, so mutate
+checks do not acquire work or execute during that pass.
 
-### Continuous Run Semantics
+Manual Test Explorer runs and ordinary `exohook validate <lane>` invocations
+omit the selector and execute the lane as configured. This gives users and
+agents an explicit path for workflows that intentionally include mutation.
+The JSONL discovery stream carries each check's category, allowing VS Code to
+use observe checks when deciding which lanes a saved file affects.
 
-Continuous run should only include `observe` category checks:
+### Hook And Workflow Context
 
-```toml
-[workflows.dev]
-label = "Dev (uncommitted)"
-checks = ["lint", "typecheck", "format", "test"]
+The category also informs command selection. Mutation checks may use their fix
+command when the execution context permits repair. Interactive pre-commit
+execution and manual workflows select the fix command by default when one is
+available; pre-push and other non-interactive hook contexts select the primary
+command unless policy explicitly requests repair. Category continues to
+describe the check's behavior whichever command the context selects.
 
-# Only observe checks run in continuous mode
-continuous_checks = ["lint", "typecheck", "test"]  # excludes format
+Workflow `fix_policy` remains independent from category. Category answers what
+a check can do. Policy and invocation context answer which command Exohook
+chooses for this run.
+
+### Staged Mutation
+
+Pre-commit validation may apply a mutation to the staged snapshot and restage
+the result. Exohook gives this path a narrower boundary than ordinary lane
+parallelism.
+
+When a parallel lane uses staged scope, checks with both `category = "mutate"`
+and automatic restaging execute sequentially after the lane's parallel-safe
+checks. Before restaging, Exohook requires lane-scoped files to be free of
+unstaged changes. This prevents the restage step from folding unrelated local
+edits into the index.
+
+After the command runs, Exohook compares the worktree with its pre-command
+state. It restages changed lane-scoped files and applies the configured
+containment policy to newly changed files outside that scope. Containment can
+allow, warn about, or reject those changes. A failed containment check leaves
+the unexpected work visible for inspection rather than presenting the
+mutation as a successful staged result.
+
+This is a staged-restage guarantee, not a global transaction over every
+validation command. Ordinary observation checks retain the lane's configured
+parallelism, while explicit mutations outside this path remain visible
+filesystem operations.
+
+## Reference-Level Explanation
+
+### Category Selection
+
+`exohook validate` accepts an optional V3 category selector:
+
+```text
+exohook validate <lane> --category <observe|mutate>
 ```
 
-Alternatively, derive this automatically from check categories.
+The selector filters resolved checks before Exohook computes filesets, invokes
+tools, or creates command plans. Without the selector, validation includes all
+checks in workflow order. Category selection requires a version 3
+configuration because earlier schemas do not carry this distinction.
 
-### Mutation Checks as Explicit Actions
+Hook execution uses the same resolved category metadata. A category filter can
+therefore describe a coherent pass whether the lane is reached as a named V3
+workflow or through its configured hook name.
 
-`mutate` category checks should:
+### Machine-Readable Feedback
 
-1. **Not run in continuous mode** — only on explicit request
-2. **Show a confirmation** — "This check will modify files. Proceed?"
-3. **Invalidate prior observations** — after running, all `observe` checks should re-run
-4. **Block concurrent checks** — no other checks run while a mutating check is in progress
+Exohook discovery emits suite and check records over JSONL. Check records carry
+the lane, command metadata, filters, and category. Validation emits lane and
+check lifecycle events, output, completion status, matched-file information,
+and restage failures.
 
-### Quick Fixes and Diagnostics
+VS Code consumes these events to build Test Explorer items and settle their
+results. It retains category and filter metadata from discovery, then uses the
+saved file's path to select affected lanes for continuous execution. Exohook
+remains authoritative for the final category filter when the selected lane
+runs.
 
-Diagnostics with quick fixes follow the same model:
+The Test Explorer is a presentation of Exohook results. Exohook failures do
+not currently become entries in VS Code's diagnostic collection, and the
+controller does not publish a shared validation snapshot into Exo state.
 
-```typescript
-interface Diagnostic {
-  message: string;
-  severity: "error" | "warning" | "info";
-  location: Location;
-  fixes?: QuickFix[]; // Optional mutations
-}
+### Relationship To Exo Steering
 
-interface QuickFix {
-  label: string;
-  edits: TextEdit[]; // The mutation
-  isPreferred?: boolean;
-}
-```
+Exo commands provide contextual steering and completion review around durable
+project work. Those command boundaries complement Exohook's validation
+boundary: validation produces evidence about a stable workspace state, while
+Exo records progress and decides when a task or goal has a sufficient outcome.
 
-Applying a quick fix is a **mutation** that:
+The systems remain independently useful. Running an Exohook lane does not
+implicitly complete Exo work, and an Exo command does not acquire control of a
+running mutation. Callers compose them by validating a stable state and then
+recording the resulting evidence through the Exo workflow.
 
-1. Should wait for current observations to complete
-2. Should trigger re-observation after applying
-3. Should be atomic (all edits or none)
+## Drawbacks
 
-### Agent Steering Boundaries
+Category is a behavioral promise made by configuration. Exohook cannot prove
+that an observe command leaves the filesystem unchanged, so an incorrectly
+classified command can still violate the continuous-run expectation.
 
-For the agent feedback loop:
+Filtering at check granularity also means a continuous pass may represent only
+part of a lane. The Test Explorer preserves the lane-shaped presentation, but
+mutate checks settle only when an explicit run includes them. Interfaces that
+want to display this distinction more prominently can build on the discovery
+category.
 
-1. **Observe**: Run `exo status`, read diagnostics, check validation results
-2. **Decide**: Analyze results, plan next action, update task status
-3. **Mutate**: Edit files, run fixes, update plan artifacts
-4. **Commit**: All mutations complete, state is stable
+Finally, staged containment detects filesystem effects after a command has
+run. It protects restaging and reports unexpected scope, but it does not roll
+back the command's changes.
 
-**Steering should be read at commit points**, not mid-mutation. This means:
+## Alternatives
 
-- Don't read steering while file edits are in progress
-- Don't start new edits while checks are running
-- Treat "check running" as a transient state, not a steering input
+One alternative is to maintain separate continuous and explicit workflows.
+That can express the same behavior, but it duplicates lane membership and lets
+the two definitions drift. Category selection keeps one workflow authoritative
+while allowing callers to request a safe observational subset.
 
-### Terminology and Scope
+Another alternative is to infer mutation from command names or the presence of
+a fix command. Command names are conventions rather than contracts, and some
+mutating checks use their primary command. An explicit category is readable by
+people and stable across adapters.
 
-The Exosuit system uses multiple loops at different scopes:
+A global validation lock would provide a broader exclusion boundary. The
+current design instead serializes the staged mutations whose restage behavior
+requires ordering and lets observation checks retain useful parallelism.
 
-| Loop                                | Scope               |
-| ----------------------------------- | ------------------- |
-| **SOAR** (Status-Orient-Act-Review) | Project/session     |
-| **ODM** (Observe-Decide-Mutate)     | Phase/task          |
-| **PER** (Prepare-Execute-Review)    | Goal/implementation |
+## Future Extensions
 
-**ODM** names the observe/decide/mutate boundary inside work execution, **SOAR** frames project- and session-level flow, and **PER** structures goal- or implementation-level work. These loops are intentionally layered: each one describes the same work at a different scope.
+The category model provides a foundation for richer interaction without making
+those features part of the current Candidate contract. VS Code can present
+mutate checks as explicit actions, validation failures can participate in a
+unified diagnostic model, and a repair action can request confirmation before
+it changes files. A future observation service can also publish validation
+freshness into Exo's shared perception model and schedule re-observation after
+an accepted mutation.
 
-## Implementation
+Those extensions will need to define their own authority, freshness, and
+failure semantics. This RFC supplies the distinction they can rely on:
+observation reports a state, mutation creates a state, and callers choose the
+boundary appropriate to their feedback loop.
 
-### Implemented: Check Categories
+## Implementation Evidence
 
-1. Added `CheckCategory` enum (`observe`, `mutate`) to `exohook`
-2. Added `category` field to `CheckV3`, removing `fix: bool` (hard break)
-3. Added migration plugin to convert `fix = true` → `category = "mutate"` in existing configs
-4. Replaced `CheckPlan.autofix: bool` with `CheckPlan.category: CheckCategory`
-5. Updated `should_fix()` and scheduling logic to use `category` instead of `fix`/`autofix`
-6. Updated v2→v3 migration to write `category` instead of `fix`
-7. Defaulted to `observe` if not specified
+The Stage 3 contract is implemented across Exohook and the VS Code extension:
 
-### Implemented: Continuous Run Filtering
-
-1. Added `category` to JSONL discovery output (`DiscoveryItem::Check`)
-2. TypeScript Test Explorer parses and stores `category` in `ItemMeta`
-3. `findMatchingLanes()` filters out `mutate` checks from continuous run
-4. Backward compatible: undefined category (old CLI) treated as allowed
-
-### Planned: UI Enhancements
-
-1. Add UI indication that some checks are "manual only"
-2. Add explicit "Run All" vs "Run Continuous" distinction
-
-### Planned: Mutation Boundaries
-
-1. Add concurrency guard: no checks run while mutation in progress
-2. Add invalidation: mutation completes → re-run observe checks
-3. Add confirmation UI for mutation checks
-
-### Planned: Unified Diagnostic Model
-
-1. Exohook check failures become diagnostics
-2. Quick fixes from checks (e.g., "run formatter") surface as diagnostic actions
-3. Agent can "apply fix" through same mechanism as human
-
-## Open Questions
-
-1. **Granularity**: Should mutation boundaries be per-check or per-file?
-2. **Partial mutations**: What if a mutation check partially succeeds?
-3. **Rollback**: Should we support undoing mutation checks?
-4. **Parallelism**: Can multiple `observe` checks run in parallel? (Probably yes)
-5. **Agent autonomy**: Should agents be able to auto-apply "safe" fixes without confirmation?
-6. **`fix_command` retention**: Should `fix_command` remain as an override for `mutate` checks, or should it be folded into a more general "command variants" pattern?
-
-## Related Work
-
-- VS Code's "format on save" has similar atomicity concerns
-- Git's staging area is a mutation boundary
-- Database transactions provide atomicity guarantees
-- The OODA loop (Observe-Orient-Decide-Act) is a related military/business concept
+- `CheckCategory`, `CheckV3`, and `ExecutionContext` define category and command
+  selection.
+- Validation filters resolved V3 checks by category and gives staged
+  mutate-and-restage checks sequential containment-aware execution.
+- Discovery and validation JSONL events carry the metadata used by Test
+  Explorer.
+- VS Code uses observe-only validation for continuous initial and save-triggered
+  runs while preserving complete manual lane execution.
+- Focused tests cover category parsing and defaults, execution-context command
+  selection, staged restaging and containment, category-filtered execution,
+  and the VS Code invocation boundary.
 
 ## Related RFCs
 
-- RFC 00224: The SOAR Loop — ODM refines Act/Review transitions
-- RFC 00240: Fractal SOAR / Goal Loop — mutation boundaries clarify when steering can happen inside L1 loops
-- RFC 0026: Validation-Based Reactivity — atomic snapshots and transaction boundaries map to observe/mutate
-- RFC 0119: Reactive File System — watcher-driven invalidation relates to commit points
-- RFC 00225: Problems Pane Integration — diagnostics are observe-only, quick fixes are mutations
-
-## Appendix: The SOAR Connection
-
-This RFC's ODM loop relates to the existing SOAR loop:
-
-| SOAR   | ODM        | Notes                             |
-| ------ | ---------- | --------------------------------- |
-| Status | Observe    | Both gather current state         |
-| Orient | Decide     | Both synthesize and plan          |
-| Act    | Mutate     | Both execute changes              |
-| Review | (implicit) | ODM's commit point enables review |
-
-The key addition is explicit **mutation boundaries** and **check categories** that SOAR doesn't address.
+- RFC 0081, *Exohook: File Expansion Worked Examples*, describes the fileset
+  behavior used to build check plans.
+- RFC 0113, *Exohook Machine Channel Protocol*, introduces machine-readable
+  discovery and validation events.
+- RFC 0122, *Exohook Streaming Progress Reporting*, defines the streaming
+  progress model consumed by interactive clients.
+- RFC 00224, *The SOAR Loop*, describes the larger project workflow in which
+  validation evidence informs orientation and review.
+- RFC 00225, *Problems Pane Integration with SOAR Loop*, explores the future
+  diagnostic presentation boundary.
+- RFCs 10181, 10182, and 10183 develop shared perception, contextual steering,
+  and activity evidence as adjacent Exo contracts.
