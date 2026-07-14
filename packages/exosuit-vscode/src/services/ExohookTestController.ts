@@ -85,7 +85,15 @@ type ItemMeta = {
   filters?: string[];
 };
 
+type CheckCategory = "observe" | "mutate";
 type ValidationMode = "manual" | "continuous";
+
+export function includesCheckInValidation(
+  mode: ValidationMode,
+  category?: CheckCategory,
+): boolean {
+  return mode === "manual" || category !== "mutate";
+}
 
 export function exohookValidateArgs(
   lane: string,
@@ -376,7 +384,7 @@ export class ExohookTestController implements vscode.Disposable {
 
     for (const lane of lanes) {
       if (token.isCancellationRequested) {
-        this.skipLane(run, lane);
+        this.skipLane(run, lane, mode);
         continue;
       }
 
@@ -458,7 +466,7 @@ export class ExohookTestController implements vscode.Disposable {
       const run = this.controller.createTestRun(request);
       for (const lane of lanes) {
         if (token.isCancellationRequested) {
-          this.skipLane(run, lane);
+          this.skipLane(run, lane, "continuous");
           continue;
         }
         await this.runLane(lane, run, token, "continuous");
@@ -547,7 +555,7 @@ export class ExohookTestController implements vscode.Disposable {
     mode: ValidationMode = "manual",
   ): Promise<void> {
     const suiteItem = this.suiteItems.get(lane);
-    const laneChecks = this.getLaneChecks(lane);
+    const laneChecks = this.getLaneChecks(lane, mode);
     const completed = new Set<string>();
     let suiteCompleted = false;
     let cancelled = false;
@@ -806,9 +814,13 @@ export class ExohookTestController implements vscode.Disposable {
     }
   }
 
-  private skipLane(run: vscode.TestRun, lane: string): void {
+  private skipLane(
+    run: vscode.TestRun,
+    lane: string,
+    mode: ValidationMode = "manual",
+  ): void {
     // Only skip leaf check items — never call run.* on suite items
-    for (const checkItem of this.getLaneChecks(lane)) {
+    for (const checkItem of this.getLaneChecks(lane, mode)) {
       run.skipped(checkItem);
     }
   }
@@ -869,10 +881,17 @@ export class ExohookTestController implements vscode.Disposable {
     // TODO: validation summary needs a new home (not old ReactiveStateRegistry)
   }
 
-  private getLaneChecks(lane: string): vscode.TestItem[] {
+  private getLaneChecks(
+    lane: string,
+    mode: ValidationMode = "manual",
+  ): vscode.TestItem[] {
     const items: vscode.TestItem[] = [];
     for (const [key, item] of this.checkItems) {
-      if (key.startsWith(`${lane}::`)) {
+      const meta = this.itemMeta.get(item.id);
+      if (
+        key.startsWith(`${lane}::`) &&
+        includesCheckInValidation(mode, meta?.category)
+      ) {
         items.push(item);
       }
     }

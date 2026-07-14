@@ -7,8 +7,8 @@
 Exohook distinguishes checks that observe a workspace from checks that mutate
 it. That distinction lets each execution context choose an appropriate safety
 boundary: continuous validation runs observation checks, explicit validation
-may run the complete lane, and staged mutation can restage its results under a
-containment policy.
+may run the complete lane, and staged mutation can restage its lane-scoped
+results without absorbing pre-existing unstaged edits.
 
 This RFC defines that contract. It also places Exohook validation in Exo's
 larger feedback model without making validation responsible for steering,
@@ -106,11 +106,11 @@ unstaged changes. This prevents the restage step from folding unrelated local
 edits into the index.
 
 After the command runs, Exohook compares the worktree with its pre-command
-state. It restages changed lane-scoped files and applies the configured
-containment policy to newly changed files outside that scope. Containment can
-allow, warn about, or reject those changes. A failed containment check leaves
-the unexpected work visible for inspection rather than presenting the
-mutation as a successful staged result.
+state and restages changed lane-scoped files. Version 3 plans currently use
+containment-off semantics: changes outside the lane remain visible in the
+worktree, and Exohook neither restages them nor promotes them to a warning or
+failure. The earlier configuration model supports warn and fail containment
+overrides; the V3 schema does not yet expose that policy.
 
 This is a staged-restage guarantee, not a global transaction over every
 validation command. Ordinary observation checks retain the lane's configured
@@ -177,9 +177,9 @@ mutate checks settle only when an explicit run includes them. Interfaces that
 want to display this distinction more prominently can build on the discovery
 category.
 
-Finally, staged containment detects filesystem effects after a command has
-run. It protects restaging and reports unexpected scope, but it does not roll
-back the command's changes.
+Finally, staged restaging protects the index from pre-existing unstaged lane
+edits, but V3 does not contain or roll back a command's filesystem effects
+outside the lane.
 
 ## Alternatives
 
@@ -212,6 +212,10 @@ failure semantics. This RFC supplies the distinction they can rely on:
 observation reports a state, mutation creates a state, and callers choose the
 boundary appropriate to their feedback loop.
 
+The V3 schema can also grow an explicit containment policy for automatic
+restaging. That extension would let projects promote outside-lane mutations to
+warnings or failures while preserving today's containment-off default.
+
 ## Implementation Evidence
 
 The Stage 3 contract is implemented across Exohook and the VS Code extension:
@@ -219,14 +223,14 @@ The Stage 3 contract is implemented across Exohook and the VS Code extension:
 - `CheckCategory`, `CheckV3`, and `ExecutionContext` define category and command
   selection.
 - Validation filters resolved V3 checks by category and gives staged
-  mutate-and-restage checks sequential containment-aware execution.
+  mutate-and-restage checks sequential execution with index safeguards.
 - Discovery and validation JSONL events carry the metadata used by Test
   Explorer.
 - VS Code uses observe-only validation for continuous initial and save-triggered
   runs while preserving complete manual lane execution.
 - Focused tests cover category parsing and defaults, execution-context command
-  selection, staged restaging and containment, category-filtered execution,
-  and the VS Code invocation boundary.
+  selection, staged restaging, category-filtered execution, and the VS Code
+  invocation and finalization boundaries.
 
 ## Related RFCs
 
