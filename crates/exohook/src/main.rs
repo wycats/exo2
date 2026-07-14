@@ -355,6 +355,9 @@ fn main() -> Result<()> {
             category,
         } => {
             let Some(lane) = lane else {
+                if category.is_some() {
+                    return Err(anyhow!("--category requires a validation lane"));
+                }
                 // Early return for lane listing (no actual validation)
                 return show_lane_listing(color, None);
             };
@@ -552,17 +555,13 @@ fn validate(
             );
         }
         if category.is_some() {
-            return Err(anyhow!(
-                "--category requires a version 3 exohook configuration"
-            ));
+            return Err(category_requires_v3());
         }
         return validate_from_config(&config_path, lane, dry_run, format, verbose, color);
     }
 
     if category.is_some() {
-        return Err(anyhow!(
-            "--category requires a version 3 exohook configuration"
-        ));
+        return Err(category_requires_v3());
     }
 
     // Temporary bootstrap: wire a couple of lanes directly to the current
@@ -601,6 +600,12 @@ fn validate(
     }
 
     Ok(())
+}
+
+fn category_requires_v3() -> anyhow::Error {
+    anyhow!(
+        "--category requires a version 3 exohook configuration; migrate with `exohook migrate v3 --in-place`"
+    )
 }
 
 fn handle_config_command(command: ConfigCommands) -> Result<()> {

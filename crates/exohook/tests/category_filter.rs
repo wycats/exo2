@@ -41,3 +41,56 @@ category = "mutate"
         .assert()
         .failure();
 }
+
+#[test]
+fn category_filter_requires_a_lane() {
+    cargo_bin_cmd!("exohook")
+        .args(["validate", "--category", "observe"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--category requires a validation lane",
+        ));
+}
+
+#[test]
+fn category_filter_points_v1_and_v2_projects_to_the_migration_command() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        fs::create_dir_all(root.join(".config/exo")).unwrap();
+        let config = format!(
+            r#"version = {version}
+
+[lane.gate]
+scope = {{ op = "base", base = "head" }}
+checks = ["inspect"]
+
+[check.inspect]
+input_mode = "none"
+run = "rustc --version"
+"#
+        );
+        fs::write(root.join(".config/exo/hooks.toml"), &config).unwrap();
+
+        cargo_bin_cmd!("exohook")
+            .current_dir(root)
+            .args(["validate", "gate", "--category", "observe"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("exohook migrate v3 --in-place"));
+    }
+}
+
+#[test]
+fn category_filter_points_bootstrap_projects_to_the_migration_command() {
+    let temp = tempfile::tempdir().unwrap();
+
+    cargo_bin_cmd!("exohook")
+        .current_dir(temp.path())
+        .args(["validate", "gate", "--category", "observe"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exohook migrate v3 --in-place"));
+}
