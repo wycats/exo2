@@ -83,15 +83,16 @@ use observe checks when deciding which lanes a saved file affects.
 ### Hook And Workflow Context
 
 The category also informs command selection. Mutation checks may use their fix
-command when the execution context permits repair. Interactive pre-commit
-execution and manual workflows select the fix command by default when one is
-available; pre-push and other non-interactive hook contexts select the primary
-command unless policy explicitly requests repair. Category continues to
-describe the check's behavior whichever command the context selects.
+command when the execution context permits repair. Interactive pre-commit hooks
+and manual workflows select the fix command by default when one is available.
+Pre-push, commit-message, and pre-merge-commit hooks always select the primary
+command. Hook execution does not consult workflow `fix_policy`.
 
-Workflow `fix_policy` remains independent from category. Category answers what
-a check can do. Policy and invocation context answer which command Exohook
-chooses for this run.
+A named manual workflow applies its own `fix_policy`: `never` selects the
+primary command, while `always` explicitly selects the fix command. In the
+absence of either override, manual execution permits the fix command. Category
+continues to describe what the check can do; invocation context and manual
+workflow policy select the command for a particular run.
 
 ### Staged Mutation
 
