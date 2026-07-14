@@ -344,6 +344,13 @@ fn main() -> Result<()> {
 
     // Track whether this is the ci emit command (skip auto-regeneration for it)
     let is_ci_emit = matches!(cli.command, Commands::Ci { .. });
+    let is_observe_validation = matches!(
+        &cli.command,
+        Commands::Validate {
+            category: Some(CheckCategoryArg::Observe),
+            ..
+        }
+    );
 
     let result = match cli.command {
         Commands::Validate {
@@ -440,7 +447,7 @@ fn main() -> Result<()> {
     };
 
     // Auto-regenerate CI workflow after successful commands (except ci emit itself)
-    if result.is_ok() && !is_ci_emit {
+    if result.is_ok() && !is_ci_emit && !is_observe_validation {
         maybe_regenerate_ci_workflow();
     }
 

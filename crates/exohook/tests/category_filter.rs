@@ -105,6 +105,45 @@ category = "mutate"
 }
 
 #[test]
+fn observe_category_validation_does_not_regenerate_ci_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let generated_workflow = root.join(".github/workflows/exo-ci.yml");
+
+    fs::create_dir_all(root.join(".config/exo")).unwrap();
+    fs::write(
+        root.join(".config/exo/hooks.toml"),
+        r#"version = 3
+
+[workflow.dev]
+checks = ["inspect"]
+
+[workflow.ci]
+checks = ["inspect"]
+
+[check.inspect]
+command = "rustc --version"
+category = "observe"
+"#,
+    )
+    .unwrap();
+
+    cargo_bin_cmd!("exohook")
+        .current_dir(root)
+        .args(["validate", "dev", "--category", "observe"])
+        .assert()
+        .success();
+    assert!(!generated_workflow.exists());
+
+    cargo_bin_cmd!("exohook")
+        .current_dir(root)
+        .args(["validate", "dev"])
+        .assert()
+        .success();
+    assert!(generated_workflow.exists());
+}
+
+#[test]
 fn category_filter_requires_a_lane() {
     cargo_bin_cmd!("exohook")
         .args(["validate", "--category", "observe"])
