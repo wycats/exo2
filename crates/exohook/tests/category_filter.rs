@@ -44,6 +44,67 @@ category = "mutate"
 }
 
 #[test]
+fn empty_category_selection_is_explicit_for_humans_and_structured_for_jsonl() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    fs::create_dir_all(root.join(".config/exo")).unwrap();
+    fs::write(
+        root.join(".config/exo/hooks.toml"),
+        r#"version = 3
+
+[hooks]
+pre_commit = "coherence"
+
+[workflow.coherence]
+checks = ["rewrite"]
+
+[check.rewrite]
+command = "rustc --version"
+category = "mutate"
+"#,
+    )
+    .unwrap();
+
+    let empty_summary = "No checks matched --category observe in workflow 'coherence'.";
+    for lane in ["coherence", "pre_commit"] {
+        cargo_bin_cmd!("exohook")
+            .current_dir(root)
+            .args(["validate", lane, "--category", "observe"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(empty_summary));
+
+        let jsonl = cargo_bin_cmd!("exohook")
+            .current_dir(root)
+            .args([
+                "validate",
+                lane,
+                "--category",
+                "observe",
+                "--format",
+                "jsonl",
+            ])
+            .output()
+            .unwrap();
+        assert!(jsonl.status.success());
+
+        let events: Vec<Value> = String::from_utf8_lossy(&jsonl.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSONL output must stay structured"))
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event["type"] == "lane_started" && event["check_count"] == 0 })
+        );
+        assert!(events.iter().any(|event| {
+            event["type"] == "summary" && event["checks"].as_array().is_some_and(Vec::is_empty)
+        }));
+    }
+}
+
+#[test]
 fn category_filter_requires_a_lane() {
     cargo_bin_cmd!("exohook")
         .args(["validate", "--category", "observe"])

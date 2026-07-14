@@ -491,6 +491,27 @@ fn emit_jsonl(emitter: &JsonlEmitter, event: JsonlEvent) -> Result<()> {
     emitter.emit(&event).map_err(|e| anyhow!(e))
 }
 
+fn report_empty_category_selection(
+    format: OutputFormat,
+    category: Option<CheckCategory>,
+    workflow_name: &str,
+    selected_check_count: usize,
+) -> bool {
+    let Some(category) = category.filter(|_| selected_check_count == 0) else {
+        return false;
+    };
+
+    if format != OutputFormat::Jsonl {
+        let category = match category {
+            CheckCategory::Observe => "observe",
+            CheckCategory::Mutate => "mutate",
+        };
+        println!("No checks matched --category {category} in workflow '{workflow_name}'.");
+    }
+
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_check_plans_jsonl(
     lane: &str,
@@ -1694,6 +1715,7 @@ pub(crate) fn validate_v3_hook(
     let mut fileset_cache: Option<Vec<String>> = None;
     let mut plans: Vec<CheckPlan> = Vec::new();
     let mut tool_failures: Vec<String> = Vec::new();
+    let mut selected_check_count = 0;
 
     for (idx, check_ref) in checks.iter().enumerate() {
         let check_id = match check_ref {
@@ -1704,6 +1726,7 @@ pub(crate) fn validate_v3_hook(
         if category.is_some_and(|category| check.category != category) {
             continue;
         }
+        selected_check_count += 1;
 
         let label = check.label.as_deref().unwrap_or(&check_id);
 
@@ -1904,6 +1927,8 @@ pub(crate) fn validate_v3_hook(
         });
     }
 
+    report_empty_category_selection(format, category, workflow_name, selected_check_count);
+
     if dry_run {
         return Ok(());
     }
@@ -1992,6 +2017,7 @@ pub fn validate_v3_workflow(
     let mut fileset_cache: Option<Vec<String>> = None;
     let mut plans: Vec<CheckPlan> = Vec::new();
     let mut tool_failures: Vec<String> = Vec::new();
+    let mut selected_check_count = 0;
 
     for (idx, check_ref) in workflow.checks.iter().enumerate() {
         let check_id = match check_ref {
@@ -2002,6 +2028,7 @@ pub fn validate_v3_workflow(
         if category.is_some_and(|category| check.category != category) {
             continue;
         }
+        selected_check_count += 1;
         let label = check.label.as_deref().unwrap_or(&check_id);
 
         let workdir = if let Some(cwd) = check.cwd.as_deref() {
@@ -2192,6 +2219,9 @@ pub fn validate_v3_workflow(
         });
     }
 
+    let empty_category_selection =
+        report_empty_category_selection(format, category, workflow_name, selected_check_count);
+
     if dry_run {
         return Ok(());
     }
@@ -2207,7 +2237,9 @@ pub fn validate_v3_workflow(
             emitter,
         )
     } else if plans.is_empty() {
-        println!("No checks to run in workflow '{}'.", workflow_name);
+        if !empty_category_selection {
+            println!("No checks to run in workflow '{}'.", workflow_name);
+        }
         Ok(())
     } else {
         run_check_plans(
