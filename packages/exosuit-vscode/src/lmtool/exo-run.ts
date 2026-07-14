@@ -176,7 +176,10 @@ function buildHelpRequest(path: string[]): MachineChannelRequestEnvelope {
   } else if (path.length === 1) {
     address = { kind: "namespace", path };
   } else {
-    address = { kind: "operation", path };
+    address = {
+      kind: "operation",
+      path: [path[0], path.slice(1).join(".")],
+    };
   }
 
   return {

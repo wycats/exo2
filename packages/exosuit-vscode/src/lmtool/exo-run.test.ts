@@ -128,4 +128,27 @@ describe("exo-run workflow confirmation", () => {
       WORKFLOW_COMPLETION_CONFIRMATION_KIND,
     );
   });
+
+  it("normalizes dotted operation help to the machine-channel address", async () => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command: "help docs links check" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    expect(machineChannelMock).toHaveBeenCalledTimes(1);
+    const request = machineChannelMock.mock.calls[0]?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toEqual({
+      kind: "help",
+      params: {
+        address: { kind: "operation", path: ["docs", "links.check"] },
+      },
+    });
+  });
 });

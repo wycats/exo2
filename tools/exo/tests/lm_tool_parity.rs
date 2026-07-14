@@ -45,6 +45,8 @@ struct PackageJson {
 #[serde(rename_all = "camelCase")]
 struct Contributes {
     language_model_tools: Vec<LmTool>,
+    #[serde(default)]
+    language_model_tool_sets: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,11 +59,13 @@ struct LmTool {
 
 /// Load the package.json languageModelTools.
 fn load_package_json_tools() -> Vec<LmTool> {
+    load_package_json().contributes.language_model_tools
+}
+
+fn load_package_json() -> PackageJson {
     let path = repo_root().join("packages/exosuit-vscode/package.json");
     let raw = std::fs::read_to_string(&path).expect("expected package.json to load");
-    let package: PackageJson =
-        serde_json::from_str(&raw).expect("expected package.json to deserialize");
-    package.contributes.language_model_tools
+    serde_json::from_str(&raw).expect("expected package.json to deserialize")
 }
 
 #[test]
@@ -79,6 +83,17 @@ fn package_json_tools_are_exact_curated_surface() {
 
     assert_eq!(package_names, CURATED_TOOL_NAMES);
     assert_eq!(reference_names, CURATED_TOOL_REFERENCE_NAMES);
+}
+
+#[test]
+fn package_json_does_not_declare_language_model_tool_sets() {
+    assert!(
+        load_package_json()
+            .contributes
+            .language_model_tool_sets
+            .is_none(),
+        "package.json must not declare languageModelToolSets"
+    );
 }
 
 #[test]
