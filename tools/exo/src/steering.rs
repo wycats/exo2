@@ -323,7 +323,10 @@ fn is_placeholder_argument(value: &str) -> bool {
 
 fn is_placeholder(value: &str) -> bool {
     let value = value.trim_matches(|character| character == '"' || character == '\'');
-    value == "..." || (value.starts_with('<') && value.ends_with('>'))
+    matches!(
+        value,
+        "..." | "<id>" | "<message>" | "<phase-id>" | "<summary>" | "<title>"
+    )
 }
 
 /// Summary of an RFC being advanced by the current phase.
@@ -2293,6 +2296,13 @@ mod tests {
         assert_eq!(
             tool_suggestion_for_command("exo phase start <phase-id>"),
             None
+        );
+        assert_eq!(
+            tool_suggestion_for_command("exo phase finish --message <init>"),
+            Some((
+                "exo-run".to_string(),
+                serde_json::json!({ "command": "phase finish --message <init>" }),
+            ))
         );
         assert_eq!(
             tool_suggestion_for_command("exo\tphase start phase-1"),
