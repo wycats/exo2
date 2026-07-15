@@ -2,6 +2,9 @@
 
 # RFC 51: Coherence Bootstrap
 
+- **Supersedes**: RFC 10068
+
+
 
 # RFC 0051: Coherence Bootstrap
 
@@ -74,5 +77,3 @@ This plan is fully aligned with the **Cognitive Grimoire**:
 *   **Constraint**: Must work with existing `exo` CLI.
 *   **Constraint**: Must be portable (no hardcoded paths to `exosuit` repo in the prompts themselves).
 *   **Question**: Should we bundle `cast.prompt.md` itself into this global package?
-
-

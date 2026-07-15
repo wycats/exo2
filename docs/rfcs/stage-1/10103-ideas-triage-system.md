@@ -3,6 +3,9 @@
 
 # RFC 10103: Ideas & Triage System
 
+- **Superseded by**: RFC 0011
+
+
 ## Problem
 Currently, `ideas.md` is a free-form unstructured list. This makes it difficult to:
 1. Programmatically manage ideas (sort, filter, promote).

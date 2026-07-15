@@ -2,6 +2,9 @@
 
 # RFC 43: User-Facing Workflow Model for Exosuit (VS Code)
 
+- **Superseded by**: RFC 0056
+
+
 
 # RFC 0043: User-Facing Workflow Model for Exosuit (VS Code)
 

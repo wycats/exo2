@@ -3,6 +3,9 @@
 
 # RFC 10093: Organic Context Injection (State-Aware Agents)
 
+- **Superseded by**: RFC 0172
+
+
 ## Summary
 
 This RFC proposes leveraging the existing **Persistent Tree** (maintained by the VS Code Extension) to inject "Organic Context" into the Agent's prompt. Instead of just providing file contents, we provide **Derived State** (e.g., "File modified after last build", "Test passed 5m ago"). This prevents "Existential Crises" where the agent is confused by stale errors or out-of-sync artifacts.

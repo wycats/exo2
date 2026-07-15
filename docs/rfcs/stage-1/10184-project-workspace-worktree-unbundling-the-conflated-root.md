@@ -2,6 +2,9 @@
 
 # RFC 10184: Project / Workspace / Worktree: unbundling the conflated root
 
+- **Supersedes**: RFC 0093, RFC 0163
+
+
 ## Summary
 
 RFC 10184 defines exo's project/workspace split for the `exo Everywhere` epoch.

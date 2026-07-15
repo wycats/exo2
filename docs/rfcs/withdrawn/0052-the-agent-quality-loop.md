@@ -2,6 +2,12 @@
 
 # RFC 52: The Agent Quality Loop
 
+- **Superseded by**: RFC 10182
+
+
+- **Supersedes**: RFC 10069
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

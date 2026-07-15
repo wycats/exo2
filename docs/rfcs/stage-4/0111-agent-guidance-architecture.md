@@ -7,7 +7,7 @@
 
 | Field        | Value                                                       |
 | ------------ | ----------------------------------------------------------- |
-| **Stage**    | 3 (Candidate - Implemented)                                 |
+| **Stage**    | 4 (Stable)                                                  |
 | **Created**  | 2026-01-15                                                  |
 | **Champion** | —                                                           |
 | **Related**  | RFC 0091 (Protected Files), RFC 0136 (LM Tool Architecture) |

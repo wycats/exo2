@@ -2,6 +2,9 @@
 
 # RFC 142: Agent Ecosystem
 
+- **Supersedes**: RFC 0144
+
+
 
 # RFC 0142: Agent Ecosystem
 
@@ -233,4 +236,3 @@ Rely on user discipline and prompts. Rejected because:
 3. **Custom Agents**: Users define their own agents
 4. **Agent Marketplace**: Share agent definitions across projects
 5. **Automated Handoff**: Phase transitions auto-invoke appropriate agents
-

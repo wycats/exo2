@@ -2,6 +2,9 @@
 
 # RFC 143: Prompt Workflow Integration
 
+- **Supersedes**: RFC 0145
+
+
 
 # RFC 0143: Prompt Workflow Integration
 

@@ -3,6 +3,12 @@
 
 # RFC 10102: Dynamic Planning
 
+- **Superseded by**: RFC 10176
+
+
+- **Supersedes**: RFC 0009
+
+
 ---
 status: provisional
 ---

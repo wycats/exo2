@@ -2,6 +2,9 @@
 
 # RFC 9: Dynamic Planning
 
+- **Superseded by**: RFC 10102
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:
@@ -87,4 +90,3 @@ We need a "Markdown Stringifier" that takes our Model and writes it back to `pla
 
 - **Phase 4.6**: Build the `plan-mod` script using `remark`.
 - **Phase 5**: Expose this via the VS Code extension UI (e.g., a "+" button in the Project Plan view).
-

@@ -2,6 +2,12 @@
 
 # RFC 56: User-Facing Workflow Model for Exosuit (VS Code)
 
+- **Superseded by**: RFC 10202
+
+
+- **Supersedes**: RFC 0043
+
+
 
 # RFC 0056: User-Facing Workflow Model for Exosuit (VS Code)
 

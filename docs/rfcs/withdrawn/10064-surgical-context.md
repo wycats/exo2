@@ -1,9 +1,14 @@
-<!-- exo:47 ulid:01kg5kp2d8js1kzwh41rzjrrf3 -->
-
-# RFC 47: Surgical Context
+<!-- exo:10064 ulid:01kmzxefdtd9y2kg61phgm4wn6 -->
 
 
-# RFC 0047: Surgical Context
+# RFC 10064: Surgical Context
+
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: The proposal depends on retired plan.toml persistence and an exosuit-surgeon surface that was not implemented in the current SQLite project-state architecture. Preserve the design as history; any future surgical-context work should begin from current project-state and workbench evidence.
+
+- **Superseded by**: RFC 0047
+
 
 ## Summary
 
@@ -34,14 +39,14 @@ We treat the codebase not as a collection of dead files, but as a **Living Graph
 
 ### 1. The Patient: Reactive Collections
 
-This layer is defined in **RFC 0118: Reactive Collections**. It provides the "Cellular Data Structures" (Sequence, Map) that the Surgeon operates on.
+This layer is defined in **RFC 10003: Reactive Collections**. It provides the "Cellular Data Structures" (Sequence, Map) that the Surgeon operates on.
 
 **The "Split Brain" Architecture**:
 We distinguish between the **Structural Backbone** (Reactive) and the **Semantic Overlay** (Computed).
 
 #### The Reactive Backbone (Level 0)
 
-The "Truth" of the system is **Reactive Collections** (see RFC 0118).
+The "Truth" of the system is **Reactive Collections** (see RFC 10003).
 
 - **Abstraction**: `ReactiveSequence<T>` and `ReactiveMap<K, V>`.
 - **Stability**: We maintain "Stable IDs" for regions (e.g., functions) via a lightweight map.
@@ -121,4 +126,3 @@ To support complex queries without polluting the global namespace, the Engine us
 - **Axiom 1 (Context is King)**: The Graph _is_ the Context.
 - **Axiom 11 (Agent-First Tooling)**: The API is typed and structural, perfect for LLMs.
 - **Axiom 13 (Reactive Glitch Freedom)**: The UI and Agent share the same Reactive State.
-

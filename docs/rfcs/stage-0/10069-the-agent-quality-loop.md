@@ -3,6 +3,9 @@
 
 # RFC 10069: The Agent Quality Loop
 
+- **Superseded by**: RFC 0052
+
+
 ## Summary
 
 This RFC proposes a set of enhancements to the `exo` CLI to foster an "Organic Quality Loop" for AI agents. Instead of enforcing quality via paternalistic gates ("Did you write tests?"), we aim to **steer** the agent toward high-quality behavior by providing Just-In-Time (JIT) context, mission-oriented prompts, and narrative-driven verification.

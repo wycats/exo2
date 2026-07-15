@@ -2,6 +2,9 @@
 
 # RFC 80: Agent-first CLI Discovery Ladder
 
+- **Supersedes**: RFC 0019
+
+
 
 # RFC 0080: Agent-first CLI Discovery Ladder
 
@@ -51,4 +54,3 @@ This RFC is intended as a consolidation point for prior CLI-related proposals th
 ## Recovery note
 
 This RFC file was previously 0 bytes in the repo with no recoverable historical content in git. This document is a best-effort reconstruction based on the current CLI manual and existing CLI behavior.
-

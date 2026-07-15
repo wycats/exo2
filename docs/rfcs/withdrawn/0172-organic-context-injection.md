@@ -2,6 +2,12 @@
 
 # RFC 172: Organic Context Injection (State-Aware Agents)
 
+- **Superseded by**: RFC 10182
+
+
+- **Supersedes**: RFC 10093
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

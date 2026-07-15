@@ -2,6 +2,12 @@
 
 # RFC 163: CWD Discipline & Wrong Directory Mitigation
 
+- **Superseded by**: RFC 10184
+
+
+- **Supersedes**: RFC 10084
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:
