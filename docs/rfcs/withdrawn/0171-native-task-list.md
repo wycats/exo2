@@ -2,7 +2,7 @@
 
 # RFC 171: Native Task List Integration
 
-- **Supersedes**: RFC 10092
+- **Superseded by**: RFC 10092
 
 
 - **Status**: Withdrawn
@@ -31,5 +31,3 @@ _Research required:_
 
 - Is the API stable?
 - Does it support the rich metadata we need (status, verification)?
-
-

@@ -3,7 +3,7 @@
 
 # RFC 10092: Native Task List Integration
 
-- **Superseded by**: RFC 0171
+- **Supersedes**: RFC 0171
 
 
 ## Summary

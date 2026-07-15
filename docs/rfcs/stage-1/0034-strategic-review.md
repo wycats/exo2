@@ -5,11 +5,12 @@
 - **Supersedes**: RFC 10114
 
 
+- **Superseded by**: -
+
+
 
 
 # RFC 0034: Strategic Plan Review (The Groomer)
-
-- **Superseded by**: RFC 0080
 
 
 ## Summary
@@ -97,5 +98,3 @@ The tool will specifically highlight "Low Hanging Fruit" — tasks or phases tha
 ## Updates to RFC 0023
 
 This RFC extends RFC 0023 by adding `exo plan review` to the command set.
-
-

@@ -3,6 +3,10 @@
 
 # RFC 10064: Surgical Context
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: The proposal depends on retired plan.toml persistence and an exosuit-surgeon surface that was not implemented in the current SQLite project-state architecture. Preserve the design as history; any future surgical-context work should begin from current project-state and workbench evidence.
+
 - **Superseded by**: RFC 0047
 
 

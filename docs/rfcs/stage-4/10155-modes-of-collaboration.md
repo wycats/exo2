@@ -3,7 +3,7 @@
 
 # RFC 10155: Modes of Collaboration
 
-- **Supersedes**: RFC 0004, RFC 0142
+- **Supersedes**: RFC 0004
 
 
 ## Summary

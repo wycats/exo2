@@ -3,7 +3,7 @@
 
 # RFC 10176: Project State Model
 
-- **Supersedes**: RFC 00177, RFC 00229, RFC 0022, RFC 10161, RFC 0009, RFC 0011
+- **Supersedes**: RFC 00177, RFC 00229, RFC 0022, RFC 10161, RFC 10102
 
 ## Summary
 

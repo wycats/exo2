@@ -2,9 +2,6 @@
 
 # RFC 11: Ideas & Triage System
 
-- **Superseded by**: RFC 10176
-
-
 - **Supersedes**: RFC 10103
 
 
@@ -73,4 +70,3 @@ We will introduce a specialized chat participant (or a mode of the main particip
 3. **Update UI**: Create a "Ideas" view in the sidebar (or a section in the Dashboard).
 4. **Implement Triage Logic**: Build the logic to analyze and update `ideas.toml`.
 5. **Create Participant**: Register `@exosuit-triage` (or add triage capabilities to `@exosuit`).
-

@@ -2,9 +2,6 @@
 
 # RFC 111: Agent Guidance Architecture
 
-- **Supersedes**: RFC 0051
-
-
 
 # RFC 0111: Agent Guidance Architecture
 
