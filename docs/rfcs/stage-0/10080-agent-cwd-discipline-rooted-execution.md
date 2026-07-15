@@ -3,6 +3,9 @@
 
 # RFC 10080: Agent CWD Discipline (Rooted Execution)
 
+- **Superseded by**: RFC 0093
+
+
 ## Summary
 
 This RFC proposes a strict **"Rooted Execution"** policy for the AI Agent. The agent MUST always execute commands from the Workspace Root. It MUST NOT change its persistent working directory (e.g., via `cd`). If a command requires a specific context, it must use sub-shells `(cd foo && bar)` or tool-specific flags (`npm -w`, `cargo -p`).

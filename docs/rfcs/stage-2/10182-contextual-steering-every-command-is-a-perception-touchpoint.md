@@ -2,6 +2,9 @@
 
 # RFC 10182: Contextual Steering: Every Command is a Perception Touchpoint
 
+- **Supersedes**: RFC 0172, RFC 0052
+
+
 ## Summary
 
 Every exo command that operates on an entity (task, goal, phase) should return entity-scoped steering that includes perception data from the inbox. Today, the agent only discovers user feedback when it explicitly calls `exo status`. During execution — the mode where it spends most of its time — the agent is blind to user feedback, concerns, and completion claims.

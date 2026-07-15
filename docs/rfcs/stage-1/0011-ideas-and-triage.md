@@ -2,6 +2,12 @@
 
 # RFC 11: Ideas & Triage System
 
+- **Superseded by**: RFC 10176
+
+
+- **Supersedes**: RFC 10103
+
+
 
 # Ideas & Background Triage Design
 

@@ -2,6 +2,9 @@
 
 # RFC 19: Consolidate Agent Workflow into rfc-status
 
+- **Supersedes**: RFC 10056
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

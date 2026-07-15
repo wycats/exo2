@@ -3,6 +3,9 @@
 
 # RFC 10056: Consolidate Agent Workflow into rfc-status
 
+- **Superseded by**: RFC 0019
+
+
 ## Summary
 
 Replace the current collection of ad-hoc bash scripts (`scripts/agent/*.sh`) and markdown prompts (`.github/prompts/*.md`) with a unified set of subcommands within the `rfc-status` tool.

@@ -2,6 +2,9 @@
 
 # RFC 10202: Lane-Centered Workbench Adoption
 
+- **Supersedes**: RFC 0056
+
+
 **Feature**: lane-centered-workbench
 
 ## Summary

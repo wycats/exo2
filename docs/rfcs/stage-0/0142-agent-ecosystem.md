@@ -2,6 +2,12 @@
 
 # RFC 142: Agent Ecosystem
 
+- **Superseded by**: RFC 10155
+
+
+- **Supersedes**: RFC 0144
+
+
 
 # RFC 0142: Agent Ecosystem
 

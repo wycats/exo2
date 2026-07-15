@@ -2,6 +2,12 @@
 
 # RFC 93: Agent CWD Discipline (Rooted Execution)
 
+- **Superseded by**: RFC 10184
+
+
+- **Supersedes**: RFC 10080
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

@@ -2,6 +2,9 @@
 
 # RFC 46: Bug Reporting Workflow
 
+- **Supersedes**: RFC 10063
+
+
 
 # RFC 0046: Bug Reporting Workflow
 

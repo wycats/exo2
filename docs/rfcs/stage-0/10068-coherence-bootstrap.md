@@ -3,6 +3,9 @@
 
 # RFC 10068: Coherence Bootstrap
 
+- **Superseded by**: RFC 0051
+
+
 ## Summary
 
 This RFC proposes restructuring the project's "Coherence" prompts into a modular **Coherence Matrix**. This system decomposes "coherence" into four orthogonal axes—Time, Truth, Logic, and Intent—and provides specialized prompts to diagnose and repair fractures in each dimension.

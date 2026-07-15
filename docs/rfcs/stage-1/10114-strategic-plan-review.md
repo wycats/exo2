@@ -3,7 +3,7 @@
 
 # RFC 10114: Strategic Plan Review
 
-- **Superseded by**: RFC 10014
+- **Superseded by**: RFC 0034
 
 
 ## Summary

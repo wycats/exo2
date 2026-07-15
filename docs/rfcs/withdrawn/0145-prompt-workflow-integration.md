@@ -2,6 +2,9 @@
 
 # RFC 145: Prompt Workflow Integration
 
+- **Superseded by**: RFC 0143
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

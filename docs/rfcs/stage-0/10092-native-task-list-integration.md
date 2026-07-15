@@ -3,6 +3,9 @@
 
 # RFC 10092: Native Task List Integration
 
+- **Superseded by**: RFC 0171
+
+
 ## Summary
 
 Investigate integrating Exosuit's phase/task system with VS Code's native "Task List" UI (if available/applicable) or similar native UI surfaces to reduce custom UI maintenance and feel more "at home".

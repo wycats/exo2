@@ -2,6 +2,12 @@
 
 # RFC 51: Coherence Bootstrap
 
+- **Superseded by**: RFC 0111
+
+
+- **Supersedes**: RFC 10068
+
+
 
 # RFC 0051: Coherence Bootstrap
 

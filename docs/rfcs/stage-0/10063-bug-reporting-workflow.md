@@ -3,6 +3,9 @@
 
 # RFC 10063: Bug Reporting Workflow
 
+- **Superseded by**: RFC 0046
+
+
 ## Summary
 
 This RFC proposes a new `exo bugreport` command designed to streamline the creation of high-quality bug reports. It introduces a "Steering Command" pattern where the root command (`exo bugreport`) acts as a Just-In-Time (JIT) steering mechanism for the Agent/User, while a subcommand (`exo bugreport create`) performs the actual artifact generation.

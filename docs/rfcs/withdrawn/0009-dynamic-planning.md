@@ -2,6 +2,12 @@
 
 # RFC 9: Dynamic Planning
 
+- **Superseded by**: RFC 10176
+
+
+- **Supersedes**: RFC 10102
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

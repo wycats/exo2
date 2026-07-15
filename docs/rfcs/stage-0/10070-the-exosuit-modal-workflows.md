@@ -3,6 +3,9 @@
 
 # RFC 10070: The Exosuit Modal Workflows
 
+- **Superseded by**: RFC 0053
+
+
 ## Summary
 
 This RFC proposes transforming the Exosuit from a static toolset into a **Context-Adaptive Environment**. It defines a UI architecture that adapts to the user's current focus while maintaining global context, and an **Entropy System** that surfaces system health issues at appropriate natural breakpoints.

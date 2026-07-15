@@ -3,6 +3,9 @@
 
 # RFC 10064: Surgical Context
 
+- **Superseded by**: RFC 0047
+
+
 ## Summary
 
 This RFC proposes a fundamental shift in how the Exosuit Agent interacts with the codebase. We move from **Text-Based Editing** (fragile, blind, regex-heavy) to **Surgical Mutation** (structural, typed, reactive).

@@ -2,6 +2,9 @@
 
 # RFC 34: Strategic Plan Review
 
+- **Supersedes**: RFC 10114
+
+
 
 
 # RFC 0034: Strategic Plan Review (The Groomer)

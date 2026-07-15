@@ -2,6 +2,9 @@
 
 # RFC 80: Agent-first CLI Discovery Ladder
 
+- **Supersedes**: RFC 0019, RFC 0034
+
+
 
 # RFC 0080: Agent-first CLI Discovery Ladder
 

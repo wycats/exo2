@@ -3,6 +3,9 @@
 
 # RFC 10084: CWD Discipline & Wrong Directory Mitigation
 
+- **Superseded by**: RFC 0163
+
+
 ## Summary
 
 Investigate mechanisms to prevent the agent from executing commands in the wrong directory, a common source of errors ("whoops, wrong directory").

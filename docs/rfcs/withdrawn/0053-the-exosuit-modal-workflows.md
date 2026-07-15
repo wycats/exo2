@@ -2,6 +2,12 @@
 
 # RFC 53: The Exosuit Modal Workflows
 
+- **Superseded by**: RFC 00184
+
+
+- **Supersedes**: RFC 10070
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:
