@@ -2,6 +2,9 @@
 
 # RFC 74: E2E Verified Dashboard Behavior
 
+- **Supersedes**: RFC 10124
+
+
 
 # RFC 0074: E2E Verified Dashboard Behavior
 

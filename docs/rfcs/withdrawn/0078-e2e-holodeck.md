@@ -2,6 +2,9 @@
 
 # RFC 78: E2E Holodeck
 
+- **Supersedes**: RFC 10077
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

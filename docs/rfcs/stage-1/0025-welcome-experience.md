@@ -2,6 +2,9 @@
 
 # RFC 25: The Welcome Experience
 
+- **Supersedes**: RFC 10111
+
+
 
 # RFC 0025: The Welcome Experience
 

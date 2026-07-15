@@ -2,6 +2,9 @@
 
 # RFC 67: Interactive Verification UI
 
+- **Supersedes**: RFC 10031
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

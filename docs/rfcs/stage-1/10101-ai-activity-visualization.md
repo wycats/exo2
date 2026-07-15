@@ -3,6 +3,9 @@
 
 # RFC 10101: AI Activity Visualization
 
+- **Superseded by**: RFC 0008
+
+
 ## Goal
 
 Visualize the internal thought process and context gathering of the `@exosuit` agent to build trust and aid debugging.

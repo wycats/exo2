@@ -3,6 +3,9 @@
 
 # RFC 10124: E2E Verified Dashboard Behavior
 
+- **Superseded by**: RFC 0074
+
+
 ## Summary
 Define the canonical behavior of the Exosuit Dashboard (V2) and establish the E2E test suite as the primary verification mechanism for these behaviors.
 

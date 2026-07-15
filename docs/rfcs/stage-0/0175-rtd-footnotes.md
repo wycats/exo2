@@ -2,6 +2,9 @@
 
 # RFC 175: RTD Footnote Support
 
+- **Supersedes**: RFC 10098
+
+
 
 # RFC: RTD Footnote Support
 

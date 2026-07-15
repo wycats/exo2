@@ -3,6 +3,9 @@
 
 # RFC 10098: RTD Footnote Support
 
+- **Superseded by**: RFC 0175
+
+
 ## Summary
 
 This RFC proposes adding support for **GitHub Flavored Markdown (GFM) Footnotes** to the Rich Text Document (RTD) specification. This will allow the `exo` parser to recognize, validate, and render footnotes, enabling the rigorous citation system required by the **Formal Spec Frontmatter Upgrade**.

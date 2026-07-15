@@ -2,6 +2,9 @@
 
 # RFC 174: Rich Diffs for Context Editors
 
+- **Supersedes**: RFC 10096
+
+
 
 # RFC 0174: Rich Diffs for Context Editors
 

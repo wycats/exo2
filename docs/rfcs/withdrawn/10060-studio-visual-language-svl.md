@@ -3,6 +3,13 @@
 
 # RFC 10060: Studio Visual Language (SVL)
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This later reconstruction duplicate revives the withdrawn Studio Visual Language proposal in RFC 0032. The retired Studio component vocabulary is not part of the current extension implementation.
+
+- **Superseded by**: RFC 0032
+
+
 ## Meta
 
 - **Status**: Stage 0 (Draft)

@@ -2,6 +2,9 @@
 
 # RFC 8: AI Activity Visualization
 
+- **Supersedes**: RFC 10101
+
+
 
 # AI Activity Visualization Design
 

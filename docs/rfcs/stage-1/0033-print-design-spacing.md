@@ -2,6 +2,9 @@
 
 # RFC 33: Print-Inspired Vertical Rhythm & Spacing
 
+- **Supersedes**: RFC 10113
+
+
 
 
 # RFC 0033: Print-Inspired Vertical Rhythm & Spacing

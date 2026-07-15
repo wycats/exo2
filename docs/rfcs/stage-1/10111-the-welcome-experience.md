@@ -3,6 +3,9 @@
 
 # RFC 10111: The Welcome Experience
 
+- **Superseded by**: RFC 0025
+
+
 ## Summary
 
 This RFC defines the "First Run" experience for new Exosuit projects. It proposes a "Welcome Wizard" (interactive CLI or Webview) that bootstraps the `AGENTS.md`, the scoped axioms files (`docs/agent-context/axioms.workflow.toml`, `docs/agent-context/axioms.system.toml`, `docs/design/axioms.design.toml`), and initial `plan.toml` based on a user interview.
