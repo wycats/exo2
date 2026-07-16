@@ -73,7 +73,7 @@ Serialization rules are defined in this RFC.
 
 ### Exosuit (`exosuit.toml`)
 
-Expansion is supported in the task system (including RFC 0023 recipe tasks):
+Expansion is supported in the task system (including RFC 0044 recipe tasks):
 
 - argv-native: `argv = ["prog", "arg", ...]`
 - shorthand: `run = "..."` (a string that is parsed into argv)
@@ -222,7 +222,7 @@ When a surface supports `run = "..."` as shorthand for argv:
 
 1) Apply scalar substitution `{name}` to the `run` string.
 2) Parse the resulting string into argv using a real shell-words parser.
-3) Validate the argv for unsupported shell operators as required by the caller (e.g., RFC 0023).
+3) Validate the argv for unsupported shell operators as required by the caller (e.g., RFC 0044).
 
 `{{name}}` injection in `run` is not supported in Stage 1 unless explicitly specified by the consumer; if present, it MUST be rejected with a clear diagnostic.
 

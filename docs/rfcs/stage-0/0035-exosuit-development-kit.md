@@ -10,7 +10,7 @@
 
 - **Status**: Stage 0 (Draft)
 - **Feature**: Tooling / Architecture
-- **Related**: RFC 0029 (Rust Infra), RFC 0008 (Reactive Bindings)
+- **Related**: RFC 0127 (Rigorous Rust Infrastructure)
 
 ## Summary
 
@@ -22,7 +22,7 @@ The current Exosuit extension architecture is robust, featuring:
 -   **Hybrid Build System**: Vite for Webviews + esbuild for Extension Host.
 -   **Rigorous Testing**: Playwright for E2E + Vitest for Unit tests.
 -   **Type-Safe RPC**: A bridge between the Extension Host and Webviews.
--   **Reactive Bindings**: Signals for VS Code APIs (RFC 0008).
+-   **Reactive Bindings**: Signals for VS Code APIs.
 
 However, this setup is tightly coupled to the `exosuit-vscode` package. Reusing this architecture for other projects currently requires copying a massive amount of boilerplate, which is "daunting" and unmaintainable.
 
@@ -70,7 +70,7 @@ However, it *should* integrate well with them if present.
 ### 4. Updatability & Lifecycle
 
 -   **Non-Negotiable Updatability**: The EDK is designed to be updated. We minimize generated code.
--   **Semver Strictness**: We follow a strict "Train Model" (see RFC 0026).
+-   **Semver Strictness**: We follow a strict "Train Model" (see RFC 0037).
 -   **Codemods**: We prioritize automated migration tools for any breaking changes or deprecations.
 
 ## Strategy: "Extraction by Refactoring"
