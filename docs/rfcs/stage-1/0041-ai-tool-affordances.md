@@ -2,6 +2,9 @@
 
 # RFC 41: AI Tool Affordances
 
+- **Supersedes**: RFC 10117
+
+
 
 
 # RFC 0041: AI Tool Affordances

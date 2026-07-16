@@ -2,6 +2,9 @@
 
 # RFC 159: The `ai` Subcommand Pattern
 
+- **Supersedes**: RFC 10081
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

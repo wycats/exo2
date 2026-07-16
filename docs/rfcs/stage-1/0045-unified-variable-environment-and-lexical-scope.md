@@ -2,6 +2,9 @@
 
 # RFC 45: Unified Variable Environment and Lexical Scope
 
+- **Supersedes**: RFC 0059
+
+
 
 
 # RFC 0045: Unified Variable Environment and Lexical Scope

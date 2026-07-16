@@ -2,6 +2,9 @@
 
 # RFC 44: Declarative Task Recipes in exosuit.toml
 
+- **Supersedes**: RFC 0058
+
+
 
 
 # RFC 0044: Declarative Task Recipes in exosuit.toml

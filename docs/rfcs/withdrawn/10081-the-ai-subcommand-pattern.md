@@ -3,7 +3,13 @@
 
 # RFC 10081: The `ai` Subcommand Pattern
 
-**Status**: Stage 0 (Draft)
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn as the March reconstruction duplicate of withdrawn RFC 0159. The generic per-tool ai subcommand pattern was not adopted; current exo ai and exo-run are distinct surfaces.
+
+- **Superseded by**: RFC 0159
+
+
 **Context**: Tooling / DX
 **Created**: 2025-12-05
 

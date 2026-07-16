@@ -2,6 +2,9 @@
 
 # RFC 55: exo map Command
 
+- **Superseded by**: RFC 0080
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

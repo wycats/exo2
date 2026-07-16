@@ -2,6 +2,9 @@
 
 # RFC 35: Exosuit Development Kit (EDK)
 
+- **Supersedes**: RFC 10061
+
+
 
 # RFC 0035: Exosuit Development Kit (EDK)
 
