@@ -2,6 +2,13 @@
 
 # RFC 173: RFC Tooling Completion
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: The proposal was implemented and stabilized by RFC 0120.
+
+- **Superseded by**: RFC 0120
+
+
 
 # RFC: RFC Tooling Completion
 

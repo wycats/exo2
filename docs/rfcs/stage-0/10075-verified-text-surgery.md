@@ -3,6 +3,9 @@
 
 # RFC 10075: Verified Text Surgery
 
+- **Supersedes**: RFC 10018
+
+
 ## Summary
 
 Define “verified text surgery”: constrained, verifiable edits to text files with clear pre/post conditions.

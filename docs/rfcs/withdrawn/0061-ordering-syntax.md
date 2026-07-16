@@ -8,7 +8,7 @@
 
 # RFC 0061: Ordering Syntax
 
-This RFC has been superseded by RFC 0057.
+This RFC has been superseded by RFC 0130.
 
 ## Summary
 

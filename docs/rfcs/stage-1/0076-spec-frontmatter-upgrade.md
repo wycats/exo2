@@ -2,6 +2,9 @@
 
 # RFC 76: Formal Spec Frontmatter Upgrade
 
+- **Supersedes**: RFC 10127
+
+
 
 # RFC: Formal Spec Frontmatter Upgrade
 

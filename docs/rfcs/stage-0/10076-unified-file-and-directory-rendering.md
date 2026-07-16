@@ -3,6 +3,9 @@
 
 # RFC 10076: Unified File and Directory Rendering
 
+- **Supersedes**: RFC 10022
+
+
 ## Summary
 
 Unify how the system renders files and directories for humans and tools.

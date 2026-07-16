@@ -3,6 +3,13 @@
 
 # RFC 10083: Exposing RFCs as Copilot Resources
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Later reconstruction duplicate of RFC 0162; RFC 0162 remains the canonical proposal.
+
+- **Superseded by**: RFC 0162
+
+
 ## Summary
 
 This RFC proposes a mechanism to expose Exosuit RFCs and other documentation artifacts as first-class "Tagged Resources" in GitHub Copilot (e.g., `#rfc:0030`, `#manual:axioms`). This allows users and agents to explicitly reference specific context without dumping entire files into the chat, and enables "Rich Linkage" where the agent can traverse relationships between documents.

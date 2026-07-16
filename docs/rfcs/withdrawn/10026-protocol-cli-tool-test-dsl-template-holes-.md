@@ -3,6 +3,13 @@
 
 # RFC 10026: Protocol/CLI/Tool Test DSL (Template+Holes)
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Later reconstruction duplicate of RFC 0062; RFC 0062 remains the canonical proposal.
+
+- **Superseded by**: RFC 0062
+
+
 ## Summary
 
 Introduce a single, declarative test-case DSL that can be executed against four runners:

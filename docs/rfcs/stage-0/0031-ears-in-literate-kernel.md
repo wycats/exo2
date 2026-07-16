@@ -2,6 +2,9 @@
 
 # RFC 31: EARS in Literate Kernel
 
+- **Supersedes**: RFC 10059
+
+
 
 # RFC 0031: EARS in Literate Kernel
 

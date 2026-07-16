@@ -2,6 +2,9 @@
 
 # RFC 10022: Unified File and Directory Rendering
 
+- **Superseded by**: RFC 10076
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

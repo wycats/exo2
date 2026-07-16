@@ -3,6 +3,9 @@
 
 # RFC 10055: Dedicated Format for Agent Context Links
 
+- **Supersedes**: RFC 0010
+
+
 ## Summary
 
 Establish a dedicated syntax and resolution strategy for internal links within Agent Context files, RFCs, and the Manual. This system will allow unambiguous references to semantic entities (like "RFC 12", "The Architecture Axioms", "Phase 1 Plan") rather than just file paths.

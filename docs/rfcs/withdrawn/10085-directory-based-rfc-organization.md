@@ -3,6 +3,13 @@
 
 # RFC 10085: Directory-Based RFC Organization
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Later reconstruction duplicate of RFC 0164; RFC 0164 remains the canonical proposal.
+
+- **Superseded by**: RFC 0164
+
+
 ## Summary
 
 Refactor the RFC directory structure to group RFCs by their stage (e.g., `docs/rfcs/stage-0/`, `docs/rfcs/stage-1/`). This replaces the current flat structure.

@@ -2,6 +2,9 @@
 
 # RFC 10018: Verified Text Surgery
 
+- **Superseded by**: RFC 10075
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

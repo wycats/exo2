@@ -2,6 +2,9 @@
 
 # RFC 162: Exposing RFCs as Copilot Resources
 
+- **Supersedes**: RFC 10083
+
+
 
 # RFC: Exposing RFCs as Copilot Resources
 

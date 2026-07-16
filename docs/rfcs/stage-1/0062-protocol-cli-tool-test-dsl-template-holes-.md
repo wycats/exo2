@@ -2,6 +2,9 @@
 
 # RFC 62: Protocol/CLI/Tool Test DSL (Template+Holes)
 
+- **Supersedes**: RFC 10026
+
+
 
 # RFC 0062: Protocol/CLI/Tool Test DSL (Template+Holes)
 
