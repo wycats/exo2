@@ -1,6 +1,5 @@
 <!-- exo:10060 ulid:01kmzxefdwmtk59n18pqh2fs49 -->
 
-
 # RFC 10060: Studio Visual Language (SVL)
 
 - **Status**: Withdrawn
@@ -12,7 +11,6 @@
 
 ## Meta
 
-- **Status**: Stage 0 (Draft)
 - **Created**: 2025-12-09
 - **Authors**: GitHub Copilot
 - **Epoch**: 18 (Usability Slices)

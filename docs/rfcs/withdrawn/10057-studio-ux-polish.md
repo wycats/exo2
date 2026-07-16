@@ -1,6 +1,5 @@
 <!-- exo:10057 ulid:01kmzxefe4esd8zna8zpzja3va -->
 
-
 # RFC 10057: Studio UX Polish
 
 - **Status**: Withdrawn
@@ -12,7 +11,6 @@
 
 ## Meta
 
-- **Status**: Stage 0 (Draft)
 - **Created**: 2025-12-09
 - **Authors**: GitHub Copilot
 - **Epoch**: 18 (Usability Slices)
