@@ -2,6 +2,9 @@
 
 # RFC 130: ULID-like Identifiers, Ordering Projections, and Human Slugs
 
+- **Supersedes**: RFC 0061, RFC 10123, RFC 0057
+
+
 
 # RFC 0130: ULID-like Identifiers, Ordering Projections, and Human Slugs
 

@@ -3,7 +3,11 @@
 
 # RFC 10123: Ordering Syntax
 
-This RFC has been superseded by RFC 0057.
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Historical ordering-syntax duplicate; RFC 0130 is the implemented authority for ordering as a projection.
+
+This RFC has been superseded by RFC 0130.
 
 ## Summary
 

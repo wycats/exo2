@@ -3,6 +3,13 @@
 
 # RFC 10095: RFC Tooling Completion
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: The proposal was implemented and stabilized by RFC 0120.
+
+- **Superseded by**: RFC 0120
+
+
 ## Summary
 
 This RFC proposes to complete the implementation of the `exo rfc` command suite by adding the missing `promote`, `edit`, and `withdraw` commands, which are essential for a fully read-only context workflow.

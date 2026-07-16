@@ -3,6 +3,9 @@
 
 # RFC 10126: Distinguishing Spec vs. Work RFCs
 
+- **Supersedes**: RFC 0075
+
+
 ## Summary
 Introduce a distinct numbering scheme (`W-XXXX`) and lifecycle for "Work" RFCs to separate ephemeral implementation plans from permanent architectural specifications (`S-XXXX` or just `XXXX`).
 

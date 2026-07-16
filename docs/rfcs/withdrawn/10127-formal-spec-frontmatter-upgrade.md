@@ -3,6 +3,13 @@
 
 # RFC 10127: Formal Spec Frontmatter Upgrade
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Later reconstruction duplicate of RFC 0076; RFC 0076 remains the canonical proposal.
+
+- **Superseded by**: RFC 0076
+
+
 ## Summary
 
 This RFC proposes upgrading the existing Formal Specifications in `docs/specs/` to use the standardized YAML frontmatter schema defined in the **Copilot Resources** RFC. This will transform them from "floating text files" into first-class nodes in the Exosuit Knowledge Graph, capable of being indexed, linked, and validated by our tooling.

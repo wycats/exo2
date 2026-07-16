@@ -2,6 +2,9 @@
 
 # RFC 75: Distinguishing Spec vs. Work RFCs
 
+- **Superseded by**: RFC 10126
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

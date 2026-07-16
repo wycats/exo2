@@ -2,6 +2,13 @@
 
 # RFC 57: ULID-like Identifiers, Ordering Projections, and Human Slugs
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Later partial duplicate of RFC 0130; RFC 0130 is the implemented Stage 3 authority.
+
+- **Superseded by**: RFC 0130
+
+
 
 # RFC 0057: ULID-like Identifiers, Ordering Projections, and Human Slugs
 

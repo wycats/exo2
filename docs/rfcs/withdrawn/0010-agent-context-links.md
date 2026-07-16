@@ -2,6 +2,9 @@
 
 # RFC 10: Dedicated Format for Agent Context Links
 
+- **Superseded by**: RFC 10055
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

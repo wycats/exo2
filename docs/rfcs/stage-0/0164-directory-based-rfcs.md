@@ -2,6 +2,9 @@
 
 # RFC 164: Directory-Based RFC Organization
 
+- **Supersedes**: RFC 10085
+
+
 
 # RFC 0164: Directory-Based RFC Organization
 

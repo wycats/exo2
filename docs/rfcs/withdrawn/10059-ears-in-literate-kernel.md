@@ -1,11 +1,16 @@
 <!-- exo:10059 ulid:01kmzxefdzdbvzpyzkrstd03hz -->
 
-
 # RFC 10059: EARS in Literate Kernel
+
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Later reconstruction duplicate of RFC 0031; RFC 0031 remains the canonical proposal.
+
+- **Superseded by**: RFC 0031
+
 
 ## Meta
 
-- **Status**: Stage 0 (Draft)
 - **Created**: 2025-12-09
 - **Authors**: GitHub Copilot
 - **Epoch**: Future
