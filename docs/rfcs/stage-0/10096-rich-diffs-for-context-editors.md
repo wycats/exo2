@@ -3,6 +3,9 @@
 
 # RFC 10096: Rich Diffs for Context Editors
 
+- **Superseded by**: RFC 0174
+
+
 ## Summary
 
 Implement a "Rich Diff" view for Exosuit's custom editors (Studio) that displays changes as a single, annotated document rather than two side-by-side windows.

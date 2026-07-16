@@ -1,11 +1,16 @@
 <!-- exo:10057 ulid:01kmzxefe4esd8zna8zpzja3va -->
 
-
 # RFC 10057: Studio UX Polish
+
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This later reconstruction duplicate revives the withdrawn Studio UX Polish proposal in RFC 0028. The retired Studio component surface is not part of the current extension implementation.
+
+- **Superseded by**: RFC 0028
+
 
 ## Meta
 
-- **Status**: Stage 0 (Draft)
 - **Created**: 2025-12-09
 - **Authors**: GitHub Copilot
 - **Epoch**: 18 (Usability Slices)

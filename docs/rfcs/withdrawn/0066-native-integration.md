@@ -2,6 +2,9 @@
 
 # RFC 66: Native Integration
 
+- **Supersedes**: RFC 10030
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

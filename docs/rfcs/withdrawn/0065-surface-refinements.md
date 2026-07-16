@@ -2,6 +2,9 @@
 
 # RFC 65: Surface Refinements
 
+- **Supersedes**: RFC 10029
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

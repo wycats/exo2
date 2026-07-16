@@ -3,6 +3,13 @@
 
 # RFC 10077: E2E Holodeck
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This later reconstruction duplicate revives the previously withdrawn placeholder RFC 0078. Current end-to-end behavior is documented by the maintained test harness and research evidence rather than this placeholder.
+
+- **Superseded by**: RFC 0078
+
+
 ## Summary
 
 Define an end-to-end (“holodeck”) testing approach for Exosuit workflows.

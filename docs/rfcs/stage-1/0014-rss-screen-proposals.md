@@ -2,6 +2,9 @@
 
 # RFC 14: RSS Screen Proposals
 
+- **Supersedes**: RFC 10106
+
+
 
 # RSS Screen Proposals
 

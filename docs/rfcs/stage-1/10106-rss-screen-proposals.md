@@ -3,6 +3,9 @@
 
 # RFC 10106: RSS Screen Proposals
 
+- **Superseded by**: RFC 0014
+
+
 This document proposes the layout and styling for the Axiom, Decision, and Plan editors using **Svelte + RSS (RTD Surface Syntax)** styled with **RSL (RTD Style Language)**.
 
 ## Shared RSL Tokens

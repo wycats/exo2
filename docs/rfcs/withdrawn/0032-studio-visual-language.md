@@ -2,6 +2,9 @@
 
 # RFC 32: Studio Visual Language (SVL)
 
+- **Supersedes**: RFC 10060
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

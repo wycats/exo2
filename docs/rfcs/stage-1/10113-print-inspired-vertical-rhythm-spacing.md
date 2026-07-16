@@ -3,6 +3,9 @@
 
 # RFC 10113: Print-Inspired Vertical Rhythm & Spacing
 
+- **Superseded by**: RFC 0033
+
+
 ## Summary
 Establish a rigorous "Vertical Rhythm" system for the Studio UI, inspired by print design best practices. This RFC defines specific spacing rules to ensure strong visual hierarchy, consistent grouping (Proximity), and a professional "typeset" look.
 
