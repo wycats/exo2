@@ -3,6 +3,9 @@
 
 # RFC 10107: RTD Surface Mapping
 
+- **Superseded by**: RFC 0015
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**: Withdrawn by RFC 10180 storage disposition: this proposal depends on retired file-backed phase context or direct editing/protection of legacy docs/agent-context current artifacts.
