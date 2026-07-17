@@ -2,6 +2,9 @@
 
 # RFC 0132: CLI Patterns: Command Spec, Router, and Tool-Safe DSL
 
+- **Supersedes**: RFC 0042, RFC 10118
+
+
 ## Summary
 
 Exo presents one command vocabulary and typed execution model across its CLI,

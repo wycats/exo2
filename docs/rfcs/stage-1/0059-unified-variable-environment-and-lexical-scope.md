@@ -2,6 +2,9 @@
 
 # RFC 59: Unified Variable Environment and Lexical Scope
 
+- **Superseded by**: RFC 0045
+
+
 
 
 # RFC 0059: Unified Variable Environment and Lexical Scope

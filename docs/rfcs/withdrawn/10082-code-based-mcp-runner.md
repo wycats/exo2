@@ -3,6 +3,13 @@
 
 # RFC 10082: Code-Based MCP Runner
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn as the March reconstruction duplicate of withdrawn RFC 0161. The arbitrary code-based MCP runner was not adopted; RFC 10200 deliberately keeps execution inside Exo’s CLI-shaped command semantics.
+
+- **Superseded by**: RFC 0161
+
+
 ## Summary
 
 Investigate replacing the current verbose MCP tool style with a "Code Execution" approach, where the agent writes and executes scripts (e.g., Python/TS) to interact with the system.

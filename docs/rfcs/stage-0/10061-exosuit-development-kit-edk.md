@@ -3,6 +3,9 @@
 
 # RFC 10061: Exosuit Development Kit (EDK)
 
+- **Superseded by**: RFC 0035
+
+
 - **Status**: Stage 0 (Draft)
 - **Feature**: Tooling / Architecture
 - **Related**: RFC 0029 (Rust Infra), RFC 0031 (Reactive Bindings)

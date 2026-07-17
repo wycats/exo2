@@ -3,6 +3,13 @@
 
 # RFC 10118: CLI AST Tool Schema
 
+- **Status**: Withdrawn
+- **Stage**: 1
+- **Reason**: Withdrawn as the March reconstruction duplicate of RFC 0042; the implemented CLI command-schema contract is RFC 0132.
+
+- **Superseded by**: RFC 0132
+
+
 ## Summary
 
 Define a schema/AST for CLI commands so tools can reliably parse, validate, and display invocations.

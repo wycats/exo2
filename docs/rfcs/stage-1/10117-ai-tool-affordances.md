@@ -3,6 +3,9 @@
 
 # RFC 10117: AI Tool Affordances
 
+- **Superseded by**: RFC 0041
+
+
 ## Summary
 
 Define affordances and constraints for AI-driven tools so behavior is predictable and safe.

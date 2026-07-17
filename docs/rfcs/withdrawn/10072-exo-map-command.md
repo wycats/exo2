@@ -3,6 +3,13 @@
 
 # RFC 10072: exo map Command
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: Withdrawn as the March reconstruction duplicate of withdrawn RFC 0055; the implemented exo map contract is RFC 0080.
+
+- **Superseded by**: RFC 0080
+
+
 ## Summary
 
 Specify `exo map` as the primary steering command for “what should I do next?”.
