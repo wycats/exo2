@@ -2,6 +2,9 @@
 
 # RFC 92: Test-Driven Development (TDD) Workflow for Agents
 
+- **Supersedes**: RFC 10100
+
+
 
 # RFC 0092: Test-Driven Development (TDD) Workflow for Agents
 

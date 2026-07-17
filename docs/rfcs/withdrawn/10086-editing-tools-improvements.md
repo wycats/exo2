@@ -3,6 +3,9 @@
 
 # RFC 10086: Editing Tools Improvements
 
+- **Superseded by**: RFC 0165
+
+
 ## Summary
 
 Investigate improvements to the file editing tools (`replace_string_in_file`, etc.) to reduce "mashing" (repeated failed attempts to edit files).

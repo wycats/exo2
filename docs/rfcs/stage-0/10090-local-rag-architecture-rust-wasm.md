@@ -3,6 +3,9 @@
 
 # RFC 10090: Local RAG Architecture (Rust/Wasm)
 
+- **Superseded by**: RFC 0169
+
+
 **Status**: Stage 0 (Draft)
 **Context**: Future Work
 **Created**: 2025-12-05

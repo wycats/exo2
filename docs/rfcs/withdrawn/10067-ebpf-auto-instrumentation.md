@@ -3,6 +3,9 @@
 
 # RFC 10067: eBPF Auto Instrumentation
 
+- **Superseded by**: RFC 0050
+
+
 ## Summary
 
 Describe an approach for auto-instrumentation using eBPF.

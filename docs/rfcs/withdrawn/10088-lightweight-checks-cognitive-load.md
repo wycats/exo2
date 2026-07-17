@@ -3,6 +3,9 @@
 
 # RFC 10088: Lightweight Checks / Cognitive Load
 
+- **Superseded by**: RFC 0087
+
+
 **Status**: Stage 0 (Draft)
 **Feature**: Agent Workflow
 

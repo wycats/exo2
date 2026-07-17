@@ -2,6 +2,9 @@
 
 # RFC 87: Agent Quality and Workflow Discipline
 
+- **Supersedes**: RFC 0167, RFC 10088
+
+
 
 # RFC 0087: Agent Quality and Workflow Discipline
 

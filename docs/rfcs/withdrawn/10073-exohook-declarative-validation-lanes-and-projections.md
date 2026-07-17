@@ -3,7 +3,7 @@
 
 # RFC 10073: Exohook: Declarative Validation Lanes and Projections
 
-- **Superseded by**: RFC 10017
+- **Superseded by**: RFC 0081
 
 
 ## Summary

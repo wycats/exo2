@@ -3,6 +3,9 @@
 
 # RFC 10089: Lint and Format Lane
 
+- **Superseded by**: RFC 0081
+
+
 ## Summary
 
 Define a dedicated “lane” in the workflow for linting and formatting.

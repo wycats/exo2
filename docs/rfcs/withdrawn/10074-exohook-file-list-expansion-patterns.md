@@ -3,7 +3,7 @@
 
 # RFC 10074: Exohook: File List Expansion Patterns
 
-- **Superseded by**: RFC 10017
+- **Superseded by**: RFC 0081
 
 
 ## Summary

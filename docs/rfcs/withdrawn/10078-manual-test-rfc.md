@@ -3,4 +3,7 @@
 
 # RFC 10078: Manual Test RFC
 
+- **Superseded by**: RFC 0155
+
+
 Test body
