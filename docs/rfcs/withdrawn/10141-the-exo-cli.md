@@ -7,7 +7,7 @@
 - **Stage**: 3
 - **Reason**:
 
-- **Superseded by**: RFC 10014
+- **Superseded by**: RFC 0018
 
 
 ## Summary

@@ -3,6 +3,9 @@
 
 # RFC 10109: Rigorous Rust Infrastructure
 
+- **Superseded by**: RFC 0127
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

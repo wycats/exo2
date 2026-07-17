@@ -3,6 +3,9 @@
 
 # RFC 10134: The Grand Unification (RFC Transition)
 
+- **Superseded by**: RFC 0123
+
+
 ## Summary
 
 A comprehensive plan to fully adopt the Staged RFC process as the backbone of the Exosuit project. This involves transitioning from a mix of ad-hoc scripts, design docs, and "Session Laws" to a unified workflow managed by a strongly-typed CLI (`exo`) and a rigorous distinction between historical decisions (RFCs) and current reality (The Manual).

@@ -3,6 +3,9 @@
 
 # RFC 10151: Refined Staged RFC Process
 
+- **Superseded by**: RFC 0108
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

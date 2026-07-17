@@ -2,7 +2,7 @@
 
 # RFC 120: RFC Lifecycle Management Tools (Authoring)
 
-- **Supersedes**: RFC 0173, RFC 10095
+- **Supersedes**: RFC 0173, RFC 10095, RFC 10148
 
 
 

@@ -3,6 +3,9 @@
 
 # RFC 10133: Plan Lens Architecture
 
+- **Supersedes**: RFC 0038, RFC 0039
+
+
 ## Summary
 
 Describe the architecture for a “plan lens”: a view/projection over plan state optimized for specific workflows.

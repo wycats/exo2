@@ -3,6 +3,9 @@
 
 # RFC 10138: Externalized Prompts
 
+- **Superseded by**: RFC 0115
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

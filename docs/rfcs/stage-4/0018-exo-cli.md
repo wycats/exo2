@@ -2,6 +2,9 @@
 
 # RFC 18: The `exo` CLI
 
+- **Supersedes**: RFC 10141
+
+
 
 # RFC 0018: The `exo` CLI
 

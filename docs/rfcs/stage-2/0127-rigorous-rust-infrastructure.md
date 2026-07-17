@@ -2,6 +2,9 @@
 
 # RFC 127: Rigorous Rust Infrastructure
 
+- **Supersedes**: RFC 10109
+
+
 
 # RFC 0127: Rigorous Rust Infrastructure
 

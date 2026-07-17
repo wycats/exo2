@@ -3,6 +3,9 @@
 
 # RFC 10145: Robust Extension Architecture
 
+- **Superseded by**: RFC 0110
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

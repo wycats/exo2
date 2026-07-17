@@ -2,6 +2,9 @@
 
 # RFC 140: Exohook CI Workflow Projection
 
+- **Superseded by**: RFC 0137
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

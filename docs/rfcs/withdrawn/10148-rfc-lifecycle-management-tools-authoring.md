@@ -3,6 +3,9 @@
 
 # RFC 10148: RFC Lifecycle Management Tools (Authoring)
 
+- **Superseded by**: RFC 0120
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

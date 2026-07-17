@@ -2,6 +2,9 @@
 
 # RFC 156: CLI Command for Axioms
 
+- **Supersedes**: RFC 10152
+
+
 
 # RFC 0156: CLI Command for Axioms
 

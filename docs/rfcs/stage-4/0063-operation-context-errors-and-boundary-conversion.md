@@ -2,6 +2,9 @@
 
 # RFC 63: Operation-Context Errors and Boundary Conversion
 
+- **Supersedes**: RFC 10027
+
+
 
 
 # RFC 0063: Operation-Context Errors and Boundary Conversion

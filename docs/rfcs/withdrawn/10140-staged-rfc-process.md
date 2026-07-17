@@ -3,6 +3,9 @@
 
 # RFC 10140: Staged RFC Process
 
+- **Superseded by**: RFC 0106
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

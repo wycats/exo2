@@ -3,6 +3,9 @@
 
 # RFC 10136: Dashboard V2
 
+- **Superseded by**: RFC 00184
+
+
 - Feature Name: `dashboard_v2`
 - Start Date: 2025-12-07
 - RFC PR: (leave empty)
