@@ -3,6 +3,13 @@
 
 # RFC 10086: Editing Tools Improvements
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This record duplicates withdrawn RFC 0165 and targets retired agent editing primitives rather than an Exo product surface.
+
+- **Superseded by**: RFC 0165
+
+
 ## Summary
 
 Investigate improvements to the file editing tools (`replace_string_in_file`, etc.) to reduce "mashing" (repeated failed attempts to edit files).

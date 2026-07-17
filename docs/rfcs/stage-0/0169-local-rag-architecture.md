@@ -2,6 +2,9 @@
 
 # RFC 169: Local RAG Architecture (Rust/Wasm)
 
+- **Supersedes**: RFC 10090
+
+
 
 # RFC 0169: Local RAG Architecture (Rust/Wasm)
 

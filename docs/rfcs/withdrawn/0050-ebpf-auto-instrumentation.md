@@ -2,6 +2,9 @@
 
 # RFC 50: eBPF Auto Instrumentation
 
+- **Supersedes**: RFC 10067
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

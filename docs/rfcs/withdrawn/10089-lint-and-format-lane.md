@@ -3,6 +3,13 @@
 
 # RFC 10089: Lint and Format Lane
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: The dedicated lint-and-format lane was not adopted. Current Exohook composes lint and format checks into the validation workflows described by RFC 0081.
+
+- **Superseded by**: RFC 0081
+
+
 ## Summary
 
 Define a dedicated “lane” in the workflow for linting and formatting.

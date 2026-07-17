@@ -2,6 +2,9 @@
 
 # RFC 167: Lightweight Checks / Cognitive Load
 
+- **Superseded by**: RFC 0087
+
+
 - **Stage**: 0
 - **Reason**:
 

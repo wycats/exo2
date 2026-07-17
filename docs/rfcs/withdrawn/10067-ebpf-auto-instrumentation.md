@@ -3,6 +3,13 @@
 
 # RFC 10067: eBPF Auto Instrumentation
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This recovered placeholder contains no design beyond withdrawn historical RFC 0050, and no eBPF instrumentation surface is implemented. Future work should begin from current observability evidence.
+
+- **Superseded by**: RFC 0050
+
+
 ## Summary
 
 Describe an approach for auto-instrumentation using eBPF.

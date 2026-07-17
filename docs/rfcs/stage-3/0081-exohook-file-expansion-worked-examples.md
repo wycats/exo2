@@ -2,6 +2,9 @@
 
 # RFC 81: Exohook: File Expansion Worked Examples
 
+- **Supersedes**: RFC 10015, RFC 10073, RFC 10016, RFC 10074, RFC 0168, RFC 10089, RFC 10052
+
+
 
 # RFC 0081: Exohook: File Expansion Worked Examples
 

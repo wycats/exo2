@@ -3,6 +3,9 @@
 
 # RFC 10100: Test-Driven Development (TDD) Workflow for Agents
 
+- **Superseded by**: RFC 0092
+
+
 ## Summary
 Integrate Test-Driven Development (TDD) into the Exosuit agent workflow to ensure "Grounding" and reduce hallucinations.
 

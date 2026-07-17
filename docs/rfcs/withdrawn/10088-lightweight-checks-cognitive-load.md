@@ -3,7 +3,13 @@
 
 # RFC 10088: Lightweight Checks / Cognitive Load
 
-**Status**: Stage 0 (Draft)
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This record duplicates withdrawn RFC 0167 and is consolidated into RFC 0087, Agent Quality and Workflow Discipline.
+
+- **Superseded by**: RFC 0087
+
+
 **Feature**: Agent Workflow
 
 ## Context

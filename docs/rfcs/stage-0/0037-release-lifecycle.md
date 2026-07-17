@@ -2,12 +2,15 @@
 
 # RFC 37: The Exosuit Release Lifecycle
 
+- **Supersedes**: RFC 10062
+
+
 
 # RFC 0037: The Exosuit Release Lifecycle
 
 - **Status**: Stage 0 (Draft)
 - **Feature**: Process / Governance
-- **Related**: RFC 0023 (EDK)
+- **Related**: RFC 0035 (EDK)
 
 ## Summary
 

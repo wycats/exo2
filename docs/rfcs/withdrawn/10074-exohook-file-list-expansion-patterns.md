@@ -3,7 +3,11 @@
 
 # RFC 10074: Exohook: File List Expansion Patterns
 
-- **Superseded by**: RFC 10017
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This record duplicates withdrawn RFC 10016. RFC 0081 owns the implemented Exohook file-expansion contract.
+
+- **Superseded by**: RFC 0081
 
 
 ## Summary
