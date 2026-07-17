@@ -3,6 +3,9 @@
 
 # RFC 10052: Exohook: File Expansion Worked Examples
 
+- **Superseded by**: RFC 0081
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

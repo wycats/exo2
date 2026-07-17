@@ -3,6 +3,10 @@
 
 # RFC 10073: Exohook: Declarative Validation Lanes and Projections
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This record duplicates withdrawn RFC 10015. Implemented Exohook lane and fileset behavior is owned by RFC 0081, with adjacent projection and mutation boundaries in RFCs 0137 and 10170.
+
 - **Superseded by**: RFC 0081
 
 

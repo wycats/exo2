@@ -3,6 +3,10 @@
 
 # RFC 10086: Editing Tools Improvements
 
+- **Status**: Withdrawn
+- **Stage**: 0
+- **Reason**: This record duplicates withdrawn RFC 0165 and targets retired agent editing primitives rather than an Exo product surface.
+
 - **Superseded by**: RFC 0165
 
 
