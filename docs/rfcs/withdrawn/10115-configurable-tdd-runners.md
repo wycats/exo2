@@ -3,6 +3,9 @@
 
 # RFC 10115: Configurable TDD Runners
 
+- **Superseded by**: RFC 0129
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

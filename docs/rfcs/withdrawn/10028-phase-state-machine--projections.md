@@ -3,6 +3,9 @@
 
 # RFC 10028: Phase State Machine & Projections
 
+- **Supersedes**: RFC 0064
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**: Withdrawn by RFC 10180 storage disposition: file-backed phase context, docs/agent-context/current artifacts, and docs/agent-context/archive phase snapshots are retired.

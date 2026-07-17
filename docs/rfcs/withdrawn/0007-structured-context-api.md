@@ -2,6 +2,9 @@
 
 # RFC 7: Structured Context API
 
+- **Supersedes**: RFC 10158
+
+
 - **Status**: Withdrawn
 - **Stage**: 4
 - **Reason**:

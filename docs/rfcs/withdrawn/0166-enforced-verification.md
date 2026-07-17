@@ -2,6 +2,9 @@
 
 # RFC 166: Enforced UI Verification
 
+- **Superseded by**: RFC 10087
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

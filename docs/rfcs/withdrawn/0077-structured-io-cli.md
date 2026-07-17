@@ -8,7 +8,7 @@
 
 # RFC 0077: Structured IO CLI
 
-- **Superseded by**: RFC 0080
+- **Superseded by**: RFC 10128
 
 
 ## Summary

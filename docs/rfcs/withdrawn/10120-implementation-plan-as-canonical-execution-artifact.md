@@ -3,6 +3,9 @@
 
 # RFC 10120: Implementation Plan as Canonical Execution Artifact
 
+- **Superseded by**: RFC 0131
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

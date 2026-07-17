@@ -2,6 +2,9 @@
 
 # RFC 91: Protected File Watcher with Revert and Notice System
 
+- **Supersedes**: RFC 10054
+
+
 - **Stage**: 0
 
 > **Status**: Withdrawn  

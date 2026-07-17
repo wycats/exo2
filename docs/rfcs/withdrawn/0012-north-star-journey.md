@@ -2,6 +2,9 @@
 
 # RFC 12: North Star User Journey
 
+- **Superseded by**: RFC 10104
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

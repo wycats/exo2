@@ -2,6 +2,9 @@
 
 # RFC 148: Implicit Walkthrough via Task Logs
 
+- **Supersedes**: RFC 10199
+
+
 - **Status**: Withdrawn
 - **Stage**: 2
 - **Reason**: Withdrawn by RFC 10180 storage disposition: file-backed phase context, docs/agent-context/current artifacts, and docs/agent-context/archive phase snapshots are retired.

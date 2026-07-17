@@ -2,6 +2,9 @@
 
 # RFC 10198: Walkthrough Workflow
 
+- **Superseded by**: RFC 0017
+
+
 - **Status**: Withdrawn
 - **Stage**: 0
 - **Reason**:

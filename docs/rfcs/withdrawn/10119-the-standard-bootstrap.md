@@ -3,6 +3,9 @@
 
 # RFC 10119: The Standard Bootstrap
 
+- **Superseded by**: RFC 0138
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

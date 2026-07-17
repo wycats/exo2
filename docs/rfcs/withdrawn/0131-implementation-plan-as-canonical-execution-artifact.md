@@ -2,6 +2,9 @@
 
 # RFC 131: Implementation Plan as Canonical Execution Artifact
 
+- **Supersedes**: RFC 10120
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

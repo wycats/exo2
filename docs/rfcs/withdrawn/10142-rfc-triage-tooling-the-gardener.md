@@ -3,6 +3,9 @@
 
 # RFC 10142: RFC Triage Tooling (The Gardener)
 
+- **Superseded by**: RFC 0021
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:
