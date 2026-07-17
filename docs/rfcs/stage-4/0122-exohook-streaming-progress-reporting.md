@@ -2,6 +2,9 @@
 
 # RFC 122: Exohook Streaming Progress Reporting
 
+- **Supersedes**: RFC 0141
+
+
 
 # RFC 0122: Exohook Streaming Progress Reporting
 

@@ -4,6 +4,9 @@
 
 # RFC 10027: Operation-Context Errors and Boundary Conversion
 
+- **Superseded by**: RFC 0063
+
+
 ## Summary
 
 Introduce a consistent error propagation strategy that preserves *semantic operation context* (what we were trying to do) while maintaining Exosuit invariants:

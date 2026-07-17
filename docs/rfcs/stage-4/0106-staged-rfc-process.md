@@ -2,6 +2,9 @@
 
 # RFC 106: Staged RFC Process
 
+- **Supersedes**: RFC 10140
+
+
 - **Superseded by**: RFC 0108
 
 

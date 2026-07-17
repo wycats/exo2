@@ -2,6 +2,9 @@
 
 # RFC 110: Robust Extension Architecture
 
+- **Supersedes**: RFC 10145
+
+
 
 # RFC 0110: Robust Extension Architecture
 

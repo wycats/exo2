@@ -5,7 +5,7 @@
 
 # RFC 00184: Mode-Aware Sidebar Cockpit
 
-- **Supersedes**: RFC 0126, RFC 0053
+- **Supersedes**: RFC 0126, RFC 0053, RFC 10136
 
 ## Summary
 

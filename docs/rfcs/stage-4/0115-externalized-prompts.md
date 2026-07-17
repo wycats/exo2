@@ -2,6 +2,9 @@
 
 # RFC 115: Externalized Prompts
 
+- **Supersedes**: RFC 10138
+
+
 
 # RFC 0115: Externalized Prompts
 

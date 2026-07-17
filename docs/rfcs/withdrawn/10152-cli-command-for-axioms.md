@@ -3,6 +3,9 @@
 
 # RFC 10152: CLI Command for Axioms
 
+- **Superseded by**: RFC 0156
+
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

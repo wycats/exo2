@@ -2,6 +2,9 @@
 
 # RFC 123: The Grand Unification (RFC Transition)
 
+- **Supersedes**: RFC 10134
+
+
 
 # RFC 0123: The Grand Unification (RFC Transition)
 

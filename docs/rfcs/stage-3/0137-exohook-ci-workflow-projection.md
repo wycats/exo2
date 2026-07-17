@@ -2,6 +2,9 @@
 
 # RFC 137: Exohook CI Workflow Projection
 
+- **Supersedes**: RFC 0140
+
+
 
 # RFC 0137: Exohook CI Workflow Projection
 
