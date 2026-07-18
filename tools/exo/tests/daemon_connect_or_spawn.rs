@@ -1009,6 +1009,12 @@ async fn daemon_status_reports_running_current_identity(backend: &str) {
     );
     assert_eq!(
         result
+            .get("identity_matches_project")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        result
             .get("identity_matches_executable")
             .and_then(|v| v.as_bool()),
         Some(true)
@@ -1287,7 +1293,7 @@ async fn ensure_daemon_restarts_probed_daemon_when_pid_file_is_missing_or_invali
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
-async fn ensure_daemon_restarts_existing_daemon_when_workspace_identity_differs(backend: &str) {
+async fn ensure_daemon_reuses_existing_daemon_for_linked_worktree(backend: &str) {
     assert_eq!(backend, "sqlite");
     let dir = TempDir::new().unwrap();
     let (primary, linked) = create_primary_and_linked_worktree(&dir);
@@ -1302,24 +1308,32 @@ async fn ensure_daemon_restarts_existing_daemon_when_workspace_identity_differs(
 
     let second = exo::daemon::ensure_daemon_with_report(&linked)
         .await
-        .expect("linked ensure should restart mismatched daemon")
+        .expect("linked ensure should reuse the project daemon")
         .into_report();
     let second_pid = second.pid.expect("second ensure should report pid");
 
     assert_eq!(paths.socket_path(), second.socket_path);
-    assert_ne!(
+    assert_eq!(
         first_pid, second_pid,
-        "workspace identity mismatch should force automatic daemon restart"
+        "linked worktrees sharing project state must keep one daemon authority"
     );
-    assert_eq!(second.state, exo::daemon::DaemonEnsureState::Spawned);
+    assert_eq!(
+        second.state,
+        exo::daemon::DaemonEnsureState::ConnectedExisting
+    );
     assert!(
         second
             .diagnostics
             .iter()
-            .any(|message| message.contains("terminated stale daemon process")),
-        "restart diagnostics should mention stale daemon termination: {:?}",
+            .any(|message| message.contains("responsive daemon instance")),
+        "reuse diagnostics should mention the responsive daemon: {:?}",
         second.diagnostics
     );
+
+    let status = exo::daemon::daemon_status(&linked);
+    assert!(status.ok, "linked status should accept project authority");
+    assert_eq!(status.identity_matches_workspace, Some(false));
+    assert_eq!(status.identity_matches_project, Some(true));
 }
 
 #[cfg(unix)]
@@ -1568,10 +1582,22 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
         .await
         .expect("primary should spawn daemon");
     drop(primary_stream);
+    let primary_paths = exo::daemon::paths_for_workspace(&primary).unwrap();
+    let primary_pid = std::fs::read_to_string(primary_paths.pid_path())
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
 
-    let linked_stream = exo::daemon::ensure_daemon(&linked)
+    let linked_outcome = exo::daemon::ensure_daemon_with_report(&linked)
         .await
         .expect("linked worktree should connect to shared daemon socket");
+    let (linked_stream, linked_report) = linked_outcome.into_parts();
+    assert_eq!(linked_report.pid, Some(primary_pid));
+    assert_eq!(
+        linked_report.state,
+        exo::daemon::DaemonEnsureState::ConnectedExisting
+    );
     let request = serde_json::json!({
         "protocol_version": 1,
         "id": "linked-epoch-add",

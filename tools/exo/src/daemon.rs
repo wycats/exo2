@@ -93,6 +93,8 @@ fn now_secs() -> u64 {
 #[derive(Debug, Clone)]
 pub struct LocalRuntimePaths {
     workspace_root: PathBuf,
+    project_id: String,
+    state_root: PathBuf,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -116,6 +118,8 @@ impl LocalRuntimePaths {
             .map(Path::to_path_buf);
         Self {
             workspace_root: workspace_root.into(),
+            project_id: project.id.to_string(),
+            state_root: project.state_root.clone(),
             runtime_dir,
             socket_path,
             pid_path,
@@ -169,6 +173,14 @@ impl LocalRuntimePaths {
     /// The workspace root this runtime is for.
     pub fn workspace(&self) -> &Path {
         &self.workspace_root
+    }
+
+    fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     fn config_home(&self) -> Option<&Path> {
@@ -246,6 +258,7 @@ pub struct DaemonStatusReport {
     pub identity_exists: Option<bool>,
     pub identity_readable: Option<bool>,
     pub identity_matches_workspace: Option<bool>,
+    pub identity_matches_project: Option<bool>,
     pub identity_matches_executable: Option<bool>,
     pub recorded_identity: Option<serde_json::Value>,
     pub current_identity: Option<serde_json::Value>,
@@ -256,6 +269,10 @@ pub struct DaemonStatusReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RuntimeDaemonIdentity {
     workspace_root: PathBuf,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    state_root: Option<PathBuf>,
     executable: RuntimeExecutableIdentity,
     #[serde(default)]
     instance_id: Option<String>,
@@ -269,6 +286,8 @@ impl RuntimeDaemonIdentity {
     fn current(paths: &LocalRuntimePaths) -> io::Result<Self> {
         Ok(Self {
             workspace_root: paths.workspace().to_path_buf(),
+            project_id: Some(paths.project_id().to_string()),
+            state_root: Some(paths.state_root().to_path_buf()),
             executable: RuntimeExecutableIdentity::current()?,
             instance_id: None,
             pid: None,
@@ -279,6 +298,8 @@ impl RuntimeDaemonIdentity {
     fn for_daemon(paths: &LocalRuntimePaths) -> io::Result<Self> {
         Ok(Self {
             workspace_root: paths.workspace().to_path_buf(),
+            project_id: Some(paths.project_id().to_string()),
+            state_root: Some(paths.state_root().to_path_buf()),
             executable: RuntimeExecutableIdentity::current()?,
             instance_id: Some(ulid::Ulid::new().to_string().to_lowercase()),
             pid: Some(std::process::id()),
@@ -286,8 +307,23 @@ impl RuntimeDaemonIdentity {
         })
     }
 
+    fn matches_project_authority(&self, current: &Self) -> bool {
+        match (
+            self.project_id.as_deref(),
+            self.state_root.as_deref(),
+            current.project_id.as_deref(),
+            current.state_root.as_deref(),
+        ) {
+            (Some(recorded_id), Some(recorded_root), Some(current_id), Some(current_root)) => {
+                recorded_id == current_id && recorded_root == current_root
+            }
+            (None, None, Some(_), Some(_)) => self.workspace_root == current.workspace_root,
+            _ => false,
+        }
+    }
+
     fn matches_runtime(&self, current: &Self) -> bool {
-        self.workspace_root == current.workspace_root && self.executable == current.executable
+        self.matches_project_authority(current) && self.executable == current.executable
     }
 }
 
@@ -513,6 +549,7 @@ pub fn daemon_status(workspace_path: &Path) -> DaemonStatusReport {
             identity_exists: None,
             identity_readable: None,
             identity_matches_workspace: None,
+            identity_matches_project: None,
             identity_matches_executable: None,
             recorded_identity: None,
             current_identity: None,
@@ -543,6 +580,7 @@ pub fn daemon_status_for_project(workspace_path: &Path, project: &Project) -> Da
             identity_exists: None,
             identity_readable: None,
             identity_matches_workspace: None,
+            identity_matches_project: None,
             identity_matches_executable: None,
             recorded_identity: None,
             current_identity: None,
@@ -577,6 +615,11 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .as_ref()
         .ok()
         .map(|identity| identity.workspace_root == paths.workspace());
+    let identity_matches_project = recorded_identity_result
+        .as_ref()
+        .ok()
+        .zip(current_identity_result.as_ref().ok())
+        .map(|(recorded, current)| recorded.matches_project_authority(current));
     let identity_matches_executable = recorded_identity_result
         .as_ref()
         .ok()
@@ -597,12 +640,12 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .and_then(|identity| serde_json::to_value(identity).ok());
 
     let state = if socket_connectable {
-        if identity_matches_workspace == Some(true)
+        if identity_matches_project == Some(true)
             && identity_matches_executable == Some(true)
             && probe_ok == Some(true)
         {
             DaemonStatusState::RunningCurrent
-        } else if identity_matches_workspace == Some(true)
+        } else if identity_matches_project == Some(true)
             && identity_matches_executable == Some(true)
         {
             DaemonStatusState::Unreachable
@@ -619,7 +662,7 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         DaemonStatusState::RunningCurrent => None,
         DaemonStatusState::Stopped => Some("daemon is stopped".to_string()),
         DaemonStatusState::StaleIdentity => Some(
-            "daemon identity is missing or does not match the current executable/workspace"
+            "daemon identity is missing or does not match the current executable/project runtime"
                 .to_string(),
         ),
         DaemonStatusState::Unreachable => Some(if socket_connectable {
@@ -648,6 +691,7 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         identity_exists: Some(identity_exists),
         identity_readable: Some(identity_readable),
         identity_matches_workspace,
+        identity_matches_project,
         identity_matches_executable,
         recorded_identity,
         current_identity,
@@ -3413,6 +3457,66 @@ mod tests {
             paths.pid_path(),
             PathBuf::from("/home/user/project/.exo/runtime/daemon.pid")
         );
+    }
+
+    #[test]
+    fn daemon_identity_matches_linked_workspace_with_same_project_authority() {
+        let primary = PathBuf::from("/home/user/project");
+        let linked = PathBuf::from("/home/user/project-linked");
+        let project = test_project(&primary, PathBuf::from("/state/projects/project"));
+        let recorded = RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&primary, &project))
+            .expect("recorded identity");
+        let current = RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&linked, &project))
+            .expect("linked identity");
+
+        assert_ne!(recorded.workspace_root, current.workspace_root);
+        assert!(recorded.matches_project_authority(&current));
+        assert!(recorded.matches_runtime(&current));
+    }
+
+    #[test]
+    fn daemon_identity_rejects_different_project_or_state_root() {
+        let workspace = PathBuf::from("/home/user/project");
+        let project = test_project(&workspace, PathBuf::from("/state/projects/project"));
+        let recorded =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&workspace, &project))
+                .expect("recorded identity");
+
+        let mut other_project = project.clone();
+        other_project.id = ProjectId::from_git_common_dir(Path::new("/other/.git"));
+        let other_project_identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&workspace, &other_project))
+                .expect("other project identity");
+        assert!(!recorded.matches_project_authority(&other_project_identity));
+
+        let mut other_state = project;
+        other_state.state_root = PathBuf::from("/state/projects/other");
+        let other_state_identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&workspace, &other_state))
+                .expect("other state identity");
+        assert!(!recorded.matches_project_authority(&other_state_identity));
+    }
+
+    #[test]
+    fn legacy_daemon_identity_is_compatible_only_with_its_recorded_workspace() {
+        let primary = PathBuf::from("/home/user/project");
+        let linked = PathBuf::from("/home/user/project-linked");
+        let project = test_project(&primary, PathBuf::from("/state/projects/project"));
+        let mut legacy =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&primary, &project))
+                .expect("legacy identity");
+        legacy.project_id = None;
+        legacy.state_root = None;
+
+        let primary_identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&primary, &project))
+                .expect("primary identity");
+        let linked_identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&linked, &project))
+                .expect("linked identity");
+
+        assert!(legacy.matches_project_authority(&primary_identity));
+        assert!(!legacy.matches_project_authority(&linked_identity));
     }
 
     #[test]
