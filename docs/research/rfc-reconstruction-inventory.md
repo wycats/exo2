@@ -60,10 +60,11 @@ archived history. Effective status records what Exo presents to readers.
 - Canonical quarantine rows: 0
 - Sidecar repository: clean and synchronized
 
-RFC 00178 is the sole current-workspace absence. Its document declares two
-RFC headings and Stage 0 body metadata while living in the Stage 1 directory,
-so Exo records a `metadata_conflict`. The final coherence audit owns that
-repair decision.
+RFC 00178 is the sole record absent from the current workspace observation.
+Its document declares two RFC headings and Stage 0 body metadata while living
+in the Stage 1 directory, so Exo records a `metadata_conflict`. The effective
+view still includes the canonical record with `workspace_presence: absent`.
+The final coherence audit owns the repair decision.
 
 ## Duplicate Title Families
 

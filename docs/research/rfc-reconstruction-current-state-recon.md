@@ -95,10 +95,11 @@ The identity and duplicate-family work is complete at the corpus level:
 - the sidecar repository is clean and synchronized.
 
 The current workspace observes 332 of 333 records. RFC 00178 is absent from the
-effective workspace view because its Markdown declares two RFC headings and
+workspace observation set because its Markdown declares two RFC headings and
 Stage 0 body metadata while living in the Stage 1 directory. Exo records that
-as a `metadata_conflict`. This is explicit final-audit debt, not canonical data
-loss.
+as a `metadata_conflict`, then retains the canonical record in the effective
+view with `workspace_presence: absent`. This is explicit final-audit debt, not
+canonical data loss or an effective-read failure.
 
 Older linked-worktree observations also retain an RFC 0111 metadata conflict.
 The cross-worktree audit must distinguish stale observations from a defect in
@@ -152,7 +153,7 @@ checkpoint records them without deciding their disposition:
 
 | Candidate | Observed State | Audit Question |
 | --- | --- | --- |
-| RFC 00178 | Current workspace `metadata_conflict`; canonical file has duplicate headings and Stage 0 body metadata in a Stage 1 path. | What single Stage 1 document shape preserves its proposal while restoring effective workspace presence? |
+| RFC 00178 | Current workspace `metadata_conflict`; canonical file has duplicate headings and Stage 0 body metadata in a Stage 1 path. | What single Stage 1 document shape preserves its proposal while restoring a valid workspace observation? |
 | RFCs 0030 and 0040 | Both point to RFC 0080, whose reciprocal `Supersedes` set names RFCs 0019, 0055, and 10072. | Are 0030/0040 true predecessors of RFC 0080, or stale links that should be removed? |
 | RFC 0082 | Points to RFC 0122, while RFC 0122 names only RFC 0141. | Does streaming progress replace the signed-capability proposal, or is the successor semantically wrong? |
 | RFC 0103 | Points to RFC 00225 without reciprocal target metadata. | Is this a legitimate replacement chain requiring symmetry? |
