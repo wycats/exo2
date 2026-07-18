@@ -4,6 +4,7 @@
 # RFC 10128: Structured IO CLI
 
 - **Supersedes**: RFC 0077
+- **Superseded by**:
 
 
 - **Status**: Withdrawn
