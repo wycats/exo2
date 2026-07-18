@@ -8,7 +8,7 @@
 
 # RFC 0073: Semantic Merge Driver for Structured Context Files
 
-- **Superseded by**: RFC 0072
+- **Superseded by**: RFC 72
 
 
 ## Motivation

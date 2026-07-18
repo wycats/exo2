@@ -4,6 +4,9 @@
 
 # RFC 10036: Semantic Merge Driver for Structured Context Files
 
+- **Superseded by**: RFC 72
+
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:
