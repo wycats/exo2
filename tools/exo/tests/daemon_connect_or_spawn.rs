@@ -411,6 +411,7 @@ fn wait_for_diagnostics_events(path: &Path, names: &[&str]) -> Vec<serde_json::V
     }
 }
 
+#[cfg(all(unix, debug_assertions))]
 fn wait_for_path(path: &Path) {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
