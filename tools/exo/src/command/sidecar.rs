@@ -5446,13 +5446,15 @@ fn read_sidecar_write_ownership_status_with_current(
     let liveness = process_liveness(marker.pid);
     let same_binary = marker.executable_blake3 == current.executable_blake3;
     let same_process = sidecar_write_owner_is_same_process(&marker, current);
+    let pid_reused_by_current_process =
+        sidecar_write_owner_pid_was_reused_by_current_process(&marker, current);
     let binary_identity_known =
         marker.executable_blake3.is_some() && current.executable_blake3.is_some();
     let process_identity_known =
         marker.process_start_id.is_some() && current.process_start_id.is_some();
     let (state, ok, issue) = if compatible && same_process && same_binary {
         ("owned", true, None)
-    } else if liveness == ProcessLiveness::Dead {
+    } else if pid_reused_by_current_process || liveness == ProcessLiveness::Dead {
         (
             "stale",
             true,
@@ -5649,9 +5651,30 @@ fn sidecar_write_owner_is_same_process(
     owner: &SidecarWriteOwnerMarker,
     current: &SidecarWriteOwnerMarker,
 ) -> bool {
+    if owner.pid != current.pid || owner.machine != current.machine {
+        return false;
+    }
+
+    match (&owner.process_start_id, &current.process_start_id) {
+        (Some(owner_start), Some(current_start)) => owner_start == current_start,
+        (None, None) => {
+            owner.executable_blake3.is_some()
+                && owner.executable_blake3 == current.executable_blake3
+        }
+        _ => false,
+    }
+}
+
+fn sidecar_write_owner_pid_was_reused_by_current_process(
+    owner: &SidecarWriteOwnerMarker,
+    current: &SidecarWriteOwnerMarker,
+) -> bool {
     owner.pid == current.pid
         && owner.machine == current.machine
-        && owner.process_start_id == current.process_start_id
+        && matches!(
+            (&owner.process_start_id, &current.process_start_id),
+            (Some(owner_start), Some(current_start)) if owner_start != current_start
+        )
 }
 
 fn now_ms() -> u128 {
@@ -6326,6 +6349,41 @@ mod sidecar_write_owner_compatibility_tests {
         assert!(sidecar_write_owner_is_same_process(
             &owner,
             &current_without_start_id
+        ));
+
+        owner.executable_blake3 = None;
+        current_without_start_id.executable_blake3 = None;
+        assert!(!sidecar_write_owner_is_same_process(
+            &owner,
+            &current_without_start_id
+        ));
+    }
+
+    #[test]
+    fn reused_current_pid_with_different_start_identity_is_reclaimable() {
+        let current = marker("/worktrees/current");
+        let mut owner = marker("/worktrees/linked");
+        owner.process_start_id = Some("previous-process-start".to_string());
+
+        assert!(sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+
+        owner.pid += 1;
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+        owner.pid = current.pid;
+
+        owner.machine = "other-machine".to_string();
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+        owner.machine = current.machine.clone();
+
+        owner.process_start_id = None;
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
         ));
     }
 }
