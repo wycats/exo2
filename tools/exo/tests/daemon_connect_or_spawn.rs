@@ -85,6 +85,19 @@ impl Drop for DaemonGuard {
     }
 }
 
+#[cfg(unix)]
+struct StoppedProcessGuard(i32);
+
+#[cfg(unix)]
+impl Drop for StoppedProcessGuard {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.0),
+            nix::sys::signal::Signal::SIGCONT,
+        );
+    }
+}
+
 fn run_git_ok(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -255,6 +268,14 @@ fn run_exo_status_from_subdir(workspace: &Path, subdir: &Path) -> std::process::
 }
 
 fn run_exo_daemon_ensure(workspace: &Path, direct: bool) -> std::process::Output {
+    run_exo_daemon_ensure_with_env(workspace, direct, &[])
+}
+
+fn run_exo_daemon_ensure_with_env(
+    workspace: &Path,
+    direct: bool,
+    envs: &[(&str, &OsStr)],
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_exo"));
     command.arg("--format").arg("json");
     if direct {
@@ -270,9 +291,11 @@ fn run_exo_daemon_ensure(workspace: &Path, direct: bool) -> std::process::Output
         .env("HOME", workspace.join(".test-home"))
         .env("XDG_CONFIG_HOME", workspace.join(".test-home/config"))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap()
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().unwrap()
 }
 
 fn run_exo_daemon_restart(workspace: &Path) -> std::process::Output {
@@ -366,11 +389,16 @@ fn assert_has_event(events: &[serde_json::Value], name: &str) {
 }
 
 fn wait_for_diagnostics_event(path: &Path, name: &str) -> Vec<serde_json::Value> {
+    wait_for_diagnostics_events(path, &[name])
+}
+
+fn wait_for_diagnostics_events(path: &Path, names: &[&str]) -> Vec<serde_json::Value> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if path.exists() {
             let events = read_ndjson(path);
-            if event_names(&events).contains(&name) {
+            let observed = event_names(&events);
+            if names.iter().all(|name| observed.contains(name)) {
                 return events;
             }
         }
@@ -381,6 +409,17 @@ fn wait_for_diagnostics_event(path: &Path, name: &str) -> Vec<serde_json::Value>
     } else {
         Vec::new()
     }
+}
+
+fn wait_for_path(path: &Path) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
 }
 
 /// Create a workspace with required files for the given backend.
@@ -495,7 +534,16 @@ async fn diagnostics_enabled_with_explicit_path_writes_request_events(backend: &
         "exo status failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let events = wait_for_diagnostics_event(&diagnostics_path, "request.write_end");
+    let events = wait_for_diagnostics_events(
+        &diagnostics_path,
+        &[
+            "daemon.start",
+            "socket.accept",
+            "request.handler_start",
+            "request.handler_end",
+            "request.write_end",
+        ],
+    );
 
     assert_has_event(&events, "daemon.start");
     assert_has_event(&events, "socket.accept");
@@ -537,6 +585,107 @@ async fn diagnostics_env_propagates_through_spawn_daemon(backend: &str) {
     let events = wait_for_diagnostics_event(&diagnostics_path, "daemon.start");
 
     assert_has_event(&events, "daemon.start");
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_ensure_reports_spawned_and_reused_diagnostics_active(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let diagnostics_path = dir.path().join("ensure-diagnostics.ndjson");
+    let envs = [
+        ("EXO_DAEMON_DIAGNOSTICS", OsStr::new("1")),
+        ("EXO_DAEMON_DIAG_PATH", diagnostics_path.as_os_str()),
+    ];
+
+    let first = run_exo_daemon_ensure_with_env(&workspace, true, &envs);
+    assert!(
+        first.status.success(),
+        "diagnostic daemon ensure failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first = parse_cli_json(&first);
+    let first = first.get("result").expect("first daemon ensure result");
+    assert_eq!(first["state"], "spawned", "{first}");
+    assert_eq!(first["diagnostics_requested"], true, "{first}");
+    assert_eq!(first["diagnostics_active"], true, "{first}");
+    let first_pid = first["pid"].as_u64().expect("first daemon PID");
+
+    let second = run_exo_daemon_ensure_with_env(&workspace, true, &envs);
+    assert!(
+        second.status.success(),
+        "reused diagnostic daemon ensure failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second = parse_cli_json(&second);
+    let second = second.get("result").expect("second daemon ensure result");
+    assert_eq!(second["state"], "connected_existing", "{second}");
+    assert_eq!(second["diagnostics_requested"], true, "{second}");
+    assert_eq!(second["diagnostics_active"], true, "{second}");
+    assert_eq!(second["pid"], first_pid, "diagnostic reuse must keep PID");
+
+    let status = run_exo_daemon_status(&workspace);
+    assert!(status.status.success());
+    let status = parse_cli_json(&status);
+    let status = status.get("result").expect("diagnostic daemon status");
+    assert_eq!(status["diagnostics_active"], true, "{status}");
+    assert_eq!(status["accept_loop_health"], "responsive", "{status}");
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn daemon_ensure_reports_requested_diagnostics_inactive_without_restart(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let diagnostics_path = dir.path().join("should-not-be-created.ndjson");
+
+    let first = run_exo_daemon_ensure(&workspace, true);
+    assert!(first.status.success());
+    let first = parse_cli_json(&first);
+    let first = first.get("result").expect("first daemon ensure result");
+    let first_pid = first["pid"].as_u64().expect("first daemon PID");
+    let first_instance = first["instance_id"]
+        .as_str()
+        .expect("first daemon instance")
+        .to_string();
+
+    let second = run_exo_daemon_ensure_with_env(
+        &workspace,
+        true,
+        &[
+            ("EXO_DAEMON_DIAGNOSTICS", OsStr::new("1")),
+            ("EXO_DAEMON_DIAG_PATH", diagnostics_path.as_os_str()),
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "non-diagnostic daemon reuse failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second = parse_cli_json(&second);
+    let second = second.get("result").expect("second daemon ensure result");
+    assert_eq!(second["state"], "connected_existing", "{second}");
+    assert_eq!(
+        second["pid"], first_pid,
+        "ensure must not restart the daemon"
+    );
+    assert_eq!(second["instance_id"], first_instance, "{second}");
+    assert_eq!(second["diagnostics_requested"], true, "{second}");
+    assert_eq!(second["diagnostics_active"], false, "{second}");
+    assert!(
+        second["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic.as_str() == Some("daemon.diagnostics_requested_but_inactive")
+            })),
+        "ensure must surface the stable inactive-diagnostics code: {second}"
+    );
+    assert!(
+        !diagnostics_path.exists(),
+        "requesting diagnostics must not activate or restart an existing daemon"
+    );
 }
 
 #[test_matrix(["sqlite"])]
@@ -749,6 +898,16 @@ async fn daemon_ensure_cli_returns_actual_runtime_metadata(backend: &str) {
     );
     assert_eq!(result.get("spawned").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(result.get("reused").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        result
+            .get("diagnostics_requested")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        result.get("diagnostics_active").and_then(|v| v.as_bool()),
+        Some(false)
+    );
     assert!(
         result.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
         "daemon ensure should report daemon PID: {result}"
@@ -932,6 +1091,10 @@ async fn daemon_status_reports_stopped_without_starting_daemon(backend: &str) {
         result.get("identity_exists").and_then(|v| v.as_bool()),
         Some(false)
     );
+    assert_eq!(result["diagnostics_active"], false, "{result}");
+    assert_eq!(result["accept_loop_health"], "stopped", "{result}");
+    assert!(result["server_task_alive"].is_null(), "{result}");
+    assert!(result["accept_count"].is_null(), "{result}");
     assert!(
         !paths.socket_path().exists(),
         "daemon status should inspect without creating a socket"
@@ -1019,8 +1182,145 @@ async fn daemon_status_reports_running_current_identity(backend: &str) {
             .and_then(|v| v.as_bool()),
         Some(true)
     );
+    assert_eq!(result["diagnostics_active"], false, "{result}");
+    assert_eq!(result["accept_loop_health"], "responsive", "{result}");
+    assert_eq!(result["server_task_alive"], true, "{result}");
+    assert!(
+        result["accept_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "status probe should advance the accept counter: {result}"
+    );
+    assert!(result["last_accept_at"].is_string(), "{result}");
+    assert!(result["health_updated_at"].is_string(), "{result}");
     assert!(result.get("recorded_identity").is_some());
     assert!(result.get("current_identity").is_some());
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test_matrix(["sqlite"])]
+fn daemon_status_reports_bound_but_paused_accept_loop_as_stalled(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let paths = exo::daemon::paths_for_workspace(&workspace).unwrap();
+    let gate = dir.path().join("accept-gate");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_exo"))
+        .args(["daemon", "run", "--workspace"])
+        .arg(&workspace)
+        .args(["--timeout", "60"])
+        .current_dir(&workspace)
+        .env("EXO_NO_REEXEC", "1")
+        .env("HOME", workspace.join(".test-home"))
+        .env("XDG_CONFIG_HOME", workspace.join(".test-home/config"))
+        .env("EXO_TEST_DAEMON_ACCEPT_GATE_PATH", &gate)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn accept-gated daemon");
+    wait_for_path(&gate.join("bound"));
+    let identity_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(paths.identity_path()).expect("read gated daemon identity"),
+    )
+    .expect("parse gated daemon identity");
+
+    let started = std::time::Instant::now();
+    let output = run_exo_daemon_status(&workspace);
+    assert!(
+        output.status.success(),
+        "daemon status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stalled classification must remain bounded"
+    );
+    let response = parse_cli_json(&output);
+    let result = response.get("result").expect("daemon status result");
+    assert_eq!(result["state"], "unreachable", "{result}");
+    assert_eq!(result["accept_loop_health"], "stalled", "{result}");
+    assert_eq!(result["server_task_alive"], true, "{result}");
+    assert_eq!(result["accept_count"], 0, "{result}");
+    assert!(result["last_accept_at"].is_null(), "{result}");
+    assert_eq!(result["identity_matches_project"], true, "{result}");
+    assert_eq!(result["identity_matches_executable"], true, "{result}");
+    assert_eq!(
+        result["instance_id"], identity_before["instance_id"],
+        "status must preserve the stalled daemon identity"
+    );
+    assert!(
+        daemon.try_wait().expect("inspect gated daemon").is_none(),
+        "status must not automatically restart or terminate a stalled daemon"
+    );
+    let identity_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(paths.identity_path()).expect("reread gated daemon identity"),
+    )
+    .expect("parse gated daemon identity after status");
+    assert_eq!(identity_after, identity_before);
+
+    std::fs::write(gate.join("release"), b"release\n").expect("release accept gate");
+}
+
+#[cfg(unix)]
+#[test_matrix(["sqlite"])]
+fn daemon_status_ignores_missing_and_mismatched_health(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let paths = exo::daemon::paths_for_workspace(&workspace).unwrap();
+
+    let ensure = run_exo_daemon_ensure(&workspace, true);
+    assert!(ensure.status.success());
+    let ensure = parse_cli_json(&ensure);
+    let ensure = ensure.get("result").expect("daemon ensure result");
+    let pid = i32::try_from(ensure["pid"].as_u64().expect("daemon PID")).expect("PID fits i32");
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(paths.identity_path()).expect("read daemon identity"),
+    )
+    .expect("parse daemon identity");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .expect("pause daemon");
+    let _stopped = StoppedProcessGuard(pid);
+
+    std::fs::remove_file(paths.health_path()).expect("remove daemon health");
+    let missing = run_exo_daemon_status(&workspace);
+    assert!(missing.status.success());
+    let missing = parse_cli_json(&missing);
+    let missing = missing.get("result").expect("missing-health status");
+    assert_eq!(missing["state"], "unreachable", "{missing}");
+    assert_eq!(missing["accept_loop_health"], "unknown", "{missing}");
+    assert!(missing["server_task_alive"].is_null(), "{missing}");
+    assert!(missing["accept_count"].is_null(), "{missing}");
+
+    let mismatched = serde_json::json!({
+        "instance_id": "stale-instance",
+        "pid": identity["pid"],
+        "process_start_id": identity["process_start_id"],
+        "server_task_alive": true,
+        "accept_count": 99,
+        "last_accept_at": "2026-07-20T12:00:00.000Z",
+        "last_accept_error": null,
+        "health_updated_at": "2026-07-20T12:00:01.000Z"
+    });
+    std::fs::write(
+        paths.health_path(),
+        serde_json::to_vec_pretty(&mismatched).unwrap(),
+    )
+    .expect("write mismatched daemon health");
+    let stale = run_exo_daemon_status(&workspace);
+    assert!(stale.status.success());
+    let stale = parse_cli_json(&stale);
+    let stale = stale.get("result").expect("mismatched-health status");
+    assert_eq!(stale["state"], "unreachable", "{stale}");
+    assert_eq!(stale["accept_loop_health"], "unknown", "{stale}");
+    assert!(stale["server_task_alive"].is_null(), "{stale}");
+    assert!(stale["accept_count"].is_null(), "{stale}");
+    assert_eq!(stale["instance_id"], identity["instance_id"], "{stale}");
 }
 
 #[test_matrix(["sqlite"])]
@@ -1620,6 +1920,37 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
     assert_eq!(primary_project.db_path(), linked_project.db_path());
     assert_db_has_epoch(&primary_project.db_path(), "Linked Daemon Epoch");
 
+    for (label, workspace) in [("primary", &primary), ("linked", &linked)] {
+        let stream = exo::daemon::connect_to_daemon(workspace)
+            .await
+            .unwrap_or_else(|error| panic!("{label} post-write daemon connection failed: {error}"));
+        let request = serde_json::json!({
+            "protocol_version": 1,
+            "id": format!("{label}-post-write-epoch-list"),
+            "workspace_root": workspace.canonicalize().expect("canonical read workspace"),
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": ["epoch", "list"] },
+                    "input": {}
+                }
+            }
+        });
+        let readback = send_machine_request(stream, &request.to_string()).await;
+        assert_eq!(readback["status"], "ok", "{label} readback: {readback}");
+        assert!(
+            readback.to_string().contains("Linked Daemon Epoch"),
+            "{label} readback must see the committed write: {readback}"
+        );
+        let status = exo::daemon::daemon_status(workspace);
+        assert!(status.ok, "{label} post-write status: {status:?}");
+        assert_eq!(status.identity_matches_project, Some(true));
+        assert_eq!(
+            status.accept_loop_health,
+            exo::daemon::AcceptLoopHealth::Responsive
+        );
+    }
+
     assert!(
         !primary.join(".runtime").exists(),
         "primary legacy runtime dir should not exist"
@@ -2094,8 +2425,7 @@ async fn test_sigterm_triggers_graceful_shutdown(backend: &str) {
 
     while start.elapsed() < timeout {
         if !paths.socket_path().exists() && !paths.pid_path().exists() {
-            // Cleanup complete
-            return;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2109,4 +2439,11 @@ async fn test_sigterm_triggers_graceful_shutdown(backend: &str) {
         !paths.pid_path().exists(),
         "PID file should be cleaned up after SIGTERM"
     );
+    let health: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(paths.health_path()).expect("cleanup should preserve daemon health"),
+    )
+    .expect("parse cleanup daemon health");
+    assert_eq!(health["pid"], pid, "{health}");
+    assert_eq!(health["server_task_alive"], false, "{health}");
+    assert!(health["health_updated_at"].is_string(), "{health}");
 }
