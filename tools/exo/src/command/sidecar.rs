@@ -5628,7 +5628,6 @@ fn sidecar_write_owner_is_compatible(
     owner.version == current.version
         && owner.sidecar_key == current.sidecar_key
         && owner.sidecar_root == current.sidecar_root
-        && owner.workspace_root == current.workspace_root
         && owner.state_root == current.state_root
         && owner.db_path == current.db_path
         && owner.runtime_dir == current.runtime_dir
@@ -6217,6 +6216,68 @@ mod tests {
 
         assert_eq!(process_liveness(pid), ProcessLiveness::Dead);
         child.wait().expect("reap child");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_write_owner_compatibility_tests {
+    use super::*;
+
+    fn marker(workspace_root: &str) -> SidecarWriteOwnerMarker {
+        SidecarWriteOwnerMarker {
+            version: 1,
+            sidecar_key: "project-key".to_string(),
+            sidecar_root: PathBuf::from("/sidecar"),
+            workspace_root: Some(PathBuf::from(workspace_root)),
+            state_root: PathBuf::from("/sidecar/projects/project-key"),
+            db_path: PathBuf::from("/sidecar/projects/project-key/cache/exo.db"),
+            runtime_dir: PathBuf::from("/sidecar/projects/project-key/runtime"),
+            pid: 1,
+            executable_path: Some(PathBuf::from("/bin/exo")),
+            executable_blake3: Some("binary".to_string()),
+            process_start_id: Some("process-start".to_string()),
+            machine: "machine".to_string(),
+            acquired_at_ms: 1,
+            refreshed_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn linked_worktree_workspace_root_is_provenance_not_writer_authority() {
+        let owner = marker("/worktrees/primary");
+        let current = marker("/worktrees/linked");
+
+        assert!(sidecar_write_owner_is_compatible(&owner, &current));
+        assert_ne!(owner.workspace_root, current.workspace_root);
+    }
+
+    #[test]
+    fn writer_authority_rejects_every_shared_sidecar_identity_mismatch() {
+        let current = marker("/worktrees/current");
+
+        let mut owner = current.clone();
+        owner.version += 1;
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.sidecar_key = "foreign-key".to_string();
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.sidecar_root = PathBuf::from("/foreign-sidecar");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.state_root = PathBuf::from("/foreign-state");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.db_path = PathBuf::from("/foreign-state/cache/exo.db");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.runtime_dir = PathBuf::from("/foreign-state/runtime");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
     }
 }
 
