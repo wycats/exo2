@@ -46,6 +46,7 @@ fn git_init(root: &Path) {
     git_success(root, &["branch", "-M", "main"]);
 }
 
+#[cfg(unix)]
 fn create_primary_and_linked_worktree(temp: &Path) -> (PathBuf, PathBuf) {
     let primary = temp.join("primary");
     let linked = temp.join("linked");
@@ -249,6 +250,7 @@ fn project_state_path(sidecar_root: &Path, key: &str, relative: &[&str]) -> Path
     path
 }
 
+#[cfg(unix)]
 fn epoch_title_count(sidecar_root: &Path, key: &str, title: &str) -> usize {
     let db_path = project_state_path(sidecar_root, key, &["cache", "exo.db"]);
     let db = exosuit_storage::open_database(&db_path).expect("open sidecar database");
@@ -7237,7 +7239,7 @@ fn sidecar_checkpoint_project_respects_active_foreign_owner() {
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("stale Exo runtime")),
+            .is_some_and(|message| message.contains("another active runtime")),
         "{error:?}"
     );
     assert_eq!(git_output(&sidecar_root, &["rev-parse", "HEAD"]), before);
@@ -7946,7 +7948,7 @@ fn sidecar_repo_status_human_omits_reclaimable_dead_owner() {
 }
 
 #[test]
-fn sidecar_repo_status_human_reports_stale_runtime_block() {
+fn sidecar_repo_status_human_reports_live_owner_block() {
     let fixture = basic_sidecar_fixture();
     let other_workspace = fixture._temp.path().join("other-workspace");
     let owner_pid = std::process::id();
@@ -7967,13 +7969,16 @@ fn sidecar_repo_status_human_reports_stale_runtime_block() {
         .stdout
         .clone();
     let human = String::from_utf8(human_output).expect("human output is utf-8");
-    assert!(human.contains("Ownership blocked"), "{human}");
+    assert!(
+        human.contains("Ownership blocked by active runtime"),
+        "{human}"
+    );
     assert!(human.contains(&owner_pid.to_string()), "{human}");
-    assert!(human.contains("stale Exo runtime"), "{human}");
+    assert!(human.contains("another active runtime"), "{human}");
 }
 
 #[test]
-fn daemon_sidecar_repo_status_human_reports_stale_runtime_block() {
+fn daemon_sidecar_repo_status_human_reports_live_owner_block() {
     let fixture = basic_sidecar_fixture();
     let other_workspace = fixture._temp.path().join("other-workspace");
     let owner_pid = std::process::id();
@@ -7996,9 +8001,11 @@ fn daemon_sidecar_repo_status_human_reports_stale_runtime_block() {
         .clone();
     let human = String::from_utf8(human_output).expect("human output is utf-8");
     assert!(human.contains("Sidecar repo clean"), "{human}");
-    assert!(human.contains("Ownership blocked"), "{human}");
+    assert!(
+        human.contains("Ownership blocked by active runtime"),
+        "{human}"
+    );
     assert!(human.contains(&owner_pid.to_string()), "{human}");
-    assert!(human.contains("stale Exo runtime"), "{human}");
     assert!(
         human.contains(other_workspace.to_string_lossy().as_ref()),
         "{human}"

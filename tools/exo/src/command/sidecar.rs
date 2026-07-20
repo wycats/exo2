@@ -5467,6 +5467,12 @@ fn read_sidecar_write_ownership_status_with_current(
             false,
             Some("sidecar write ownership is held by another active runtime".to_string()),
         )
+    } else if compatible && !same_process && !binary_identity_known {
+        (
+            "blocked",
+            false,
+            Some("sidecar write ownership is held by another active runtime".to_string()),
+        )
     } else if compatible
         && !same_process
         && !same_binary
