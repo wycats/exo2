@@ -60,6 +60,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default idle timeout in seconds (5 minutes).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_DAEMON_MAX_CONNECTIONS: usize = 128;
+const DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
@@ -1146,6 +1148,68 @@ fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnv
     daemon_handler_error_response(id, code, error.to_string())
 }
 
+fn daemon_busy_response(id: String) -> ResponseEnvelope {
+    ResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id,
+        status: Status::Error,
+        result: None,
+        error: Some(ErrorBody {
+            code: ErrorCode::PreconditionFailed,
+            message: "daemon request capacity is exhausted; retry later".to_string(),
+            details: Some(serde_json::json!({
+                "kind": "daemon.busy",
+                "retryable": true,
+                "mutation_performed": false,
+            })),
+        }),
+        ticket: None,
+        steering: None,
+        reminders: None,
+        display: None,
+        preview: None,
+        effect: None,
+        trace: None,
+    }
+}
+
+async fn dispatch_bounded_daemon_request<F>(
+    request_id: String,
+    admission: Arc<tokio::sync::Semaphore>,
+    diagnostics: DaemonDiagnostics,
+    task: F,
+) -> ResponseEnvelope
+where
+    F: FnOnce() -> ResponseEnvelope + Send + 'static,
+{
+    let permit = match admission.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            diagnostics.record(
+                "request.busy",
+                serde_json::json!({ "request_id": request_id }),
+            );
+            return daemon_busy_response(request_id);
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || {
+        // Keep the permit on the blocking worker so cancellation of the async
+        // connection task cannot admit a replacement while this work continues.
+        let _permit = permit;
+        task()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => daemon_handler_error_response(
+            request_id,
+            ErrorCode::Internal,
+            format!("daemon handler task failed: {error}"),
+        ),
+    }
+}
+
 fn replay_request_context(
     startup_workspace: &Path,
     startup_project: &Project,
@@ -2122,6 +2186,9 @@ pub async fn run_daemon(
     let request_project = Arc::clone(&project);
     let request_outcome_ledger = Arc::clone(&outcome_ledger);
     let request_instance_id = Arc::clone(&instance_id);
+    let request_admission = Arc::new(tokio::sync::Semaphore::new(
+        DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
+    ));
     let server_handle = tokio::spawn(async move {
         run_socket_server(
             &paths_clone,
@@ -2138,10 +2205,15 @@ pub async fn run_daemon(
                 let diagnostics = handler_diagnostics.clone();
                 let outcome_ledger = Arc::clone(&request_outcome_ledger);
                 let instance_id = Arc::clone(&request_instance_id);
+                let request_admission = Arc::clone(&request_admission);
                 async move {
                     let request_id = req.id.clone();
                     let handler_request_id = request_id.clone();
-                    match tokio::task::spawn_blocking(move || {
+                    dispatch_bounded_daemon_request(
+                        request_id,
+                        request_admission,
+                        diagnostics.clone(),
+                        move || {
                         if let Ok(Some(outcome)) =
                             outcome_ledger.terminal_outcome_before_preparation(&req)
                         {
@@ -2277,16 +2349,9 @@ pub async fn run_daemon(
                                 )
                             }
                         }
-                    })
+                    },
+                    )
                     .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => daemon_handler_error_response(
-                            request_id,
-                            ErrorCode::Internal,
-                            format!("daemon handler task failed: {error}"),
-                        ),
-                    }
                 }
             },
         )
@@ -2469,8 +2534,16 @@ async fn run_socket_server<F, Fut>(
     eprintln!("exo daemon: listening on {}", endpoint.display());
 
     let handler = Arc::new(handler);
+    let connection_admission =
+        Arc::new(tokio::sync::Semaphore::new(DEFAULT_DAEMON_MAX_CONNECTIONS));
 
     loop {
+        // Acquire before accept so accepted descriptors and connection tasks
+        // remain bounded even when clients outpace request execution.
+        let connection_permit = Arc::clone(&connection_admission)
+            .acquire_owned()
+            .await
+            .expect("daemon connection admission semaphore remains open");
         let stream = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
@@ -2490,6 +2563,7 @@ async fn run_socket_server<F, Fut>(
         let mut write_rx = write_tx.subscribe();
         let diagnostics = diagnostics.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let (reader, mut writer) = tokio::io::split(stream);
             let mut lines = BufReader::new(reader).lines();
 
@@ -2717,6 +2791,91 @@ mod tests {
         .expect_err("unanswered probe should time out");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn bounded_daemon_request_admission_returns_stable_busy_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let invocation_count = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_admission = Arc::clone(&admission);
+        let first_invocation_count = Arc::clone(&invocation_count);
+
+        let first = tokio::spawn(async move {
+            dispatch_bounded_daemon_request(
+                "first".to_string(),
+                first_admission,
+                DaemonDiagnostics::disabled(),
+                move || {
+                    first_invocation_count.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).expect("signal first request start");
+                    release_rx.recv().expect("release first request");
+                    ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        id: "first".to_string(),
+                        status: Status::Ok,
+                        result: Some(serde_json::json!({ "ok": true })),
+                        error: None,
+                        ticket: None,
+                        steering: None,
+                        reminders: None,
+                        display: None,
+                        preview: None,
+                        effect: None,
+                        trace: None,
+                    }
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("first request starts within the admission bound")
+            .expect("first request start signal");
+
+        let second_invocation_count = Arc::clone(&invocation_count);
+        let busy = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_bounded_daemon_request(
+                "second".to_string(),
+                Arc::clone(&admission),
+                DaemonDiagnostics::disabled(),
+                move || {
+                    second_invocation_count.fetch_add(1, Ordering::SeqCst);
+                    panic!("busy request must not be dispatched");
+                },
+            ),
+        )
+        .await
+        .expect("busy response is bounded");
+
+        assert_eq!(busy.status, Status::Error);
+        let error = busy.error.expect("busy response error");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            error.message,
+            "daemon request capacity is exhausted; retry later"
+        );
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "kind": "daemon.busy",
+                "retryable": true,
+                "mutation_performed": false,
+            }))
+        );
+        assert_eq!(invocation_count.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).expect("release first request");
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first request finishes within the admission bound")
+            .expect("join first request");
+        assert_eq!(first.status, Status::Ok);
     }
 
     fn test_project(workspace: &Path, state_root: PathBuf) -> Project {
