@@ -64,6 +64,10 @@ impl DaemonDiagnostics {
         Self { path: None }
     }
 
+    pub const fn is_active(&self) -> bool {
+        self.path.is_some()
+    }
+
     pub fn record(&self, event: &str, fields: JsonValue) {
         let Some(path) = &self.path else {
             return;

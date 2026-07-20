@@ -55,7 +55,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default idle timeout in seconds (5 minutes).
@@ -63,8 +64,16 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_DAEMON_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_FAILED_PROBE_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
+const DAEMON_HEALTH_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
+const DAEMON_HEALTH_PERSIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
+const DAEMON_DIAGNOSTICS_INACTIVE: &str = "daemon.diagnostics_requested_but_inactive";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_ACCEPT_GATE_ENV: &str = "EXO_TEST_DAEMON_ACCEPT_GATE_PATH";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_ACCEPT_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(windows)]
 fn daemon_startup_timeout() -> Duration {
@@ -102,6 +111,7 @@ pub struct LocalRuntimePaths {
     pid_path: PathBuf,
     lock_path: PathBuf,
     identity_path: PathBuf,
+    health_path: PathBuf,
     config_home: Option<PathBuf>,
 }
 
@@ -112,6 +122,7 @@ impl LocalRuntimePaths {
         let pid_path = project.pid_path();
         let lock_path = runtime_dir.join("daemon.lock");
         let identity_path = runtime_dir.join("daemon.identity.json");
+        let health_path = runtime_dir.join("daemon.health.json");
         let config_home = project
             .projects_config_path
             .as_ref()
@@ -127,6 +138,7 @@ impl LocalRuntimePaths {
             pid_path,
             lock_path,
             identity_path,
+            health_path,
             config_home,
         }
     }
@@ -165,6 +177,11 @@ impl LocalRuntimePaths {
     /// Daemon executable identity path: `{state_root}/runtime/daemon.identity.json`
     pub fn identity_path(&self) -> PathBuf {
         self.identity_path.clone()
+    }
+
+    /// Daemon accept-loop health path: `{state_root}/runtime/daemon.health.json`
+    pub fn health_path(&self) -> PathBuf {
+        self.health_path.clone()
     }
 
     /// Durable request/outcome ledger used to recover interrupted mutations.
@@ -228,6 +245,8 @@ pub struct DaemonEnsureReport {
     pub connected: bool,
     pub spawned: bool,
     pub reused: bool,
+    pub diagnostics_requested: bool,
+    pub diagnostics_active: bool,
     pub diagnostics: Vec<String>,
 }
 
@@ -239,6 +258,15 @@ pub enum DaemonStatusState {
     StaleIdentity,
     Unreachable,
     InvalidWorkspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptLoopHealth {
+    Responsive,
+    Stalled,
+    Stopped,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,6 +290,13 @@ pub struct DaemonStatusReport {
     pub identity_matches_workspace: Option<bool>,
     pub identity_matches_project: Option<bool>,
     pub identity_matches_executable: Option<bool>,
+    pub diagnostics_active: bool,
+    pub accept_loop_health: AcceptLoopHealth,
+    pub server_task_alive: Option<bool>,
+    pub accept_count: Option<u64>,
+    pub last_accept_at: Option<String>,
+    pub last_accept_error: Option<String>,
+    pub health_updated_at: Option<String>,
     pub recorded_identity: Option<serde_json::Value>,
     pub current_identity: Option<serde_json::Value>,
     pub state: DaemonStatusState,
@@ -282,6 +317,8 @@ struct RuntimeDaemonIdentity {
     pid: Option<u32>,
     #[serde(default)]
     process_start_id: Option<String>,
+    #[serde(default)]
+    diagnostics_active: bool,
 }
 
 impl RuntimeDaemonIdentity {
@@ -294,10 +331,11 @@ impl RuntimeDaemonIdentity {
             instance_id: None,
             pid: None,
             process_start_id: None,
+            diagnostics_active: false,
         })
     }
 
-    fn for_daemon(paths: &LocalRuntimePaths) -> io::Result<Self> {
+    fn for_daemon(paths: &LocalRuntimePaths, diagnostics_active: bool) -> io::Result<Self> {
         Ok(Self {
             workspace_root: paths.workspace().to_path_buf(),
             project_id: Some(paths.project_id().to_string()),
@@ -306,6 +344,7 @@ impl RuntimeDaemonIdentity {
             instance_id: Some(ulid::Ulid::new().to_string().to_lowercase()),
             pid: Some(std::process::id()),
             process_start_id: Some(process_start_identity(std::process::id())?),
+            diagnostics_active,
         })
     }
 
@@ -327,6 +366,251 @@ impl RuntimeDaemonIdentity {
     fn matches_runtime(&self, current: &Self) -> bool {
         self.matches_project_authority(current) && self.executable == current.executable
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DaemonHealthSnapshot {
+    instance_id: String,
+    pid: u32,
+    process_start_id: String,
+    server_task_alive: bool,
+    accept_count: u64,
+    last_accept_at: Option<String>,
+    last_accept_error: Option<String>,
+    health_updated_at: String,
+}
+
+#[derive(Clone)]
+struct DaemonHealthWriter {
+    path: PathBuf,
+    state: Arc<Mutex<DaemonHealthWriterState>>,
+    write_lock: Arc<Mutex<()>>,
+    write_scheduled: Arc<AtomicBool>,
+}
+
+struct DaemonHealthWriterState {
+    snapshot: DaemonHealthSnapshot,
+    finalized: bool,
+    revision: u64,
+}
+
+struct DaemonServerTaskHealthGuard(DaemonHealthWriter);
+
+impl Drop for DaemonServerTaskHealthGuard {
+    fn drop(&mut self) {
+        self.0.server_task_stopped();
+    }
+}
+
+impl DaemonHealthWriter {
+    fn new(paths: &LocalRuntimePaths, identity: &RuntimeDaemonIdentity) -> Self {
+        Self {
+            path: paths.health_path(),
+            state: Arc::new(Mutex::new(DaemonHealthWriterState {
+                snapshot: DaemonHealthSnapshot {
+                    instance_id: identity
+                        .instance_id
+                        .clone()
+                        .expect("daemon health requires an instance id"),
+                    pid: identity.pid.expect("daemon health requires a PID"),
+                    process_start_id: identity
+                        .process_start_id
+                        .clone()
+                        .expect("daemon health requires a process start identity"),
+                    server_task_alive: true,
+                    accept_count: 0,
+                    last_accept_at: None,
+                    last_accept_error: None,
+                    health_updated_at: daemon_health_timestamp(),
+                },
+                finalized: false,
+                revision: 0,
+            })),
+            write_lock: Arc::new(Mutex::new(())),
+            write_scheduled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn bound(&self) {
+        self.update(|snapshot| {
+            snapshot.server_task_alive = true;
+            snapshot.last_accept_error = None;
+        });
+    }
+
+    fn accepted(&self) {
+        self.update_in_background(|snapshot| {
+            snapshot.accept_count = snapshot.accept_count.saturating_add(1);
+            snapshot.last_accept_at = Some(daemon_health_timestamp());
+            snapshot.last_accept_error = None;
+        });
+    }
+
+    fn accept_error(&self, error: &io::Error) {
+        self.update_in_background(|snapshot| {
+            snapshot.last_accept_error = Some(error.to_string());
+        });
+    }
+
+    fn server_task_stopped(&self) {
+        self.update_in_background(|snapshot| snapshot.server_task_alive = false);
+    }
+
+    fn cleanup(&self) {
+        let finalized = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.finalized {
+                return;
+            }
+            state.snapshot.server_task_alive = false;
+            state.snapshot.health_updated_at = daemon_health_timestamp();
+            state.revision = state.revision.saturating_add(1);
+            state.finalized = true;
+            (state.revision, state.snapshot.clone())
+        };
+        self.persist_if_current(finalized.0, &finalized.1);
+    }
+
+    fn update(&self, update: impl FnOnce(&mut DaemonHealthSnapshot)) {
+        let Some(updated) = self.update_snapshot(update) else {
+            return;
+        };
+        self.persist_if_current(updated.0, &updated.1);
+    }
+
+    fn update_in_background(&self, update: impl FnOnce(&mut DaemonHealthSnapshot)) {
+        if self.update_snapshot(update).is_some() {
+            self.schedule_background_persist();
+        }
+    }
+
+    fn update_snapshot(
+        &self,
+        update: impl FnOnce(&mut DaemonHealthSnapshot),
+    ) -> Option<(u64, DaemonHealthSnapshot)> {
+        let updated = {
+            let Ok(mut state) = self.state.lock() else {
+                return None;
+            };
+            if state.finalized {
+                return None;
+            }
+            update(&mut state.snapshot);
+            state.snapshot.health_updated_at = daemon_health_timestamp();
+            state.revision = state.revision.saturating_add(1);
+            (state.revision, state.snapshot.clone())
+        };
+        Some(updated)
+    }
+
+    fn schedule_background_persist(&self) {
+        if self.write_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let writer = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || writer.persist_latest_in_background());
+        } else {
+            std::thread::spawn(move || writer.persist_latest_in_background());
+        }
+    }
+
+    fn persist_latest_in_background(self) {
+        loop {
+            let Some((revision, snapshot)) = self.current_unfinalized_snapshot() else {
+                self.write_scheduled.store(false, Ordering::Release);
+                return;
+            };
+            self.persist_unfinalized_if_current(revision, &snapshot);
+            self.write_scheduled.store(false, Ordering::Release);
+
+            let needs_retry = self
+                .state
+                .lock()
+                .is_ok_and(|state| !state.finalized && state.revision != revision);
+            if !needs_retry
+                || self
+                    .write_scheduled
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn current_unfinalized_snapshot(&self) -> Option<(u64, DaemonHealthSnapshot)> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| (!state.finalized).then(|| (state.revision, state.snapshot.clone())))
+    }
+
+    fn persist_unfinalized_if_current(&self, revision: u64, snapshot: &DaemonHealthSnapshot) {
+        self.persist_matching_snapshot(revision, snapshot, false);
+    }
+
+    fn persist_if_current(&self, revision: u64, snapshot: &DaemonHealthSnapshot) {
+        self.persist_matching_snapshot(revision, snapshot, true);
+    }
+
+    fn persist_matching_snapshot(
+        &self,
+        revision: u64,
+        snapshot: &DaemonHealthSnapshot,
+        allow_finalized: bool,
+    ) {
+        let Ok(_write_guard) = self.write_lock.lock() else {
+            return;
+        };
+        let current = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.revision == revision && (allow_finalized || !state.finalized));
+        if current {
+            if let Err(error) = write_daemon_health_atomically(&self.path, snapshot) {
+                eprintln!(
+                    "exo daemon: failed to write health snapshot at {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn flush_for_test(&self) {
+        if let Some((revision, snapshot)) = self.current_unfinalized_snapshot() {
+            self.persist_if_current(revision, &snapshot);
+        }
+    }
+}
+
+fn daemon_health_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn write_daemon_health_atomically(path: &Path, snapshot: &DaemonHealthSnapshot) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("daemon health path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let content = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".daemon.health.json.exo-tmp.")
+        .tempfile_in(parent)?;
+    use std::io::Write;
+    temporary.write_all(&content)?;
+    temporary
+        .persist(path)
+        .map(drop)
+        .map_err(|error| error.error)
+}
+
+fn read_daemon_health(paths: &LocalRuntimePaths) -> io::Result<DaemonHealthSnapshot> {
+    let content = std::fs::read(paths.health_path())?;
+    serde_json::from_slice(&content).map_err(io::Error::other)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -373,6 +657,15 @@ impl RuntimeExecutableIdentity {
 impl DaemonEnsureReport {
     fn new(paths: &LocalRuntimePaths, state: DaemonEnsureState) -> Self {
         let spawned = state == DaemonEnsureState::Spawned;
+        let diagnostics_requested = daemon_diagnostics_requested();
+        let runtime_identity = read_daemon_identity(paths).ok();
+        let diagnostics_active = runtime_identity
+            .as_ref()
+            .is_some_and(|identity| identity.diagnostics_active);
+        let mut diagnostics = Vec::new();
+        if diagnostics_requested && !diagnostics_active {
+            diagnostics.push(DAEMON_DIAGNOSTICS_INACTIVE.to_string());
+        }
         Self {
             kind: "daemon.ensure",
             ok: true,
@@ -382,21 +675,25 @@ impl DaemonEnsureReport {
             endpoint: paths.endpoint().display(),
             pid_path: paths.pid_path(),
             pid: read_pid_file(&paths.pid_path()),
-            instance_id: read_daemon_identity(paths)
-                .ok()
-                .and_then(|identity| identity.instance_id),
+            instance_id: runtime_identity.and_then(|identity| identity.instance_id),
             probe_ok: true,
             state,
             connected: true,
             spawned,
             reused: !spawned,
-            diagnostics: Vec::new(),
+            diagnostics_requested,
+            diagnostics_active,
+            diagnostics,
         }
     }
 
     fn diagnostic(&mut self, message: impl Into<String>) {
         self.diagnostics.push(message.into());
     }
+}
+
+fn daemon_diagnostics_requested() -> bool {
+    std::env::var_os(crate::daemon_diagnostics::ENABLED_ENV).is_some()
 }
 
 #[derive(Debug)]
@@ -494,8 +791,11 @@ fn read_pid_file(pid_path: &Path) -> Option<u32> {
         .and_then(|pid| pid.trim().parse().ok())
 }
 
-fn write_daemon_identity(paths: &LocalRuntimePaths) -> io::Result<RuntimeDaemonIdentity> {
-    let identity = RuntimeDaemonIdentity::for_daemon(paths)?;
+fn write_daemon_identity(
+    paths: &LocalRuntimePaths,
+    diagnostics_active: bool,
+) -> io::Result<RuntimeDaemonIdentity> {
+    let identity = RuntimeDaemonIdentity::for_daemon(paths, diagnostics_active)?;
     let path = paths.identity_path();
     let content = serde_json::to_vec_pretty(&identity).map_err(io::Error::other)?;
     std::fs::write(path, content)?;
@@ -514,9 +814,17 @@ fn daemon_identity_matches_current(paths: &LocalRuntimePaths) -> bool {
     let Ok(current) = RuntimeDaemonIdentity::current(paths) else {
         return false;
     };
-    recorded.matches_runtime(&current)
+    runtime_identity_is_exact(&recorded, &current, read_pid_file(&paths.pid_path()))
+}
+
+fn runtime_identity_is_exact(
+    recorded: &RuntimeDaemonIdentity,
+    current: &RuntimeDaemonIdentity,
+    pid: Option<u32>,
+) -> bool {
+    recorded.matches_runtime(current)
         && recorded.pid.is_some()
-        && recorded.pid == read_pid_file(&paths.pid_path())
+        && recorded.pid == pid
         && recorded.instance_id.is_some()
         && recorded
             .process_start_id
@@ -553,6 +861,13 @@ pub fn daemon_status(workspace_path: &Path) -> DaemonStatusReport {
             identity_matches_workspace: None,
             identity_matches_project: None,
             identity_matches_executable: None,
+            diagnostics_active: false,
+            accept_loop_health: AcceptLoopHealth::Unknown,
+            server_task_alive: None,
+            accept_count: None,
+            last_accept_at: None,
+            last_accept_error: None,
+            health_updated_at: None,
             recorded_identity: None,
             current_identity: None,
             state: DaemonStatusState::InvalidWorkspace,
@@ -584,6 +899,13 @@ pub fn daemon_status_for_project(workspace_path: &Path, project: &Project) -> Da
             identity_matches_workspace: None,
             identity_matches_project: None,
             identity_matches_executable: None,
+            diagnostics_active: false,
+            accept_loop_health: AcceptLoopHealth::Unknown,
+            server_task_alive: None,
+            accept_count: None,
+            last_accept_at: None,
+            last_accept_error: None,
+            health_updated_at: None,
             recorded_identity: None,
             current_identity: None,
             state: DaemonStatusState::InvalidWorkspace,
@@ -605,13 +927,18 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     let recorded_identity_result = read_daemon_identity(&paths);
     let identity_readable = recorded_identity_result.is_ok();
     let current_identity_result = RuntimeDaemonIdentity::current(&paths);
-    let (socket_connectable, probe_ok) = inspect_daemon_endpoint(
+    let health_before_probe = read_daemon_health(&paths).ok();
+    let (socket_connectable, probe_ok) = inspect_daemon_endpoint_with_confirmation(
         &paths,
         recorded_identity_result
             .as_ref()
             .ok()
             .and_then(|identity| identity.instance_id.as_deref()),
     );
+    let health_after_probe =
+        read_daemon_health_after_probe(&paths, health_before_probe.as_ref(), probe_ok);
+    let recorded_identity_after_probe = read_daemon_identity(&paths).ok();
+    let pid_after_probe = read_pid_file(&pid_path);
 
     let identity_matches_workspace = recorded_identity_result
         .as_ref()
@@ -627,6 +954,29 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .ok()
         .zip(current_identity_result.as_ref().ok())
         .map(|(recorded, current)| recorded.executable == current.executable);
+    let exact_runtime_identity = recorded_identity_result
+        .as_ref()
+        .ok()
+        .zip(current_identity_result.as_ref().ok())
+        .is_some_and(|(recorded, current)| {
+            recorded_identity_after_probe.as_ref() == Some(recorded)
+                && pid_after_probe == pid
+                && runtime_identity_is_exact(recorded, current, pid)
+        });
+    let matching_health_before = exact_runtime_identity.then_some(()).and_then(|()| {
+        recorded_identity_result.as_ref().ok().and_then(|identity| {
+            health_before_probe
+                .as_ref()
+                .filter(|health| daemon_health_matches_identity(health, identity))
+        })
+    });
+    let matching_health_after = exact_runtime_identity.then_some(()).and_then(|()| {
+        recorded_identity_result.as_ref().ok().and_then(|identity| {
+            health_after_probe
+                .as_ref()
+                .filter(|health| daemon_health_matches_identity(health, identity))
+        })
+    });
 
     let recorded_identity = recorded_identity_result
         .as_ref()
@@ -640,6 +990,10 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .as_ref()
         .ok()
         .and_then(|identity| serde_json::to_value(identity).ok());
+    let diagnostics_active = exact_runtime_identity
+        && recorded_identity_result
+            .as_ref()
+            .is_ok_and(|identity| identity.diagnostics_active);
 
     let state = if socket_connectable {
         if identity_matches_project == Some(true)
@@ -674,6 +1028,13 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         }),
         DaemonStatusState::InvalidWorkspace => None,
     };
+    let accept_loop_health = classify_accept_loop_health(
+        state,
+        exact_runtime_identity,
+        probe_ok,
+        matching_health_before,
+        matching_health_after,
+    );
 
     DaemonStatusReport {
         kind: "daemon.status",
@@ -695,6 +1056,14 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         identity_matches_workspace,
         identity_matches_project,
         identity_matches_executable,
+        diagnostics_active,
+        accept_loop_health,
+        server_task_alive: matching_health_after.map(|health| health.server_task_alive),
+        accept_count: matching_health_after.map(|health| health.accept_count),
+        last_accept_at: matching_health_after.and_then(|health| health.last_accept_at.clone()),
+        last_accept_error: matching_health_after
+            .and_then(|health| health.last_accept_error.clone()),
+        health_updated_at: matching_health_after.map(|health| health.health_updated_at.clone()),
         recorded_identity,
         current_identity,
         state,
@@ -702,7 +1071,99 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     }
 }
 
-fn inspect_daemon_endpoint(
+fn daemon_health_matches_identity(
+    health: &DaemonHealthSnapshot,
+    identity: &RuntimeDaemonIdentity,
+) -> bool {
+    identity.instance_id.as_deref() == Some(health.instance_id.as_str())
+        && identity.pid == Some(health.pid)
+        && identity.process_start_id.as_deref() == Some(health.process_start_id.as_str())
+}
+
+fn read_daemon_health_after_probe(
+    paths: &LocalRuntimePaths,
+    health_before: Option<&DaemonHealthSnapshot>,
+    probe_ok: Option<bool>,
+) -> Option<DaemonHealthSnapshot> {
+    if probe_ok.is_none() {
+        return read_daemon_health(paths).ok();
+    }
+
+    let deadline = std::time::Instant::now() + DAEMON_HEALTH_PERSIST_TIMEOUT;
+    loop {
+        let health_after = read_daemon_health(paths).ok();
+        let accept_is_durable = match (health_before, health_after.as_ref()) {
+            (None, _) => false,
+            (Some(before), Some(after)) => {
+                before.instance_id != after.instance_id
+                    || before.pid != after.pid
+                    || before.process_start_id != after.process_start_id
+                    || after.accept_count > before.accept_count
+            }
+            _ => false,
+        };
+        if accept_is_durable {
+            return health_after;
+        }
+        if std::time::Instant::now() >= deadline {
+            return if probe_ok == Some(false) {
+                health_after
+            } else {
+                None
+            };
+        }
+        std::thread::sleep(DAEMON_HEALTH_PERSIST_POLL_INTERVAL);
+    }
+}
+
+fn classify_accept_loop_health(
+    state: DaemonStatusState,
+    exact_runtime_identity: bool,
+    probe_ok: Option<bool>,
+    health_before: Option<&DaemonHealthSnapshot>,
+    health_after: Option<&DaemonHealthSnapshot>,
+) -> AcceptLoopHealth {
+    if state == DaemonStatusState::Stopped {
+        return AcceptLoopHealth::Stopped;
+    }
+    if exact_runtime_identity && health_after.is_some_and(|health| !health.server_task_alive) {
+        return AcceptLoopHealth::Stopped;
+    }
+    if exact_runtime_identity && probe_ok == Some(true) {
+        return AcceptLoopHealth::Responsive;
+    }
+    if exact_runtime_identity
+        && probe_ok == Some(false)
+        && health_before
+            .zip(health_after)
+            .is_some_and(|(before, after)| {
+                after.server_task_alive && before.accept_count == after.accept_count
+            })
+    {
+        return AcceptLoopHealth::Stalled;
+    }
+    AcceptLoopHealth::Unknown
+}
+
+fn inspect_daemon_endpoint_with_confirmation(
+    paths: &LocalRuntimePaths,
+    expected_instance_id: Option<&str>,
+) -> (bool, Option<bool>) {
+    let first = inspect_daemon_endpoint_once(paths, expected_instance_id);
+    if first.1 != Some(false) {
+        return first;
+    }
+
+    // A request can be accepted just before its response times out. Confirm the
+    // failure before status waits for the background health writer. Only the
+    // latest explicit probe failure can therefore contribute to a stalled
+    // classification.
+    std::thread::sleep(DAEMON_FAILED_PROBE_SETTLE_TIMEOUT);
+    let second = inspect_daemon_endpoint_once(paths, expected_instance_id);
+    (first.0 || second.0, second.1)
+}
+
+fn inspect_daemon_endpoint_once(
     paths: &LocalRuntimePaths,
     expected_instance_id: Option<&str>,
 ) -> (bool, Option<bool>) {
@@ -1545,6 +2006,10 @@ fn spawn_daemon_paths(paths: &LocalRuntimePaths) -> std::io::Result<()> {
             crate::daemon_diagnostics::enabled_env_vars().map(|(key, value)| (key.into(), value)),
         )
         .collect();
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os(TEST_DAEMON_ACCEPT_GATE_ENV) {
+        preserved_env.push((TEST_DAEMON_ACCEPT_GATE_ENV.into(), value));
+    }
     if let Some(config_home) = paths.config_home() {
         preserved_env.retain(|(key, _)| key != "XDG_CONFIG_HOME");
         preserved_env.push(("XDG_CONFIG_HOME".into(), config_home.as_os_str().into()));
@@ -2093,13 +2558,14 @@ pub async fn run_daemon(
         "daemon.pid_written",
         serde_json::json!({ "pid": std::process::id(), "pid_path": paths.pid_path() }),
     );
-    let runtime_identity = match write_daemon_identity(&paths) {
+    let runtime_identity = match write_daemon_identity(&paths, diagnostics.is_active()) {
         Ok(identity) => {
             diagnostics.record(
                 "daemon.identity_written",
                 serde_json::json!({
                     "identity_path": paths.identity_path(),
                     "instance_id": identity.instance_id.as_deref(),
+                    "diagnostics_active": identity.diagnostics_active,
                 }),
             );
             identity
@@ -2116,6 +2582,7 @@ pub async fn run_daemon(
             return;
         }
     };
+    let health = DaemonHealthWriter::new(&paths, &runtime_identity);
     let instance_id: Arc<str> = runtime_identity
         .instance_id
         .expect("daemon runtime identity includes an instance id")
@@ -2181,6 +2648,7 @@ pub async fn run_daemon(
     // Run the socket server
     let paths_clone = paths.clone();
     let diagnostics_clone = diagnostics.clone();
+    let server_health = health.clone();
     let handler_diagnostics = diagnostics.clone();
     let last_activity_clone = Arc::clone(&last_activity);
     let cleanup_workspace = Arc::clone(&workspace);
@@ -2192,6 +2660,7 @@ pub async fn run_daemon(
         DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
     ));
     let server_handle = tokio::spawn(async move {
+        let _health_guard = DaemonServerTaskHealthGuard(server_health.clone());
         run_socket_server(
             &paths_clone,
             Arc::clone(&workspace),
@@ -2201,6 +2670,7 @@ pub async fn run_daemon(
             last_activity_clone,
             write_tx,
             diagnostics_clone,
+            server_health.clone(),
             move |req: RequestEnvelope| {
                 let workspace = Arc::clone(&workspace);
                 let project = Arc::clone(&request_project);
@@ -2428,6 +2898,7 @@ pub async fn run_daemon(
 
     // Cleanup: remove endpoint and PID files, then release lock
     eprintln!("exo daemon: cleaning up");
+    health.cleanup();
     let _ = paths.endpoint().remove_stale();
     let _ = std::fs::remove_file(paths.pid_path());
     let _ = std::fs::remove_file(paths.lock_path());
@@ -2510,6 +2981,7 @@ async fn run_socket_server<F, Fut>(
     last_activity: Arc<AtomicU64>,
     write_tx: tokio::sync::broadcast::Sender<()>,
     diagnostics: DaemonDiagnostics,
+    health: DaemonHealthWriter,
     handler: F,
 ) where
     F: Fn(RequestEnvelope) -> Fut + Send + Sync + 'static,
@@ -2521,6 +2993,7 @@ async fn run_socket_server<F, Fut>(
     let endpoint = paths.endpoint();
     let mut listener = match endpoint.bind().await {
         Ok(l) => {
+            health.bound();
             diagnostics.record(
                 "daemon.socket_bind",
                 serde_json::json!({ "socket_path": socket_path, "endpoint": endpoint.display() }),
@@ -2534,6 +3007,8 @@ async fn run_socket_server<F, Fut>(
     };
 
     eprintln!("exo daemon: listening on {}", endpoint.display());
+
+    wait_for_test_accept_gate().await;
 
     let handler = Arc::new(handler);
     let connection_admission =
@@ -2549,10 +3024,12 @@ async fn run_socket_server<F, Fut>(
         let stream = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
+                health.accept_error(&e);
                 eprintln!("exo daemon: accept error: {e}");
                 continue;
             }
         };
+        health.accepted();
         diagnostics.record("socket.accept", serde_json::json!({}));
 
         let handler = Arc::clone(&handler);
@@ -2685,6 +3162,38 @@ async fn run_socket_server<F, Fut>(
         });
     }
 }
+
+#[cfg(debug_assertions)]
+async fn wait_for_test_accept_gate() {
+    let Some(path) = std::env::var_os(TEST_DAEMON_ACCEPT_GATE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    wait_for_test_accept_gate_path(&path, TEST_DAEMON_ACCEPT_GATE_TIMEOUT).await;
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_test_accept_gate_path(path: &Path, timeout: Duration) {
+    if std::fs::create_dir_all(&path).is_err()
+        || std::fs::write(path.join("bound"), b"bound\n").is_err()
+    {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.join("release").exists() {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "exo daemon: test accept gate timed out after {}ms at {}",
+                timeout.as_millis(),
+                path.display()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10).min(timeout)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn wait_for_test_accept_gate() {}
 
 #[cfg(test)]
 mod tests {
@@ -3619,6 +4128,10 @@ mod tests {
             paths.pid_path(),
             PathBuf::from("/home/user/project/.exo/runtime/daemon.pid")
         );
+        assert_eq!(
+            paths.health_path(),
+            PathBuf::from("/home/user/project/.exo/runtime/daemon.health.json")
+        );
     }
 
     #[test]
@@ -3679,6 +4192,276 @@ mod tests {
 
         assert!(legacy.matches_project_authority(&primary_identity));
         assert!(!legacy.matches_project_authority(&linked_identity));
+    }
+
+    #[test]
+    fn legacy_daemon_identity_defaults_diagnostics_inactive() {
+        let workspace = PathBuf::from("/home/user/project");
+        let project = test_project(&workspace, PathBuf::from("/state/projects/project"));
+        let identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&workspace, &project))
+                .expect("current identity");
+        let mut value = serde_json::to_value(identity).expect("serialize identity");
+        value
+            .as_object_mut()
+            .expect("identity object")
+            .remove("diagnostics_active");
+
+        let legacy: RuntimeDaemonIdentity =
+            serde_json::from_value(value).expect("deserialize legacy identity");
+        assert!(!legacy.diagnostics_active);
+    }
+
+    #[test]
+    fn exact_runtime_identity_uses_one_recorded_snapshot() {
+        let workspace = PathBuf::from("/home/user/project");
+        let project = test_project(&workspace, PathBuf::from("/state/projects/project"));
+        let paths = LocalRuntimePaths::new(&workspace, &project);
+        let recorded = RuntimeDaemonIdentity::for_daemon(&paths, false).expect("daemon identity");
+        let current = RuntimeDaemonIdentity::current(&paths).expect("current identity");
+
+        assert!(runtime_identity_is_exact(&recorded, &current, recorded.pid));
+        assert!(!runtime_identity_is_exact(
+            &recorded,
+            &current,
+            recorded.pid.map(|pid| pid.saturating_add(1))
+        ));
+    }
+
+    fn test_health(instance_id: &str, pid: u32, process_start_id: &str) -> DaemonHealthSnapshot {
+        DaemonHealthSnapshot {
+            instance_id: instance_id.to_string(),
+            pid,
+            process_start_id: process_start_id.to_string(),
+            server_task_alive: true,
+            accept_count: 7,
+            last_accept_at: Some("2026-07-20T12:00:00.000Z".to_string()),
+            last_accept_error: None,
+            health_updated_at: "2026-07-20T12:00:01.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn accept_loop_health_classification_is_conservative() {
+        let before = test_health("instance-a", 42, "start-a");
+        let mut advanced = before.clone();
+        advanced.accept_count += 1;
+
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::RunningCurrent,
+                true,
+                Some(true),
+                None,
+                None,
+            ),
+            AcceptLoopHealth::Responsive,
+            "a successful exact-instance probe is responsive even without health telemetry"
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                Some(false),
+                Some(&before),
+                Some(&before),
+            ),
+            AcceptLoopHealth::Stalled
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                None,
+                Some(&before),
+                Some(&before),
+            ),
+            AcceptLoopHealth::Unknown,
+            "a missing probe result must not be called stalled"
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                Some(false),
+                Some(&before),
+                Some(&advanced),
+            ),
+            AcceptLoopHealth::Unknown,
+            "advancing admission must not be called stalled"
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                Some(false),
+                None,
+                None,
+            ),
+            AcceptLoopHealth::Unknown,
+            "missing health must remain unknown"
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                false,
+                Some(false),
+                Some(&before),
+                Some(&before),
+            ),
+            AcceptLoopHealth::Unknown,
+            "health cannot classify a non-exact runtime identity"
+        );
+        let mut server_stopped = before.clone();
+        server_stopped.server_task_alive = false;
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                Some(false),
+                Some(&server_stopped),
+                Some(&server_stopped),
+            ),
+            AcceptLoopHealth::Stopped,
+            "an exact matching snapshot records server-task exit"
+        );
+        assert_eq!(
+            classify_accept_loop_health(DaemonStatusState::Stopped, false, None, None, None,),
+            AcceptLoopHealth::Stopped
+        );
+    }
+
+    #[test]
+    fn daemon_health_requires_all_runtime_identity_keys() {
+        let workspace = PathBuf::from("/home/user/project");
+        let project = test_project(&workspace, PathBuf::from("/state/projects/project"));
+        let mut identity =
+            RuntimeDaemonIdentity::current(&LocalRuntimePaths::new(&workspace, &project))
+                .expect("current identity");
+        identity.instance_id = Some("instance-a".to_string());
+        identity.pid = Some(42);
+        identity.process_start_id = Some("start-a".to_string());
+        let health = test_health("instance-a", 42, "start-a");
+        assert!(daemon_health_matches_identity(&health, &identity));
+
+        let mut stale_instance = health.clone();
+        stale_instance.instance_id = "instance-b".to_string();
+        assert!(!daemon_health_matches_identity(&stale_instance, &identity));
+        let mut stale_pid = health.clone();
+        stale_pid.pid = 43;
+        assert!(!daemon_health_matches_identity(&stale_pid, &identity));
+        let mut stale_start = health;
+        stale_start.process_start_id = "start-b".to_string();
+        assert!(!daemon_health_matches_identity(&stale_start, &identity));
+    }
+
+    #[test]
+    fn daemon_health_writer_atomically_records_accept_lifecycle() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("project");
+        let project = test_project(&workspace, temp.path().join("state"));
+        let paths = LocalRuntimePaths::new(&workspace, &project);
+        paths.ensure_dir().expect("create runtime directory");
+        let mut identity = RuntimeDaemonIdentity::current(&paths).expect("current identity");
+        identity.instance_id = Some("instance-a".to_string());
+        identity.pid = Some(42);
+        identity.process_start_id = Some("start-a".to_string());
+        let writer = DaemonHealthWriter::new(&paths, &identity);
+
+        writer.bound();
+        let bound = read_daemon_health(&paths).expect("read bound health");
+        assert!(bound.server_task_alive);
+        assert_eq!(bound.accept_count, 0);
+
+        writer.accepted();
+        writer.flush_for_test();
+        let accepted = read_daemon_health(&paths).expect("read accepted health");
+        assert_eq!(accepted.accept_count, 1);
+        assert!(accepted.last_accept_at.is_some());
+        assert!(accepted.last_accept_error.is_none());
+
+        writer.accept_error(&io::Error::other("accept failed"));
+        writer.flush_for_test();
+        let failed = read_daemon_health(&paths).expect("read accept-error health");
+        assert_eq!(failed.accept_count, 1);
+        assert_eq!(failed.last_accept_error.as_deref(), Some("accept failed"));
+
+        writer.server_task_stopped();
+        writer.flush_for_test();
+        let stopped = read_daemon_health(&paths).expect("read stopped health");
+        assert!(!stopped.server_task_alive);
+        assert_eq!(stopped.instance_id, "instance-a");
+        assert_eq!(stopped.pid, 42);
+        assert_eq!(stopped.process_start_id, "start-a");
+
+        let late_server_task = writer.clone();
+        let in_flight_snapshot = {
+            let state = writer.state.lock().expect("lock health writer state");
+            (state.revision, state.snapshot.clone())
+        };
+        writer.cleanup();
+        let finalized = read_daemon_health(&paths).expect("read finalized health");
+        late_server_task.persist_if_current(in_flight_snapshot.0, &in_flight_snapshot.1);
+        late_server_task.accepted();
+        late_server_task.accept_error(&io::Error::other("late accept error"));
+        late_server_task.server_task_stopped();
+        assert_eq!(
+            read_daemon_health(&paths).expect("reread finalized health"),
+            finalized,
+            "cleanup must seal the old generation against late server-task writes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_health_writer_coalesces_background_accept_persistence() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("project");
+        let project = test_project(&workspace, temp.path().join("state"));
+        let paths = LocalRuntimePaths::new(&workspace, &project);
+        paths.ensure_dir().expect("create runtime directory");
+        let mut identity = RuntimeDaemonIdentity::current(&paths).expect("current identity");
+        identity.instance_id = Some("instance-a".to_string());
+        identity.pid = Some(42);
+        identity.process_start_id = Some("start-a".to_string());
+        let writer = DaemonHealthWriter::new(&paths, &identity);
+        writer.bound();
+        let bound = read_daemon_health(&paths).expect("read bound health");
+
+        for _ in 0..1_000 {
+            writer.accepted();
+        }
+
+        let first_durable = read_daemon_health_after_probe(&paths, Some(&bound), Some(true))
+            .expect("successful probe observes durable accept progress");
+        assert!(first_durable.accept_count > bound.accept_count);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if read_daemon_health(&paths).is_ok_and(|health| health.accept_count == 1_000) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("coalesced health persistence completes");
+        writer.cleanup();
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn test_accept_gate_times_out_without_release() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let gate = temp.path().join("accept-gate");
+        let started = std::time::Instant::now();
+
+        wait_for_test_accept_gate_path(&gate, Duration::from_millis(25)).await;
+
+        assert!(gate.join("bound").exists());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "test-only accept gate must remain bounded"
+        );
     }
 
     #[test]
