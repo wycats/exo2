@@ -1179,7 +1179,7 @@ impl AgentContext {
         root: &Path,
         project: Option<&Project>,
     ) -> ExoResult<()> {
-        let _loader = Self::open_sqlite_loader(root, project)?;
+        Self::initialize_sqlite(root, project)?;
         crate::rfc::reconcile_rfcs_once_with_project(root, project)
             .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
         Ok(())
@@ -1206,9 +1206,10 @@ impl AgentContext {
         root: &Path,
         project: Option<&Project>,
     ) -> ExoResult<(ExoState, crate::rfc::EffectiveRfcView)> {
-        let loader = Self::open_sqlite_loader(root, project)?;
+        Self::initialize_sqlite(root, project)?;
         let (_, rfc_view) = crate::rfc::observe_effective_rfc_view_with_project(root, project)
             .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
+        let loader = Self::open_sqlite_loader(root, project)?;
         let plan = loader
             .load_state()
             .with_context(|| "Failed to load state from SQLite database")?;
@@ -1216,15 +1217,23 @@ impl AgentContext {
     }
 
     fn load_from_sqlite(root: &Path, project: Option<&Project>) -> ExoResult<ExoState> {
-        let loader = Self::open_sqlite_loader(root, project)?;
+        Self::initialize_sqlite(root, project)?;
         let db_path = db_path(root, project);
         if exosuit_storage::active_request_database(&db_path)?.is_none() {
             crate::rfc::reconcile_rfcs_once_with_project(root, project)
                 .with_context(|| "Failed to reconcile RFC metadata from disk into SQLite")?;
         }
+        let loader = Self::open_sqlite_loader(root, project)?;
         loader
             .load_state()
             .with_context(|| "Failed to load state from SQLite database")
+    }
+
+    /// Ensure the SQLite file exists and its schema is current without retaining
+    /// a connection across RFC reconcile-lock acquisition.
+    fn initialize_sqlite(root: &Path, project: Option<&Project>) -> ExoResult<()> {
+        drop(Self::open_sqlite_loader(root, project)?);
+        Ok(())
     }
 
     fn open_sqlite_loader(root: &Path, project: Option<&Project>) -> ExoResult<SqliteLoader> {
@@ -1578,6 +1587,185 @@ pub(crate) fn import_sql_dumps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const LOCK_ORDER_HELPER_MODE_ENV: &str = "EXO_TEST_CONTEXT_LOCK_ORDER_MODE";
+    const LOCK_ORDER_HELPER_ROOT_ENV: &str = "EXO_TEST_CONTEXT_LOCK_ORDER_ROOT";
+    const LOCK_ORDER_WAIT_MARKER_ENV: &str = "EXO_TEST_RFC_RECONCILE_LOCK_WAIT_MARKER";
+
+    struct LockOrderChild(Option<Child>);
+
+    impl LockOrderChild {
+        fn spawn(root: &Path, mode: &str, marker: &Path) -> Self {
+            let child = Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "context::tests::lock_order_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env(LOCK_ORDER_HELPER_MODE_ENV, mode)
+                .env(LOCK_ORDER_HELPER_ROOT_ENV, root)
+                .env(LOCK_ORDER_WAIT_MARKER_ENV, marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn lock-order helper process");
+            Self(Some(child))
+        }
+
+        fn wait_for_marker(&mut self, marker: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if marker.exists() {
+                    return;
+                }
+                if self
+                    .0
+                    .as_mut()
+                    .expect("child available")
+                    .try_wait()
+                    .expect("poll helper process")
+                    .is_some()
+                {
+                    let output = self
+                        .0
+                        .take()
+                        .expect("child available")
+                        .wait_with_output()
+                        .expect("collect lock-order helper output after premature exit");
+                    panic!(
+                        "lock-order helper exited before waiting on the RFC lock:\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("lock-order helper did not reach the RFC lock within 5 seconds");
+        }
+
+        fn wait_for_success(mut self) {
+            let mut child = self.0.take().expect("child available");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll helper process") {
+                    let output = child
+                        .wait_with_output()
+                        .expect("collect lock-order helper output");
+                    assert!(
+                        status.success(),
+                        "lock-order helper failed:\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "lock-order helper did not finish within 30 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for LockOrderChild {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn initialize_lock_order_workspace(root: &Path) -> PathBuf {
+        std::fs::create_dir_all(root.join("docs/rfcs")).expect("create RFC directory");
+        std::fs::create_dir_all(root.join(".cache")).expect("create cache directory");
+        std::fs::write(
+            root.join("exosuit.toml"),
+            "[storage]\nbackend = \"sqlite\"\n",
+        )
+        .expect("write exosuit config");
+        let database_path = db_path(root, None);
+        drop(SqliteWriter::open(&database_path).expect("initialize SQLite database"));
+        database_path
+    }
+
+    fn assert_context_path_does_not_hold_database_while_waiting(mode: &str) {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let database_path = initialize_lock_order_workspace(root);
+        let lock_path = database_path.with_extension("rfc-reconcile.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .expect("open RFC reconcile lock");
+        lock_file.lock_exclusive().expect("hold RFC reconcile lock");
+
+        let marker = temp.path().join(format!("{mode}.waiting"));
+        let mut child = LockOrderChild::spawn(root, mode, &marker);
+        child.wait_for_marker(&marker);
+
+        let connection = exosuit_storage::Connection::open(&database_path)
+            .expect("open independent SQLite connection");
+        connection
+            .busy_timeout(Duration::from_millis(100))
+            .expect("set independent busy timeout");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .expect("switch journal mode while helper waits on RFC lock");
+        assert_eq!(journal_mode, "delete");
+        drop(connection);
+
+        lock_file.unlock().expect("release RFC reconcile lock");
+        child.wait_for_success();
+    }
+
+    #[test]
+    fn lock_order_subprocess_helper() {
+        let Some(mode) = std::env::var_os(LOCK_ORDER_HELPER_MODE_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(
+            std::env::var_os(LOCK_ORDER_HELPER_ROOT_ENV).expect("lock-order helper root"),
+        );
+        match mode.to_string_lossy().as_ref() {
+            "load" => {
+                AgentContext::load_with_project(root, None).expect("load agent context");
+            }
+            "rfc-view" => {
+                AgentContext::load_with_project_and_rfc_view(root, None)
+                    .expect("load agent context with RFC view");
+            }
+            "prepare" => {
+                AgentContext::prepare_request_transaction(&root, None)
+                    .expect("prepare request transaction");
+            }
+            other => panic!("unknown lock-order helper mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn load_from_sqlite_does_not_hold_database_while_waiting_for_rfc_lock() {
+        assert_context_path_does_not_hold_database_while_waiting("load");
+    }
+
+    #[test]
+    fn load_with_rfc_view_does_not_hold_database_while_waiting_for_rfc_lock() {
+        assert_context_path_does_not_hold_database_while_waiting("rfc-view");
+    }
+
+    #[test]
+    fn request_preparation_does_not_hold_database_while_waiting_for_rfc_lock() {
+        assert_context_path_does_not_hold_database_while_waiting("prepare");
+    }
 
     #[test]
     fn test_parse_plan() {

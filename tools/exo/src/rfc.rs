@@ -1058,6 +1058,11 @@ fn with_reconcile_lock<T>(
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("Failed to open RFC reconcile lock {}", lock_path.display()))?;
+    #[cfg(test)]
+    if let Some(marker) = std::env::var_os("EXO_TEST_RFC_RECONCILE_LOCK_WAIT_MARKER") {
+        std::fs::write(marker, b"waiting")
+            .context("Failed to write RFC reconcile lock wait marker")?;
+    }
     file.lock_exclusive()
         .with_context(|| format!("Failed to lock RFC reconcile lock {}", lock_path.display()))?;
     let result = f();
