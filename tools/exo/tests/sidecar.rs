@@ -8122,7 +8122,7 @@ fn auto_persist_blocks_live_different_binary_sidecar_write_owner() {
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("stale Exo runtime")),
+            .is_some_and(|message| message.contains("another active runtime")),
         "{error:?}"
     );
     assert!(
@@ -8170,7 +8170,7 @@ fn auto_persist_blocks_live_different_binary_sidecar_write_owner() {
     assert!(
         result["ownership"]["issue"]
             .as_str()
-            .is_some_and(|issue| issue.contains("stale Exo runtime")),
+            .is_some_and(|issue| issue.contains("another active runtime")),
         "{result:?}"
     );
 }
@@ -8368,7 +8368,7 @@ fn auto_persist_blocks_old_different_binary_exo_owner_without_heartbeat() {
 
 #[cfg(unix)]
 #[test]
-fn live_stale_owner_without_start_identity_is_not_reclaimable() {
+fn live_owner_without_start_identity_is_not_reclaimable() {
     let temp = short_tempdir();
     let repo = temp.path().join("external-repo");
     let home = temp.path().join("home");
@@ -8407,7 +8407,7 @@ fn live_stale_owner_without_start_identity_is_not_reclaimable() {
     assert!(
         status["ownership"]["issue"]
             .as_str()
-            .is_some_and(|issue| issue.contains("stale Exo runtime")),
+            .is_some_and(|issue| issue.contains("another active runtime")),
         "{status:?}"
     );
 
@@ -8431,7 +8431,7 @@ fn live_stale_owner_without_start_identity_is_not_reclaimable() {
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("stale Exo runtime")),
+            .is_some_and(|message| message.contains("another active runtime")),
         "{error:?}"
     );
     assert!(

@@ -5489,6 +5489,12 @@ fn read_sidecar_write_ownership_status_with_current(
                     .to_string(),
             ),
         )
+    } else if compatible && !same_process && liveness == ProcessLiveness::Alive {
+        (
+            "blocked",
+            false,
+            Some("sidecar write ownership is held by another active runtime".to_string()),
+        )
     } else if compatible && !same_binary {
         (
             "blocked",
@@ -6296,7 +6302,7 @@ mod sidecar_write_owner_compatibility_tests {
     }
 
     #[test]
-    fn same_process_requires_pid_machine_and_process_start_identity() {
+    fn same_process_uses_process_start_identity_when_available() {
         let current = marker("/worktrees/current");
         let mut owner = marker("/worktrees/linked");
 
