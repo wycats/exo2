@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default idle timeout in seconds (5 minutes).
@@ -69,6 +69,8 @@ const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
 const DAEMON_DIAGNOSTICS_INACTIVE: &str = "daemon.diagnostics_requested_but_inactive";
 #[cfg(debug_assertions)]
 const TEST_DAEMON_ACCEPT_GATE_ENV: &str = "EXO_TEST_DAEMON_ACCEPT_GATE_PATH";
+#[cfg(debug_assertions)]
+const TEST_DAEMON_ACCEPT_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(windows)]
 fn daemon_startup_timeout() -> Duration {
@@ -380,6 +382,7 @@ struct DaemonHealthWriter {
     path: PathBuf,
     state: Arc<Mutex<DaemonHealthWriterState>>,
     write_lock: Arc<Mutex<()>>,
+    write_scheduled: Arc<AtomicBool>,
 }
 
 struct DaemonHealthWriterState {
@@ -421,6 +424,7 @@ impl DaemonHealthWriter {
                 revision: 0,
             })),
             write_lock: Arc::new(Mutex::new(())),
+            write_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -432,7 +436,7 @@ impl DaemonHealthWriter {
     }
 
     fn accepted(&self) {
-        self.update(|snapshot| {
+        self.update_in_background(|snapshot| {
             snapshot.accept_count = snapshot.accept_count.saturating_add(1);
             snapshot.last_accept_at = Some(daemon_health_timestamp());
             snapshot.last_accept_error = None;
@@ -440,13 +444,13 @@ impl DaemonHealthWriter {
     }
 
     fn accept_error(&self, error: &io::Error) {
-        self.update(|snapshot| {
+        self.update_in_background(|snapshot| {
             snapshot.last_accept_error = Some(error.to_string());
         });
     }
 
     fn server_task_stopped(&self) {
-        self.update(|snapshot| snapshot.server_task_alive = false);
+        self.update_in_background(|snapshot| snapshot.server_task_alive = false);
     }
 
     fn cleanup(&self) {
@@ -467,29 +471,101 @@ impl DaemonHealthWriter {
     }
 
     fn update(&self, update: impl FnOnce(&mut DaemonHealthSnapshot)) {
+        let Some(updated) = self.update_snapshot(update) else {
+            return;
+        };
+        self.persist_if_current(updated.0, &updated.1);
+    }
+
+    fn update_in_background(&self, update: impl FnOnce(&mut DaemonHealthSnapshot)) {
+        if self.update_snapshot(update).is_some() {
+            self.schedule_background_persist();
+        }
+    }
+
+    fn update_snapshot(
+        &self,
+        update: impl FnOnce(&mut DaemonHealthSnapshot),
+    ) -> Option<(u64, DaemonHealthSnapshot)> {
         let updated = {
             let Ok(mut state) = self.state.lock() else {
-                return;
+                return None;
             };
             if state.finalized {
-                return;
+                return None;
             }
             update(&mut state.snapshot);
             state.snapshot.health_updated_at = daemon_health_timestamp();
             state.revision = state.revision.saturating_add(1);
             (state.revision, state.snapshot.clone())
         };
-        self.persist_if_current(updated.0, &updated.1);
+        Some(updated)
+    }
+
+    fn schedule_background_persist(&self) {
+        if self.write_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let writer = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || writer.persist_latest_in_background());
+        } else {
+            std::thread::spawn(move || writer.persist_latest_in_background());
+        }
+    }
+
+    fn persist_latest_in_background(self) {
+        loop {
+            let Some((revision, snapshot)) = self.current_unfinalized_snapshot() else {
+                self.write_scheduled.store(false, Ordering::Release);
+                return;
+            };
+            self.persist_unfinalized_if_current(revision, &snapshot);
+            self.write_scheduled.store(false, Ordering::Release);
+
+            let needs_retry = self
+                .state
+                .lock()
+                .is_ok_and(|state| !state.finalized && state.revision != revision);
+            if !needs_retry
+                || self
+                    .write_scheduled
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn current_unfinalized_snapshot(&self) -> Option<(u64, DaemonHealthSnapshot)> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| (!state.finalized).then(|| (state.revision, state.snapshot.clone())))
+    }
+
+    fn persist_unfinalized_if_current(&self, revision: u64, snapshot: &DaemonHealthSnapshot) {
+        self.persist_matching_snapshot(revision, snapshot, false);
     }
 
     fn persist_if_current(&self, revision: u64, snapshot: &DaemonHealthSnapshot) {
+        self.persist_matching_snapshot(revision, snapshot, true);
+    }
+
+    fn persist_matching_snapshot(
+        &self,
+        revision: u64,
+        snapshot: &DaemonHealthSnapshot,
+        allow_finalized: bool,
+    ) {
         let Ok(_write_guard) = self.write_lock.lock() else {
             return;
         };
         let current = self
             .state
             .lock()
-            .is_ok_and(|state| state.revision == revision);
+            .is_ok_and(|state| state.revision == revision && (allow_finalized || !state.finalized));
         if current {
             if let Err(error) = write_daemon_health_atomically(&self.path, snapshot) {
                 eprintln!(
@@ -497,6 +573,13 @@ impl DaemonHealthWriter {
                     self.path.display()
                 );
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn flush_for_test(&self) {
+        if let Some((revision, snapshot)) = self.current_unfinalized_snapshot() {
+            self.persist_if_current(revision, &snapshot);
         }
     }
 }
@@ -3026,13 +3109,27 @@ async fn wait_for_test_accept_gate() {
     let Some(path) = std::env::var_os(TEST_DAEMON_ACCEPT_GATE_ENV).map(PathBuf::from) else {
         return;
     };
+    wait_for_test_accept_gate_path(&path, TEST_DAEMON_ACCEPT_GATE_TIMEOUT).await;
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_test_accept_gate_path(path: &Path, timeout: Duration) {
     if std::fs::create_dir_all(&path).is_err()
         || std::fs::write(path.join("bound"), b"bound\n").is_err()
     {
         return;
     }
+    let deadline = tokio::time::Instant::now() + timeout;
     while !path.join("release").exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "exo daemon: test accept gate timed out after {}ms at {}",
+                timeout.as_millis(),
+                path.display()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10).min(timeout)).await;
     }
 }
 
@@ -4218,17 +4315,20 @@ mod tests {
         assert_eq!(bound.accept_count, 0);
 
         writer.accepted();
+        writer.flush_for_test();
         let accepted = read_daemon_health(&paths).expect("read accepted health");
         assert_eq!(accepted.accept_count, 1);
         assert!(accepted.last_accept_at.is_some());
         assert!(accepted.last_accept_error.is_none());
 
         writer.accept_error(&io::Error::other("accept failed"));
+        writer.flush_for_test();
         let failed = read_daemon_health(&paths).expect("read accept-error health");
         assert_eq!(failed.accept_count, 1);
         assert_eq!(failed.last_accept_error.as_deref(), Some("accept failed"));
 
         writer.server_task_stopped();
+        writer.flush_for_test();
         let stopped = read_daemon_health(&paths).expect("read stopped health");
         assert!(!stopped.server_task_alive);
         assert_eq!(stopped.instance_id, "instance-a");
@@ -4250,6 +4350,53 @@ mod tests {
             read_daemon_health(&paths).expect("reread finalized health"),
             finalized,
             "cleanup must seal the old generation against late server-task writes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_health_writer_coalesces_background_accept_persistence() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("project");
+        let project = test_project(&workspace, temp.path().join("state"));
+        let paths = LocalRuntimePaths::new(&workspace, &project);
+        paths.ensure_dir().expect("create runtime directory");
+        let mut identity = RuntimeDaemonIdentity::current(&paths).expect("current identity");
+        identity.instance_id = Some("instance-a".to_string());
+        identity.pid = Some(42);
+        identity.process_start_id = Some("start-a".to_string());
+        let writer = DaemonHealthWriter::new(&paths, &identity);
+        writer.bound();
+
+        for _ in 0..1_000 {
+            writer.accepted();
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if read_daemon_health(&paths).is_ok_and(|health| health.accept_count == 1_000) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("coalesced health persistence completes");
+        writer.cleanup();
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn test_accept_gate_times_out_without_release() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let gate = temp.path().join("accept-gate");
+        let started = std::time::Instant::now();
+
+        wait_for_test_accept_gate_path(&gate, Duration::from_millis(25)).await;
+
+        assert!(gate.join("bound").exists());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "test-only accept gate must remain bounded"
         );
     }
 
