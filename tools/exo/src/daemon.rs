@@ -1004,7 +1004,7 @@ fn classify_accept_loop_health(
         return AcceptLoopHealth::Responsive;
     }
     if exact_runtime_identity
-        && probe_ok != Some(true)
+        && probe_ok == Some(false)
         && health_before
             .zip(health_after)
             .is_some_and(|(before, after)| {
@@ -4106,6 +4106,17 @@ mod tests {
                 Some(&before),
             ),
             AcceptLoopHealth::Stalled
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                None,
+                Some(&before),
+                Some(&before),
+            ),
+            AcceptLoopHealth::Unknown,
+            "a missing probe result must not be called stalled"
         );
         assert_eq!(
             classify_accept_loop_health(
