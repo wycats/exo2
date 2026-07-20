@@ -491,7 +491,12 @@ impl DaemonHealthWriter {
             .lock()
             .is_ok_and(|state| state.revision == revision);
         if current {
-            let _ = write_daemon_health_atomically(&self.path, snapshot);
+            if let Err(error) = write_daemon_health_atomically(&self.path, snapshot) {
+                eprintln!(
+                    "exo daemon: failed to write health snapshot at {}: {error}",
+                    self.path.display()
+                );
+            }
         }
     }
 }
