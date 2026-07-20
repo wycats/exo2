@@ -1156,11 +1156,13 @@ fn daemon_busy_response(id: String) -> ResponseEnvelope {
         result: None,
         error: Some(ErrorBody {
             code: ErrorCode::PreconditionFailed,
-            message: "daemon request capacity is exhausted; retry later".to_string(),
+            message: "daemon request capacity is exhausted; retry later with the same request ID"
+                .to_string(),
             details: Some(serde_json::json!({
                 "kind": "daemon.busy",
                 "retryable": true,
-                "mutation_performed": false,
+                "retry_with_same_request_id": true,
+                "request_outcome_checked": false,
             })),
         }),
         ticket: None,
@@ -2858,14 +2860,15 @@ mod tests {
         assert_eq!(error.code, ErrorCode::PreconditionFailed);
         assert_eq!(
             error.message,
-            "daemon request capacity is exhausted; retry later"
+            "daemon request capacity is exhausted; retry later with the same request ID"
         );
         assert_eq!(
             error.details,
             Some(serde_json::json!({
                 "kind": "daemon.busy",
                 "retryable": true,
-                "mutation_performed": false,
+                "retry_with_same_request_id": true,
+                "request_outcome_checked": false,
             }))
         );
         assert_eq!(invocation_count.load(Ordering::SeqCst), 1);
