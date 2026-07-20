@@ -379,11 +379,13 @@ struct DaemonHealthSnapshot {
 struct DaemonHealthWriter {
     path: PathBuf,
     state: Arc<Mutex<DaemonHealthWriterState>>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 struct DaemonHealthWriterState {
     snapshot: DaemonHealthSnapshot,
     finalized: bool,
+    revision: u64,
 }
 
 struct DaemonServerTaskHealthGuard(DaemonHealthWriter);
@@ -416,7 +418,9 @@ impl DaemonHealthWriter {
                     health_updated_at: daemon_health_timestamp(),
                 },
                 finalized: false,
+                revision: 0,
             })),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -446,28 +450,49 @@ impl DaemonHealthWriter {
     }
 
     fn cleanup(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
+        let finalized = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.finalized {
+                return;
+            }
+            state.snapshot.server_task_alive = false;
+            state.snapshot.health_updated_at = daemon_health_timestamp();
+            state.revision = state.revision.saturating_add(1);
+            state.finalized = true;
+            (state.revision, state.snapshot.clone())
         };
-        if state.finalized {
-            return;
-        }
-        state.snapshot.server_task_alive = false;
-        state.snapshot.health_updated_at = daemon_health_timestamp();
-        let _ = write_daemon_health_atomically(&self.path, &state.snapshot);
-        state.finalized = true;
+        self.persist_if_current(finalized.0, &finalized.1);
     }
 
     fn update(&self, update: impl FnOnce(&mut DaemonHealthSnapshot)) {
-        let Ok(mut state) = self.state.lock() else {
+        let updated = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.finalized {
+                return;
+            }
+            update(&mut state.snapshot);
+            state.snapshot.health_updated_at = daemon_health_timestamp();
+            state.revision = state.revision.saturating_add(1);
+            (state.revision, state.snapshot.clone())
+        };
+        self.persist_if_current(updated.0, &updated.1);
+    }
+
+    fn persist_if_current(&self, revision: u64, snapshot: &DaemonHealthSnapshot) {
+        let Ok(_write_guard) = self.write_lock.lock() else {
             return;
         };
-        if state.finalized {
-            return;
+        let current = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.revision == revision);
+        if current {
+            let _ = write_daemon_health_atomically(&self.path, snapshot);
         }
-        update(&mut state.snapshot);
-        state.snapshot.health_updated_at = daemon_health_timestamp();
-        let _ = write_daemon_health_atomically(&self.path, &state.snapshot);
     }
 }
 
@@ -480,7 +505,7 @@ fn write_daemon_health_atomically(path: &Path, snapshot: &DaemonHealthSnapshot) 
         .parent()
         .ok_or_else(|| io::Error::other("daemon health path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let content = serde_json::to_vec_pretty(snapshot).map_err(io::Error::other)?;
+    let content = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".daemon.health.json.exo-tmp.")
         .tempfile_in(parent)?;
@@ -4195,8 +4220,13 @@ mod tests {
         assert_eq!(stopped.process_start_id, "start-a");
 
         let late_server_task = writer.clone();
+        let in_flight_snapshot = {
+            let state = writer.state.lock().expect("lock health writer state");
+            (state.revision, state.snapshot.clone())
+        };
         writer.cleanup();
         let finalized = read_daemon_health(&paths).expect("read finalized health");
+        late_server_task.persist_if_current(in_flight_snapshot.0, &in_flight_snapshot.1);
         late_server_task.accepted();
         late_server_task.accept_error(&io::Error::other("late accept error"));
         late_server_task.server_task_stopped();
