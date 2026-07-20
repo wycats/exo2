@@ -2444,7 +2444,7 @@ async fn test_sigterm_triggers_graceful_shutdown(backend: &str) {
         &std::fs::read(paths.health_path()).expect("cleanup should preserve daemon health"),
     )
     .expect("parse cleanup daemon health");
-    assert_eq!(health["pid"], pid, "{health}");
+    assert_eq!(health["pid"].as_i64(), Some(i64::from(pid)), "{health}");
     assert_eq!(health["server_task_alive"], false, "{health}");
     assert!(health["health_updated_at"].is_string(), "{health}");
 }
