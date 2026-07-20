@@ -1198,6 +1198,44 @@ async fn daemon_status_reports_running_current_identity(backend: &str) {
     assert!(result.get("current_identity").is_some());
 }
 
+#[cfg(unix)]
+#[test_matrix(["sqlite"])]
+fn daemon_status_does_not_report_diagnostics_from_dead_identity(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+
+    let ensure = run_exo_daemon_ensure_with_env(
+        &workspace,
+        true,
+        &[("EXO_DAEMON_DIAGNOSTICS", OsStr::new("1"))],
+    );
+    assert!(ensure.status.success());
+    let ensure = parse_cli_json(&ensure);
+    let ensure = ensure.get("result").expect("daemon ensure result");
+    assert_eq!(ensure["diagnostics_active"], true, "{ensure}");
+    let pid = i32::try_from(ensure["pid"].as_u64().expect("daemon PID")).expect("PID fits i32");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill diagnostic daemon without cleanup");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let status = run_exo_daemon_status(&workspace);
+    assert!(status.status.success());
+    let status = parse_cli_json(&status);
+    let status = status.get("result").expect("daemon status result");
+    assert_eq!(status["diagnostics_active"], false, "{status}");
+    assert_ne!(status["state"], "running_current", "{status}");
+}
+
 #[cfg(all(unix, debug_assertions))]
 #[test_matrix(["sqlite"])]
 fn daemon_status_reports_bound_but_paused_accept_loop_as_stalled(backend: &str) {

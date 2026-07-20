@@ -65,6 +65,8 @@ const DEFAULT_DAEMON_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_FAILED_PROBE_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
+const DAEMON_HEALTH_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
+const DAEMON_HEALTH_PERSIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
 const DAEMON_DIAGNOSTICS_INACTIVE: &str = "daemon.diagnostics_requested_but_inactive";
@@ -933,7 +935,8 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
             .ok()
             .and_then(|identity| identity.instance_id.as_deref()),
     );
-    let health_after_probe = read_daemon_health(&paths).ok();
+    let health_after_probe =
+        read_daemon_health_after_probe(&paths, health_before_probe.as_ref(), probe_ok);
     let recorded_identity_after_probe = read_daemon_identity(&paths).ok();
     let pid_after_probe = read_pid_file(&pid_path);
 
@@ -987,9 +990,10 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         .as_ref()
         .ok()
         .and_then(|identity| serde_json::to_value(identity).ok());
-    let diagnostics_active = recorded_identity_result
-        .as_ref()
-        .is_ok_and(|identity| identity.diagnostics_active);
+    let diagnostics_active = exact_runtime_identity
+        && recorded_identity_result
+            .as_ref()
+            .is_ok_and(|identity| identity.diagnostics_active);
 
     let state = if socket_connectable {
         if identity_matches_project == Some(true)
@@ -1076,6 +1080,42 @@ fn daemon_health_matches_identity(
         && identity.process_start_id.as_deref() == Some(health.process_start_id.as_str())
 }
 
+fn read_daemon_health_after_probe(
+    paths: &LocalRuntimePaths,
+    health_before: Option<&DaemonHealthSnapshot>,
+    probe_ok: Option<bool>,
+) -> Option<DaemonHealthSnapshot> {
+    if probe_ok.is_none() {
+        return read_daemon_health(paths).ok();
+    }
+
+    let deadline = std::time::Instant::now() + DAEMON_HEALTH_PERSIST_TIMEOUT;
+    loop {
+        let health_after = read_daemon_health(paths).ok();
+        let accept_is_durable = match (health_before, health_after.as_ref()) {
+            (None, _) => false,
+            (Some(before), Some(after)) => {
+                before.instance_id != after.instance_id
+                    || before.pid != after.pid
+                    || before.process_start_id != after.process_start_id
+                    || after.accept_count > before.accept_count
+            }
+            _ => false,
+        };
+        if accept_is_durable {
+            return health_after;
+        }
+        if std::time::Instant::now() >= deadline {
+            return if probe_ok == Some(false) {
+                health_after
+            } else {
+                None
+            };
+        }
+        std::thread::sleep(DAEMON_HEALTH_PERSIST_POLL_INTERVAL);
+    }
+}
+
 fn classify_accept_loop_health(
     state: DaemonStatusState,
     exact_runtime_identity: bool,
@@ -1115,12 +1155,11 @@ fn inspect_daemon_endpoint_with_confirmation(
     }
 
     // A request can be accepted just before its response times out. Confirm the
-    // failure and leave both background health writes time to reach disk before
-    // status compares accept counters. Only the latest explicit probe failure
-    // can therefore contribute to a stalled classification.
+    // failure before status waits for the background health writer. Only the
+    // latest explicit probe failure can therefore contribute to a stalled
+    // classification.
     std::thread::sleep(DAEMON_FAILED_PROBE_SETTLE_TIMEOUT);
     let second = inspect_daemon_endpoint_once(paths, expected_instance_id);
-    std::thread::sleep(DAEMON_FAILED_PROBE_SETTLE_TIMEOUT);
     (first.0 || second.0, second.1)
 }
 
@@ -4386,10 +4425,15 @@ mod tests {
         identity.process_start_id = Some("start-a".to_string());
         let writer = DaemonHealthWriter::new(&paths, &identity);
         writer.bound();
+        let bound = read_daemon_health(&paths).expect("read bound health");
 
         for _ in 0..1_000 {
             writer.accepted();
         }
+
+        let first_durable = read_daemon_health_after_probe(&paths, Some(&bound), Some(true))
+            .expect("successful probe observes durable accept progress");
+        assert!(first_durable.accept_count > bound.accept_count);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
