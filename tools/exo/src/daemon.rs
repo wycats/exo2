@@ -64,6 +64,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_DAEMON_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_FAILED_PROBE_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
 const DAEMON_DIAGNOSTICS_INACTIVE: &str = "daemon.diagnostics_requested_but_inactive";
@@ -925,7 +926,7 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     let identity_readable = recorded_identity_result.is_ok();
     let current_identity_result = RuntimeDaemonIdentity::current(&paths);
     let health_before_probe = read_daemon_health(&paths).ok();
-    let (socket_connectable, probe_ok) = inspect_daemon_endpoint(
+    let (socket_connectable, probe_ok) = inspect_daemon_endpoint_with_confirmation(
         &paths,
         recorded_identity_result
             .as_ref()
@@ -1104,7 +1105,26 @@ fn classify_accept_loop_health(
     AcceptLoopHealth::Unknown
 }
 
-fn inspect_daemon_endpoint(
+fn inspect_daemon_endpoint_with_confirmation(
+    paths: &LocalRuntimePaths,
+    expected_instance_id: Option<&str>,
+) -> (bool, Option<bool>) {
+    let first = inspect_daemon_endpoint_once(paths, expected_instance_id);
+    if first.1 != Some(false) {
+        return first;
+    }
+
+    // A request can be accepted just before its response times out. Confirm the
+    // failure and leave both background health writes time to reach disk before
+    // status compares accept counters. Only the latest explicit probe failure
+    // can therefore contribute to a stalled classification.
+    std::thread::sleep(DAEMON_FAILED_PROBE_SETTLE_TIMEOUT);
+    let second = inspect_daemon_endpoint_once(paths, expected_instance_id);
+    std::thread::sleep(DAEMON_FAILED_PROBE_SETTLE_TIMEOUT);
+    (first.0 || second.0, second.1)
+}
+
+fn inspect_daemon_endpoint_once(
     paths: &LocalRuntimePaths,
     expected_instance_id: Option<&str>,
 ) -> (bool, Option<bool>) {
