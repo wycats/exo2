@@ -5445,7 +5445,7 @@ fn read_sidecar_write_ownership_status_with_current(
     let compatible = sidecar_write_owner_is_compatible(&marker, current);
     let liveness = process_liveness(marker.pid);
     let same_binary = marker.executable_blake3 == current.executable_blake3;
-    let same_process = marker.pid == current.pid;
+    let same_process = sidecar_write_owner_is_same_process(&marker, current);
     let binary_identity_known =
         marker.executable_blake3.is_some() && current.executable_blake3.is_some();
     let process_identity_known =
@@ -5637,6 +5637,15 @@ fn sidecar_write_owner_is_compatible(
         && owner.state_root == current.state_root
         && owner.db_path == current.db_path
         && owner.runtime_dir == current.runtime_dir
+}
+
+fn sidecar_write_owner_is_same_process(
+    owner: &SidecarWriteOwnerMarker,
+    current: &SidecarWriteOwnerMarker,
+) -> bool {
+    owner.pid == current.pid
+        && owner.machine == current.machine
+        && owner.process_start_id == current.process_start_id
 }
 
 fn now_ms() -> u128 {
@@ -6284,6 +6293,34 @@ mod sidecar_write_owner_compatibility_tests {
         let mut owner = current.clone();
         owner.runtime_dir = PathBuf::from("/foreign-state/runtime");
         assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+    }
+
+    #[test]
+    fn same_process_requires_pid_machine_and_process_start_identity() {
+        let current = marker("/worktrees/current");
+        let mut owner = marker("/worktrees/linked");
+
+        assert!(sidecar_write_owner_is_same_process(&owner, &current));
+
+        owner.pid += 1;
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.pid = current.pid;
+
+        owner.machine = "other-machine".to_string();
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.machine = current.machine.clone();
+
+        owner.process_start_id = Some("other-process-start".to_string());
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.process_start_id = None;
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+
+        let mut current_without_start_id = current;
+        current_without_start_id.process_start_id = None;
+        assert!(sidecar_write_owner_is_same_process(
+            &owner,
+            &current_without_start_id
+        ));
     }
 }
 
