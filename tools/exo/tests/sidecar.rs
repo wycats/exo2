@@ -46,6 +46,32 @@ fn git_init(root: &Path) {
     git_success(root, &["branch", "-M", "main"]);
 }
 
+#[cfg(unix)]
+fn create_primary_and_linked_worktree(temp: &Path) -> (PathBuf, PathBuf) {
+    let primary = temp.join("primary");
+    let linked = temp.join("linked");
+    std::fs::create_dir_all(&primary).expect("create primary worktree");
+    git_init(&primary);
+    std::fs::write(primary.join("README.md"), "linked worktree fixture\n")
+        .expect("write primary fixture");
+    git_success(&primary, &["add", "README.md"]);
+    git_success(
+        &primary,
+        &["commit", "-m", "Initialize linked worktree fixture"],
+    );
+    git_success(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-test",
+            linked.to_str().expect("linked worktree path is utf-8"),
+        ],
+    );
+    (primary, linked)
+}
+
 fn git_init_bare(root: &Path) {
     let output = Command::new("git")
         .args(["init", "--bare"])
@@ -222,6 +248,21 @@ fn project_state_path(sidecar_root: &Path, key: &str, relative: &[&str]) -> Path
         path.push(component);
     }
     path
+}
+
+#[cfg(unix)]
+fn epoch_title_count(sidecar_root: &Path, key: &str, title: &str) -> usize {
+    let db_path = project_state_path(sidecar_root, key, &["cache", "exo.db"]);
+    let db = exosuit_storage::open_database(&db_path).expect("open sidecar database");
+    let count = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM epochs WHERE title = ?1",
+            [title],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count matching epochs");
+    usize::try_from(count).expect("epoch count is non-negative")
 }
 
 fn policy_value_for_sidecar_key(config_home: &Path, sidecar_key: &str, key: &str) -> String {
@@ -2103,6 +2144,156 @@ tasks = ["Legacy Goal"]
     )
     .expect("read sidecar epoch projection");
     assert!(sidecar_epochs.contains("Legacy Epoch"));
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_worktrees_share_one_daemon_sidecar_writer_and_direct_process_stays_blocked() {
+    let temp = short_tempdir();
+    let (primary, linked) = create_primary_and_linked_worktree(temp.path());
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    let sidecar_root = temp.path().join("sidecars");
+    let diagnostics_path = temp.path().join("linked-worktree-daemon.ndjson");
+    std::fs::create_dir_all(&sidecar_root).expect("create sidecar root");
+    git_init(&sidecar_root);
+    std::fs::write(sidecar_root.join("README.md"), "sidecar\n").expect("write readme");
+    std::fs::write(
+        sidecar_root.join(".gitignore"),
+        "projects/*/cache/\nprojects/*/runtime/\n",
+    )
+    .expect("write sidecar gitignore");
+    git_success(&sidecar_root, &["add", "README.md", ".gitignore"]);
+    git_success(&sidecar_root, &["commit", "-m", "Initial sidecar"]);
+    link_sidecar(&primary, &home, &config_home, &sidecar_root);
+    if !git_status_porcelain(&sidecar_root).is_empty() {
+        git_success(&sidecar_root, &["add", "-A"]);
+        git_success(&sidecar_root, &["commit", "-m", "Link sidecar project"]);
+    }
+    let _guard = DaemonPathGuard::new(&primary);
+
+    let writes = [
+        (&primary, "Primary Sidecar Writer One"),
+        (&linked, "Linked Sidecar Writer"),
+        (&primary, "Primary Sidecar Writer Two"),
+    ];
+    let mut daemon_pid = None;
+    let mut daemon_instance_id = None;
+
+    for (workspace, title) in writes {
+        let output = exo_cmd(workspace, &home, &config_home)
+            .env("EXO_NO_REEXEC", "1")
+            .env("EXO_DAEMON_DIAGNOSTICS", "1")
+            .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
+            .args(["--format", "json", "epoch", "add", "--title", title])
+            .output()
+            .expect("run daemon-backed epoch write");
+        assert!(
+            output.status.success(),
+            "daemon write failed from {}: stdout={} stderr={} diagnostics={}",
+            workspace.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&diagnostics_path).unwrap_or_default()
+        );
+        let result = json_result(&output.stdout);
+        assert_eq!(
+            result["post_write"]["sidecar_auto_persist"]["ok"],
+            true,
+            "daemon write should persist from {}: {result:#}",
+            workspace.display()
+        );
+
+        let runtime_dir = project_state_path(&sidecar_root, "external-test", &["runtime"]);
+        let current_pid = std::fs::read_to_string(runtime_dir.join("daemon.pid"))
+            .expect("read daemon pid")
+            .trim()
+            .parse::<u64>()
+            .expect("daemon pid is u64");
+        let identity: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(runtime_dir.join("daemon.identity.json"))
+                .expect("read daemon identity"),
+        )
+        .expect("daemon identity is json");
+        let current_instance_id = identity["instance_id"]
+            .as_str()
+            .expect("daemon instance id")
+            .to_string();
+        match (daemon_pid, daemon_instance_id.as_deref()) {
+            (None, None) => {
+                daemon_pid = Some(current_pid);
+                daemon_instance_id = Some(current_instance_id);
+            }
+            (Some(expected_pid), Some(expected_instance_id)) => {
+                assert_eq!(current_pid, expected_pid, "daemon pid must not rotate");
+                assert_eq!(
+                    current_instance_id, expected_instance_id,
+                    "daemon instance must not be replaced"
+                );
+            }
+            _ => unreachable!("daemon identity baseline should be complete"),
+        }
+
+        let owner: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(sidecar_write_owner_marker_path(
+                &sidecar_root,
+                "external-test",
+            ))
+            .expect("read sidecar writer marker"),
+        )
+        .expect("sidecar writer marker is json");
+        assert_eq!(owner["pid"].as_u64(), daemon_pid);
+        assert_eq!(
+            owner["workspace_root"].as_str(),
+            Some(
+                workspace
+                    .canonicalize()
+                    .expect("canonical issuing worktree")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "workspace root remains provenance for the latest daemon write"
+        );
+        assert_eq!(
+            epoch_title_count(&sidecar_root, "external-test", title),
+            1,
+            "each daemon write should be visible exactly once"
+        );
+    }
+
+    let blocked_title = "Direct Linked Sidecar Writer Must Stay Blocked";
+    let blocked_output = exo_cmd(&linked, &home, &config_home)
+        .env("EXO_NO_REEXEC", "1")
+        .env("EXO_DAEMON_DIAGNOSTICS", "1")
+        .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
+        .args([
+            "--direct",
+            "--format",
+            "json",
+            "epoch",
+            "add",
+            "--title",
+            blocked_title,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let error = json_error(&blocked_output);
+    assert_eq!(error["code"], "precondition_failed", "{error:#}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("another active runtime")),
+        "{error:#}"
+    );
+    assert_eq!(
+        epoch_title_count(&sidecar_root, "external-test", blocked_title),
+        0,
+        "blocked direct writer must not mutate canonical state"
+    );
+    assert_eq!(git_status_porcelain(&sidecar_root), "");
 }
 
 fn disable_sidecar_auto_commit(config_home: &Path) {
@@ -7894,7 +8085,7 @@ fn sidecar_repo_status_human_reports_invalid_owner_marker() {
 }
 
 #[test]
-fn auto_persist_blocks_live_incompatible_sidecar_write_owner() {
+fn auto_persist_blocks_live_different_binary_sidecar_write_owner() {
     let fixture = basic_sidecar_fixture();
     let repo = &fixture.repo;
     let home = &fixture.home;
@@ -8177,7 +8368,7 @@ fn auto_persist_blocks_old_different_binary_exo_owner_without_heartbeat() {
 
 #[cfg(unix)]
 #[test]
-fn live_stale_owner_without_start_identity_is_not_reclaimable() {
+fn live_owner_without_start_identity_is_not_reclaimable() {
     let temp = short_tempdir();
     let repo = temp.path().join("external-repo");
     let home = temp.path().join("home");
@@ -8216,7 +8407,7 @@ fn live_stale_owner_without_start_identity_is_not_reclaimable() {
     assert!(
         status["ownership"]["issue"]
             .as_str()
-            .is_some_and(|issue| issue.contains("stale Exo runtime")),
+            .is_some_and(|issue| issue.contains("another active runtime")),
         "{status:?}"
     );
 
@@ -8240,7 +8431,7 @@ fn live_stale_owner_without_start_identity_is_not_reclaimable() {
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("stale Exo runtime")),
+            .is_some_and(|message| message.contains("another active runtime")),
         "{error:?}"
     );
     assert!(

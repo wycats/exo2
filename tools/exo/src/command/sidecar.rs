@@ -5445,14 +5445,16 @@ fn read_sidecar_write_ownership_status_with_current(
     let compatible = sidecar_write_owner_is_compatible(&marker, current);
     let liveness = process_liveness(marker.pid);
     let same_binary = marker.executable_blake3 == current.executable_blake3;
-    let same_process = marker.pid == current.pid;
+    let same_process = sidecar_write_owner_is_same_process(&marker, current);
+    let pid_reused_by_current_process =
+        sidecar_write_owner_pid_was_reused_by_current_process(&marker, current);
     let binary_identity_known =
         marker.executable_blake3.is_some() && current.executable_blake3.is_some();
     let process_identity_known =
         marker.process_start_id.is_some() && current.process_start_id.is_some();
     let (state, ok, issue) = if compatible && same_process && same_binary {
         ("owned", true, None)
-    } else if liveness == ProcessLiveness::Dead {
+    } else if pid_reused_by_current_process || liveness == ProcessLiveness::Dead {
         (
             "stale",
             true,
@@ -5462,6 +5464,12 @@ fn read_sidecar_write_ownership_status_with_current(
             ),
         )
     } else if compatible && !same_process && same_binary {
+        (
+            "blocked",
+            false,
+            Some("sidecar write ownership is held by another active runtime".to_string()),
+        )
+    } else if compatible && !same_process && !binary_identity_known {
         (
             "blocked",
             false,
@@ -5482,6 +5490,12 @@ fn read_sidecar_write_ownership_status_with_current(
                 "sidecar write ownership is held by a live runtime with a different executable identity for this workspace"
                     .to_string(),
             ),
+        )
+    } else if compatible && !same_process && liveness == ProcessLiveness::Alive {
+        (
+            "blocked",
+            false,
+            Some("sidecar write ownership is held by another active runtime".to_string()),
         )
     } else if compatible && !same_binary {
         (
@@ -5628,10 +5642,39 @@ fn sidecar_write_owner_is_compatible(
     owner.version == current.version
         && owner.sidecar_key == current.sidecar_key
         && owner.sidecar_root == current.sidecar_root
-        && owner.workspace_root == current.workspace_root
         && owner.state_root == current.state_root
         && owner.db_path == current.db_path
         && owner.runtime_dir == current.runtime_dir
+}
+
+fn sidecar_write_owner_is_same_process(
+    owner: &SidecarWriteOwnerMarker,
+    current: &SidecarWriteOwnerMarker,
+) -> bool {
+    if owner.pid != current.pid || owner.machine != current.machine {
+        return false;
+    }
+
+    match (&owner.process_start_id, &current.process_start_id) {
+        (Some(owner_start), Some(current_start)) => owner_start == current_start,
+        (None, None) => {
+            owner.executable_blake3.is_some()
+                && owner.executable_blake3 == current.executable_blake3
+        }
+        _ => false,
+    }
+}
+
+fn sidecar_write_owner_pid_was_reused_by_current_process(
+    owner: &SidecarWriteOwnerMarker,
+    current: &SidecarWriteOwnerMarker,
+) -> bool {
+    owner.pid == current.pid
+        && owner.machine == current.machine
+        && matches!(
+            (&owner.process_start_id, &current.process_start_id),
+            (Some(owner_start), Some(current_start)) if owner_start != current_start
+        )
 }
 
 fn now_ms() -> u128 {
@@ -6217,6 +6260,131 @@ mod tests {
 
         assert_eq!(process_liveness(pid), ProcessLiveness::Dead);
         child.wait().expect("reap child");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_write_owner_compatibility_tests {
+    use super::*;
+
+    fn marker(workspace_root: &str) -> SidecarWriteOwnerMarker {
+        SidecarWriteOwnerMarker {
+            version: 1,
+            sidecar_key: "project-key".to_string(),
+            sidecar_root: PathBuf::from("/sidecar"),
+            workspace_root: Some(PathBuf::from(workspace_root)),
+            state_root: PathBuf::from("/sidecar/projects/project-key"),
+            db_path: PathBuf::from("/sidecar/projects/project-key/cache/exo.db"),
+            runtime_dir: PathBuf::from("/sidecar/projects/project-key/runtime"),
+            pid: 1,
+            executable_path: Some(PathBuf::from("/bin/exo")),
+            executable_blake3: Some("binary".to_string()),
+            process_start_id: Some("process-start".to_string()),
+            machine: "machine".to_string(),
+            acquired_at_ms: 1,
+            refreshed_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn linked_worktree_workspace_root_is_provenance_not_writer_authority() {
+        let owner = marker("/worktrees/primary");
+        let current = marker("/worktrees/linked");
+
+        assert!(sidecar_write_owner_is_compatible(&owner, &current));
+        assert_ne!(owner.workspace_root, current.workspace_root);
+    }
+
+    #[test]
+    fn writer_authority_rejects_every_shared_sidecar_identity_mismatch() {
+        let current = marker("/worktrees/current");
+
+        let mut owner = current.clone();
+        owner.version += 1;
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.sidecar_key = "foreign-key".to_string();
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.sidecar_root = PathBuf::from("/foreign-sidecar");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.state_root = PathBuf::from("/foreign-state");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.db_path = PathBuf::from("/foreign-state/cache/exo.db");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+
+        let mut owner = current.clone();
+        owner.runtime_dir = PathBuf::from("/foreign-state/runtime");
+        assert!(!sidecar_write_owner_is_compatible(&owner, &current));
+    }
+
+    #[test]
+    fn same_process_uses_process_start_identity_when_available() {
+        let current = marker("/worktrees/current");
+        let mut owner = marker("/worktrees/linked");
+
+        assert!(sidecar_write_owner_is_same_process(&owner, &current));
+
+        owner.pid += 1;
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.pid = current.pid;
+
+        owner.machine = "other-machine".to_string();
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.machine = current.machine.clone();
+
+        owner.process_start_id = Some("other-process-start".to_string());
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+        owner.process_start_id = None;
+        assert!(!sidecar_write_owner_is_same_process(&owner, &current));
+
+        let mut current_without_start_id = current;
+        current_without_start_id.process_start_id = None;
+        assert!(sidecar_write_owner_is_same_process(
+            &owner,
+            &current_without_start_id
+        ));
+
+        owner.executable_blake3 = None;
+        current_without_start_id.executable_blake3 = None;
+        assert!(!sidecar_write_owner_is_same_process(
+            &owner,
+            &current_without_start_id
+        ));
+    }
+
+    #[test]
+    fn reused_current_pid_with_different_start_identity_is_reclaimable() {
+        let current = marker("/worktrees/current");
+        let mut owner = marker("/worktrees/linked");
+        owner.process_start_id = Some("previous-process-start".to_string());
+
+        assert!(sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+
+        owner.pid += 1;
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+        owner.pid = current.pid;
+
+        owner.machine = "other-machine".to_string();
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
+        owner.machine = current.machine.clone();
+
+        owner.process_start_id = None;
+        assert!(!sidecar_write_owner_pid_was_reused_by_current_process(
+            &owner, &current
+        ));
     }
 }
 
