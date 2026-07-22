@@ -2,6 +2,8 @@
 
 # RFC 185: Inbox-Driven Sidebar Actions
 
+- **Superseded by**: RFC 0124
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:

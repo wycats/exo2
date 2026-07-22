@@ -5,9 +5,9 @@
 - **Stage**: 0
 - **Reason**:
 
-> **Status**: Withdrawn (superseded by RFC 0122)
+> **Status**: Withdrawn (superseded by RFC 0083)
 >
-> This RFC proposed a single-tool architecture with port-based dispatch. After implementation experience and research into LLM tool design constraints, we adopted RFC 0122's 14-tool hybrid architecture instead.
+> This RFC proposed a single-tool architecture with port-based dispatch. After implementation experience and research into LLM tool design constraints, we adopted RFC 0083's 14-tool hybrid architecture instead.
 >
 > **What was preserved**: Steering-first error design, capability tickets, no shell strings principle
 > **Why withdrawn**: Empirical research shows specialized tools outperform single overloaded tool
@@ -183,9 +183,9 @@ This is not just UX; it is the mechanism that keeps general Copilot from thrashi
 
 ## Implementation Guidance
 
-### Tool Surface Design (Superseded by RFC 0122)
+### Tool Surface Design (Superseded by RFC 0083)
 
-The original proposal in this RFC described a single `exosuit` tool with three "ports" (run/locate/edit). This design has been superseded by [RFC 0122: Hybrid Tool Architecture](../stage-3/0083-hybrid-tool-architecture-for-lm-tools.md), which provides a more refined three-tier tool surface:
+The original proposal in this RFC described a single `exosuit` tool with three "ports" (run/locate/edit). This design has been superseded by [RFC 0083: Hybrid Tool Architecture](0083-hybrid-tool-architecture-for-lm-tools.md), which provides a more refined three-tier tool surface:
 
 1. **Zero-arg orientation tools** (7 tools) - Pure, safe context queries
 2. **Method-based dispatch tools** (5 tools) - Type-safe mutations
@@ -204,9 +204,9 @@ The original proposal in this RFC described a single `exosuit` tool with three "
 - Port-based routing → direct tool calls
 - Complex dispatch → method-based enums
 
-**Migration path**: The VS Code extension should implement the RFC 0122 tool surface rather than the single-tool model originally described here. The steering principles and ticket-based confirmation flow remain unchanged.
+**Migration path**: The VS Code extension should implement the RFC 0083 tool surface rather than the single-tool model originally described here. The steering principles and ticket-based confirmation flow remain unchanged.
 
-Refer to RFC 0122 for:
+Refer to RFC 0083 for:
 
 - Complete tool enumeration
 - Tool naming conventions
@@ -215,13 +215,13 @@ Refer to RFC 0122 for:
 
 ### Relationship to Machine Channel Namespaces
 
-The three "ports" (run/locate/edit) are **conceptual groupings** for user intent, now superseded by the RFC 0122 taxonomy:
+The three "ports" (run/locate/edit) are **conceptual groupings** for user intent, now superseded by the RFC 0083 taxonomy:
 
 - **Orientation tools** (zero-arg) → read operations (status, plan, phase, map, context)
 - **Mutation tools** (method-based) → write operations (phase-ops, task-ops, plan-ops, rfc-ops, impl-ops)
 - **Convenience tools** (zero-arg) → high-frequency writes (idea, add-task)
 
-The capability tree (RFC 0125) provides flexible discovery; the RFC 0122 taxonomy provides the tool projection strategy.
+The capability tree (RFC 0125) provides flexible discovery; the RFC 0083 taxonomy provides the tool projection strategy.
 
 ### Tool Count Constraints (Empirical)
 
@@ -231,7 +231,7 @@ Research into LLM tool design reveals practical constraints:
 2. **Tool schemas consume tokens**: 50+ tools can use 5,000-15,000 tokens
 3. **Decision quality degrades** with too many tool choices
 
-RFC 0122's 14-tool surface stays well under this limit while providing comprehensive coverage.
+RFC 0083's 14-tool surface stays well under this limit while providing comprehensive coverage.
 
 ### Navigation Convergence
 
@@ -243,5 +243,5 @@ With the help ladder pattern, navigation converges in ≤2 calls:
 
 If the agent already knows the operation, it can call directly. Steering guides recovery for unknown paths.
 
-**With RFC 0122**: Zero-arg orientation tools (`exo-map`, `exo-status`) provide immediate context without needing the help ladder at all.
+**With RFC 0083**: Zero-arg orientation tools (`exo-map`, `exo-status`) provide immediate context without needing the help ladder at all.
 

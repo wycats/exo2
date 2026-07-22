@@ -3,14 +3,14 @@
 
 # RFC 10161: The Plan Object Model
 
+- **Superseded by**: RFC 10176
+
 - **Status**: Withdrawn
 - **Stage**: 4
 - **Reason**:
 
 - **Created**: 2025-05-20
 - **Implemented**: `packages/exosuit-core`
-- **Supersedes**: RFC 0011 (Dynamic Planning)
-
 ## Summary
 
 The Plan Object Model is the canonical representation of an Exosuit project's state. It replaces the previous Markdown-based parsing strategy with a robust, TOML-backed object graph. This model is the "Brain" of the agent, tracking Epochs, Phases, and Tasks.

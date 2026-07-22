@@ -3,7 +3,7 @@
 
 # RFC 10174: Inbox System (Hierarchical Intent Queue)
 
-- **Supersedes**: RFC 0124 (Async Intent Channel), RFC 0116 (Feedback System), RFC 00185 (Inbox-Driven Sidebar Actions), RFC 10071 (Context Inbox), RFC 0016 (Attention is Sovereign)
+- **Supersedes**: RFC 0124 (Async Intent Channel)
 
 | Field          | Value                                              |
 | -------------- | -------------------------------------------------- |
@@ -12,7 +12,7 @@
 | **Stage**      | 1 (Proposal)                                       |
 | **Status**     | Active                                             |
 | **Created**    | 2026-02-19                                         |
-| **Supersedes** | RFC 0124, RFC 0116, RFC 00185, RFC 10071, RFC 0016 |
+| **Supersedes** | RFC 0124 |
 
 ---
 

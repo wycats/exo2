@@ -2,13 +2,15 @@
 
 # RFC 124: Inbox System: Async Intent Channel
 
+- **Superseded by**: RFC 10174
+
 - **Status**: Archived
 - **Reason**:
 
 # RFC 0124: Inbox System (Async Intent Channel)
 
 - **Supersedes**: RFC 0116 (Feedback System), RFC 00185 (Inbox-Driven Sidebar Actions), RFC 10071 (Context Inbox)
-- **Absorbs**: "Attention is Sovereign" axiom from RFC 0016/10071
+- **Absorbs**: "Attention is Sovereign" axiom from RFC 10071
 
 | Field          | Value                                    |
 | -------------- | ---------------------------------------- |
@@ -18,7 +20,7 @@
 | **Created**    | 2025-01-22                               |
 | **Updated**    | 2026-02-19                               |
 | **Author**     | Exosuit Team                             |
-| **Supersedes** | RFC 0116, RFC 00185, RFC 10071, RFC 0016 |
+| **Supersedes** | RFC 0116, RFC 00185, RFC 10071 |
 
 ---
 
@@ -350,7 +352,7 @@ _All resolved during RFC review:_
 
 ## References
 
-- RFC 0016: Attention is Sovereign (superseded by this RFC)
+- RFC 10071: Context Inbox and the Attention is Sovereign axiom (superseded by this RFC)
 - steering.rs: Current steering implementation
 - feedback.toml schema: Current prototype schema
 

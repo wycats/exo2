@@ -2,6 +2,7 @@
 
 # RFC 225: Problems Pane Integration with SOAR Loop
 
+- **Supersedes**: RFC 0103
 
 # RFC 00225: Problems Pane Integration with SOAR Loop
 

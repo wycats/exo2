@@ -2,6 +2,8 @@
 
 # RFC 83: Hybrid Tool Architecture for LM Tools
 
+- **Supersedes**: RFC 0082
+
 - **Status**: Withdrawn
 - **Stage**: 3
 - **Reason**:

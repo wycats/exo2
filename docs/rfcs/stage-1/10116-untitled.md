@@ -3,4 +3,4 @@
 
 # RFC 10116: Untitled
 
-- **Superseded by**: RFC 10014
+- **Superseded by**: RFC 0080
