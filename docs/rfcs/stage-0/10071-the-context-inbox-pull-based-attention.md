@@ -36,8 +36,8 @@ We introduce a new context file: `docs/agent-context/current/inbox.toml`. This f
 [[item]]
 id = "uuid-v4"
 type = "rfc" # or "plan", "report", "alert"
-title = "RFC 10011: The Context Inbox"
-path = "docs/rfcs/stage-0/10011-context-inbox.md"
+title = "RFC 10071: The Context Inbox (Pull-Based Attention)"
+path = "docs/rfcs/stage-0/10071-the-context-inbox-pull-based-attention.md"
 created_at = "2025-12-12T10:00:00Z"
 priority = "normal" # "low", "normal", "high"
 status = "unread"

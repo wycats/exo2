@@ -204,14 +204,14 @@ The original proposal in this RFC described a single `exosuit` tool with three "
 - Port-based routing → direct tool calls
 - Complex dispatch → method-based enums
 
-**Migration path**: The VS Code extension should implement the RFC 0083 tool surface rather than the single-tool model originally described here. The steering principles and ticket-based confirmation flow remain unchanged.
+**Migration path**: RFC 0083 records the intermediate 14-tool design that replaced this proposal. The VS Code extension should implement the current [RFC 0136: LM Tool Architecture v2](../stage-3/0136-lm-tool-architecture-v2.md), which supersedes RFC 0083 and defines five public tools, including `exo-run`. The steering principles and ticket-based confirmation flow remain unchanged.
 
-Refer to RFC 0083 for:
+Refer to RFC 0136 for the current:
 
 - Complete tool enumeration
-- Tool naming conventions
-- Schema examples
-- Implementation phases
+- Shared `exo-run` execution contract
+- MCP and VS Code adapter boundaries
+- Registration and parity requirements
 
 ### Relationship to Machine Channel Namespaces
 
