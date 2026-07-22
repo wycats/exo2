@@ -2,13 +2,15 @@
 
 # RFC 185: Inbox-Driven Sidebar Actions
 
+- **Superseded by**: RFC 0124
+
 - **Status**: Withdrawn
 - **Stage**: 1
 - **Reason**:
 
 # RFC 00185: Inbox-Driven Sidebar Actions
 
-> **WITHDRAWN**: This RFC has been absorbed into [RFC 0124: Inbox System](../stage-3/0124-async-intent-channel.md). The "sidebar is a channel, not a backdoor" principle and action types are now documented there.
+> **WITHDRAWN**: This RFC has been absorbed into [RFC 0124: Inbox System](../archive/0124-async-intent-channel.md). The "sidebar is a channel, not a backdoor" principle and action types are now documented there.
 
 ## Summary
 

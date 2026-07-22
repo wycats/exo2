@@ -2,6 +2,8 @@
 
 # RFC 131: Implementation Plan as Canonical Execution Artifact
 
+- **Superseded by**: RFC 10180
+
 - **Supersedes**: RFC 10120
 
 

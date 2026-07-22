@@ -2,12 +2,9 @@
 
 # RFC 178: Instruction Localization Convention
 
-
-# RFC 00178: Instruction Localization Convention
-
 | Field | Value |
 |-------|-------|
-| **Stage** | 0 (Strawman) |
+| **Stage** | 1 (Proposal) |
 | **Created** | 2025-01-30 |
 | **Champion** | — |
 | **Related** | RFC 0111 (Agent Guidance Architecture), RFC 0132 (CommandSpec Unification) |
