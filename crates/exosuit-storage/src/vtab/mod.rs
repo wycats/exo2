@@ -34,7 +34,7 @@ pub(crate) use reactive::{ReactiveModule, ReactiveVTabCursor};
 pub(crate) use shadow::is_shadow_name;
 
 use rusqlite::Connection;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::revisions::RevisionStore;
 use crate::DatabaseError;
@@ -53,14 +53,14 @@ use crate::DatabaseError;
 /// # Example
 ///
 /// ```ignore
-/// let store = Rc::new(RevisionStore::new(&conn)?);
-/// register_reactive_module(&conn, "reactive", Rc::clone(&store))?;
+/// let store = Arc::new(RevisionStore::new(&conn)?);
+/// register_reactive_module(&conn, "reactive", Arc::clone(&store))?;
 /// conn.execute("CREATE VIRTUAL TABLE epochs USING reactive(epochs_data)", [])?;
 /// ```
 pub fn register_reactive_module(
     conn: &Connection,
     module_name: &str,
-    revision_store: Rc<RevisionStore>,
+    revision_store: Arc<RevisionStore>,
 ) -> Result<(), DatabaseError> {
     reactive::register_module(conn, module_name, revision_store)?;
     Ok(())

@@ -9,29 +9,41 @@
 //! counters stored in the `rowset_revisions` table.
 
 use rusqlite::{Connection, OptionalExtension};
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::DatabaseError;
 
 /// Revision store for tracking row and row-set revisions.
 ///
 /// Maintains an in-memory cache backed by SQLite tables for persistence.
-/// Uses interior mutability (RefCell) to allow caching from immutable references.
+/// Uses interior mutability to allow caching from immutable references.
 pub struct RevisionStore {
     /// In-memory cache of row digests: (table_name, rowid) -> digest
-    row_cache: RefCell<HashMap<(String, i64), [u8; 32]>>,
+    row_cache: Mutex<HashMap<(String, i64), [u8; 32]>>,
     /// In-memory cache of rowset counters: table_name -> counter
     /// Loaded from `rowset_revisions` table on startup, not reset.
-    rowset_cache: RefCell<HashMap<String, u64>>,
+    rowset_cache: Mutex<HashMap<String, u64>>,
 }
 
 impl RevisionStore {
+    fn row_cache(&self) -> MutexGuard<'_, HashMap<(String, i64), [u8; 32]>> {
+        self.row_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn rowset_cache(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.rowset_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Create a RevisionStore, loading persisted counters from the database.
     ///
     /// Counters are NOT reset on startup — they persist across process restarts.
     pub fn new(conn: &Connection) -> Result<Self, DatabaseError> {
-        let rowset_cache = RefCell::new(HashMap::new());
+        let mut rowset_cache = HashMap::new();
 
         // Load existing rowset counters from database
         let mut stmt = conn.prepare("SELECT table_name, counter FROM rowset_revisions")?;
@@ -40,12 +52,12 @@ impl RevisionStore {
         })?;
         for row in rows {
             let (table, counter) = row?;
-            rowset_cache.borrow_mut().insert(table, counter);
+            rowset_cache.insert(table, counter);
         }
 
         Ok(Self {
-            row_cache: RefCell::new(HashMap::new()),
-            rowset_cache,
+            row_cache: Mutex::new(HashMap::new()),
+            rowset_cache: Mutex::new(rowset_cache),
         })
     }
 
@@ -73,12 +85,12 @@ impl RevisionStore {
             if bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
-                self.row_cache.borrow_mut().insert(key, arr);
+                self.row_cache().insert(key, arr);
                 return Ok(Some(arr));
             }
         }
 
-        self.row_cache.borrow_mut().remove(&key);
+        self.row_cache().remove(&key);
         Ok(None)
     }
 
@@ -94,7 +106,7 @@ impl RevisionStore {
     ) -> Result<(), DatabaseError> {
         // Update cache
         let key = (table.to_string(), rowid);
-        self.row_cache.borrow_mut().insert(key, digest);
+        self.row_cache().insert(key, digest);
 
         // Persist to *_rev table
         let rev_table = table.replace("_data", "_rev");
@@ -116,7 +128,7 @@ impl RevisionStore {
     ) -> Result<(), DatabaseError> {
         // Remove from cache
         let key = (table.to_string(), rowid);
-        self.row_cache.borrow_mut().remove(&key);
+        self.row_cache().remove(&key);
 
         // Remove from *_rev table
         let rev_table = table.replace("_data", "_rev");
@@ -133,25 +145,24 @@ impl RevisionStore {
     /// then use this method to keep the shared revision cache coherent.
     pub(crate) fn cache_row_digest(&self, table: &str, rowid: i64, digest: [u8; 32]) {
         let key = (table.to_string(), rowid);
-        self.row_cache.borrow_mut().insert(key, digest);
+        self.row_cache().insert(key, digest);
     }
 
     /// Remove one cached row digest after a raw virtual-table delete.
     pub(crate) fn uncache_row_digest(&self, table: &str, rowid: i64) {
         let key = (table.to_string(), rowid);
-        self.row_cache.borrow_mut().remove(&key);
+        self.row_cache().remove(&key);
     }
 
     /// Clear all cached row digests for a shadow table.
     pub(crate) fn clear_table_row_cache(&self, table: &str) {
-        self.row_cache
-            .borrow_mut()
+        self.row_cache()
             .retain(|(cached_table, _), _| cached_table != table);
     }
 
     /// Get the cached rowset counter for a table.
     pub fn get_rowset_counter(&self, table: &str) -> u64 {
-        self.rowset_cache.borrow().get(table).copied().unwrap_or(0)
+        self.rowset_cache().get(table).copied().unwrap_or(0)
     }
 
     /// Get the persisted rowset counter for a table and refresh the cache.
@@ -193,9 +204,7 @@ impl RevisionStore {
 
     /// Update the in-memory rowset cache after a raw virtual-table write.
     pub(crate) fn cache_rowset_counter(&self, table: &str, counter: u64) {
-        self.rowset_cache
-            .borrow_mut()
-            .insert(table.to_string(), counter);
+        self.rowset_cache().insert(table.to_string(), counter);
     }
 
     /// Backfill row revision digests for existing rows in a shadow table.
@@ -294,8 +303,8 @@ impl RevisionStore {
     /// Clear all cached data (useful for testing).
     #[cfg(test)]
     pub fn clear_cache(&self) {
-        self.row_cache.borrow_mut().clear();
-        self.rowset_cache.borrow_mut().clear();
+        self.row_cache().clear();
+        self.rowset_cache().clear();
     }
 }
 
@@ -383,6 +392,7 @@ impl exosuit_reactivity_core::StateProvider for SqliteStateProvider<'_> {
 mod tests {
     use super::*;
     use crate::open_memory_database;
+    use std::sync::Arc;
 
     struct DefensiveModeGuard<'conn> {
         conn: &'conn Connection,
@@ -415,6 +425,36 @@ mod tests {
         // Should have loaded rowset counters (persisted, not reset)
         let counter = store.get_rowset_counter("epochs_data");
         assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn revision_caches_recover_after_mutex_poisoning() {
+        let db = open_memory_database().expect("should create database");
+        let store =
+            Arc::new(RevisionStore::new(db.connection()).expect("should create revision store"));
+
+        let row_store = Arc::clone(&store);
+        assert!(std::thread::spawn(move || {
+            let _guard = row_store.row_cache.lock().expect("lock row cache");
+            panic!("poison row cache");
+        })
+        .join()
+        .is_err());
+        let rowset_store = Arc::clone(&store);
+        assert!(std::thread::spawn(move || {
+            let _guard = rowset_store.rowset_cache.lock().expect("lock rowset cache");
+            panic!("poison rowset cache");
+        })
+        .join()
+        .is_err());
+
+        store.cache_row_digest("epochs_data", 1, [7; 32]);
+        store.cache_rowset_counter("epochs_data", 9);
+        assert_eq!(
+            store.row_cache().get(&("epochs_data".to_string(), 1)),
+            Some(&[7; 32])
+        );
+        assert_eq!(store.get_rowset_counter("epochs_data"), 9);
     }
 
     #[test]

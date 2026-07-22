@@ -1177,6 +1177,7 @@ mod tests {
     use crate::context::SqliteWriter;
     use exosuit_storage::open_database;
     use std::cell::Cell;
+    use std::sync::{Arc, Barrier, mpsc};
 
     fn request(id: &str, task_id: &str) -> RequestEnvelope {
         RequestEnvelope {
@@ -1209,6 +1210,61 @@ mod tests {
             preview: None,
             effect: Some(Effect::Write),
             trace: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_preparation_probes_do_not_stall_in_sqlite_connection_churn() {
+        const WORKERS: usize = 32;
+        const PROBES_PER_WORKER: usize = 100;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(
+            RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+                .expect("open ledger"),
+        );
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for worker in 0..WORKERS {
+            let ledger = Arc::clone(&ledger);
+            let start = Arc::clone(&start);
+            let completed_tx = completed_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for probe in 0..PROBES_PER_WORKER {
+                    let request_id = format!("probe-{worker}-{probe}");
+                    let request = request(&request_id, "task-a");
+                    assert!(
+                        ledger
+                            .terminal_outcome_before_preparation(&request)
+                            .expect("terminal outcome probe")
+                            .is_none()
+                    );
+                    assert!(
+                        ledger
+                            .reserved_request_recovery_before_preparation(&request)
+                            .expect("reserved recovery probe")
+                            .is_none()
+                    );
+                }
+                completed_tx.send(worker).expect("report completion");
+            }));
+        }
+        drop(completed_tx);
+        start.wait();
+
+        let completion_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for _ in 0..WORKERS {
+            completed_rx
+                .recv_timeout(
+                    completion_deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .expect("all concurrent preparation probes must remain bounded");
+        }
+        for worker in workers {
+            worker.join().expect("probe worker");
         }
     }
 

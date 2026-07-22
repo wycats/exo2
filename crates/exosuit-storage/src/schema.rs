@@ -2,7 +2,7 @@
 
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension};
-use std::rc::Rc;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::revisions::RevisionStore;
@@ -58,8 +58,8 @@ pub(crate) const REACTIVE_TABLES: &[(&str, &str)] = &[
 pub struct Database {
     conn: Connection,
     /// Revision store for tracking row and rowset revisions.
-    /// Shared with virtual tables via Rc.
-    revision_store: Rc<RevisionStore>,
+    /// Shared with virtual tables via Arc.
+    revision_store: Arc<RevisionStore>,
 }
 
 impl std::fmt::Debug for Database {
@@ -80,10 +80,10 @@ impl Database {
     /// 3. Reactive virtual tables wrapping all shadow tables
     pub(crate) fn new(conn: Connection) -> Result<Self, DatabaseError> {
         // Create revision store first (needs connection for persistence)
-        let revision_store = Rc::new(RevisionStore::new(&conn)?);
+        let revision_store = Arc::new(RevisionStore::new(&conn)?);
 
         // Register the reactive module with the revision store
-        register_reactive_module(&conn, "reactive", Rc::clone(&revision_store))?;
+        register_reactive_module(&conn, "reactive", Arc::clone(&revision_store))?;
 
         // Ensure reactive virtual tables exist and still match their shadow
         // tables. Opening a database must not rewrite schema on every
@@ -144,7 +144,7 @@ impl Database {
     /// Get a reference to the revision store.
     ///
     /// This is used for trace validation and testing.
-    pub fn revision_store(&self) -> &Rc<RevisionStore> {
+    pub fn revision_store(&self) -> &Arc<RevisionStore> {
         &self.revision_store
     }
 }
