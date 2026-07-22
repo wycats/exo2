@@ -73,6 +73,17 @@ pub fn open_memory_database() -> Result<Database, DatabaseError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bundled_sqlite_contains_required_unix_wal_fixes() {
+        const SQLITE_3_51_3: i32 = 3_051_003;
+
+        assert!(
+            rusqlite::version_number() >= SQLITE_3_51_3,
+            "bundled SQLite {} is missing required Unix WAL fixes",
+            rusqlite::version()
+        );
+    }
+
     struct DefensiveModeGuard<'conn> {
         conn: &'conn Connection,
         restore: bool,

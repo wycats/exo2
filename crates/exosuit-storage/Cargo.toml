@@ -8,8 +8,8 @@ repository.workspace = true
 
 [dependencies]
 exosuit-reactivity-core = { path = "../exosuit-reactivity-core" }
-rusqlite = { version = "0.38", features = ["bundled", "vtab", "functions"] }
-libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "vtab", "functions"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 thiserror = "1.0"
 blake3 = "1"
 hex = "0.4"

@@ -14,7 +14,7 @@ use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::revisions::{compute_row_digest, RevisionStore};
 use crate::trace::{
@@ -25,13 +25,10 @@ use crate::DatabaseError;
 
 /// Auxiliary data passed to the virtual table module.
 ///
-/// Contains the raw sqlite3 handle and revision store needed for
-/// querying shadow tables and tracking revisions.
+/// Contains the revision store needed for tracking revisions.
 pub struct VTabAux {
-    /// Raw sqlite3 handle for querying shadow table (bypasses rusqlite's RefCell)
-    db: *mut ffi::sqlite3,
     /// Revision store for tracking row and rowset revisions
-    revision_store: Rc<RevisionStore>,
+    revision_store: Arc<RevisionStore>,
 }
 
 /// The reactive virtual table module.
@@ -63,7 +60,7 @@ pub struct ReactiveVTab {
     /// which is tied to the connection that created it.
     db: *mut ffi::sqlite3,
     /// Revision store for tracking row and rowset revisions
-    revision_store: Rc<RevisionStore>,
+    revision_store: Arc<RevisionStore>,
 }
 
 impl ReactiveVTab {
@@ -480,7 +477,11 @@ unsafe impl<'vtab> VTab<'vtab> for ReactiveVTab {
         // Query shadow table schema using raw FFI to avoid RefCell conflicts.
         // The connect callback runs while rusqlite already holds a borrow on
         // the connection, so we must bypass its RefCell wrapper.
-        let raw_db = vtab_aux.db;
+        // Safety: SQLite supplied the handle for the connection that owns this
+        // virtual table, so it remains valid for the virtual table's lifetime.
+        // Raw access is required because rusqlite already holds the connection
+        // borrow while invoking virtual-table callbacks.
+        let raw_db = unsafe { db.handle() };
         let sql = format!("PRAGMA table_info({})", shadow_table);
         let sql_cstr =
             CString::new(sql).map_err(|e| Error::ModuleError(format!("Invalid SQL: {}", e)))?;
@@ -624,8 +625,8 @@ unsafe impl<'vtab> VTab<'vtab> for ReactiveVTab {
                 columns,
                 column_defaults,
                 rowid_column_index,
-                db: vtab_aux.db,
-                revision_store: Rc::clone(&vtab_aux.revision_store),
+                db: raw_db,
+                revision_store: Arc::clone(&vtab_aux.revision_store),
             },
         ))
     }
@@ -803,16 +804,11 @@ unsafe impl<'vtab> VTabCursor for ReactiveVTabCursor<'vtab> {
 pub fn register_module(
     conn: &Connection,
     name: &str,
-    revision_store: Rc<RevisionStore>,
+    revision_store: Arc<RevisionStore>,
 ) -> Result<(), DatabaseError> {
     let module = with_reactive_shadow_names(update_module::<ReactiveVTab>());
 
-    // Create aux data with raw sqlite3 handle and revision store
-    // Safety: The connection pointer is valid for the lifetime of the module,
-    // which is tied to the connection itself.
-    // We use the raw handle to bypass rusqlite's RefCell during vtab callbacks.
-    let db = unsafe { conn.handle() };
-    let aux = VTabAux { db, revision_store };
+    let aux = VTabAux { revision_store };
     conn.create_module(name, module, Some(aux))?;
 
     Ok(())
