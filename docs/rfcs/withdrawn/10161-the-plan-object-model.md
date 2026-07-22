@@ -17,7 +17,7 @@ The Plan Object Model is the canonical representation of an Exosuit project's st
 
 ## Motivation
 
-RFC 0011 originally proposed parsing `plan-outline.md` to derive the project state. However, Markdown proved too fragile for bidirectional editing (Agent <-> User).
+RFC 10102 originally proposed parsing `plan-outline.md` to derive the project state. However, Markdown proved too fragile for bidirectional editing (Agent <-> User).
 
 1.  **Ambiguity**: Markdown structure is loose; parsing it reliably requires complex heuristics.
 2.  **Round-tripping**: Preserving user formatting while the agent updates status is difficult in Markdown.
