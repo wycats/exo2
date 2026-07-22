@@ -1,16 +1,8 @@
 <!-- exo:239 ulid:01ky5qe7mdgbb0nwt6a2knkze3 -->
 
----
-title: Pipeline Visual Language: Terse RFC Status Notation for Sidebar and Tooling
-feature: sidebar
-exo:
-    tool: exo rfc create
-    protocol: 1
----
-
-
 # RFC 00239: Pipeline Visual Language: Terse RFC Status Notation for Sidebar and Tooling
 
+**Feature**: sidebar
 - **Superseded by**: RFC 10172
 
 ## Summary

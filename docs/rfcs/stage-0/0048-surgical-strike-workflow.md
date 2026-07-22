@@ -1,15 +1,8 @@
 <!-- exo:48 ulid:01ky5qdmtmyy6sr43pct5p5j17 -->
 
----
-ulid: 01kg5kp2da62rwfsxhsg75emsa
-title: Surgical Strike Workflow
-feature: Workflow
-superseded_by: "10175"
----
-
-
 # RFC 0048: Surgical Strike Workflow
 
+**Feature**: Workflow
 - **Superseded by**: RFC 10175
 
 ## Summary

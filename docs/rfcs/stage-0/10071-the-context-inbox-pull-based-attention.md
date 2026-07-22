@@ -1,15 +1,8 @@
 <!-- exo:10071 ulid:01ky5qeze4pbgv0j8cbyprn8rb -->
 
----
-title: The Context Inbox (Pull-Based Attention)
-feature: Agent Experience
-exo:
-    tool: exo rfc create
-    protocol: 1
----
-
 # RFC 10071: The Context Inbox (Pull-Based Attention)
 
+**Feature**: Agent Experience
 - **Superseded by**: RFC 0124
 
 ## Summary
@@ -80,11 +73,11 @@ We are moving from a "Pop-up" metaphor to a "Desk" metaphor.
 *   **The Inbox**: A physical tray on the corner of the desk.
 *   **The Agent**: A colleague who walks up, places a document in the tray, and walks away silently, trusting you to read it when you are ready.
 
-### 5. Integration with Modal Workflows (RFC 10010)
+### 5. Integration with the Mode-Aware Sidebar Cockpit (RFC 00184)
 
-The Inbox serves as the "Content Layer" for the Modal Workflow system.
+The Inbox serves as the "Content Layer" for the mode-aware sidebar model.
 
-*   **Signal vs. Content**: The **Maker HUD** (RFC 10010) provides the *Signal* (e.g., Red Entropy Indicator). The **Inbox** provides the *Content* (e.g., "Critical Axiom Violation").
+*   **Signal vs. Content**: The **Mode-Aware Sidebar Cockpit** (RFC 00184) provides the *Signal* (e.g., Red Entropy Indicator). The **Inbox** provides the *Content* (e.g., "Critical Axiom Violation").
 *   **Hermetic Seal**: The Inbox never "leaks" content (popups/toasts) into Maker Mode. The user must explicitly "pull" the content by clicking the HUD/Inbox.
 *   **Gating**:
     *   **In Flow**: The Inbox is purely passive.
