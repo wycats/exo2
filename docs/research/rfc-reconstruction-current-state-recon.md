@@ -97,9 +97,12 @@ The identity and duplicate-family work is complete at the corpus level:
 The current workspace observes 332 of 333 records. RFC 00178 is absent from the
 workspace observation set because its Markdown declares two RFC headings and
 Stage 0 body metadata while living in the Stage 1 directory. Exo records that
-as a `metadata_conflict`, then retains the canonical record in the effective
-view with `workspace_presence: absent`. This is explicit final-audit debt, not
-canonical data loss or an effective-read failure.
+as a `metadata_conflict`. The current 155b sidecar still has an earlier
+canonical SQLite row, so its effective view appends RFC 00178 with
+`workspace_presence: absent`. A fresh sidecar does not have that row:
+canonical reconciliation skips the conflicted document before upsert, leaving
+the effective view with 332 records. The final audit must repair the document
+and prove clean-bootstrap reconstruction rather than relying on seeded state.
 
 Older linked-worktree observations also retain an RFC 0111 metadata conflict.
 The cross-worktree audit must distinguish stale observations from a defect in
@@ -158,6 +161,9 @@ checkpoint records them without deciding their disposition:
 | RFC 0082 | Points to RFC 0122, while RFC 0122 names only RFC 0141. | Does streaming progress replace the signed-capability proposal, or is the successor semantically wrong? |
 | RFC 0103 | Points to RFC 00225 without reciprocal target metadata. | Is this a legitimate replacement chain requiring symmetry? |
 | RFC 10116 | Points to missing RFC 10014. | Should the declared successor be cleared, relinked, or represented as unavailable history? |
+| RFCs 0124 and 10174 | Both declare that they supersede missing RFCs 0016 and 10071. | Are these recoverable historical records, stale relationship endpoints, or concepts that should be cited without RFC relationships? |
+| RFC 10172 | Declares that it supersedes missing RFC 00239 and attributes its pipeline visual language to that record. | Should RFC 00239 be recovered, or should the relationship and attribution be rewritten around extant evidence? |
+| RFC 10175 | Declares that it supersedes missing RFC 0048. | Should RFC 0048 be recovered, or should the replacement claim be removed or redirected? |
 | RFC 0111 linked-worktree diagnostics | Present in older workspace observations, absent from the current 155b workspace diagnostic set. | Is this stale observation state or canonical metadata debt? |
 
 The audit must also re-read every active Stage 3/4 record against implementation

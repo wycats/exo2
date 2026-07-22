@@ -62,9 +62,12 @@ archived history. Effective status records what Exo presents to readers.
 
 RFC 00178 is the sole record absent from the current workspace observation.
 Its document declares two RFC headings and Stage 0 body metadata while living
-in the Stage 1 directory, so Exo records a `metadata_conflict`. The effective
-view still includes the canonical record with `workspace_presence: absent`.
-The final coherence audit owns the repair decision.
+in the Stage 1 directory, so Exo records a `metadata_conflict`. The current
+155b sidecar's effective view still includes an earlier canonical SQLite row
+with `workspace_presence: absent`. A fresh sidecar has no row to append because
+canonical reconciliation skips the conflicted document before upsert, making
+the effective record count depend on prior sidecar state. The final coherence
+audit owns the document repair and clean-bootstrap verification.
 
 ## Duplicate Title Families
 
@@ -188,6 +191,9 @@ disposition:
 - RFC 0082 points to RFC 0122, while RFC 0122 names only RFC 0141.
 - RFC 0103 points to RFC 00225 without reciprocal target metadata.
 - RFC 10116 points to missing RFC 10014.
+- RFCs 0124 and 10174 point to missing RFCs 0016 and 10071.
+- RFC 10172 points to missing RFC 00239.
+- RFC 10175 points to missing RFC 0048.
 - Older linked-worktree observations retain an RFC 0111 metadata diagnostic;
   the cross-worktree audit must distinguish stale observations from canonical
   document debt.
