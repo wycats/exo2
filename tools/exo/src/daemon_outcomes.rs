@@ -805,12 +805,17 @@ impl RequestOutcomeLedger {
 
     fn abandon(&self, request_id: &str, request_hash: &str, instance_id: &str) -> Result<()> {
         let connection = self.connection()?;
-        connection.execute(
+        let deleted = connection.execute(
             "DELETE FROM daemon_request_outcomes
              WHERE request_id = ?1 AND request_hash = ?2 AND instance_id = ?3
                AND response_json IS NULL",
             params![request_id, request_hash, instance_id],
         )?;
+        if deleted != 1 {
+            return Err(anyhow!(
+                "daemon outcome reservation disappeared before abandonment"
+            ));
+        }
         Ok(())
     }
 
@@ -1463,6 +1468,17 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("daemon.request_outcome_lookup_failed")
         );
+    }
+
+    #[test]
+    fn abandoning_missing_reservation_reports_ledger_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+
+        let error = ledger
+            .abandon("missing-request", "missing-hash", "instance-a")
+            .expect_err("missing reservation must not be reported as abandoned");
+        assert!(error.to_string().contains("disappeared before abandonment"));
     }
 
     #[test]
