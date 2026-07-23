@@ -9,18 +9,23 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
+use crate::api::protocol::ErrorCode;
 use crate::context::sqlite_loader::{
     RfcRecord, RfcWorkspaceDiagnostic, RfcWorkspaceObservation, RfcWorkspaceSnapshot,
 };
 use crate::context::{SqliteLoader, SqliteWriter};
+use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::utils;
 
 const RFCS_DIR: &str = "docs/rfcs";
 const SKIP_RFC_FILES: &[&str] = &["0000-template.md", "README.md"];
 const DEFAULT_RFC_ID_WIDTH: usize = 5;
+const RFC_RECONCILE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RFC_RECONCILE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 static ANCHOR_ULID_RE: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"^<!-- exo:\d+ ulid:([a-zA-Z0-9]+) -->"));
@@ -1043,8 +1048,15 @@ fn with_reconcile_lock<T>(
     project: Option<&Project>,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    use fs2::FileExt;
+    with_reconcile_lock_timeout(root, project, RFC_RECONCILE_LOCK_TIMEOUT, f)
+}
 
+fn with_reconcile_lock_timeout<T>(
+    root: &Path,
+    project: Option<&Project>,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let db_path = crate::context::db_path(root, project);
     let lock_path = db_path.with_extension("rfc-reconcile.lock");
     if let Some(parent) = lock_path.parent() {
@@ -1063,8 +1075,7 @@ fn with_reconcile_lock<T>(
         std::fs::write(marker, b"waiting")
             .context("Failed to write RFC reconcile lock wait marker")?;
     }
-    file.lock_exclusive()
-        .with_context(|| format!("Failed to lock RFC reconcile lock {}", lock_path.display()))?;
+    acquire_reconcile_lock(&file, &lock_path, timeout)?;
     let result = f();
     let unlock_result = file.unlock();
     match (result, unlock_result) {
@@ -1074,6 +1085,78 @@ fn with_reconcile_lock<T>(
             Err(error).with_context(|| format!("Failed to unlock {}", lock_path.display()))
         }
     }
+}
+
+fn acquire_reconcile_lock(file: &std::fs::File, lock_path: &Path, timeout: Duration) -> Result<()> {
+    use fs2::FileExt;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(reconcile_lock_busy_error(lock_path));
+                }
+                std::thread::sleep(remaining.min(RFC_RECONCILE_LOCK_POLL_INTERVAL));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to lock RFC reconcile lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
+fn reconcile_lock_busy_error(_lock_path: &Path) -> anyhow::Error {
+    anyhow::Error::new(reconcile_lock_busy_failure())
+}
+
+pub(crate) fn reconcile_lock_busy_failure() -> ExoFailure {
+    ExoFailure::new(
+        ErrorCode::PreconditionFailed,
+        "RFC reconciliation is busy; retry later with the same request ID",
+        ExoFailure::orienting_steering(Vec::new()),
+    )
+    .with_details(serde_json::json!({
+        "kind": "daemon.busy",
+        "reason": "rfc_reconcile_lock",
+        "retryable": true,
+        "retry_with_same_request_id": true,
+        "request_outcome_checked": false,
+    }))
+}
+
+pub(crate) fn is_reconcile_lock_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<ExoFailure>().is_some_and(|failure| {
+            failure.error.details.as_ref().is_some_and(|details| {
+                details.get("kind").and_then(serde_json::Value::as_str) == Some("daemon.busy")
+                    && details.get("reason").and_then(serde_json::Value::as_str)
+                        == Some("rfc_reconcile_lock")
+            })
+        })
+    })
+}
+
+fn post_mutation_reconcile_busy_error() -> anyhow::Error {
+    anyhow::Error::new(
+        ExoFailure::new(
+            ErrorCode::PreconditionFailed,
+            "RFC document changed, but reconciliation is busy; inspect the workspace before retrying",
+            ExoFailure::orienting_steering(Vec::new()),
+        )
+        .with_details(serde_json::json!({
+            "kind": "rfc.reconciliation_pending",
+            "reason": "rfc_reconcile_lock",
+            "retryable": false,
+            "retry_with_same_request_id": false,
+            "request_outcome_checked": false,
+            "mutation_may_have_completed": true,
+        })),
+    )
 }
 
 fn reconciled_relationship_value<'a>(
@@ -4644,11 +4727,19 @@ fn load_rfc_record_by_text_or_number(
 }
 
 fn persist_rfc_record(root: &Path, record: &RfcRecord) -> Result<()> {
+    persist_rfc_record_with_lock_timeout(root, record, RFC_RECONCILE_LOCK_TIMEOUT)
+}
+
+fn persist_rfc_record_with_lock_timeout(
+    root: &Path,
+    record: &RfcRecord,
+    lock_timeout: Duration,
+) -> Result<()> {
     let Some((project, db_path)) = resolve_rfc_storage(root)? else {
         return Ok(());
     };
 
-    with_reconcile_lock(root, project.as_ref(), || {
+    let result = with_reconcile_lock_timeout(root, project.as_ref(), lock_timeout, || {
         let source = canonical_reconcile_source(root)?;
         if matches!(source, CanonicalReconcileSource::WorkspaceFallback) {
             let writer = SqliteWriter::open(&db_path)?;
@@ -4750,7 +4841,12 @@ fn persist_rfc_record(root: &Path, record: &RfcRecord) -> Result<()> {
         );
 
         writer.replace_rfc_workspace_snapshot(&snapshot, &observations, &diagnostics)
-    })
+    });
+
+    match result {
+        Err(error) if is_reconcile_lock_busy(&error) => Err(post_mutation_reconcile_busy_error()),
+        result => result,
+    }
 }
 
 fn apply_workspace_optional_override(
@@ -6225,6 +6321,107 @@ This RFC supersedes:
             .unwrap()
             .unwrap();
         worker.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn reconcile_lock_wait_is_bounded_and_retryable() {
+        use fs2::FileExt;
+
+        let temp = TempDir::new().unwrap();
+        let lock_path = temp.path().join("exo.rfc-reconcile.lock");
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        owner.lock_exclusive().unwrap();
+        let waiter = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        let started = Instant::now();
+        let error = acquire_reconcile_lock(&waiter, &lock_path, Duration::from_millis(50))
+            .expect_err("held reconcile lock should return a bounded busy response");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(is_reconcile_lock_busy(&error));
+        let failure = error.downcast_ref::<ExoFailure>().unwrap();
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details,
+            Some(serde_json::json!({
+                "kind": "daemon.busy",
+                "reason": "rfc_reconcile_lock",
+                "retryable": true,
+                "retry_with_same_request_id": true,
+                "request_outcome_checked": false,
+            }))
+        );
+
+        owner.unlock().unwrap();
+    }
+
+    #[test]
+    fn wrapped_reconcile_lock_busy_error_remains_detectable() {
+        let error = reconcile_lock_busy_error(Path::new("exo.rfc-reconcile.lock"))
+            .context("prepare request transaction");
+
+        assert!(is_reconcile_lock_busy(&error));
+    }
+
+    #[test]
+    fn post_mutation_reconcile_lock_busy_is_not_safe_to_retry() {
+        use fs2::FileExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        init_git_repository(root);
+        let project = Project::resolve(root).unwrap();
+        let db_path = crate::context::db_path(root, Some(&project));
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        SqliteWriter::open(&db_path).unwrap();
+        let lock_path = db_path.with_extension("rfc-reconcile.lock");
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        owner.lock_exclusive().unwrap();
+        let record = default_rfc_record(
+            "01postmutationbusy".to_string(),
+            1,
+            "Post-mutation busy".to_string(),
+            0,
+            "active".to_string(),
+            "post-mutation-busy".to_string(),
+            "docs/rfcs/stage-0/00001-post-mutation-busy.md".to_string(),
+        );
+
+        let error = persist_rfc_record_with_lock_timeout(root, &record, Duration::from_millis(50))
+            .expect_err("held lock should fail post-mutation persistence");
+        assert!(!is_reconcile_lock_busy(&error));
+        let failure = error.downcast_ref::<ExoFailure>().unwrap();
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details,
+            Some(serde_json::json!({
+                "kind": "rfc.reconciliation_pending",
+                "reason": "rfc_reconcile_lock",
+                "retryable": false,
+                "retry_with_same_request_id": false,
+                "request_outcome_checked": false,
+                "mutation_may_have_completed": true,
+            }))
+        );
+
+        owner.unlock().unwrap();
     }
 
     #[test]

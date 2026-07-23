@@ -2173,6 +2173,145 @@ async fn daemon_and_direct_rfc_views_follow_the_issuing_linked_worktree(backend:
 
 #[test_matrix(["sqlite"])]
 #[tokio::test]
+async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(backend: &str) {
+    use fs2::FileExt;
+    use tokio::task::JoinSet;
+
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let (primary, linked) = create_primary_and_linked_worktree(&dir);
+    let _guard = DaemonGuard::new(&primary);
+
+    let stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("spawn daemon before holding reconcile lock");
+    drop(stream);
+
+    let project = exo::project::Project::resolve(&primary).expect("resolve shared project");
+    let lock_path = project.db_path().with_extension("rfc-reconcile.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("open RFC reconcile lock");
+    lock_file
+        .lock_exclusive()
+        .expect("simulate stale cross-process RFC lock holder");
+
+    let started = std::time::Instant::now();
+    let mut reads = JoinSet::new();
+    for index in 0..40 {
+        let workspace = if index % 2 == 0 {
+            primary.clone()
+        } else {
+            linked.clone()
+        };
+        reads.spawn(async move {
+            let stream = exo::daemon::connect_to_daemon(&workspace)
+                .await
+                .expect("connect while RFC lock is held");
+            let request = serde_json::json!({
+                "protocol_version": 1,
+                "id": format!("held-rfc-lock-read-{index}"),
+                "workspace_root": workspace.canonicalize().expect("canonical workspace"),
+                "op": {
+                    "kind": "call",
+                    "params": {
+                        "address": { "kind": "operation", "path": ["status"] },
+                        "input": {}
+                    }
+                }
+            });
+            send_machine_request_with_timeout(stream, &request.to_string(), Duration::from_secs(20))
+                .await
+        });
+    }
+
+    let mut responses = Vec::new();
+    while let Some(response) = reads.join_next().await {
+        responses.push(response.expect("join bounded daemon read"));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "all admitted requests must release their permits within the reconcile-lock bound"
+    );
+    assert_eq!(responses.len(), 40);
+    assert!(responses.iter().all(|response| {
+        response["status"] == "error"
+            && response["error"]["code"] == "precondition_failed"
+            && response["error"]["details"]["kind"] == "daemon.busy"
+            && response["error"]["details"]["retryable"] == true
+            && response["error"]["details"]["retry_with_same_request_id"] == true
+            && response["error"]["details"]["request_outcome_checked"] == false
+    }));
+    assert!(
+        responses
+            .iter()
+            .any(|response| { response["error"]["details"]["reason"] == "rfc_reconcile_lock" }),
+        "admitted handlers should report the held RFC lock as their busy reason"
+    );
+
+    let status = exo::daemon::daemon_status(&linked);
+    assert!(
+        status.ok,
+        "probe/status path should remain responsive: {status:?}"
+    );
+    assert_eq!(status.identity_matches_project, Some(true));
+    assert_eq!(
+        status.accept_loop_health,
+        exo::daemon::AcceptLoopHealth::Responsive
+    );
+
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "id": "retry-write-after-held-rfc-lock",
+        "workspace_root": linked.canonicalize().expect("canonical linked worktree"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": ["epoch", "add"] },
+                "input": { "title": "Epoch after bounded RFC lock wait" }
+            }
+        }
+    });
+    let stream = exo::daemon::connect_to_daemon(&linked)
+        .await
+        .expect("connect atomic write while lock is held");
+    let busy =
+        send_machine_request_with_timeout(stream, &request.to_string(), Duration::from_secs(10))
+            .await;
+    assert_eq!(busy["status"], "error", "{busy}");
+    assert_eq!(busy["error"]["details"]["kind"], "daemon.busy", "{busy}");
+    assert_eq!(
+        busy["error"]["details"]["reason"], "rfc_reconcile_lock",
+        "{busy}"
+    );
+    assert_eq!(busy["effect"], serde_json::Value::Null, "{busy}");
+    assert_eq!(
+        epoch_count(&project.db_path(), "Epoch after bounded RFC lock wait"),
+        0
+    );
+
+    lock_file.unlock().expect("release stale RFC lock fixture");
+
+    let stream = exo::daemon::connect_to_daemon(&primary)
+        .await
+        .expect("connect same-ID retry after releasing lock");
+    let completed =
+        send_machine_request_with_timeout(stream, &request.to_string(), Duration::from_secs(10))
+            .await;
+    assert_eq!(completed["status"], "ok", "{completed}");
+    assert_eq!(
+        epoch_count(&project.db_path(), "Epoch after bounded RFC lock wait"),
+        1,
+        "same-ID retry should execute exactly once after the lock becomes available"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
 async fn daemon_rejects_request_workspace_from_another_project(backend: &str) {
     assert_eq!(backend, "sqlite");
     let primary_dir = TempDir::new().unwrap();

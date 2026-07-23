@@ -785,6 +785,14 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+fn to_request_preparation_io_error(error: anyhow::Error) -> io::Error {
+    if crate::rfc::is_reconcile_lock_busy(&error) {
+        io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
+    } else {
+        to_io_error(error)
+    }
+}
+
 fn read_pid_file(pid_path: &Path) -> Option<u32> {
     std::fs::read_to_string(pid_path)
         .ok()
@@ -935,8 +943,12 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
             .ok()
             .and_then(|identity| identity.instance_id.as_deref()),
     );
-    let health_after_probe =
-        read_daemon_health_after_probe(&paths, health_before_probe.as_ref(), probe_ok);
+    let health_after_probe = read_daemon_health_after_probe(
+        &paths,
+        health_before_probe.as_ref(),
+        socket_connectable,
+        probe_ok,
+    );
     let recorded_identity_after_probe = read_daemon_identity(&paths).ok();
     let pid_after_probe = read_pid_file(&pid_path);
 
@@ -1031,6 +1043,7 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
     let accept_loop_health = classify_accept_loop_health(
         state,
         exact_runtime_identity,
+        socket_connectable,
         probe_ok,
         matching_health_before,
         matching_health_after,
@@ -1083,9 +1096,10 @@ fn daemon_health_matches_identity(
 fn read_daemon_health_after_probe(
     paths: &LocalRuntimePaths,
     health_before: Option<&DaemonHealthSnapshot>,
+    socket_connectable: bool,
     probe_ok: Option<bool>,
 ) -> Option<DaemonHealthSnapshot> {
-    if probe_ok.is_none() {
+    if probe_ok.is_none() && health_before.is_none_or(|health| !health.server_task_alive) {
         return read_daemon_health(paths).ok();
     }
 
@@ -1106,7 +1120,7 @@ fn read_daemon_health_after_probe(
             return health_after;
         }
         if std::time::Instant::now() >= deadline {
-            return if probe_ok == Some(false) {
+            return if probe_ok == Some(false) || !socket_connectable {
                 health_after
             } else {
                 None
@@ -1119,6 +1133,7 @@ fn read_daemon_health_after_probe(
 fn classify_accept_loop_health(
     state: DaemonStatusState,
     exact_runtime_identity: bool,
+    socket_connectable: bool,
     probe_ok: Option<bool>,
     health_before: Option<&DaemonHealthSnapshot>,
     health_after: Option<&DaemonHealthSnapshot>,
@@ -1132,8 +1147,10 @@ fn classify_accept_loop_health(
     if exact_runtime_identity && probe_ok == Some(true) {
         return AcceptLoopHealth::Responsive;
     }
+    let endpoint_failed = probe_ok == Some(false)
+        || (!socket_connectable && probe_ok.is_none() && state == DaemonStatusState::Unreachable);
     if exact_runtime_identity
-        && probe_ok == Some(false)
+        && endpoint_failed
         && health_before
             .zip(health_after)
             .is_some_and(|(before, after)| {
@@ -1601,6 +1618,9 @@ fn validated_request_workspace(
 }
 
 fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return daemon_reconcile_busy_response(id);
+    }
     let code = if error.kind() == io::ErrorKind::InvalidInput {
         ErrorCode::InvalidInput
     } else {
@@ -1626,6 +1646,24 @@ fn daemon_busy_response(id: String) -> ResponseEnvelope {
                 "request_outcome_checked": false,
             })),
         }),
+        ticket: None,
+        steering: None,
+        reminders: None,
+        display: None,
+        preview: None,
+        effect: None,
+        trace: None,
+    }
+}
+
+fn daemon_reconcile_busy_response(id: String) -> ResponseEnvelope {
+    let error = crate::rfc::reconcile_lock_busy_failure().error;
+    ResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id,
+        status: Status::Error,
+        result: None,
+        error: Some(error),
         ticket: None,
         steering: None,
         reminders: None,
@@ -1723,7 +1761,7 @@ fn atomic_request_context(
 
     let context = daemon_request_context(startup_workspace, startup_project, request)?;
     AgentContext::prepare_request_transaction(&context.workspace_root, Some(&context.project))
-        .map_err(to_io_error)?;
+        .map_err(to_request_preparation_io_error)?;
     Ok(context)
 }
 
@@ -4251,6 +4289,7 @@ mod tests {
             classify_accept_loop_health(
                 DaemonStatusState::RunningCurrent,
                 true,
+                true,
                 Some(true),
                 None,
                 None,
@@ -4262,6 +4301,7 @@ mod tests {
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
                 true,
+                true,
                 Some(false),
                 Some(&before),
                 Some(&before),
@@ -4271,6 +4311,7 @@ mod tests {
         assert_eq!(
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
+                true,
                 true,
                 None,
                 Some(&before),
@@ -4283,6 +4324,19 @@ mod tests {
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
                 true,
+                false,
+                None,
+                Some(&before),
+                Some(&before),
+            ),
+            AcceptLoopHealth::Stalled,
+            "a matching active health record classifies an unreachable socket as stalled"
+        );
+        assert_eq!(
+            classify_accept_loop_health(
+                DaemonStatusState::Unreachable,
+                true,
+                true,
                 Some(false),
                 Some(&before),
                 Some(&advanced),
@@ -4293,6 +4347,7 @@ mod tests {
         assert_eq!(
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
+                true,
                 true,
                 Some(false),
                 None,
@@ -4305,6 +4360,7 @@ mod tests {
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
                 false,
+                true,
                 Some(false),
                 Some(&before),
                 Some(&before),
@@ -4318,6 +4374,7 @@ mod tests {
             classify_accept_loop_health(
                 DaemonStatusState::Unreachable,
                 true,
+                true,
                 Some(false),
                 Some(&server_stopped),
                 Some(&server_stopped),
@@ -4326,7 +4383,7 @@ mod tests {
             "an exact matching snapshot records server-task exit"
         );
         assert_eq!(
-            classify_accept_loop_health(DaemonStatusState::Stopped, false, None, None, None,),
+            classify_accept_loop_health(DaemonStatusState::Stopped, false, false, None, None, None,),
             AcceptLoopHealth::Stopped
         );
     }
@@ -4431,7 +4488,7 @@ mod tests {
             writer.accepted();
         }
 
-        let first_durable = read_daemon_health_after_probe(&paths, Some(&bound), Some(true))
+        let first_durable = read_daemon_health_after_probe(&paths, Some(&bound), true, Some(true))
             .expect("successful probe observes durable accept progress");
         assert!(first_durable.accept_count > bound.accept_count);
 

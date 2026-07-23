@@ -40,6 +40,13 @@ enum Reservation {
     Conflict,
 }
 
+#[derive(Debug)]
+enum WaitForResponse {
+    Completed(Box<ResponseEnvelope>),
+    TimedOut,
+    ReservationReleased,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RuntimeOutcomeState {
     Missing,
@@ -300,80 +307,129 @@ impl RequestOutcomeLedger {
             }
         };
 
-        match self.reserve(
-            &request_id,
-            &request_hash,
-            effect,
-            RecoveryClass::ExternalAtMostOnce,
-            instance_id,
-        ) {
-            Ok(Reservation::Replay(response)) => OutcomeExecution {
-                response: *response,
-                replayed: true,
-            },
-            Ok(Reservation::Conflict) => OutcomeExecution {
-                response: request_id_conflict_response(request_id, effect),
-                replayed: false,
-            },
-            Ok(Reservation::InFlight {
-                instance_id: owner, ..
-            }) if owner == instance_id => {
-                match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
-                    Ok(Some(response)) => OutcomeExecution {
-                        response,
+        let mut request = Some(request);
+        let mut execute = Some(execute);
+        loop {
+            match self.reserve(
+                &request_id,
+                &request_hash,
+                effect,
+                RecoveryClass::ExternalAtMostOnce,
+                instance_id,
+            ) {
+                Ok(Reservation::Replay(response)) => {
+                    return OutcomeExecution {
+                        response: *response,
                         replayed: true,
-                    },
-                    Ok(None) => OutcomeExecution {
-                        response: in_flight_response(request_id, effect, &owner, false),
+                    };
+                }
+                Ok(Reservation::Conflict) => {
+                    return OutcomeExecution {
+                        response: request_id_conflict_response(request_id, effect),
                         replayed: false,
-                    },
-                    Err(error) => OutcomeExecution {
+                    };
+                }
+                Ok(Reservation::InFlight {
+                    instance_id: owner, ..
+                }) if owner == instance_id => {
+                    match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
+                        Ok(WaitForResponse::Completed(response)) => {
+                            return OutcomeExecution {
+                                response: *response,
+                                replayed: true,
+                            };
+                        }
+                        Ok(WaitForResponse::TimedOut) => {
+                            return OutcomeExecution {
+                                response: in_flight_response(request_id, effect, &owner, false),
+                                replayed: false,
+                            };
+                        }
+                        Ok(WaitForResponse::ReservationReleased) => continue,
+                        Err(error) => {
+                            return OutcomeExecution {
+                                response: ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_lookup_failed",
+                                    error,
+                                    false,
+                                ),
+                                replayed: false,
+                            };
+                        }
+                    }
+                }
+                Ok(Reservation::InFlight {
+                    instance_id: owner, ..
+                }) => {
+                    return OutcomeExecution {
+                        response: in_flight_response(request_id, effect, &owner, true),
+                        replayed: false,
+                    };
+                }
+                Ok(Reservation::Execute) => {
+                    let (Some(execute), Some(request)) = (execute.take(), request.take()) else {
+                        return OutcomeExecution {
+                            response: ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_execution_state_invalid",
+                                anyhow!("external request execution state was already consumed"),
+                                false,
+                            ),
+                            replayed: false,
+                        };
+                    };
+                    let response = execute(request);
+                    if is_retryable_daemon_busy_response(&response) {
+                        return match self.abandon(&request_id, &request_hash, instance_id) {
+                            Ok(()) => OutcomeExecution {
+                                response: normalize_retryable_daemon_busy_response(response),
+                                replayed: false,
+                            },
+                            Err(error) => OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_abandon_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            },
+                        };
+                    }
+                    return match self.complete(&request_id, &request_hash, &response) {
+                        Ok(()) => OutcomeExecution {
+                            response,
+                            replayed: false,
+                        },
+                        Err(error) => OutcomeExecution {
+                            response: ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_persist_failed",
+                                error,
+                                true,
+                            ),
+                            replayed: false,
+                        },
+                    };
+                }
+                Err(error) => {
+                    return OutcomeExecution {
                         response: ledger_error_response(
                             request_id,
                             effect,
-                            "daemon.request_outcome_lookup_failed",
+                            "daemon.request_outcome_reservation_failed",
                             error,
                             false,
                         ),
                         replayed: false,
-                    },
+                    };
                 }
             }
-            Ok(Reservation::InFlight {
-                instance_id: owner, ..
-            }) => OutcomeExecution {
-                response: in_flight_response(request_id, effect, &owner, true),
-                replayed: false,
-            },
-            Ok(Reservation::Execute) => {
-                let response = execute(request);
-                match self.complete(&request_id, &request_hash, &response) {
-                    Ok(()) => OutcomeExecution {
-                        response,
-                        replayed: false,
-                    },
-                    Err(error) => OutcomeExecution {
-                        response: ledger_error_response(
-                            request_id,
-                            effect,
-                            "daemon.request_outcome_persist_failed",
-                            error,
-                            true,
-                        ),
-                        replayed: false,
-                    },
-                }
-            }
-            Err(error) => OutcomeExecution {
-                response: ledger_error_response(
-                    request_id,
-                    effect,
-                    "daemon.request_outcome_reservation_failed",
-                    error,
-                    false,
-                ),
-                replayed: false,
-            },
         }
     }
 
@@ -440,13 +496,13 @@ impl RequestOutcomeLedger {
                 instance_id: owner, ..
             }) if owner == instance_id => {
                 match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
-                    Ok(Some(response)) => {
+                    Ok(WaitForResponse::Completed(response)) => {
                         return OutcomeExecution {
-                            response,
+                            response: *response,
                             replayed: true,
                         };
                     }
-                    Ok(None) => {
+                    Ok(WaitForResponse::TimedOut) => {
                         match canonical_atomic_outcome_exists(project_db_path, &request_id) {
                             Ok(true) => false,
                             Ok(false) => {
@@ -468,6 +524,18 @@ impl RequestOutcomeLedger {
                                 };
                             }
                         }
+                    }
+                    Ok(WaitForResponse::ReservationReleased) => {
+                        return OutcomeExecution {
+                            response: without_committed_effect(ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_lookup_failed",
+                                anyhow!("daemon outcome reservation disappeared"),
+                                false,
+                            )),
+                            replayed: false,
+                        };
                     }
                     Err(error) => {
                         return OutcomeExecution {
@@ -703,7 +771,7 @@ impl RequestOutcomeLedger {
         request_id: &str,
         request_hash: &str,
         timeout: Duration,
-    ) -> Result<Option<ResponseEnvelope>> {
+    ) -> Result<WaitForResponse> {
         let deadline = Instant::now() + timeout;
         loop {
             let connection = self.connection()?;
@@ -721,28 +789,33 @@ impl RequestOutcomeLedger {
                     return Err(anyhow!("request id was reused with a different payload"));
                 }
                 Some((_, Some(response_json))) => {
-                    return Ok(Some(
+                    return Ok(WaitForResponse::Completed(Box::new(
                         serde_json::from_str(&response_json)
                             .context("deserialize recorded daemon response")?,
-                    ));
+                    )));
                 }
-                None => return Err(anyhow!("daemon outcome reservation disappeared")),
+                None => return Ok(WaitForResponse::ReservationReleased),
                 Some((_, None)) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(25));
                 }
-                Some((_, None)) => return Ok(None),
+                Some((_, None)) => return Ok(WaitForResponse::TimedOut),
             }
         }
     }
 
     fn abandon(&self, request_id: &str, request_hash: &str, instance_id: &str) -> Result<()> {
         let connection = self.connection()?;
-        connection.execute(
+        let deleted = connection.execute(
             "DELETE FROM daemon_request_outcomes
              WHERE request_id = ?1 AND request_hash = ?2 AND instance_id = ?3
                AND response_json IS NULL",
             params![request_id, request_hash, instance_id],
         )?;
+        if deleted != 1 {
+            return Err(anyhow!(
+                "daemon outcome reservation disappeared before abandonment"
+            ));
+        }
         Ok(())
     }
 
@@ -1006,6 +1079,57 @@ fn atomic_response_commits(response: &ResponseEnvelope) -> bool {
             })
 }
 
+fn is_retryable_daemon_busy_response(response: &ResponseEnvelope) -> bool {
+    response.status == Status::Error
+        && response.error.as_ref().is_some_and(|error| {
+            error.code == ErrorCode::PreconditionFailed
+                && error
+                    .details
+                    .as_ref()
+                    .is_some_and(has_retryable_daemon_busy_details)
+        })
+}
+
+fn has_retryable_daemon_busy_details(details: &serde_json::Value) -> bool {
+    retryable_daemon_busy_details(details).is_some()
+}
+
+fn retryable_daemon_busy_details(details: &serde_json::Value) -> Option<&serde_json::Value> {
+    let is_busy = details.get("kind").and_then(serde_json::Value::as_str) == Some("daemon.busy")
+        && details
+            .get("retry_with_same_request_id")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && details
+            .get("request_outcome_checked")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && details
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if is_busy {
+        Some(details)
+    } else {
+        details
+            .get("details")
+            .and_then(retryable_daemon_busy_details)
+    }
+}
+
+fn normalize_retryable_daemon_busy_response(mut response: ResponseEnvelope) -> ResponseEnvelope {
+    if let Some(error) = response.error.as_mut()
+        && let Some(details) = error
+            .details
+            .as_ref()
+            .and_then(retryable_daemon_busy_details)
+            .cloned()
+    {
+        error.details = Some(details);
+    }
+    without_committed_effect(response)
+}
+
 fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
     response.effect = None;
     response
@@ -1211,6 +1335,192 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn reconcile_busy_response(id: &str) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::Error,
+            result: None,
+            error: Some(ErrorBody {
+                code: ErrorCode::PreconditionFailed,
+                message: "RFC reconciliation is busy; retry later with the same request ID"
+                    .to_string(),
+                details: Some(serde_json::json!({
+                    "kind": "daemon.busy",
+                    "reason": "rfc_reconcile_lock",
+                    "retryable": true,
+                    "retry_with_same_request_id": true,
+                    "request_outcome_checked": false,
+                })),
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Write),
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_busy_response_abandons_external_runtime_reservation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let request = request("retry-after-reconcile-busy", "task-a");
+        let invocations = Cell::new(0);
+
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                reconcile_busy_response(&request.id)
+            },
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(first.response.effect, None);
+        let details = first
+            .response
+            .error
+            .as_ref()
+            .and_then(|error| error.details.as_ref())
+            .expect("normalized busy details");
+        assert_eq!(details["kind"], "daemon.busy");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], true);
+        assert!(details.get("details").is_none());
+
+        let second = ledger.execute(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                response(&request.id)
+            },
+        );
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(invocations.get(), 2, "the busy result must not be replayed");
+    }
+
+    #[test]
+    fn wrapped_reconcile_busy_response_abandons_external_runtime_reservation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let request = request("retry-after-wrapped-reconcile-busy", "task-a");
+        let mut busy = reconcile_busy_response(&request.id);
+        let details = busy
+            .error
+            .as_mut()
+            .and_then(|error| error.details.take())
+            .unwrap();
+        busy.error.as_mut().unwrap().details = Some(serde_json::json!({
+            "details": details,
+            "steering": [],
+        }));
+
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| busy,
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(first.response.effect, None);
+        let details = first
+            .response
+            .error
+            .as_ref()
+            .and_then(|error| error.details.as_ref())
+            .expect("normalized busy details");
+        assert_eq!(details["kind"], "daemon.busy");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], true);
+        assert!(details.get("details").is_none());
+
+        let second = ledger.execute(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        assert_eq!(second.response.status, Status::Ok);
+    }
+
+    #[test]
+    fn same_instance_waiter_re_reserves_after_busy_owner_abandons() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(
+            RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+                .expect("open ledger"),
+        );
+        let request = request("waiter-after-reconcile-busy", "task-a");
+        let request_hash = request_hash(&request).unwrap();
+        assert!(matches!(
+            ledger
+                .reserve(
+                    &request.id,
+                    &request_hash,
+                    Effect::Write,
+                    RecoveryClass::ExternalAtMostOnce,
+                    "instance-a",
+                )
+                .unwrap(),
+            Reservation::Execute
+        ));
+
+        let waiter_ledger = Arc::clone(&ledger);
+        let waiter_request = request.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            waiter_ledger.execute(
+                waiter_request,
+                Effect::Write,
+                "instance-a",
+                Duration::from_secs(2),
+                |request| response(&request.id),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+        ledger
+            .abandon(&request.id, &request_hash, "instance-a")
+            .unwrap();
+
+        let execution = waiter.join().unwrap();
+        assert_eq!(execution.response.status, Status::Ok);
+        assert_ne!(
+            execution
+                .response
+                .error
+                .as_ref()
+                .and_then(|error| error.details.as_ref())
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("daemon.request_outcome_lookup_failed")
+        );
+    }
+
+    #[test]
+    fn abandoning_missing_reservation_reports_ledger_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+
+        let error = ledger
+            .abandon("missing-request", "missing-hash", "instance-a")
+            .expect_err("missing reservation must not be reported as abandoned");
+        assert!(error.to_string().contains("disappeared before abandonment"));
     }
 
     #[test]
