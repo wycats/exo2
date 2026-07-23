@@ -2212,6 +2212,11 @@ async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(ba
             let stream = exo::daemon::connect_to_daemon(&workspace)
                 .await
                 .expect("connect while RFC lock is held");
+            let command_path = if index % 2 == 0 {
+                serde_json::json!(["status"])
+            } else {
+                serde_json::json!(["goal", "list"])
+            };
             let request = serde_json::json!({
                 "protocol_version": 1,
                 "id": format!("held-rfc-lock-read-{index}"),
@@ -2219,7 +2224,7 @@ async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(ba
                 "op": {
                     "kind": "call",
                     "params": {
-                        "address": { "kind": "operation", "path": ["status"] },
+                        "address": { "kind": "operation", "path": command_path },
                         "input": {}
                     }
                 }

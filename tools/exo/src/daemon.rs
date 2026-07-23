@@ -43,7 +43,8 @@ use crate::daemon_diagnostics::{
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, request_command_path,
+    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger,
+    normalize_retryable_daemon_busy_response_if_needed, request_command_path,
     request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
@@ -2851,11 +2852,13 @@ pub async fn run_daemon(
                                         );
                                     }
                                 };
-                                handle_request_with_project_and_diagnostics_as_writer(
-                                    &request_context.workspace_root,
-                                    Some(&request_context.project),
-                                    req,
-                                    &diagnostics,
+                                normalize_retryable_daemon_busy_response_if_needed(
+                                    handle_request_with_project_and_diagnostics_as_writer(
+                                        &request_context.workspace_root,
+                                        Some(&request_context.project),
+                                        req,
+                                        &diagnostics,
+                                    ),
                                 )
                             }
                         }

@@ -1130,6 +1130,16 @@ fn normalize_retryable_daemon_busy_response(mut response: ResponseEnvelope) -> R
     without_committed_effect(response)
 }
 
+pub(crate) fn normalize_retryable_daemon_busy_response_if_needed(
+    response: ResponseEnvelope,
+) -> ResponseEnvelope {
+    if is_retryable_daemon_busy_response(&response) {
+        normalize_retryable_daemon_busy_response(response)
+    } else {
+        response
+    }
+}
+
 fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
     response.effect = None;
     response
