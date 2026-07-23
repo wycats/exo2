@@ -347,6 +347,24 @@ impl RequestOutcomeLedger {
             },
             Ok(Reservation::Execute) => {
                 let response = execute(request);
+                if is_retryable_daemon_busy_response(&response) {
+                    return match self.abandon(&request_id, &request_hash, instance_id) {
+                        Ok(()) => OutcomeExecution {
+                            response: without_committed_effect(response),
+                            replayed: false,
+                        },
+                        Err(error) => OutcomeExecution {
+                            response: without_committed_effect(ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_abandon_failed",
+                                error,
+                                false,
+                            )),
+                            replayed: false,
+                        },
+                    };
+                }
                 match self.complete(&request_id, &request_hash, &response) {
                     Ok(()) => OutcomeExecution {
                         response,
@@ -1006,6 +1024,28 @@ fn atomic_response_commits(response: &ResponseEnvelope) -> bool {
             })
 }
 
+fn is_retryable_daemon_busy_response(response: &ResponseEnvelope) -> bool {
+    response.status == Status::Error
+        && response.error.as_ref().is_some_and(|error| {
+            error.code == ErrorCode::PreconditionFailed
+                && error.details.as_ref().is_some_and(|details| {
+                    details.get("kind").and_then(serde_json::Value::as_str) == Some("daemon.busy")
+                        && details
+                            .get("retry_with_same_request_id")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                        && details
+                            .get("request_outcome_checked")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                        && details
+                            .get("retryable")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                })
+        })
+}
+
 fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
     response.effect = None;
     response
@@ -1211,6 +1251,68 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn reconcile_busy_response(id: &str) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::Error,
+            result: None,
+            error: Some(ErrorBody {
+                code: ErrorCode::PreconditionFailed,
+                message: "RFC reconciliation is busy; retry later with the same request ID"
+                    .to_string(),
+                details: Some(serde_json::json!({
+                    "kind": "daemon.busy",
+                    "reason": "rfc_reconcile_lock",
+                    "retryable": true,
+                    "retry_with_same_request_id": true,
+                    "request_outcome_checked": false,
+                })),
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Write),
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_busy_response_abandons_external_runtime_reservation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let request = request("retry-after-reconcile-busy", "task-a");
+        let invocations = Cell::new(0);
+
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                reconcile_busy_response(&request.id)
+            },
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(first.response.effect, None);
+
+        let second = ledger.execute(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                response(&request.id)
+            },
+        );
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(invocations.get(), 2, "the busy result must not be replayed");
     }
 
     #[test]
