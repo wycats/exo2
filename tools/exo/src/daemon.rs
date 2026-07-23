@@ -1099,9 +1099,6 @@ fn read_daemon_health_after_probe(
     socket_connectable: bool,
     probe_ok: Option<bool>,
 ) -> Option<DaemonHealthSnapshot> {
-    if probe_ok.is_none() && socket_connectable {
-        return read_daemon_health(paths).ok();
-    }
     if probe_ok.is_none() && health_before.is_none_or(|health| !health.server_task_alive) {
         return read_daemon_health(paths).ok();
     }
@@ -1660,22 +1657,13 @@ fn daemon_busy_response(id: String) -> ResponseEnvelope {
 }
 
 fn daemon_reconcile_busy_response(id: String) -> ResponseEnvelope {
+    let error = crate::rfc::reconcile_lock_busy_failure().error;
     ResponseEnvelope {
         protocol_version: PROTOCOL_VERSION,
         id,
         status: Status::Error,
         result: None,
-        error: Some(ErrorBody {
-            code: ErrorCode::PreconditionFailed,
-            message: "RFC reconciliation is busy; retry later with the same request ID".to_string(),
-            details: Some(serde_json::json!({
-                "kind": "daemon.busy",
-                "reason": "rfc_reconcile_lock",
-                "retryable": true,
-                "retry_with_same_request_id": true,
-                "request_outcome_checked": false,
-            })),
-        }),
+        error: Some(error),
         ticket: None,
         steering: None,
         reminders: None,

@@ -1111,20 +1111,22 @@ fn acquire_reconcile_lock(file: &std::fs::File, lock_path: &Path, timeout: Durat
 }
 
 fn reconcile_lock_busy_error(_lock_path: &Path) -> anyhow::Error {
-    anyhow::Error::new(
-        ExoFailure::new(
-            ErrorCode::PreconditionFailed,
-            "RFC reconciliation is busy; retry later with the same request ID",
-            ExoFailure::orienting_steering(Vec::new()),
-        )
-        .with_details(serde_json::json!({
-            "kind": "daemon.busy",
-            "reason": "rfc_reconcile_lock",
-            "retryable": true,
-            "retry_with_same_request_id": true,
-            "request_outcome_checked": false,
-        })),
+    anyhow::Error::new(reconcile_lock_busy_failure())
+}
+
+pub(crate) fn reconcile_lock_busy_failure() -> ExoFailure {
+    ExoFailure::new(
+        ErrorCode::PreconditionFailed,
+        "RFC reconciliation is busy; retry later with the same request ID",
+        ExoFailure::orienting_steering(Vec::new()),
     )
+    .with_details(serde_json::json!({
+        "kind": "daemon.busy",
+        "reason": "rfc_reconcile_lock",
+        "retryable": true,
+        "retry_with_same_request_id": true,
+        "request_outcome_checked": false,
+    }))
 }
 
 pub(crate) fn is_reconcile_lock_busy(error: &anyhow::Error) -> bool {
