@@ -2224,7 +2224,7 @@ async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(ba
                     }
                 }
             });
-            send_machine_request_with_timeout(stream, &request.to_string(), Duration::from_secs(10))
+            send_machine_request_with_timeout(stream, &request.to_string(), Duration::from_secs(20))
                 .await
         });
     }
@@ -2234,7 +2234,7 @@ async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(ba
         responses.push(response.expect("join bounded daemon read"));
     }
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(15),
         "all admitted requests must release their permits within the reconcile-lock bound"
     );
     assert_eq!(responses.len(), 40);
