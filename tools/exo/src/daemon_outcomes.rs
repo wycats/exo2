@@ -385,7 +385,7 @@ impl RequestOutcomeLedger {
                     if is_retryable_daemon_busy_response(&response) {
                         return match self.abandon(&request_id, &request_hash, instance_id) {
                             Ok(()) => OutcomeExecution {
-                                response: without_committed_effect(response),
+                                response: normalize_retryable_daemon_busy_response(response),
                                 replayed: false,
                             },
                             Err(error) => OutcomeExecution {
@@ -1091,6 +1091,10 @@ fn is_retryable_daemon_busy_response(response: &ResponseEnvelope) -> bool {
 }
 
 fn has_retryable_daemon_busy_details(details: &serde_json::Value) -> bool {
+    retryable_daemon_busy_details(details).is_some()
+}
+
+fn retryable_daemon_busy_details(details: &serde_json::Value) -> Option<&serde_json::Value> {
     let is_busy = details.get("kind").and_then(serde_json::Value::as_str) == Some("daemon.busy")
         && details
             .get("retry_with_same_request_id")
@@ -1104,10 +1108,26 @@ fn has_retryable_daemon_busy_details(details: &serde_json::Value) -> bool {
             .get("retryable")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
-    is_busy
-        || details
+    if is_busy {
+        Some(details)
+    } else {
+        details
             .get("details")
-            .is_some_and(has_retryable_daemon_busy_details)
+            .and_then(retryable_daemon_busy_details)
+    }
+}
+
+fn normalize_retryable_daemon_busy_response(mut response: ResponseEnvelope) -> ResponseEnvelope {
+    if let Some(error) = response.error.as_mut()
+        && let Some(details) = error
+            .details
+            .as_ref()
+            .and_then(retryable_daemon_busy_details)
+            .cloned()
+    {
+        error.details = Some(details);
+    }
+    without_committed_effect(response)
 }
 
 fn without_committed_effect(mut response: ResponseEnvelope) -> ResponseEnvelope {
@@ -1364,6 +1384,17 @@ mod tests {
         );
         assert_eq!(first.response.status, Status::Error);
         assert_eq!(first.response.effect, None);
+        let details = first
+            .response
+            .error
+            .as_ref()
+            .and_then(|error| error.details.as_ref())
+            .expect("normalized busy details");
+        assert_eq!(details["kind"], "daemon.busy");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], true);
+        assert!(details.get("details").is_none());
 
         let second = ledger.execute(
             request,
@@ -1404,6 +1435,17 @@ mod tests {
         );
         assert_eq!(first.response.status, Status::Error);
         assert_eq!(first.response.effect, None);
+        let details = first
+            .response
+            .error
+            .as_ref()
+            .and_then(|error| error.details.as_ref())
+            .expect("normalized busy details");
+        assert_eq!(details["kind"], "daemon.busy");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], true);
+        assert!(details.get("details").is_none());
 
         let second = ledger.execute(
             request,
