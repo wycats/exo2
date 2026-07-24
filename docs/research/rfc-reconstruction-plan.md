@@ -185,10 +185,10 @@ The action sequence at this checkpoint was:
    `0106 -> 0108`.
 5. Resolve the remaining numeric collision `0060`.
 
-The completed sequence and its final validation are recorded in
-`docs/research/rfc-reconstruction-final-disposition.md`. Future lifecycle or
-rewrite work begins through the ordinary staged RFC process rather than this
-historical queue.
+The completed sequence and its final validation are recorded in the
+[RFC Reconstruction Final Disposition](./rfc-reconstruction-final-disposition.md).
+Future lifecycle or rewrite work begins through the ordinary staged RFC process
+rather than this historical queue.
 
 ## Session Note
 
