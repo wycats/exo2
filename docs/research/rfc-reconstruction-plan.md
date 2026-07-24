@@ -1,15 +1,15 @@
 # RFC Reconstruction Plan
 
-Current status source: [RFC Reconstruction Current-State Recon](./rfc-reconstruction-current-state-recon.md).
-That checkpoint refreshes the public-tree corpus inventory after the clean-root
-cutover and supersedes the next-step recommendations in this older plan.
+Final outcome: [RFC Reconstruction Final Disposition](./rfc-reconstruction-final-disposition.md).
+That disposition records the completed public-tree reconstruction and
+supersedes the next-step recommendations in this historical execution plan.
 
-This plan turns the inventory into an evidence-driven reconstruction sequence.
-It avoids editing RFC files directly until each action can be expressed through
-the Exo RFC command surface (`supersede`, `archive`, `withdraw`, `edit`,
+This plan turned the inventory into an evidence-driven reconstruction sequence.
+It avoided editing RFC files directly until each action could be expressed
+through the Exo RFC command surface (`supersede`, `archive`, `withdraw`, `edit`,
 `promote`, `repair`, or `rename`).
 
-## Current Findings
+## Findings At Plan Time
 
 - The corpus has 334 markdown files under `docs/rfcs`.
 - 332 of those files are managed RFC records; `README.md` and
@@ -171,9 +171,9 @@ IDs, because ambiguous IDs can make the command surface select no safe target.
 5. Convert broad, stale "vision" RFCs into smaller future-plan RFCs only when a
    near-term implementation slice is plausible.
 
-## Next Concrete Step
+## Historical Execution Queue
 
-The current action sequence is:
+The action sequence at this checkpoint was:
 
 1. Account for the RFC `10200` identity repair reminder before the next
    ID-addressed RFC mutation batch.
@@ -185,9 +185,10 @@ The current action sequence is:
    `0106 -> 0108`.
 5. Resolve the remaining numeric collision `0060`.
 
-Use
-`docs/research/rfc-reconstruction-current-state-recon.md` as the current queue
-before opening the next lifecycle or rewrite PR.
+The completed sequence and its final validation are recorded in
+`docs/research/rfc-reconstruction-final-disposition.md`. Future lifecycle or
+rewrite work begins through the ordinary staged RFC process rather than this
+historical queue.
 
 ## Session Note
 

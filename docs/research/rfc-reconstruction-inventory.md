@@ -1,7 +1,7 @@
 # RFC Reconstruction Inventory
 
 Generated from the canonical Markdown tree and the effective Exo RFC view on
-clean `main` at `5b0e585b567ebecda8b7699abe524dc7c9777475`.
+clean `main` at `74d7c23bee5fad6b6a987aac8c44870b3daf316b`.
 
 This is the final reconstruction-execution inventory, not a lifecycle
 proposal. Directory placement records the current Markdown location. Metadata
@@ -10,8 +10,8 @@ archived history. Effective status records what Exo presents to readers.
 
 ## Summary
 
-- RFC Markdown files: 335
-- Managed RFC records: 333
+- RFC Markdown files: 338
+- Managed RFC records: 336
 - Support files: 2 (README and template)
 - Duplicate-title families: 96
 - Records in duplicate-title families: 193
@@ -22,52 +22,48 @@ archived history. Effective status records what Exo presents to readers.
 
 | Directory | Records |
 | --- | ---: |
-| `stage-0` | 65 |
-| `stage-1` | 67 |
+| `stage-0` | 67 |
+| `stage-1` | 68 |
 | `stage-2` | 12 |
 | `stage-3` | 17 |
 | `stage-4` | 25 |
 | `archive` | 3 |
 | `withdrawn` | 144 |
-| **Total** | **333** |
+| **Total** | **336** |
 
 ### Effective Lifecycle Status
 
 | Status | Records |
 | --- | ---: |
 | `active` | 145 |
-| `superseded` | 41 |
+| `superseded` | 44 |
 | `withdrawn` | 144 |
 | `archived` | 3 |
-| **Total** | **333** |
+| **Total** | **336** |
 
 ### Retained Metadata Stage
 
 | Stage | Records |
 | ---: | ---: |
-| 0 | 152 |
-| 1 | 94 |
+| 0 | 154 |
+| 1 | 95 |
 | 2 | 17 |
 | 3 | 37 |
 | 4 | 33 |
-| **Total** | **333** |
+| **Total** | **336** |
 
 ## Canonical And Workspace Presence
 
-- Canonically present: 333/333
-- Present in this workspace observation: 332/333
+- Canonically present: 336/336
+- Present in this workspace observation: 336/336
 - Different from canonical: 0
 - Canonical quarantine rows: 0
 - Sidecar repository: clean and synchronized
 
-RFC 00178 is the sole record absent from the current workspace observation.
-Its document declares two RFC headings and Stage 0 body metadata while living
-in the Stage 1 directory, so Exo records a `metadata_conflict`. The current
-155b sidecar's effective view still includes an earlier canonical SQLite row
-with `workspace_presence: absent`. A fresh sidecar has no row to append because
-canonical reconciliation skips the conflicted document before upsert, making
-the effective record count depend on prior sidecar state. The final coherence
-audit owns the document repair and clean-bootstrap verification.
+RFC 00178 now has one Stage 1 identity and is present in both views. Historical
+RFCs 0048, 00239, and 10071 have been restored with portable identity and
+relationship metadata. A clean-bootstrap reconstruction produces the same 336
+records as the established sidecar.
 
 ## Duplicate Title Families
 
@@ -176,27 +172,22 @@ paths and effective lifecycle status.
 
 ## Numeric Identity
 
-All 333 managed documents declare a unique numeric `exo:` anchor. The eight
+All 336 managed documents declare a unique numeric `exo:` anchor. The eight
 collision families in the initial inventory, including the final RFC 0060
 collision, have been resolved. ID-addressed Exo operations are no longer
 blocked by numeric ambiguity.
 
-## Final Audit Candidates
+## Final Audit State
 
-The inventory identifies evidence for the next audit task without deciding the
-disposition:
+The coherence audit is complete:
 
-- RFC 00178 has a current-workspace metadata conflict.
-- RFCs 0030 and 0040 point to RFC 0080 without reciprocal target entries.
-- RFC 0082 points to RFC 0122, while RFC 0122 names only RFC 0141.
-- RFC 0103 points to RFC 00225 without reciprocal target metadata.
-- RFC 10116 points to missing RFC 10014.
-- RFCs 0124 and 10174 point to missing RFCs 0016 and 10071.
-- RFC 10172 points to missing RFC 00239.
-- RFC 10175 points to missing RFC 0048.
-- Older linked-worktree observations retain an RFC 0111 metadata diagnostic;
-  the cross-worktree audit must distinguish stale observations from canonical
+- RFC 00178's document identity and retained stage are unambiguous.
+- Historical RFCs 0048, 00239, and 10071 are canonically present.
+- Every relationship target resolves to a managed RFC record.
+- Reciprocal relationship edges are symmetric.
+- Older RFC 0111 diagnostics are stale workspace observations, not canonical
   document debt.
+- Clean-bootstrap and established-sidecar views reconstruct the same corpus.
 
 ## Managed Record Index
 
@@ -207,6 +198,7 @@ disposition:
 | `stage-0` | 0035 | 0 | `active` | Exosuit Development Kit (EDK) | `docs/rfcs/stage-0/0035-exosuit-development-kit.md` |
 | `stage-0` | 0037 | 0 | `active` | The Exosuit Release Lifecycle | `docs/rfcs/stage-0/0037-release-lifecycle.md` |
 | `stage-0` | 0046 | 0 | `active` | Bug Reporting Workflow | `docs/rfcs/stage-0/0046-bug-reporting-workflow.md` |
+| `stage-0` | 0048 | 0 | `superseded` | Surgical Strike Workflow | `docs/rfcs/stage-0/0048-surgical-strike-workflow.md` |
 | `stage-0` | 0051 | 0 | `active` | Coherence Bootstrap | `docs/rfcs/stage-0/0051-coherence-bootstrap.md` |
 | `stage-0` | 0070 | 0 | `active` | Resource Protocol and Layered Architecture | `docs/rfcs/stage-0/0070-resource-protocol-and-layered-architecture.md` |
 | `stage-0` | 0086 | 0 | `active` | Studio UI Polish and Visual Language | `docs/rfcs/stage-0/0086-studio-ui-polish-and-visual-language.md` |
@@ -249,6 +241,7 @@ disposition:
 | `stage-0` | 10068 | 0 | `superseded` | Coherence Bootstrap | `docs/rfcs/stage-0/10068-coherence-bootstrap.md` |
 | `stage-0` | 10069 | 0 | `superseded` | The Agent Quality Loop | `docs/rfcs/stage-0/10069-the-agent-quality-loop.md` |
 | `stage-0` | 10070 | 0 | `superseded` | The Exosuit Modal Workflows | `docs/rfcs/stage-0/10070-the-exosuit-modal-workflows.md` |
+| `stage-0` | 10071 | 0 | `superseded` | The Context Inbox (Pull-Based Attention) | `docs/rfcs/stage-0/10071-the-context-inbox-pull-based-attention.md` |
 | `stage-0` | 10075 | 0 | `active` | Verified Text Surgery | `docs/rfcs/stage-0/10075-verified-text-surgery.md` |
 | `stage-0` | 10076 | 0 | `active` | Unified File and Directory Rendering | `docs/rfcs/stage-0/10076-unified-file-and-directory-rendering.md` |
 | `stage-0` | 10080 | 0 | `superseded` | Agent CWD Discipline (Rooted Execution) | `docs/rfcs/stage-0/10080-agent-cwd-discipline-rooted-execution.md` |
@@ -302,6 +295,7 @@ disposition:
 | `stage-1` | 0234 | 1 | `active` | Command Output Boundary: Eliminating println! Pollution | `docs/rfcs/stage-1/00234-command-output-boundary-eliminating-println-pollution.md` |
 | `stage-1` | 0237 | 1 | `active` | Dynamic Derived Roots (Reactive Families) | `docs/rfcs/stage-1/00237-dynamic-derived-roots.md` |
 | `stage-1` | 0238 | 1 | `active` | Pipeline-Aware Self-Model: Making the System Perceive and Steer Itself | `docs/rfcs/stage-1/00238-pipeline-aware-self-model.md` |
+| `stage-1` | 0239 | 1 | `superseded` | Pipeline Visual Language: Terse RFC Status Notation for Sidebar and Tooling | `docs/rfcs/stage-1/00239-pipeline-visual-language-terse-rfc-status-notation-for-sidebar-and-tooling.md` |
 | `stage-1` | 0240 | 1 | `active` | Fractal SOAR & The Goal Loop | `docs/rfcs/stage-1/00240-fractal-soar-the-goal-loop.md` |
 | `stage-1` | 0241 | 1 | `active` | Reactive State Roots: Mutable Application State in the Reactive Graph | `docs/rfcs/stage-1/00241-reactive-state-roots-mutable-application-state-in-the-reactive-graph.md` |
 | `stage-1` | 0242 | 1 | `active` | Progress Tool: Task Logs as Lightweight Steering | `docs/rfcs/stage-1/00242-progress-tool-lightweight-steering-during-goal-execution.md` |
