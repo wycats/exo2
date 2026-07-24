@@ -149,16 +149,20 @@ The two workspace focus relations obey one invariant:
 > When a workspace has a focused lane, its active phase is the phase associated
 > with that lane.
 
-`lane focus` and `lane start` update both relations in one canonical SQLite
-transaction. `phase focus` and `phase start` preserve an existing lane focus
-when it belongs to the selected phase and clear it when it belongs to another
-phase. Finishing a phase clears the current workspace's focus when it points
-to a lane under that phase, but it does not delete or close the portable lane.
-Supported commands therefore cannot publish a half-updated focus or leave a
-completed phase presented as the current execution stream.
+`lane focus` and `lane start` require the lane's phase to be in progress and
+update both relations in one canonical SQLite transaction. `phase start`
+preserves an existing lane focus when it belongs to the phase being started.
+`phase focus` preserves an existing lane focus only when it belongs to the
+selected in-progress phase; selecting a pending or different phase clears it.
+Finishing a phase clears every workspace focus row in the project-state
+database whose lane belongs to that phase, but it does not delete or close the
+portable lane. Supported commands therefore cannot publish a half-updated
+focus or leave a completed phase presented as a current execution stream in
+another linked worktree.
 
 Reads do not silently repair inconsistent legacy or manually edited rows. They
-return the observed lane and a stable `lane.phase_focus_mismatch` diagnostic,
+return the observed lane and a stable `lane.phase_focus_mismatch` diagnostic
+when the phase relation disagrees or the lane's phase is not in progress,
 allowing the caller to focus the intended lane or phase explicitly.
 
 Creating or starting a lane is a phase-scoped mutation and uses the existing
@@ -179,7 +183,7 @@ The command surface is:
 | `lane list` | Pure | List portable lanes with phase and current-workspace focus summaries |
 | `lane show <id>` | Pure | Show one lane, its phase, and phase goal summaries |
 | `lane current` | Pure | Show the current workspace's focused lane, or `null` |
-| `lane focus <id>` | Write | Require a pending or in-progress phase, then atomically focus the lane and phase in this workspace |
+| `lane focus <id>` | Write | Require an in-progress phase, then atomically focus the lane and phase in this workspace |
 | `lane start <id>` | Write | Require an in-progress phase, transition the lane to executing, and focus it |
 
 Pure commands use replayable-read recovery. The three writes mutate only

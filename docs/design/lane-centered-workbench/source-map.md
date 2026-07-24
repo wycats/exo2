@@ -183,7 +183,7 @@ The design package intentionally leaves these as future implementation questions
 
 Do not rewrite RFC history. Keep RFCs as durable history and create a current architecture layer that says what the system believes now.
 
-[RFC 10202: Lane-Centered Workbench Adoption](../../rfcs/stage-1/10202-lane-centered-workbench-adoption.md)
-records the adoption decision and first proof. This package remains the detailed
-product, system, interaction, and implementation authority rather than being
-flattened into the RFC.
+[RFC 10202: Lane-Centered Workbench Adoption](../../rfcs/stage-2/10202-lane-centered-workbench-adoption.md)
+records the adoption decision and implementation-ready first-proof contract.
+This package remains the detailed product, system, interaction, and
+implementation authority rather than being flattened into the RFC.
