@@ -106,8 +106,12 @@ The first proof introduces one portable reactive table,
 
 The phase foreign key uses restrictive deletion. A phase with lanes cannot be
 removed accidentally; `phase remove` reports an actionable precondition rather
-than allowing SQLite to erase a durable work identity. Moving the phase within
-the plan does not change the lane.
+than allowing SQLite to erase a durable work identity. A mistakenly created
+lane can be removed while it is still `prepared`; removing it clears any
+workspace focus rows for that lane in the same transaction. An `executing`
+lane cannot be removed, so its phase remains protected until a later lifecycle
+contract supplies closure or abandonment. Moving the phase within the plan
+does not change the lane.
 
 The two-state lifecycle is intentionally incomplete. `prepared` means the
 stream has durable intent but has not begun execution. `executing` means work
@@ -136,6 +140,13 @@ command output never exposes the workspace path.
 This split permits every linked worktree to observe the same lane identities
 while choosing its own focus. Removing or recreating one worktree cannot change
 the focus of another.
+
+`project move-root` treats lane focus like the existing workspace-active phase
+and ownership records. Its dry run reports matching lane-focus rows and any
+destination conflict. Apply rewrites the source workspace root to the validated
+destination in the same relocation transaction; an existing destination row
+for a different lane is a blocker rather than an implicit choice. The portable
+lane identity and shared state root do not change.
 
 ### Relationship to phases
 
@@ -185,10 +196,11 @@ The command surface is:
 | `lane current` | Pure | Show the current workspace's focused lane, or `null` |
 | `lane focus <id>` | Write | Require an in-progress phase, then atomically focus the lane and phase in this workspace |
 | `lane start <id>` | Write | Require an in-progress phase, transition the lane to executing, and focus it |
+| `lane remove <id>` | Write | Require phase ownership and a prepared lane, clear its workspace focus rows, and remove it atomically |
 
-Pure commands use replayable-read recovery. The three writes mutate only
-canonical SQLite state and use atomic-project-state recovery, so the mutation,
-deterministic event, and replayable core response commit together. The normal
+Pure commands use replayable-read recovery. The write commands mutate only
+canonical SQLite state and use atomic-project-state recovery, so each mutation,
+deterministic event, and replayable core response commits together. The normal
 post-write path remains responsible for portable projection and sidecar
 persistence.
 
@@ -225,11 +237,11 @@ and reactive invalidation refreshes the tree from that result. Loading, no-lane,
 focus-mismatch, and transport-error states are rendered as states rather than
 guessed from stale editor memory.
 
-Creation and start remain available through the CLI and `exo-run`. That is a
-complete first editor role: observe the work streams available to this
-workspace, see which one is current, and switch context. Rich creation,
-attachment, status explanation, and lifecycle actions belong to the later
-workbench UI.
+Creation, start, and prepared-lane removal remain available through the CLI and
+`exo-run`. That is a complete first editor role: observe the work streams
+available to this workspace, see which one is current, and switch context.
+Rich creation, attachment, status explanation, and lifecycle actions belong to
+the later workbench UI.
 
 ## Compatibility and Migration
 
@@ -320,8 +332,8 @@ evidence establish all of the following:
 - portable lane state survives deterministic dump/import with stable phase
   references and no workspace paths;
 - linked worktrees share lane records while retaining independent lane focus;
-- create, list, show, current, focus, and start agree across direct CLI, daemon,
-  JSON machine channel, and MCP;
+- create, list, show, current, focus, start, and prepared-lane removal agree
+  across direct CLI, daemon, JSON machine channel, and MCP;
 - lane and phase focus remain atomic, and inconsistent rows are diagnosed
   without read-time mutation;
 - daemon replacement, editor reload, and a new agent session recover the same
