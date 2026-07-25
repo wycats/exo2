@@ -2,6 +2,7 @@
 
 Generated from the canonical Markdown tree and the effective Exo RFC view on
 clean `main` at `74d7c23bee5fad6b6a987aac8c44870b3daf316b`.
+Updated incrementally for RFC 10202's reviewed Stage 2 promotion.
 
 This is the final reconstruction-execution inventory, not a lifecycle
 proposal. Directory placement records the current Markdown location. Metadata
@@ -23,8 +24,8 @@ archived history. Effective status records what Exo presents to readers.
 | Directory | Records |
 | --- | ---: |
 | `stage-0` | 67 |
-| `stage-1` | 68 |
-| `stage-2` | 12 |
+| `stage-1` | 67 |
+| `stage-2` | 13 |
 | `stage-3` | 17 |
 | `stage-4` | 25 |
 | `archive` | 3 |
@@ -46,8 +47,8 @@ archived history. Effective status records what Exo presents to readers.
 | Stage | Records |
 | ---: | ---: |
 | 0 | 154 |
-| 1 | 95 |
-| 2 | 17 |
+| 1 | 94 |
+| 2 | 18 |
 | 3 | 37 |
 | 4 | 33 |
 | **Total** | **336** |
@@ -327,7 +328,6 @@ The coherence audit is complete:
 | `stage-1` | 10194 | 1 | `active` | Command Surface Coherence and the Shared Exo Command Language | `docs/rfcs/stage-1/10194-command-text-frontend-and-parser-library-evaluation.md` |
 | `stage-1` | 10195 | 1 | `active` | Daemon Lifecycle Authority and Shared Perception Surfaces | `docs/rfcs/stage-1/10195-daemon-lifecycle-authority-and-shared-perception-surfaces.md` |
 | `stage-1` | 10200 | 1 | `active` | CLI-Shaped exo-run MCP Transport | `docs/rfcs/stage-1/10200-cli-shaped-exo-run-mcp-transport.md` |
-| `stage-1` | 10202 | 1 | `active` | Lane-Centered Workbench Adoption | `docs/rfcs/stage-1/10202-lane-centered-workbench-adoption.md` |
 | `stage-2` | 0071 | 2 | `active` | Reactive Collections: Directory Listing and Writable Projections | `docs/rfcs/stage-2/0071-reactive-collections-directory-listing-and-writable-projections.md` |
 | `stage-2` | 0127 | 2 | `active` | Rigorous Rust Infrastructure | `docs/rfcs/stage-2/0127-rigorous-rust-infrastructure.md` |
 | `stage-2` | 0233 | 2 | `active` | ExoSpec: Unified Command Definition and the End of Dual-Source Drift | `docs/rfcs/stage-2/00233-exospec-unified-command-definition-and-the-end-of-dual-source-drift.md` |
@@ -340,6 +340,7 @@ The coherence audit is complete:
 | `stage-2` | 10181 | 2 | `active` | Shared Perception: Inbox as a Steering Channel | `docs/rfcs/stage-2/10181-shared-perception-inbox-as-a-steering-channel.md` |
 | `stage-2` | 10182 | 2 | `active` | Contextual Steering: Every Command is a Perception Touchpoint | `docs/rfcs/stage-2/10182-contextual-steering-every-command-is-a-perception-touchpoint.md` |
 | `stage-2` | 10183 | 2 | `active` | Agent Activity Model: Event Sourcing for Steering Context | `docs/rfcs/stage-2/10183-agent-activity-model-event-sourcing-for-steering-context.md` |
+| `stage-2` | 10202 | 2 | `active` | Lane-Centered Workbench Adoption | `docs/rfcs/stage-2/10202-lane-centered-workbench-adoption.md` |
 | `stage-3` | 0069 | 3 | `active` | Canonical ULIDs, Scoped Slugs, and RFC Corpus Control | `docs/rfcs/stage-3/0069-canonical-ulids-scoped-slugs-and-rfc-corpus-control.md` |
 | `stage-3` | 0080 | 3 | `active` | Agent-first CLI Discovery Ladder | `docs/rfcs/stage-3/0080-agent-first-cli-discovery-ladder.md` |
 | `stage-3` | 0081 | 3 | `active` | Exohook: File Expansion Worked Examples | `docs/rfcs/stage-3/0081-exohook-file-expansion-worked-examples.md` |
