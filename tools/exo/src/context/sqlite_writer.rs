@@ -153,15 +153,15 @@ impl SqliteWriter {
 
     /// Remove an epoch by `text_id`. Cascades to phases/goals/tasks.
     pub fn remove_epoch(&self, text_id: &str) -> Result<()> {
-        let conn = self.db.connection();
-        delete_entity_aliases(conn, "epoch", "epochs_data", text_id)?;
-        let rows = conn
+        let savepoint = SqliteSavepoint::begin(self.db.connection(), "remove_epoch_savepoint")?;
+        delete_entity_aliases(&savepoint, "epoch", "epochs_data", text_id)?;
+        let rows = savepoint
             .execute("DELETE FROM epochs WHERE text_id = ?", [text_id])
             .context("Failed to delete epoch")?;
         if rows == 0 {
             return Err(anyhow!("Epoch not found: {text_id}"));
         }
-        Ok(())
+        savepoint.commit()
     }
 
     /// Update an epoch's reviewed status.
@@ -196,27 +196,43 @@ impl SqliteWriter {
 
     /// Bankrupt an epoch by marking pending/in-progress phases/goals as abandoned.
     pub fn bankrupt_epoch(&self, text_id: &str) -> Result<()> {
-        let conn = self.db.connection();
-        let epoch_id = resolve_id(conn, "epochs_data", text_id)?;
+        let savepoint = SqliteSavepoint::begin(self.db.connection(), "bankrupt_epoch_savepoint")?;
+        let epoch_id = resolve_id(&savepoint, "epochs_data", text_id)?;
 
-        conn.execute(
-            "UPDATE phases
+        savepoint
+            .execute(
+                "UPDATE phases
              SET status = 'abandoned'
              WHERE epoch_id = ?1 AND status IN ('pending', 'in-progress')",
-            [epoch_id],
-        )
-        .context("Failed to update phase statuses for bankrupt epoch")?;
+                [epoch_id],
+            )
+            .context("Failed to update phase statuses for bankrupt epoch")?;
 
-        conn.execute(
-            "UPDATE goals
+        savepoint
+            .execute(
+                "UPDATE goals
              SET status = 'abandoned'
              WHERE phase_id IN (SELECT id FROM phases_data WHERE epoch_id = ?1)
              AND status IN ('pending', 'in-progress')",
-            [epoch_id],
-        )
-        .context("Failed to update goal statuses for bankrupt epoch")?;
+                [epoch_id],
+            )
+            .context("Failed to update goal statuses for bankrupt epoch")?;
 
-        Ok(())
+        savepoint
+            .execute(
+                "DELETE FROM workspace_lane_focus
+                 WHERE lane_id IN (
+                     SELECT lane.id
+                     FROM workbench_lanes_data lane
+                     JOIN phases_data phase ON phase.id = lane.execution_phase_id
+                     WHERE phase.epoch_id = ?1
+                       AND phase.status = 'abandoned'
+                 )",
+                [epoch_id],
+            )
+            .context("Failed to clear bankrupt epoch lane focus rows")?;
+
+        savepoint.commit()
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2872,6 +2888,97 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_epoch_rolls_back_alias_cleanup_when_lane_restricts_delete() -> Result<()> {
+        let w = SqliteWriter::open_memory()?;
+        let conn = w.database().connection();
+        let epoch_id = w.add_epoch("E1", None, &["epoch-alias".to_string()])?;
+        let phase_id = w.add_phase(
+            &epoch_id,
+            "P1",
+            "regular",
+            None,
+            &["phase-alias".to_string()],
+        )?;
+        w.add_workbench_lane("Lane", "Keep the epoch reachable", &phase_id)?;
+
+        assert!(
+            w.remove_epoch(&epoch_id).is_err(),
+            "a descendant lane should restrict epoch deletion"
+        );
+
+        let epoch_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM epochs_data WHERE text_id = ?1",
+            [&epoch_id],
+            |row| row.get(0),
+        )?;
+        let phase_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM phases_data WHERE text_id = ?1",
+            [&phase_id],
+            |row| row.get(0),
+        )?;
+        let alias_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM entity_aliases", [], |row| row.get(0))?;
+        assert_eq!(epoch_count, 1);
+        assert_eq!(phase_count, 1);
+        assert_eq!(
+            alias_count, 2,
+            "failed epoch deletion must preserve epoch and descendant aliases"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bankrupt_epoch_clears_focus_for_every_abandoned_phase_lane() -> Result<()> {
+        let w = SqliteWriter::open_memory()?;
+        let conn = w.database().connection();
+        let epoch_id = w.add_epoch("E1", None, &[])?;
+        let pending_phase = w.add_phase(&epoch_id, "Pending", "regular", None, &[])?;
+        let active_phase = w.add_phase(&epoch_id, "Active", "regular", None, &[])?;
+        w.update_phase_status(&active_phase, "in-progress")?;
+        let pending_lane = w.add_workbench_lane("Pending Lane", "Wait", &pending_phase)?;
+        let active_lane = w.add_workbench_lane("Active Lane", "Execute", &active_phase)?;
+
+        let other_epoch = w.add_epoch("E2", None, &[])?;
+        let other_phase = w.add_phase(&other_epoch, "Other", "regular", None, &[])?;
+        let other_lane = w.add_workbench_lane("Other Lane", "Remain focused", &other_phase)?;
+
+        w.set_workspace_lane_focus("/tmp/pending-worktree", &pending_lane)?;
+        w.set_workspace_lane_focus("/tmp/active-worktree", &active_lane)?;
+        w.set_workspace_lane_focus("/tmp/other-worktree", &other_lane)?;
+
+        w.bankrupt_epoch(&epoch_id)?;
+
+        let abandoned_phases: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM phases_data
+             WHERE epoch_id = (SELECT id FROM epochs_data WHERE text_id = ?1)
+               AND status = 'abandoned'",
+            [&epoch_id],
+            |row| row.get(0),
+        )?;
+        let affected_focus: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM workspace_lane_focus_data focus
+             JOIN workbench_lanes_data lane ON lane.id = focus.lane_id
+             JOIN phases_data phase ON phase.id = lane.execution_phase_id
+             WHERE phase.epoch_id = (SELECT id FROM epochs_data WHERE text_id = ?1)",
+            [&epoch_id],
+            |row| row.get(0),
+        )?;
+        let other_focus: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM workspace_lane_focus_data
+             WHERE workspace_root = '/tmp/other-worktree'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(abandoned_phases, 2);
+        assert_eq!(affected_focus, 0);
+        assert_eq!(other_focus, 1, "unrelated epoch focus must remain");
         Ok(())
     }
 

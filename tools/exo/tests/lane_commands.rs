@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_methods)]
 
+use exo::command::epoch::EpochStart;
 use exo::command::lane::{
     LaneCreate, LaneCurrent, LaneFocus, LaneList, LaneRemove, LaneShow, LaneStart,
 };
@@ -328,6 +329,57 @@ fn phase_commands_preserve_or_clear_lane_focus_by_execution_phase() {
             .load_workspace_active_phase(&workspace_root)
             .expect("load phase focus"),
         Some(later_phase)
+    );
+}
+
+#[test]
+fn epoch_start_clears_lane_focus_from_another_epoch() {
+    let (temp, project, _bootstrap_phase, execution_phase) = fixture();
+    let root = temp.path();
+    let writer = SqliteWriter::open(project.db_path()).expect("open writer");
+    writer
+        .update_phase_status(&execution_phase, "in-progress")
+        .expect("start current phase");
+    let lane_id = writer
+        .add_workbench_lane(
+            "Current lane",
+            "Yield focus to the next epoch",
+            &execution_phase,
+        )
+        .expect("add current lane");
+    let workspace_root = project
+        .workspace_root
+        .as_ref()
+        .expect("workspace root")
+        .to_string_lossy()
+        .into_owned();
+    writer
+        .focus_workbench_lane(&workspace_root, &lane_id, &execution_phase)
+        .expect("focus current lane");
+
+    let next_epoch = writer
+        .add_epoch("Next Epoch", None, &[])
+        .expect("add next epoch");
+    let next_phase = writer
+        .add_phase(&next_epoch, "Next Phase", "regular", None, &[])
+        .expect("add next phase");
+
+    let started = execute_mut(&EpochStart::new(&next_epoch), root, &project);
+    assert_eq!(started["first_phase_id"], next_phase);
+
+    let loader = exo::context::SqliteLoader::open(project.db_path()).expect("open loader");
+    assert_eq!(
+        loader
+            .load_workspace_active_phase(&workspace_root)
+            .expect("load phase focus"),
+        Some(next_phase)
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(&workspace_root)
+            .expect("load lane focus"),
+        None,
+        "starting another epoch must clear the old epoch's lane focus"
     );
 }
 
