@@ -6,7 +6,9 @@ use exo::command::lane::{
 };
 use exo::command::phase_cmd::{PhaseFocus, PhaseRemove, PhaseStart};
 use exo::command::plan::PlanUpdateStatus;
-use exo::command::{Command, CommandContext, MutableCommand, MutableCommandContext, OutputFormat};
+use exo::command::{
+    Command, CommandContext, CommandOutput, MutableCommand, MutableCommandContext, OutputFormat,
+};
 use exo::context::{SqliteWriter, db_path};
 use exo::project::Project;
 use serde_json::Value;
@@ -77,6 +79,18 @@ fn execute<C: Command>(command: &C, root: &Path, project: &Project) -> Value {
         .execute(&read_context(root, project))
         .expect("command succeeds")
         .data
+}
+
+fn execute_human<C: Command>(command: &C, root: &Path, project: &Project) -> CommandOutput {
+    command
+        .execute(&CommandContext {
+            root,
+            project: Some(project),
+            format: OutputFormat::Human,
+            agent_id: None,
+            workflow_confirmation: None,
+        })
+        .expect("human command succeeds")
 }
 
 fn execute_mut<C: MutableCommand>(command: &C, root: &Path, project: &Project) -> Value {
@@ -244,6 +258,18 @@ fn lane_current_reports_phase_focus_mismatch_without_repairing_it() {
         still_mismatched["diagnostics"][0]["code"], "lane.phase_focus_mismatch",
         "pure reads must not silently repair phase focus"
     );
+
+    for output in [
+        execute_human(&LaneList, root, &project),
+        execute_human(&LaneShow::new(&lane_id), root, &project),
+        execute_human(&LaneCurrent, root, &project),
+    ] {
+        let message = output.human_message.expect("human message");
+        assert!(
+            message.contains("lane.phase_focus_mismatch"),
+            "human lane reads must surface focus diagnostics: {message}"
+        );
+    }
 }
 
 #[test]

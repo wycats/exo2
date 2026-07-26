@@ -605,6 +605,7 @@ impl SqliteWriter {
     ) -> Result<()> {
         let savepoint =
             SqliteSavepoint::begin(self.db.connection(), "focus_workbench_lane_savepoint")?;
+        require_lane_phase_in_progress(&savepoint, lane_text_id, phase_text_id)?;
         self.set_workspace_active_phase(workspace_root, phase_text_id)?;
         self.set_workspace_lane_focus(workspace_root, lane_text_id)?;
         savepoint.commit()
@@ -621,6 +622,7 @@ impl SqliteWriter {
             self.db.connection(),
             "start_and_focus_workbench_lane_savepoint",
         )?;
+        require_lane_phase_in_progress(&savepoint, lane_text_id, phase_text_id)?;
         self.start_workbench_lane(lane_text_id)?;
         self.set_workspace_active_phase(workspace_root, phase_text_id)?;
         self.set_workspace_lane_focus(workspace_root, lane_text_id)?;
@@ -2482,6 +2484,46 @@ fn invalid_task_handle(message: impl Into<String>) -> anyhow::Error {
         message.into(),
         ExoFailure::orienting_steering(Vec::new()),
     ))
+}
+
+fn require_lane_phase_in_progress(
+    conn: &Connection,
+    lane_text_id: &str,
+    phase_text_id: &str,
+) -> Result<()> {
+    let phase_status: Option<String> = conn
+        .query_row(
+            "SELECT phase.status
+             FROM workbench_lanes_data lane
+             JOIN phases_data phase ON phase.id = lane.execution_phase_id
+             WHERE lane.text_id = ?1 AND phase.text_id = ?2",
+            (lane_text_id, phase_text_id),
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to validate workbench lane execution phase")?;
+
+    match phase_status.as_deref() {
+        Some("in-progress") => Ok(()),
+        Some(status) => Err(anyhow::Error::new(
+            ExoFailure::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "Cannot focus workbench lane '{lane_text_id}' while phase '{phase_text_id}' is {status}"
+                ),
+                ExoFailure::orienting_steering(Vec::new()),
+            )
+            .with_details(serde_json::json!({
+                "kind": "lane.phase_not_in_progress",
+                "lane_id": lane_text_id,
+                "phase_id": phase_text_id,
+                "phase_status": status,
+            })),
+        )),
+        None => Err(anyhow!(
+            "Workbench lane {lane_text_id} is not attached to phase {phase_text_id}"
+        )),
+    }
 }
 
 fn goal_reference_handles(conn: &Connection, goal_row_id: i64) -> Result<Vec<String>> {

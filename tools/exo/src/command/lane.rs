@@ -358,6 +358,19 @@ fn require_nonempty(value: &str, name: &str) -> ExoResult<()> {
     Ok(())
 }
 
+fn human_message_with_diagnostics(message: String, diagnostics: &[LaneDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return message;
+    }
+
+    let warnings = diagnostics
+        .iter()
+        .map(|diagnostic| format!("- {}: {}", diagnostic.code, diagnostic.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{message}\n\nWarnings:\n{warnings}")
+}
+
 fn mutable_command_unreachable(name: &str) -> ! {
     unreachable!("{name} should be dispatched via execute_mut")
 }
@@ -513,6 +526,7 @@ impl Command for LaneList {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+                let message = human_message_with_diagnostics(message, &output.diagnostics);
                 Ok(CommandOutput::new(output, message))
             }
         }
@@ -565,9 +579,8 @@ impl Command for LaneShow {
 
         match ctx.format {
             OutputFormat::Json => Ok(CommandOutput::data(output)),
-            OutputFormat::Human => Ok(CommandOutput::new(
-                output,
-                format!(
+            OutputFormat::Human => {
+                let message = format!(
                     "# {}\n\nID: {}\nState: {}\nPhase: {} ({})\n\n{}",
                     lane.title,
                     lane.text_id,
@@ -575,8 +588,10 @@ impl Command for LaneShow {
                     lane.execution_phase_id,
                     state.phase(&lane.execution_phase_id)?.status,
                     lane.intent
-                ),
-            )),
+                );
+                let message = human_message_with_diagnostics(message, &output.diagnostics);
+                Ok(CommandOutput::new(output, message))
+            }
         }
     }
 }
@@ -632,6 +647,7 @@ impl Command for LaneCurrent {
                         )
                     },
                 );
+                let message = human_message_with_diagnostics(message, &output.diagnostics);
                 Ok(CommandOutput::new(output, message))
             }
         }

@@ -363,6 +363,8 @@ fn composed_lane_focus_updates_phase_and_lane_atomically() -> Result<()> {
     let lane_a = writer.add_workbench_lane("Lane A", "Intent A", &phase_a)?;
     let lane_b = writer.add_workbench_lane("Lane B", "Intent B", &phase_b)?;
     let workspace = "/tmp/exo-worktree";
+    writer.update_phase_status(&phase_a, "in-progress")?;
+    writer.update_phase_status(&phase_b, "in-progress")?;
 
     writer.focus_workbench_lane(workspace, &lane_a, &phase_a)?;
     assert_eq!(
@@ -421,6 +423,7 @@ fn composed_lane_start_rolls_back_before_focus_can_diverge() -> Result<()> {
     );
     assert_eq!(loader.load_workspace_lane_focus(workspace)?, None);
 
+    writer.update_phase_status(&phase_id, "in-progress")?;
     writer.start_and_focus_workbench_lane(workspace, &lane_id, &phase_id)?;
     assert_eq!(
         loader
@@ -435,6 +438,38 @@ fn composed_lane_start_rolls_back_before_focus_can_diverge() -> Result<()> {
             .map(|focus| focus.lane_id),
         Some(lane_id)
     );
+
+    Ok(())
+}
+
+#[test]
+fn composed_lane_start_revalidates_phase_status_before_transitioning() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let lane_id = writer.add_workbench_lane("Lane", "Intent", &phase_id)?;
+    let workspace = "/tmp/exo-worktree";
+    writer.update_phase_status(&phase_id, "in-progress")?;
+
+    writer.update_phase_status(&phase_id, "completed")?;
+    let error = writer
+        .start_and_focus_workbench_lane(workspace, &lane_id, &phase_id)
+        .expect_err("stale phase precheck must be revalidated");
+    let failure = error
+        .downcast_ref::<exo::failure::ExoFailure>()
+        .expect("structured phase precondition");
+    assert_eq!(
+        failure.error.details.as_ref().expect("details")["kind"],
+        "lane.phase_not_in_progress"
+    );
+    assert_eq!(
+        loader
+            .load_workbench_lane(&lane_id)?
+            .expect("lane remains")
+            .state,
+        "prepared"
+    );
+    assert_eq!(loader.load_workspace_lane_focus(workspace)?, None);
 
     Ok(())
 }
