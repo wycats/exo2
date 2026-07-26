@@ -72,6 +72,25 @@ describe("Work Lanes provider", () => {
     expect(items[1]?.iconPath).toMatchObject({ id: "target" });
   });
 
+  it("offers the row focus action only for lanes in an in-progress phase", () => {
+    for (const phaseStatus of [
+      "pending",
+      "completed",
+      "abandoned",
+      "deferred",
+    ]) {
+      const item = new WorkLaneTreeItem({
+        ...preparedLane,
+        phase_status: phaseStatus,
+      });
+      expect(item.contextValue).toBe("workbench-lane-unfocusable");
+    }
+
+    expect(new WorkLaneTreeItem(preparedLane).contextValue).toBe(
+      "workbench-lane",
+    );
+  });
+
   it("renders loading, empty, and transport-error states", () => {
     expect(
       renderWorkLanes(roots(undefined), diagnostics())[0],

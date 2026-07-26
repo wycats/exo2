@@ -22,7 +22,9 @@ export class WorkLaneTreeItem extends vscode.TreeItem {
       .join(" • ");
     this.contextValue = lane.focused_here
       ? "workbench-lane-focused"
-      : "workbench-lane";
+      : lane.phase_status === "in-progress"
+        ? "workbench-lane"
+        : "workbench-lane-unfocusable";
     this.iconPath = lane.focused_here
       ? new vscode.ThemeIcon(
           "target",

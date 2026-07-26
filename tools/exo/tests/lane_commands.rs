@@ -45,7 +45,13 @@ fn fixture() -> (tempfile::TempDir, Project, String, String) {
         .add_phase(&epoch_id, "Bootstrap", "regular", None, &[])
         .expect("add bootstrap phase");
     let execution_phase = writer
-        .add_phase(&epoch_id, "Lane Execution", "regular", None, &[])
+        .add_phase(
+            &epoch_id,
+            "Lane Execution",
+            "regular",
+            Some("lane-execution"),
+            &[],
+        )
         .expect("add execution phase");
     writer
         .update_phase_status(&bootstrap_phase, "completed")
@@ -114,7 +120,7 @@ fn lane_commands_cover_preparation_execution_focus_and_removal() {
         &LaneCreate::new(
             "First proof",
             "Deliver the command surface",
-            &execution_phase,
+            "lane-execution",
         ),
         root,
         &project,
@@ -156,7 +162,13 @@ fn lane_commands_cover_preparation_execution_focus_and_removal() {
         )
         .expect("add goal");
 
-    let started = execute_mut(&LaneStart::new(&lane_id), root, &project);
+    let lane_prefix = lane_id[..8].to_ascii_uppercase();
+    let shown_by_prefix = execute(&LaneShow::new(&lane_prefix), root, &project);
+    assert_eq!(shown_by_prefix["lane"]["id"], lane_id);
+    let focused = execute_mut(&LaneFocus::new(&lane_prefix), root, &project);
+    assert_eq!(focused["lane"]["focused_here"], true);
+
+    let started = execute_mut(&LaneStart::new(&lane_prefix), root, &project);
     assert_eq!(started["lane"]["state"], "executing");
     assert_eq!(started["lane"]["phase_status"], "in-progress");
     assert_eq!(started["lane"]["focused_here"], true);
@@ -209,8 +221,34 @@ fn lane_commands_cover_preparation_execution_focus_and_removal() {
         .as_str()
         .expect("prepared lane id")
         .to_string();
-    execute_mut(&LaneFocus::new(&prepared_id), root, &project);
-    let removed = execute_mut(&LaneRemove::new(&prepared_id), root, &project);
+
+    let ambiguous_prefix = lane_id
+        .chars()
+        .zip(prepared_id.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character)
+        .collect::<String>();
+    assert!(!ambiguous_prefix.is_empty(), "ULIDs share a time prefix");
+    let ambiguous = LaneShow::new(&ambiguous_prefix)
+        .execute(&read_context(root, &project))
+        .expect_err("shared lane prefix must be rejected");
+    let failure = ambiguous
+        .downcast_ref::<exo::failure::ExoFailure>()
+        .expect("structured ambiguity");
+    assert_eq!(
+        failure.error.details.as_ref().expect("details")["kind"],
+        "lane.ambiguous"
+    );
+
+    let prepared_prefix_len = lane_id
+        .chars()
+        .zip(prepared_id.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+        + 1;
+    let prepared_prefix = prepared_id[..prepared_prefix_len].to_ascii_uppercase();
+    execute_mut(&LaneFocus::new(&prepared_prefix), root, &project);
+    let removed = execute_mut(&LaneRemove::new(&prepared_prefix), root, &project);
     assert_eq!(removed["id"], prepared_id);
     assert!(execute(&LaneCurrent, root, &project)["lane"].is_null());
 }

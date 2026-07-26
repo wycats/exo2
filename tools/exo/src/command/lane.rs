@@ -183,10 +183,25 @@ impl LaneReadState {
     }
 
     fn lane(&self, id: &str) -> ExoResult<&WorkbenchLaneData> {
-        self.lanes
+        if let Some(lane) = self.lanes.iter().find(|lane| lane.text_id == id) {
+            return Ok(lane);
+        }
+
+        if id.is_empty() {
+            return Err(anyhow::Error::new(lane_not_found_failure(id)));
+        }
+
+        let normalized = id.to_ascii_lowercase();
+        let matches = self
+            .lanes
             .iter()
-            .find(|lane| lane.text_id == id)
-            .ok_or_else(|| anyhow::Error::new(lane_not_found_failure(id)))
+            .filter(|lane| lane.text_id.starts_with(&normalized))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [lane] => Ok(*lane),
+            [] => Err(anyhow::Error::new(lane_not_found_failure(id))),
+            _ => Err(anyhow::Error::new(lane_ambiguous_failure(id, &matches))),
+        }
     }
 
     fn phase(&self, phase_id: &str) -> ExoResult<&Phase> {
@@ -270,10 +285,7 @@ impl LaneReadState {
 }
 
 fn find_phase<'a>(plan: &'a ExoState, phase_id: &str) -> Option<&'a Phase> {
-    plan.epochs
-        .iter()
-        .flat_map(|epoch| epoch.phases.iter())
-        .find(|phase| phase.id == phase_id)
+    plan.find_phase_by_id(phase_id).map(|info| info.phase)
 }
 
 fn lane_steering() -> crate::steering::SteeringBlock {
@@ -295,6 +307,26 @@ fn lane_not_found_failure(id: &str) -> ExoFailure {
     .with_details(serde_json::json!({
         "kind": "lane.not_found",
         "lane_id": id,
+    }))
+}
+
+fn lane_ambiguous_failure(id: &str, matches: &[&WorkbenchLaneData]) -> ExoFailure {
+    let lane_ids = matches
+        .iter()
+        .map(|lane| lane.text_id.clone())
+        .collect::<Vec<_>>();
+    ExoFailure::new(
+        ErrorCode::InvalidInput,
+        format!(
+            "Workbench lane prefix '{id}' is ambiguous; matching lanes: {}",
+            lane_ids.join(", ")
+        ),
+        lane_steering(),
+    )
+    .with_details(serde_json::json!({
+        "kind": "lane.ambiguous",
+        "lane_id": id,
+        "matches": lane_ids,
     }))
 }
 
