@@ -34,6 +34,7 @@ pub mod idea;
 // Namespace modules (Wave 2 - medium)
 pub mod gc;
 pub mod inbox;
+pub mod lane;
 pub mod strike;
 
 // Namespace modules (Wave 3)

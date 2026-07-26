@@ -408,6 +408,36 @@ fn seed_sidecar_workspace_root_state(sidecar_root: &Path, key: &str, workspace_r
     .expect("insert phase owner");
 }
 
+fn seed_sidecar_lane_focus(
+    sidecar_root: &Path,
+    key: &str,
+    workspace_root: &Path,
+    lane_text_id: &str,
+) {
+    let db_path = project_state_path(sidecar_root, key, &["cache", "exo.db"]);
+    let db = exosuit_storage::open_database(&db_path).expect("open sidecar db");
+    let conn = db.connection();
+    conn.execute(
+        "INSERT INTO workbench_lanes (
+             text_id, title, intent, state, execution_phase_id, created_at, updated_at
+         )
+         SELECT ?1, 'Move Root Lane', 'Preserve workspace focus', 'executing', id,
+                '2026-06-22T00:00:00.000Z', '2026-06-22T00:00:00.000Z'
+         FROM phases
+         WHERE text_id = 'move-root-phase'",
+        [lane_text_id],
+    )
+    .expect("insert workbench lane");
+    conn.execute(
+        "INSERT INTO workspace_lane_focus (workspace_root, lane_id, updated_at)
+         SELECT ?1, id, '2026-06-22T00:00:00.000Z'
+         FROM workbench_lanes
+         WHERE text_id = ?2",
+        (workspace_root.to_string_lossy().as_ref(), lane_text_id),
+    )
+    .expect("insert workspace lane focus");
+}
+
 fn create_rfc_00001(root: &Path, home: &Path, config_home: &Path) -> PathBuf {
     let output = exo_direct_cmd(root, home, config_home)
         .args([
@@ -2441,6 +2471,7 @@ fn project_move_root_dry_run_reports_changes_without_writing() {
     let new_project_id = project_id_for(&new_repo, &home, &config_home);
     let canonical_new_repo = new_repo.canonicalize().expect("canonical new repo");
     seed_sidecar_workspace_root_state(&sidecar_root, "move-root-test", &old_repo);
+    seed_sidecar_lane_focus(&sidecar_root, "move-root-test", &old_repo, "move-root-lane");
     let old_rfc_path = create_rfc_00001(&old_repo, &home, &config_home);
     copy_rfc_file_to_new_root(&old_rfc_path, &old_repo, &new_repo);
 
@@ -2477,6 +2508,17 @@ fn project_move_root_dry_run_reports_changes_without_writing() {
         Some(canonical_new_repo.to_string_lossy().as_ref())
     );
     assert_eq!(result["verification"]["rfc_00001_found"], true);
+    assert!(
+        result["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .any(|change| {
+                change["target"] == "workspace_lane_focus.workspace_root"
+                    && change["action"] == "rewrite"
+                    && change["rows"] == 1
+            })
+    );
     let rfc_00001_path = PathBuf::from(
         result["verification"]["rfc_00001_path"]
             .as_str()
@@ -2501,6 +2543,15 @@ fn project_move_root_dry_run_reports_changes_without_writing() {
             &sidecar_root,
             "move-root-test",
             "workspace_active_phase_data",
+            "workspace_root"
+        ),
+        vec![old_repo.to_string_lossy().to_string()]
+    );
+    assert_eq!(
+        sidecar_workspace_roots(
+            &sidecar_root,
+            "move-root-test",
+            "workspace_lane_focus_data",
             "workspace_root"
         ),
         vec![old_repo.to_string_lossy().to_string()]
@@ -2530,6 +2581,7 @@ fn project_move_root_retargets_policy_state_and_preserves_rfc_lookup() {
     let new_project_id = project_id_for(&new_repo, &home, &config_home);
     let canonical_new_repo = new_repo.canonicalize().expect("canonical new repo");
     seed_sidecar_workspace_root_state(&sidecar_root, "move-root-test", &old_repo);
+    seed_sidecar_lane_focus(&sidecar_root, "move-root-test", &old_repo, "move-root-lane");
     let old_rfc_path = create_rfc_00001(&old_repo, &home, &config_home);
     copy_rfc_file_to_new_root(&old_rfc_path, &old_repo, &new_repo);
 
@@ -2577,6 +2629,15 @@ fn project_move_root_retargets_policy_state_and_preserves_rfc_lookup() {
         sidecar_workspace_roots(
             &sidecar_root,
             "move-root-test",
+            "workspace_lane_focus_data",
+            "workspace_root"
+        ),
+        vec![canonical_new_repo.to_string_lossy().to_string()]
+    );
+    assert_eq!(
+        sidecar_workspace_roots(
+            &sidecar_root,
+            "move-root-test",
             "phase_ownership_data",
             "claimed_by_workspace_root"
         ),
@@ -2598,6 +2659,159 @@ fn project_move_root_retargets_policy_state_and_preserves_rfc_lookup() {
     let show = json_result(&show_output);
     assert_eq!(show["id"], "00001");
     assert_eq!(show["title"], "Root Move RFC");
+}
+
+#[test]
+fn project_move_root_blocks_conflicting_destination_lane_focus() {
+    let temp = short_tempdir();
+    let old_repo = temp.path().join("old-repo");
+    let new_repo = temp.path().join("new-repo");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    let sidecar_root = temp.path().join("sidecars");
+    std::fs::create_dir_all(&old_repo).expect("create old repo");
+    std::fs::create_dir_all(&new_repo).expect("create new repo");
+    git_init(&old_repo);
+    git_init(&new_repo);
+    link_sidecar_with_key(
+        &old_repo,
+        &home,
+        &config_home,
+        &sidecar_root,
+        "move-root-test",
+    );
+    let canonical_new_repo = new_repo.canonicalize().expect("canonical new repo");
+    seed_sidecar_workspace_root_state(&sidecar_root, "move-root-test", &old_repo);
+    seed_sidecar_lane_focus(
+        &sidecar_root,
+        "move-root-test",
+        &old_repo,
+        "move-root-source-lane",
+    );
+    seed_sidecar_lane_focus(
+        &sidecar_root,
+        "move-root-test",
+        &canonical_new_repo,
+        "move-root-destination-lane",
+    );
+
+    let output = exo_direct_cmd(&old_repo, &home, &config_home)
+        .args([
+            "--format",
+            "json",
+            "project",
+            "move-root",
+            "--key",
+            "move-root-test",
+            "--to",
+            new_repo.to_str().expect("new repo path is utf-8"),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json_result(&output);
+
+    assert_eq!(result["apply_ready"], false);
+    assert!(
+        result["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .is_some_and(|message| message.contains("already focuses workbench lane"))),
+        "{result:#?}"
+    );
+    assert_eq!(
+        sidecar_workspace_roots(
+            &sidecar_root,
+            "move-root-test",
+            "workspace_lane_focus_data",
+            "workspace_root"
+        ),
+        vec![
+            canonical_new_repo.to_string_lossy().to_string(),
+            old_repo.to_string_lossy().to_string(),
+        ]
+    );
+}
+
+#[test]
+fn project_move_root_collapses_matching_destination_lane_focus() {
+    let temp = short_tempdir();
+    let old_repo = temp.path().join("old-repo");
+    let new_repo = temp.path().join("new-repo");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    let sidecar_root = temp.path().join("sidecars");
+    std::fs::create_dir_all(&old_repo).expect("create old repo");
+    std::fs::create_dir_all(&new_repo).expect("create new repo");
+    git_init(&old_repo);
+    git_init(&new_repo);
+    link_sidecar_with_key(
+        &old_repo,
+        &home,
+        &config_home,
+        &sidecar_root,
+        "move-root-test",
+    );
+    let canonical_new_repo = new_repo.canonicalize().expect("canonical new repo");
+    seed_sidecar_workspace_root_state(&sidecar_root, "move-root-test", &old_repo);
+    seed_sidecar_lane_focus(&sidecar_root, "move-root-test", &old_repo, "move-root-lane");
+    let db_path = project_state_path(&sidecar_root, "move-root-test", &["cache", "exo.db"]);
+    let db = exosuit_storage::open_database(&db_path).expect("open sidecar db");
+    db.connection()
+        .execute(
+            "INSERT INTO workspace_lane_focus (workspace_root, lane_id, updated_at)
+             SELECT ?1, id, '2026-06-22T00:00:01.000Z'
+             FROM workbench_lanes
+             WHERE text_id = 'move-root-lane'",
+            [canonical_new_repo.to_string_lossy().as_ref()],
+        )
+        .expect("focus the same lane at destination");
+
+    let output = exo_direct_cmd(&old_repo, &home, &config_home)
+        .args([
+            "--format",
+            "json",
+            "project",
+            "move-root",
+            "--key",
+            "move-root-test",
+            "--to",
+            new_repo.to_str().expect("new repo path is utf-8"),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result = json_result(&output);
+
+    assert_eq!(result["apply_ready"], true);
+    assert!(
+        result["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .any(|change| {
+                change["target"] == "workspace_lane_focus.workspace_root"
+                    && change["action"] == "delete_duplicate_source"
+                    && change["rows"] == 1
+            })
+    );
+    assert_eq!(
+        sidecar_workspace_roots(
+            &sidecar_root,
+            "move-root-test",
+            "workspace_lane_focus_data",
+            "workspace_root"
+        ),
+        vec![canonical_new_repo.to_string_lossy().to_string()]
+    );
 }
 
 #[test]

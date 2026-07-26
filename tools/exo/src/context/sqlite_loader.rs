@@ -303,6 +303,27 @@ pub struct PhaseOwnerData {
     pub updated_at: String,
 }
 
+/// Portable workbench lane state associated with one execution phase.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbenchLaneData {
+    pub text_id: String,
+    pub title: String,
+    pub intent: String,
+    pub state: String,
+    pub execution_phase_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Machine-local lane focus for one caller-supplied workspace root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLaneFocusData {
+    pub lane_id: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseDetailsData {
@@ -375,6 +396,96 @@ impl SqliteLoader {
             .context("Failed to query workspace active phase roots")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to read workspace active phase roots")
+    }
+
+    /// Load all portable workbench lanes in deterministic creation order.
+    pub fn load_workbench_lanes(&self) -> Result<Vec<WorkbenchLaneData>> {
+        let conn = self.db.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT l.text_id,
+                        l.title,
+                        l.intent,
+                        l.state,
+                        p.text_id,
+                        l.created_at,
+                        l.updated_at
+                 FROM workbench_lanes l
+                 JOIN phases p ON p.id = l.execution_phase_id
+                 ORDER BY l.created_at, l.text_id",
+            )
+            .context("Failed to prepare workbench lanes query")?;
+
+        stmt.query_map([], |row| {
+            Ok(WorkbenchLaneData {
+                text_id: row.get(0)?,
+                title: row.get(1)?,
+                intent: row.get(2)?,
+                state: row.get(3)?,
+                execution_phase_id: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })
+        .context("Failed to query workbench lanes")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to read workbench lanes")
+    }
+
+    /// Load one portable workbench lane by stable text id.
+    pub fn load_workbench_lane(&self, lane_text_id: &str) -> Result<Option<WorkbenchLaneData>> {
+        let conn = self.db.connection();
+        conn.query_row(
+            "SELECT l.text_id,
+                    l.title,
+                    l.intent,
+                    l.state,
+                    p.text_id,
+                    l.created_at,
+                    l.updated_at
+             FROM workbench_lanes l
+             JOIN phases p ON p.id = l.execution_phase_id
+             WHERE l.text_id = ?1
+             LIMIT 1",
+            [lane_text_id],
+            |row| {
+                Ok(WorkbenchLaneData {
+                    text_id: row.get(0)?,
+                    title: row.get(1)?,
+                    intent: row.get(2)?,
+                    state: row.get(3)?,
+                    execution_phase_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to load workbench lane")
+    }
+
+    /// Load the machine-local lane focus for a workspace root.
+    pub fn load_workspace_lane_focus(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Option<WorkspaceLaneFocusData>> {
+        let conn = self.db.connection();
+        conn.query_row(
+            "SELECT l.text_id, wlf.updated_at
+             FROM workspace_lane_focus wlf
+             JOIN workbench_lanes l ON l.id = wlf.lane_id
+             WHERE wlf.workspace_root = ?1
+             LIMIT 1",
+            [workspace_root],
+            |row| {
+                Ok(WorkspaceLaneFocusData {
+                    lane_id: row.get(0)?,
+                    updated_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to load workspace lane focus")
     }
 
     /// Load the ownership claim for a phase by text id.

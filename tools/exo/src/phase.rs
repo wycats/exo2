@@ -279,7 +279,7 @@ pub(crate) fn finish_phase(
     // 4. Update status to completed
     {
         let writer = crate::context::SqliteWriter::open(db_path)?;
-        writer.update_phase_status(&active_phase_id, "completed")?;
+        writer.complete_phase_and_clear_lane_focus(&active_phase_id)?;
     }
     if emit_output {
         println!("Marked phase '{active_phase_id}' as completed.");

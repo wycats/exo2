@@ -1556,6 +1556,136 @@
         }
       }
     },
+    "lane": {
+      "name": "lane",
+      "description": "Workbench lane commands",
+      "operations": {
+        "create": {
+          "name": "create",
+          "description": "Create a prepared workbench lane",
+          "effect": "write",
+          "recovery_class": "atomic_project_state",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "title",
+              "name": "title",
+              "description": "Lane title",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "intent",
+              "name": "intent",
+              "description": "The lane's durable execution intent",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "phase",
+              "name": "phase",
+              "description": "Execution phase ID",
+              "kind": "option",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "current": {
+          "name": "current",
+          "description": "Show the current workspace's focused lane",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "focus": {
+          "name": "focus",
+          "description": "Focus a lane and its phase in this workspace",
+          "effect": "write",
+          "recovery_class": "atomic_project_state",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Lane ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "list": {
+          "name": "list",
+          "description": "List workbench lanes",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "remove": {
+          "name": "remove",
+          "description": "Remove a prepared workbench lane",
+          "effect": "write",
+          "recovery_class": "atomic_project_state",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Lane ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "show": {
+          "name": "show",
+          "description": "Show a workbench lane",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Lane ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "start": {
+          "name": "start",
+          "description": "Start a prepared lane and focus it in this workspace",
+          "effect": "write",
+          "recovery_class": "atomic_project_state",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Lane ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        }
+      }
+    },
     "phase": {
       "name": "phase",
       "description": "Phase lifecycle commands",
@@ -3667,5 +3797,5 @@
       ]
     }
   },
-  "operation_count": 125
+  "operation_count": 132
 }

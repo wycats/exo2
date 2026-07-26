@@ -13,7 +13,7 @@ pub mod rfc;
 pub mod sqlite_loader;
 pub mod sqlite_writer;
 
-pub use sqlite_loader::SqliteLoader;
+pub use sqlite_loader::{SqliteLoader, WorkbenchLaneData, WorkspaceLaneFocusData};
 pub use sqlite_writer::SqliteWriter;
 
 use crate::ExoResult;
@@ -1549,6 +1549,7 @@ pub(crate) fn import_sql_dumps(
          DELETE FROM ideas_data;
          DELETE FROM tasks_data;
          DELETE FROM goals_data;
+         DELETE FROM workbench_lanes_data;
          DELETE FROM phases_data;
          DELETE FROM epochs_data;",
     );
@@ -2009,6 +2010,58 @@ status = "pending"
         assert!(
             projection_dir.join("epochs.sql").exists(),
             "current projection files should still be written"
+        );
+    }
+
+    #[test]
+    fn sql_projection_round_trips_lanes_without_workspace_focus() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection dir");
+        std::fs::create_dir_all(root.join(".cache")).expect("create cache dir");
+
+        let db_path = db_path(root, None);
+        let writer = SqliteWriter::open(&db_path).expect("open sqlite writer");
+        let epoch_id = writer
+            .add_epoch("Lane Epoch", None, &[])
+            .expect("add epoch");
+        let phase_id = writer
+            .add_phase(&epoch_id, "Lane Phase", "regular", None, &[])
+            .expect("add phase");
+        let lane_id = writer
+            .add_workbench_lane("Lane", "Prove portable projection", &phase_id)
+            .expect("add lane");
+        writer
+            .set_workspace_lane_focus("/tmp/exo-worktree", &lane_id)
+            .expect("set workspace lane focus");
+        drop(writer);
+
+        write_sql_dump_with_project_result(root, None).expect("write SQL projection");
+
+        let lane_projection = std::fs::read_to_string(projection_dir.join("workbench_lanes.sql"))
+            .expect("read lane projection");
+        assert!(lane_projection.contains("execution_phase_text_id"));
+        assert!(lane_projection.contains(&phase_id));
+        assert!(
+            !projection_dir.join("workspace_lane_focus.sql").exists(),
+            "workspace lane focus must not have a portable projection"
+        );
+
+        import_sql_dumps(&projection_dir, &db_path).expect("replace database from projection");
+
+        let loader = SqliteLoader::open(&db_path).expect("open sqlite loader");
+        let lane = loader
+            .load_workbench_lane(&lane_id)
+            .expect("load lane")
+            .expect("lane should survive projection replacement");
+        assert_eq!(lane.execution_phase_id, phase_id);
+        assert_eq!(
+            loader
+                .load_workspace_lane_focus("/tmp/exo-worktree")
+                .expect("load workspace focus"),
+            None,
+            "workspace lane focus must not survive portable replacement"
         );
     }
 

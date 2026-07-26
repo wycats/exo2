@@ -1786,6 +1786,129 @@ mod tests {
     }
 
     #[test]
+    fn workbench_lane_tables_enforce_portable_and_workspace_local_boundaries() {
+        let db = open_memory_database().expect("should create in-memory database");
+        let conn = db.connection();
+
+        for table_name in [
+            "workbench_lanes_data",
+            "workbench_lanes",
+            "workbench_lanes_rev",
+            "workspace_lane_focus_data",
+            "workspace_lane_focus",
+            "workspace_lane_focus_rev",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table_name],
+                    |row| row.get(0),
+                )
+                .expect("table lookup");
+            assert_eq!(count, 1, "{table_name} should exist");
+        }
+
+        conn.execute(
+            "INSERT INTO epochs (text_id, title, reviewed, sort_key)
+             VALUES ('01EPOCH_LANE', 'Lane Epoch', 0, 'a')",
+            [],
+        )
+        .expect("epoch insert");
+        conn.execute(
+            "INSERT INTO phases (text_id, title, status, epoch_id, kind, sort_key)
+             VALUES ('01PHASE_LANE', 'Lane Phase', 'in-progress', 1, 'regular', 'a')",
+            [],
+        )
+        .expect("phase insert");
+        conn.execute(
+            "INSERT INTO workbench_lanes (
+                 text_id, title, intent, state, execution_phase_id, created_at, updated_at
+             ) VALUES (
+                 '01LANE_TEST', 'Lane', 'Test the storage contract', 'prepared', 1,
+                 '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("lane insert");
+        conn.execute(
+            "INSERT INTO workspace_lane_focus (workspace_root, lane_id, updated_at)
+             VALUES ('/tmp/exo-worktree', 1, '2026-07-25T00:00:00Z')",
+            [],
+        )
+        .expect("workspace focus insert");
+
+        let phase_delete = conn.execute("DELETE FROM phases WHERE id = 1", []);
+        assert!(
+            phase_delete.is_err(),
+            "a phase referenced by a lane should be restricted"
+        );
+
+        conn.execute("DELETE FROM workbench_lanes WHERE id = 1", [])
+            .expect("lane delete");
+        let focus_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_lane_focus_data",
+                [],
+                |row| row.get(0),
+            )
+            .expect("focus count");
+        assert_eq!(focus_count, 0, "lane deletion should clear workspace focus");
+        let focus_revision_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_lane_focus_rev", [], |row| {
+                row.get(0)
+            })
+            .expect("focus revision count");
+        assert_eq!(
+            focus_revision_count, 0,
+            "lane deletion should clear cascaded focus revisions"
+        );
+
+        for table in ["workbench_lanes_data", "workspace_lane_focus_data"] {
+            let rowset_seed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM rowset_revisions WHERE table_name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("rowset seed");
+            assert_eq!(rowset_seed, 1, "{table} should have a rowset seed");
+        }
+    }
+
+    #[test]
+    fn workbench_lane_schema_rejects_empty_content_and_unknown_state() {
+        let db = open_memory_database().expect("should create in-memory database");
+        let conn = db.connection();
+
+        conn.execute(
+            "INSERT INTO epochs (text_id, title, reviewed, sort_key)
+             VALUES ('01EPOCH_LANE', 'Lane Epoch', 0, 'a')",
+            [],
+        )
+        .expect("epoch insert");
+        conn.execute(
+            "INSERT INTO phases (text_id, title, status, epoch_id, kind, sort_key)
+             VALUES ('01PHASE_LANE', 'Lane Phase', 'pending', 1, 'regular', 'a')",
+            [],
+        )
+        .expect("phase insert");
+
+        for (text_id, title, intent, state) in [
+            ("01LANE_EMPTY_TITLE", " ", "Intent", "prepared"),
+            ("01LANE_EMPTY_INTENT", "Title", "\t", "prepared"),
+            ("01LANE_BAD_STATE", "Title", "Intent", "parked"),
+        ] {
+            let result = conn.execute(
+                "INSERT INTO workbench_lanes (
+                     text_id, title, intent, state, execution_phase_id
+                 ) VALUES (?1, ?2, ?3, ?4, 1)",
+                (text_id, title, intent, state),
+            );
+            assert!(result.is_err(), "{text_id} should violate lane constraints");
+        }
+    }
+
+    #[test]
     fn new_file_databases_enable_incremental_auto_vacuum() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("exo.db");

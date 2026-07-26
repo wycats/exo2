@@ -726,7 +726,8 @@ pub trait MutableCommand: Command {
 /// The atomic class is deliberately narrow: these commands mutate canonical
 /// project SQLite state without owning Git, filesystem, process, or other
 /// external effects. The registry regression test keeps this list aligned
-/// with the 42-operation contract approved for RFC 10195.
+/// with the approved operation contract for RFC 10195 and later portable
+/// SQLite-only command surfaces.
 #[must_use]
 pub fn recovery_class_for_command(
     namespace: &str,
@@ -757,6 +758,7 @@ pub fn recovery_class_for_command(
             )
             | ("idea", "add" | "archive")
             | ("inbox", "ack" | "add" | "archive" | "resolve")
+            | ("lane", "create" | "focus" | "remove" | "start")
             | (
                 "phase",
                 "add" | "focus" | "move" | "release" | "remove" | "reorder" | "start" | "update"

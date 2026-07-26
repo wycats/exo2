@@ -22,6 +22,15 @@ import { TreeDecorationProvider } from "./TreeDecorationProvider";
 import { createPhaseDetailsProvider } from "./PhaseDetailsProvider";
 import { createIdeasTreeProvider } from "./IdeasTreeProvider";
 import { createSidecarStatusProvider } from "./SidecarStatusProvider";
+import { createWorkLanesProvider } from "./WorkLanesProvider";
+import {
+  focusableWorkbenchLanes,
+  focusWorkbenchLane,
+  listWorkbenchLanes,
+  workbenchLaneFocusTargetId,
+  workbenchLaneListFrom,
+  workbenchLaneQuickPickItem,
+} from "./services/WorkLanesClient";
 
 import { ExosuitNotebookSerializer } from "./notebook/serializer";
 import { ExosuitNotebookController } from "./notebook/controller";
@@ -337,6 +346,10 @@ export async function activate(context: vscode.ExtensionContext) {
     traceCache.registerRoot("context-snapshot", {
       namespace: "context",
       operation: "snapshot",
+    });
+    traceCache.registerRoot("work-lanes", {
+      namespace: "lane",
+      operation: "list",
     });
     traceCache.registerRoot("phase-details", {
       namespace: "phase",
@@ -695,7 +708,87 @@ export async function activate(context: vscode.ExtensionContext) {
     trace("activation: registered notebook serializer");
     logger.debug("Exosuit: Registered Notebook Serializer");
 
-    // 1. Register Epoch Context Provider (RFC 00232)
+    // 1. Register Work Lanes focus client (RFC 10202)
+    const workLanesProvider = createWorkLanesProvider();
+    context.subscriptions.push(workLanesProvider);
+    context.subscriptions.push(
+      vscode.window.registerTreeDataProvider(
+        "exosuit.workLanes",
+        workLanesProvider,
+      ),
+    );
+    logger.debug("Exosuit: Registered WorkLanesProvider");
+    trace("activation: registered work lanes provider");
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        "exosuit.workLanes.focus",
+        async (target?: unknown) => {
+          if (!workspaceRoot) {
+            vscode.window.showErrorMessage("No workspace folder open");
+            return;
+          }
+
+          let laneId = workbenchLaneFocusTargetId(target);
+          if (!laneId) {
+            try {
+              const cached = await getTraceCache?.().get("work-lanes");
+              const data =
+                workbenchLaneListFrom(cached?.data) ??
+                (await listWorkbenchLanes(
+                  workspaceRoot,
+                  `vscode.lane.list.${Date.now()}`,
+                ));
+              const choices = focusableWorkbenchLanes(data).map(
+                workbenchLaneQuickPickItem,
+              );
+              if (choices.length === 0) {
+                vscode.window.showInformationMessage(
+                  "No other work lanes are available to focus.",
+                );
+                return;
+              }
+              const picked = await vscode.window.showQuickPick(choices, {
+                title: "Focus Work Lane",
+                placeHolder: "Choose a work lane",
+              });
+              laneId = picked?.laneId ?? null;
+            } catch (error) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              vscode.window.showErrorMessage(
+                `Could not load work lanes: ${message}`,
+              );
+              return;
+            }
+          }
+
+          if (!laneId) {
+            return;
+          }
+
+          try {
+            const lane = await focusWorkbenchLane(
+              workspaceRoot,
+              laneId,
+              `vscode.lane.focus.${laneId}.${Date.now()}`,
+            );
+            MachineChannelServer.notifyWriteAll();
+            vscode.window.showInformationMessage(
+              `Focused work lane "${lane.title}".`,
+            );
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(
+              `Could not focus work lane: ${message}`,
+            );
+          }
+        },
+      ),
+    );
+
+    // 1b. Register Epoch Context Provider (RFC 00232)
     const epochContextProvider = createEpochContextProvider();
     context.subscriptions.push(epochContextProvider);
     context.subscriptions.push(
@@ -707,7 +800,7 @@ export async function activate(context: vscode.ExtensionContext) {
     logger.debug("Exosuit: Registered EpochContextProvider");
     trace("activation: registered epoch context provider");
 
-    // 1b. Register RFC Pipeline Provider (RFC 00239)
+    // 1c. Register RFC Pipeline Provider (RFC 00239)
     const rfcPipelineProvider = createRfcPipelineProvider();
     context.subscriptions.push(rfcPipelineProvider);
     context.subscriptions.push(

@@ -7,6 +7,7 @@
 //! - NOT auto-activate the next phase (leave in between-phases state)
 //! - Surface RFC promotion suggestions in the output
 
+use exo::context::{SqliteLoader, SqliteWriter};
 use exo::project::Project;
 use std::path::Path;
 use test_case::test_matrix;
@@ -239,6 +240,23 @@ fn phase_finish_uses_project_db_path_in_git_repo(backend: &str) {
             "[phase]\nid = \"{phase_id}\"\ntitle = \"Phase 1\"\n\n[plan]\n\n[verification]\nautomated = []\nmanual = []\n",
         ),
     );
+    let writer = SqliteWriter::open(project.db_path()).expect("open project writer");
+    let lane_id = writer
+        .add_workbench_lane("Phase lane", "Clear every workspace focus", &phase_id)
+        .expect("add phase lane");
+    let workspace_root = project
+        .workspace_root
+        .as_ref()
+        .expect("project workspace root")
+        .to_string_lossy()
+        .into_owned();
+    let linked_workspace_root = format!("{workspace_root}.linked");
+    writer
+        .set_workspace_lane_focus(&workspace_root, &lane_id)
+        .expect("focus lane in current workspace");
+    writer
+        .set_workspace_lane_focus(&linked_workspace_root, &lane_id)
+        .expect("focus lane in linked workspace");
 
     assert!(project.db_path().exists(), "project DB should exist");
     assert!(
@@ -267,5 +285,26 @@ fn phase_finish_uses_project_db_path_in_git_repo(backend: &str) {
     assert!(
         !root.join(".cache/exo.db").exists(),
         "phase finish should not recreate legacy root DB"
+    );
+    let loader = SqliteLoader::open(project.db_path()).expect("open project loader");
+    assert!(
+        loader
+            .load_workbench_lane(&lane_id)
+            .expect("load lane")
+            .is_some(),
+        "phase finish preserves the portable lane"
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(&workspace_root)
+            .expect("load current workspace focus"),
+        None
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(&linked_workspace_root)
+            .expect("load linked workspace focus"),
+        None,
+        "phase finish clears lane focus in every workspace"
     );
 }

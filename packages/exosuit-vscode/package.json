@@ -366,6 +366,11 @@
     "views": {
       "exosuit-sidebar": [
         {
+          "id": "exosuit.workLanes",
+          "name": "Work Lanes",
+          "icon": "$(git-branch)"
+        },
+        {
           "id": "exosuit.epochContext",
           "name": "Epoch Context",
           "icon": "$(package)"
@@ -426,6 +431,11 @@
       {
         "command": "exosuit.focusPhase",
         "title": "Exosuit: Focus Phase",
+        "icon": "$(target)"
+      },
+      {
+        "command": "exosuit.workLanes.focus",
+        "title": "Exosuit: Focus Work Lane",
         "icon": "$(target)"
       },
       {
@@ -602,6 +612,11 @@
       ],
       "view/item/context": [
         {
+          "command": "exosuit.workLanes.focus",
+          "when": "view == exosuit.workLanes && viewItem == workbench-lane",
+          "group": "inline@1"
+        },
+        {
           "command": "exosuit.addFeedback",
           "when": "view == exosuit.phaseDetails && viewItem == phase-task-readonly",
           "group": "inline@2"
@@ -668,6 +683,11 @@
         }
       ],
       "view/title": [
+        {
+          "command": "exosuit.workLanes.focus",
+          "when": "view == exosuit.workLanes",
+          "group": "navigation@0"
+        },
         {
           "command": "exosuit.resetFocus",
           "when": "view == exosuit.phaseDetails && exosuit.hasFocusedPhase",

@@ -634,7 +634,7 @@ impl MutableCommand for EpochStart {
             writer.update_phase_status(&first_phase_id, "in-progress")?;
         }
         if let Some(workspace_root) = agent_ctx.workspace_root_key() {
-            writer.set_workspace_active_phase(&workspace_root, &first_phase_id)?;
+            writer.focus_phase_for_workspace(&workspace_root, &first_phase_id)?;
         }
 
         let message = if should_mark_started {
