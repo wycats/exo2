@@ -204,6 +204,35 @@ async fn send_machine_request(
     send_machine_request_with_timeout(stream, request, Duration::from_secs(30)).await
 }
 
+async fn send_machine_operation(
+    workspace: &Path,
+    request_id: &str,
+    path: &[&str],
+    input: serde_json::Value,
+) -> serde_json::Value {
+    let stream = exo::daemon::connect_to_daemon(workspace)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} should connect to the shared daemon: {error}",
+                workspace.display()
+            )
+        });
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "id": request_id,
+        "workspace_root": workspace.canonicalize().expect("canonical request workspace"),
+        "op": {
+            "kind": "call",
+            "params": {
+                "address": { "kind": "operation", "path": path },
+                "input": input
+            }
+        }
+    });
+    send_machine_request(stream, &request.to_string()).await
+}
+
 async fn send_machine_request_with_timeout(
     stream: exo::daemon_transport::DaemonStream,
     request: &str,
@@ -2005,6 +2034,205 @@ async fn linked_worktree_daemon_connection_writes_shared_project_db(backend: &st
     assert!(
         !linked.join(".cache/exo.db").exists(),
         "linked legacy root DB should not exist"
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[tokio::test]
+async fn linked_worktree_lane_focus_agrees_across_direct_and_daemon_adapters(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let (primary, linked) = create_primary_and_linked_worktree(&dir);
+    let _guard = DaemonGuard::new(&primary);
+
+    let primary_project =
+        exo::project::Project::resolve(&primary).expect("resolve primary project");
+    let linked_project = exo::project::Project::resolve(&linked).expect("resolve linked project");
+    assert_eq!(
+        primary_project.db_path(),
+        linked_project.db_path(),
+        "linked worktrees must share portable lane storage"
+    );
+
+    let writer =
+        exo::context::SqliteWriter::open(primary_project.db_path()).expect("open project writer");
+    let epoch_id = writer
+        .add_epoch("Linked Lane Epoch", None, &[])
+        .expect("add lane epoch");
+    let phase_id = writer
+        .add_phase(&epoch_id, "Linked Lane Phase", "regular", None, &[])
+        .expect("add lane phase");
+    writer
+        .update_phase_status(&phase_id, "in-progress")
+        .expect("start lane phase");
+    let primary_lane_id = writer
+        .add_workbench_lane("Primary lane", "Stay focused in primary", &phase_id)
+        .expect("add primary lane");
+    let linked_lane_id = writer
+        .add_workbench_lane("Linked lane", "Stay focused in linked", &phase_id)
+        .expect("add linked lane");
+    drop(writer);
+
+    let primary_stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("primary should spawn daemon");
+    drop(primary_stream);
+
+    let primary_focus = send_machine_operation(
+        &primary,
+        "primary-lane-focus",
+        &["lane", "focus"],
+        serde_json::json!({ "id": primary_lane_id }),
+    )
+    .await;
+    assert_eq!(primary_focus["status"], "ok", "{primary_focus}");
+    assert_eq!(
+        primary_focus["result"]["lane"]["id"], primary_lane_id,
+        "{primary_focus}"
+    );
+    assert_eq!(
+        primary_focus["result"]["lane"]["focused_here"], true,
+        "{primary_focus}"
+    );
+
+    let linked_focus = send_machine_operation(
+        &linked,
+        "linked-lane-focus",
+        &["lane", "focus"],
+        serde_json::json!({ "id": linked_lane_id }),
+    )
+    .await;
+    assert_eq!(linked_focus["status"], "ok", "{linked_focus}");
+    assert_eq!(
+        linked_focus["result"]["lane"]["id"], linked_lane_id,
+        "{linked_focus}"
+    );
+    assert_eq!(
+        linked_focus["result"]["lane"]["focused_here"], true,
+        "{linked_focus}"
+    );
+
+    let primary_list = send_machine_operation(
+        &primary,
+        "primary-lane-list",
+        &["lane", "list"],
+        serde_json::json!({}),
+    )
+    .await;
+    let linked_list = send_machine_operation(
+        &linked,
+        "linked-lane-list",
+        &["lane", "list"],
+        serde_json::json!({}),
+    )
+    .await;
+    for (label, response) in [("primary", &primary_list), ("linked", &linked_list)] {
+        assert_eq!(response["status"], "ok", "{label}: {response}");
+        assert_eq!(
+            response["result"]["lanes"]
+                .as_array()
+                .map(std::vec::Vec::len),
+            Some(2),
+            "{label}: {response}"
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains(&primary.display().to_string()),
+            "{label} lane output must not expose the primary workspace root: {response}"
+        );
+        assert!(
+            !response.to_string().contains(&linked.display().to_string()),
+            "{label} lane output must not expose the linked workspace root: {response}"
+        );
+    }
+
+    let focused_lane = |response: &serde_json::Value| {
+        response["result"]["lanes"]
+            .as_array()
+            .expect("lane list")
+            .iter()
+            .find(|lane| lane["focused_here"] == true)
+            .and_then(|lane| lane["id"].as_str())
+            .expect("one focused lane")
+            .to_string()
+    };
+    assert_eq!(focused_lane(&primary_list), primary_lane_id);
+    assert_eq!(focused_lane(&linked_list), linked_lane_id);
+
+    for (label, workspace, expected_lane_id) in [
+        ("primary", &primary, &primary_lane_id),
+        ("linked", &linked, &linked_lane_id),
+    ] {
+        let direct = test_support::exo_cmd(workspace)
+            .args(["--format", "json", "lane", "current"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&direct).expect("direct lane current JSON");
+        assert_eq!(
+            direct["result"]["lane"]["id"], *expected_lane_id,
+            "{label} direct read: {direct}"
+        );
+
+        let daemon = send_machine_operation(
+            workspace,
+            &format!("{label}-lane-current"),
+            &["lane", "current"],
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(daemon["status"], "ok", "{label}: {daemon}");
+        assert_eq!(
+            daemon["result"]["lane"]["id"], *expected_lane_id,
+            "{label} daemon read: {daemon}"
+        );
+
+        let status = exo::daemon::daemon_status(workspace);
+        assert!(status.ok, "{label} daemon status: {status:?}");
+        assert_eq!(status.identity_matches_project, Some(true));
+    }
+
+    let loader = exo::context::SqliteLoader::open(primary_project.db_path())
+        .expect("open shared project loader");
+    assert_eq!(
+        loader
+            .load_workbench_lanes()
+            .expect("load portable lanes")
+            .len(),
+        2,
+        "focusing from two worktrees must not duplicate portable lane rows"
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(
+                primary_project
+                    .workspace_root
+                    .as_ref()
+                    .expect("primary workspace root")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .expect("load primary focus")
+            .map(|focus| focus.lane_id),
+        Some(primary_lane_id)
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(
+                linked_project
+                    .workspace_root
+                    .as_ref()
+                    .expect("linked workspace root")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .expect("load linked focus")
+            .map(|focus| focus.lane_id),
+        Some(linked_lane_id)
     );
 }
 

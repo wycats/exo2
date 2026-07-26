@@ -60,6 +60,7 @@ pub const TABLE_ORDER: &[(&str, &str)] = &[
     ("ideas", "ideas_data"),
     ("inbox", "inbox_data"),
     ("rfcs", "rfcs_data"),
+    ("workbench_lanes", "workbench_lanes_data"),
     ("task_logs", "task_logs"),
     ("task_verifications", "task_verifications"),
     ("axioms", "axioms"),
@@ -224,6 +225,22 @@ pub fn dump_tables(conn: &Connection) -> Result<Vec<TableDump>, DumpError> {
         ],
         &[],
         &HashMap::new(),
+    )?);
+
+    results.push(dump_entity_table(
+        conn,
+        "workbench_lanes_data",
+        &[
+            "text_id",
+            "title",
+            "intent",
+            "state",
+            "execution_phase_id",
+            "created_at",
+            "updated_at",
+        ],
+        &[("execution_phase_id", "execution_phase_text_id")],
+        &HashMap::from([("execution_phase_id", &phase_ids)]),
     )?);
 
     results.push(dump_entity_table(
@@ -750,6 +767,11 @@ const ENTITY_FK_MAPPINGS: &[(&str, &str, &str)] = &[
     ("task_text_id", "task_id", "tasks_data"),
     ("idea_text_id", "idea_id", "ideas_data"),
     ("axiom_text_id", "axiom_id", "axioms"),
+    (
+        "execution_phase_text_id",
+        "execution_phase_id",
+        "phases_data",
+    ),
 ];
 
 /// Import a single table's SQL dump.
@@ -795,6 +817,7 @@ fn has_text_id_column(table: &str) -> bool {
             | "ideas_data"
             | "inbox_data"
             | "rfcs_data"
+            | "workbench_lanes_data"
             | "axioms"
     )
 }
@@ -1223,6 +1246,17 @@ mod tests {
         )
         .unwrap();
 
+        // Workbench lanes
+        conn.execute_batch(
+            "INSERT INTO workbench_lanes_data(
+                 text_id, title, intent, state, execution_phase_id, created_at, updated_at
+             ) VALUES(
+                 '01LANE_AAAA', 'Storage lane', 'Prove portable lane state',
+                 'executing', 2, '2026-01-14T10:00:00Z', '2026-01-15T10:00:00Z'
+             );",
+        )
+        .unwrap();
+
         // Goals
         conn.execute_batch(
             "INSERT INTO goals_data(text_id, label, status, phase_id, kind, rfc, target_stage, started_at, description, completion_log, slug, sort_key)
@@ -1330,7 +1364,7 @@ mod tests {
 
         let dumps = dump_tables(conn).expect("dump should succeed");
 
-        assert_eq!(dumps.len(), 17, "expected 17 table dumps");
+        assert_eq!(dumps.len(), 18, "expected 18 table dumps");
 
         // Verify table order (dependency order)
         let table_names: Vec<&str> = dumps.iter().map(|(name, _)| name.as_str()).collect();
@@ -1344,6 +1378,7 @@ mod tests {
                 "ideas_data",
                 "inbox_data",
                 "rfcs_data",
+                "workbench_lanes_data",
                 "axioms",
                 "task_logs",
                 "task_verifications",
@@ -1719,6 +1754,82 @@ mod tests {
                 .any(|(_, table)| *table == "phase_ownership_data"),
             "phase_ownership_data should not be in TABLE_ORDER"
         );
+    }
+
+    #[test]
+    fn workbench_lanes_are_portable_and_workspace_focus_is_not_dumped() {
+        let db = open_memory_database().expect("should create in-memory database");
+        let conn = db.connection();
+
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO epochs_data(text_id, title, sort_key)
+                 VALUES('01EPOCH_LANE', 'Lane Epoch', 'a');
+             INSERT INTO phases_data(text_id, title, status, epoch_id, kind, sort_key)
+                 VALUES('01PHASE_LANE', 'Lane Phase', 'in-progress', 1, 'regular', 'a');
+             INSERT INTO workbench_lanes_data(
+                 text_id, title, intent, state, execution_phase_id, created_at, updated_at
+             ) VALUES(
+                 '01LANE_PORTABLE', 'Portable lane', 'Keep intent durable',
+                 'prepared', 1, '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z'
+             );
+             INSERT INTO workspace_lane_focus_data(workspace_root, lane_id, updated_at)
+                 VALUES('/tmp/exo-worktree', 1, '2026-07-25T00:00:00Z');",
+        )
+        .unwrap();
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+            .unwrap();
+
+        let dumps = dump_tables(conn).expect("dump should succeed");
+        let (_, lane_sql) = dumps
+            .iter()
+            .find(|(name, _)| name == "workbench_lanes_data")
+            .expect("workbench lane dump");
+
+        assert!(lane_sql.contains("'01LANE_PORTABLE'"));
+        assert!(lane_sql.contains("execution_phase_text_id"));
+        assert!(lane_sql.contains("'01PHASE_LANE'"));
+        assert!(!lane_sql.contains("execution_phase_id"));
+        assert!(
+            dumps
+                .iter()
+                .all(|(name, _)| name != "workspace_lane_focus_data"),
+            "workspace lane focus should not be dumped"
+        );
+        assert!(
+            !TABLE_ORDER
+                .iter()
+                .any(|(_, table)| *table == "workspace_lane_focus_data"),
+            "workspace lane focus should not be in TABLE_ORDER"
+        );
+
+        let imported = open_memory_database().expect("should create import database");
+        import_tables(imported.connection(), &with_file_headers(dumps))
+            .expect("lane dump should import");
+
+        let imported_phase: String = imported
+            .connection()
+            .query_row(
+                "SELECT p.text_id
+                 FROM workbench_lanes_data l
+                 JOIN phases_data p ON p.id = l.execution_phase_id
+                 WHERE l.text_id = '01LANE_PORTABLE'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("imported lane phase");
+        assert_eq!(imported_phase, "01PHASE_LANE");
+
+        let focus_count: i64 = imported
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_lane_focus_data",
+                [],
+                |row| row.get(0),
+            )
+            .expect("workspace focus count");
+        assert_eq!(focus_count, 0);
     }
 
     // === Helpers ===

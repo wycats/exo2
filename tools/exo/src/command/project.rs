@@ -779,6 +779,7 @@ struct ProjectMoveRootPolicyBinding {
 #[derive(Debug, Clone)]
 struct ProjectMoveRootDbRoots {
     workspace_active_phase_roots: Vec<String>,
+    workspace_lane_focus_roots: Vec<String>,
     phase_owner_workspace_roots: Vec<String>,
 }
 
@@ -909,6 +910,7 @@ fn build_project_move_root_output(
     for root in db_roots
         .workspace_active_phase_roots
         .iter()
+        .chain(db_roots.workspace_lane_focus_roots.iter())
         .chain(db_roots.phase_owner_workspace_roots.iter())
     {
         if root != &new_workspace_root_string {
@@ -957,6 +959,18 @@ fn build_project_move_root_output(
         })
         .transpose()?
         .unwrap_or_default();
+    let lane_focus_rows = old_workspace_root
+        .as_deref()
+        .map(|old| {
+            count_project_move_root_rows(
+                &db_path,
+                "workspace_lane_focus_data",
+                "workspace_root",
+                old,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let mut changes = vec![ProjectMoveRootChange {
         target: "local_project_policy",
@@ -989,6 +1003,14 @@ fn build_project_move_root_output(
         .phase_owner_workspace_roots
         .iter()
         .any(|root| root == &new_workspace_root_string);
+    let source_lane_focus = old_workspace_root
+        .as_deref()
+        .map(|old| workspace_lane_focus_id(&db_path, old))
+        .transpose()?
+        .flatten();
+    let destination_lane_focus = workspace_lane_focus_id(&db_path, &new_workspace_root_string)?;
+    let matching_destination_lane_focus =
+        source_lane_focus.is_some() && source_lane_focus == destination_lane_focus;
     let source_active_phase_statuses = old_workspace_root
         .as_deref()
         .map(|old| workspace_active_phase_statuses(&db_path, old))
@@ -1033,6 +1055,19 @@ fn build_project_move_root_output(
             from: Some(old.clone()),
             to: Some(new_workspace_root_string.clone()),
             rows: Some(phase_owner_rows),
+        });
+        changes.push(ProjectMoveRootChange {
+            target: "workspace_lane_focus.workspace_root",
+            action: if lane_focus_rows == 0 {
+                "unchanged"
+            } else if matching_destination_lane_focus {
+                "delete_duplicate_source"
+            } else {
+                "rewrite"
+            },
+            from: Some(old.clone()),
+            to: Some(new_workspace_root_string.clone()),
+            rows: Some(lane_focus_rows),
         });
     }
 
@@ -1091,6 +1126,15 @@ fn build_project_move_root_output(
         blockers.push(format!(
             "destination workspace root already has phase ownership state; inspect {} before applying",
             db_path.display()
+        ));
+    }
+    if let (Some(source_lane), Some(destination_lane)) = (
+        source_lane_focus.as_deref(),
+        destination_lane_focus.as_deref(),
+    ) && source_lane != destination_lane
+    {
+        blockers.push(format!(
+            "destination workspace root already focuses workbench lane {destination_lane}, while the source focuses {source_lane}; choose the intended lane before applying"
         ));
     }
     if let Some(marker) = &marker {
@@ -1182,7 +1226,7 @@ fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> 
         let db = exosuit_storage::open_database(&db_path)
             .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
         let conn = db.connection();
-        let result: ExoResult<(usize, usize)> = (|| {
+        let result: ExoResult<(usize, usize, usize)> = (|| {
             conn.execute_batch("BEGIN IMMEDIATE")
                 .context("Failed to begin project move-root transaction")?;
             if output.absorb_completed_source_active_phase {
@@ -1221,11 +1265,13 @@ fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> 
                     ),
                 )
                 .context("Failed to rewrite phase ownership workspace roots")?;
+            let lane_focus_rows =
+                rewrite_workspace_lane_focus_for_move(conn, old_root, &output.new_workspace_root)?;
             conn.execute_batch("COMMIT")
                 .context("Failed to commit project move-root transaction")?;
-            Ok((workspace_rows, owner_rows))
+            Ok((workspace_rows, owner_rows, lane_focus_rows))
         })();
-        let (workspace_rows, owner_rows) = match result {
+        let (workspace_rows, owner_rows, lane_focus_rows) = match result {
             Ok(rows) => rows,
             Err(error) => {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -1236,6 +1282,7 @@ fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> 
             match change.target {
                 "workspace_active_phase.workspace_root" => change.rows = Some(workspace_rows),
                 "phase_ownership.claimed_by_workspace_root" => change.rows = Some(owner_rows),
+                "workspace_lane_focus.workspace_root" => change.rows = Some(lane_focus_rows),
                 _ => {}
             }
         }
@@ -1312,6 +1359,56 @@ fn validate_absorb_completed_source_active_phase_for_apply(
     }
 
     Ok(())
+}
+
+fn rewrite_workspace_lane_focus_for_move(
+    conn: &Connection,
+    old_root: &str,
+    new_root: &str,
+) -> ExoResult<usize> {
+    let source_lane_id = conn
+        .query_row(
+            "SELECT lane_id
+             FROM workspace_lane_focus_data
+             WHERE workspace_root = ?1",
+            [old_root],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("Failed to revalidate source workspace lane focus")?;
+    let Some(source_lane_id) = source_lane_id else {
+        return Ok(0);
+    };
+    let destination_lane_id = conn
+        .query_row(
+            "SELECT lane_id
+             FROM workspace_lane_focus_data
+             WHERE workspace_root = ?1",
+            [new_root],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("Failed to revalidate destination workspace lane focus")?;
+
+    match destination_lane_id {
+        Some(destination_lane_id) if destination_lane_id == source_lane_id => conn
+            .execute(
+                "DELETE FROM workspace_lane_focus WHERE workspace_root = ?1",
+                [old_root],
+            )
+            .context("Failed to remove duplicate source workspace lane focus"),
+        Some(_) => anyhow::bail!(
+            "destination workspace root lane focus changed before move-root apply; retry after choosing the intended lane"
+        ),
+        None => conn
+            .execute(
+                "UPDATE workspace_lane_focus
+                 SET workspace_root = ?1
+                 WHERE workspace_root = ?2",
+                (new_root, old_root),
+            )
+            .context("Failed to rewrite workspace lane-focus roots"),
+    }
 }
 
 fn project_move_root_message(output: &ProjectMoveRootOutput) -> String {
@@ -1610,6 +1707,7 @@ fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootD
     if !db_path.exists() {
         return Ok(ProjectMoveRootDbRoots {
             workspace_active_phase_roots: Vec::new(),
+            workspace_lane_focus_roots: Vec::new(),
             phase_owner_workspace_roots: Vec::new(),
         });
     }
@@ -1621,12 +1719,40 @@ fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootD
             "workspace_active_phase_data",
             "workspace_root",
         )?,
+        workspace_lane_focus_roots: read_distinct_text_values(
+            &conn,
+            "workspace_lane_focus_data",
+            "workspace_root",
+        )?,
         phase_owner_workspace_roots: read_distinct_text_values(
             &conn,
             "phase_ownership_data",
             "claimed_by_workspace_root",
         )?,
     })
+}
+
+fn workspace_lane_focus_id(db_path: &Path, workspace_root: &str) -> ExoResult<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    if !sqlite_table_exists(&conn, "workspace_lane_focus_data")?
+        || !sqlite_table_exists(&conn, "workbench_lanes_data")?
+    {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT lane.text_id
+         FROM workspace_lane_focus_data focus
+         JOIN workbench_lanes_data lane ON lane.id = focus.lane_id
+         WHERE focus.workspace_root = ?1",
+        [workspace_root],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("Failed to read workspace lane focus for project move-root")
 }
 
 fn read_distinct_text_values(

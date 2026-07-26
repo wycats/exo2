@@ -383,6 +383,272 @@ impl SqliteWriter {
         Ok(())
     }
 
+    /// Add a prepared portable workbench lane under an existing phase.
+    pub fn add_workbench_lane(
+        &self,
+        title: &str,
+        intent: &str,
+        execution_phase_text_id: &str,
+    ) -> Result<String> {
+        let conn = self.db.connection();
+        let execution_phase_id = resolve_id(conn, "phases_data", execution_phase_text_id)?;
+        let text_id = ulid::Ulid::new().to_string().to_lowercase();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO workbench_lanes (
+                 text_id, title, intent, state, execution_phase_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'prepared', ?4, ?5, ?5)",
+            (&text_id, title, intent, execution_phase_id, &now),
+        )
+        .context("Failed to insert workbench lane")?;
+
+        Ok(text_id)
+    }
+
+    /// Transition a prepared workbench lane to executing.
+    pub fn start_workbench_lane(&self, lane_text_id: &str) -> Result<()> {
+        let conn = self.db.connection();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn
+            .execute(
+                "UPDATE workbench_lanes
+                 SET state = 'executing', updated_at = ?2
+                 WHERE text_id = ?1 AND state = 'prepared'",
+                (lane_text_id, &now),
+            )
+            .context("Failed to start workbench lane")?;
+        if rows == 0 {
+            let current_state: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM workbench_lanes_data WHERE text_id = ?1",
+                    [lane_text_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("Failed to inspect workbench lane state")?;
+            return match current_state {
+                Some(state) => Err(anyhow!(
+                    "Workbench lane {lane_text_id} cannot start from state {state}"
+                )),
+                None => Err(anyhow!("Workbench lane not found: {lane_text_id}")),
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Set the machine-local focused lane for a workspace root.
+    pub fn set_workspace_lane_focus(&self, workspace_root: &str, lane_text_id: &str) -> Result<()> {
+        let conn = self.db.connection();
+        let lane_id = resolve_id(conn, "workbench_lanes_data", lane_text_id)?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn
+            .execute(
+                "UPDATE workspace_lane_focus
+                 SET lane_id = ?2, updated_at = ?3
+                 WHERE workspace_root = ?1",
+                (workspace_root, lane_id, &now),
+            )
+            .context("Failed to update workspace lane focus")?;
+
+        if rows == 0 {
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO workspace_lane_focus (
+                         workspace_root, lane_id, updated_at
+                     )
+                     SELECT ?1, ?2, ?3
+                     WHERE NOT EXISTS (
+                         SELECT 1
+                         FROM workspace_lane_focus_data
+                         WHERE workspace_root = ?1
+                     )",
+                    (workspace_root, lane_id, &now),
+                )
+                .context("Failed to insert workspace lane focus")?;
+
+            if inserted == 0 {
+                let rows = conn
+                    .execute(
+                        "UPDATE workspace_lane_focus
+                         SET lane_id = ?2, updated_at = ?3
+                         WHERE workspace_root = ?1",
+                        (workspace_root, lane_id, &now),
+                    )
+                    .context("Failed to update workspace lane focus after concurrent insert")?;
+                if rows == 0 {
+                    return Err(anyhow!(
+                        "Workspace lane focus could not be set for {workspace_root}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear the focused lane for a workspace root.
+    pub fn clear_workspace_lane_focus(&self, workspace_root: &str) -> Result<()> {
+        let conn = self.db.connection();
+        conn.execute(
+            "DELETE FROM workspace_lane_focus WHERE workspace_root = ?1",
+            [workspace_root],
+        )
+        .context("Failed to clear workspace lane focus")?;
+
+        Ok(())
+    }
+
+    /// Focus a phase while preserving only a matching in-progress lane focus.
+    pub fn focus_phase_for_workspace(
+        &self,
+        workspace_root: &str,
+        phase_text_id: &str,
+    ) -> Result<()> {
+        let savepoint =
+            SqliteSavepoint::begin(self.db.connection(), "focus_phase_for_workspace_savepoint")?;
+        self.set_workspace_active_phase(workspace_root, phase_text_id)?;
+
+        let matching_in_progress_lane = savepoint
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM workspace_lane_focus_data wlf
+                     JOIN workbench_lanes_data lane ON lane.id = wlf.lane_id
+                     JOIN phases_data phase ON phase.id = lane.execution_phase_id
+                     WHERE wlf.workspace_root = ?1
+                       AND phase.text_id = ?2
+                       AND phase.status = 'in-progress'
+                 )",
+                (workspace_root, phase_text_id),
+                |row| row.get::<_, bool>(0),
+            )
+            .context("Failed to inspect workspace lane focus for phase focus")?;
+        if !matching_in_progress_lane {
+            self.clear_workspace_lane_focus(workspace_root)?;
+        }
+
+        savepoint.commit()
+    }
+
+    /// Complete a phase and clear every workspace lane focus attached to it.
+    pub fn complete_phase_and_clear_lane_focus(&self, phase_text_id: &str) -> Result<()> {
+        let savepoint = SqliteSavepoint::begin(
+            self.db.connection(),
+            "complete_phase_and_clear_lane_focus_savepoint",
+        )?;
+        let phase_id = resolve_id(&savepoint, "phases_data", phase_text_id)?;
+        let rows = savepoint
+            .execute(
+                "UPDATE phases SET status = 'completed' WHERE id = ?1",
+                [phase_id],
+            )
+            .context("Failed to complete phase")?;
+        if rows == 0 {
+            return Err(anyhow!("Phase not found: {phase_text_id}"));
+        }
+        savepoint
+            .execute(
+                "DELETE FROM workspace_lane_focus
+                 WHERE lane_id IN (
+                     SELECT id
+                     FROM workbench_lanes_data
+                     WHERE execution_phase_id = ?1
+                 )",
+                [phase_id],
+            )
+            .context("Failed to clear completed phase lane focus rows")?;
+
+        savepoint.commit()
+    }
+
+    /// Atomically focus a lane and its execution phase in one workspace.
+    pub fn focus_workbench_lane(
+        &self,
+        workspace_root: &str,
+        lane_text_id: &str,
+        phase_text_id: &str,
+    ) -> Result<()> {
+        let savepoint =
+            SqliteSavepoint::begin(self.db.connection(), "focus_workbench_lane_savepoint")?;
+        self.set_workspace_active_phase(workspace_root, phase_text_id)?;
+        self.set_workspace_lane_focus(workspace_root, lane_text_id)?;
+        savepoint.commit()
+    }
+
+    /// Atomically start a prepared lane and focus its execution phase.
+    pub fn start_and_focus_workbench_lane(
+        &self,
+        workspace_root: &str,
+        lane_text_id: &str,
+        phase_text_id: &str,
+    ) -> Result<()> {
+        let savepoint = SqliteSavepoint::begin(
+            self.db.connection(),
+            "start_and_focus_workbench_lane_savepoint",
+        )?;
+        self.start_workbench_lane(lane_text_id)?;
+        self.set_workspace_active_phase(workspace_root, phase_text_id)?;
+        self.set_workspace_lane_focus(workspace_root, lane_text_id)?;
+        savepoint.commit()
+    }
+
+    /// Remove a prepared lane after clearing every workspace focus that references it.
+    pub fn remove_prepared_workbench_lane(&self, lane_text_id: &str) -> Result<()> {
+        let conn = self.db.connection();
+        let savepoint = SqliteSavepoint::begin(conn, "remove_prepared_workbench_lane_savepoint")?;
+        let lane_id: Option<i64> = savepoint
+            .query_row(
+                "SELECT id
+                 FROM workbench_lanes_data
+                 WHERE text_id = ?1 AND state = 'prepared'",
+                [lane_text_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to inspect prepared workbench lane")?;
+
+        let Some(lane_id) = lane_id else {
+            let current_state: Option<String> = savepoint
+                .query_row(
+                    "SELECT state FROM workbench_lanes_data WHERE text_id = ?1",
+                    [lane_text_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("Failed to inspect workbench lane state")?;
+            return match current_state {
+                Some(state) => Err(anyhow!(
+                    "Workbench lane {lane_text_id} cannot be removed from state {state}"
+                )),
+                None => Err(anyhow!("Workbench lane not found: {lane_text_id}")),
+            };
+        };
+
+        savepoint
+            .execute(
+                "DELETE FROM workspace_lane_focus WHERE lane_id = ?1",
+                [lane_id],
+            )
+            .context("Failed to clear workbench lane focus rows")?;
+        let removed = savepoint
+            .execute(
+                "DELETE FROM workbench_lanes
+                 WHERE text_id = ?1 AND state = 'prepared'",
+                [lane_text_id],
+            )
+            .context("Failed to remove prepared workbench lane")?;
+        if removed != 1 {
+            return Err(anyhow!(
+                "Workbench lane {lane_text_id} changed while it was being removed"
+            ));
+        }
+
+        savepoint.commit()
+    }
+
     /// Claim ownership of a phase for a workspace, branch, or future PR owner.
     pub fn set_phase_owner(
         &self,

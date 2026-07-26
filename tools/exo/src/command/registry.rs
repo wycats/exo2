@@ -446,6 +446,22 @@ pub fn default_registry() -> CommandRegistry {
         exosuit_storage::DEFAULT_INCREMENTAL_VACUUM_PAGE_BUDGET,
     )));
 
+    // Workbench lane namespace
+    use super::lane::{
+        LaneCreate, LaneCurrent, LaneFocus, LaneList, LaneRemove, LaneShow, LaneStart,
+    };
+    registry.register(Box::new(LaneCreate::new(
+        "placeholder",
+        "placeholder",
+        "placeholder",
+    )));
+    registry.register(Box::new(LaneList));
+    registry.register(Box::new(LaneShow::new("placeholder")));
+    registry.register(Box::new(LaneCurrent));
+    registry.register(Box::new(LaneFocus::new("placeholder")));
+    registry.register(Box::new(LaneStart::new("placeholder")));
+    registry.register(Box::new(LaneRemove::new("placeholder")));
+
     // Phase namespace (Wave 7)
     use super::phase_cmd::{
         PhaseAdd, PhaseExecutionTasks, PhaseFinish, PhaseFocus, PhaseHistory, PhaseList, PhaseMove,
@@ -542,6 +558,9 @@ pub fn build_command_from_invocation(
         )),
         "json" => Ok(Some(
             super::json::JsonCommands::from_invocation(inv)?.to_command_box(root)?,
+        )),
+        "lane" => Ok(Some(
+            super::lane::LaneCommands::from_invocation(inv)?.to_command_box(root)?,
         )),
         "phase" => Ok(Some(
             super::phase_cmd::PhaseCommands::from_invocation(inv)?.to_command_box(root)?,
@@ -833,6 +852,13 @@ mod tests {
         // Check storage namespace
         assert!(registry.find("storage", "maintain").is_some());
 
+        // Check workbench lane namespace
+        for operation in [
+            "create", "list", "show", "current", "focus", "start", "remove",
+        ] {
+            assert!(registry.find("lane", operation).is_some());
+        }
+
         // Check goal namespace (Wave 3.5)
         assert!(registry.find("goal", "add").is_some());
         assert!(registry.find("goal", "list").is_some());
@@ -857,7 +883,7 @@ mod tests {
         assert!(registry.find("verify", "run").is_some());
 
         // Verify total count: registry.len() gives actual count - update as commands are added
-        assert_eq!(registry.len(), 118);
+        assert_eq!(registry.len(), 125);
     }
 
     #[test]
@@ -887,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_project_state_recovery_class_has_approved_42_operations() {
+    fn atomic_project_state_recovery_class_has_approved_operations() {
         let registry = default_registry();
         let atomic = registry
             .metadata()
@@ -895,7 +921,7 @@ mod tests {
             .filter(|command| command.recovery_class == RecoveryClass::AtomicProjectState)
             .collect::<Vec<_>>();
 
-        assert_eq!(atomic.len(), 42);
+        assert_eq!(atomic.len(), 46);
         assert!(
             atomic
                 .iter()
@@ -911,6 +937,13 @@ mod tests {
                 .iter()
                 .any(|command| { command.namespace == "phase" && command.operation == "finish" })
         );
+        for operation in ["create", "focus", "start", "remove"] {
+            assert!(
+                atomic.iter().any(|command| {
+                    command.namespace == "lane" && command.operation == operation
+                })
+            );
+        }
         assert!(!atomic.iter().any(|command| command.namespace == "rfc"));
     }
 }

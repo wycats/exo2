@@ -275,6 +275,317 @@ fn workspace_active_phase_cascades_when_phase_deleted() -> Result<()> {
 }
 
 #[test]
+fn workbench_lane_and_workspace_focus_round_trip() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+
+    let lane_id = writer.add_workbench_lane(
+        "Portable lane",
+        "Prove the first lane storage boundary",
+        &phase_id,
+    )?;
+    let lane = loader
+        .load_workbench_lane(&lane_id)?
+        .expect("workbench lane should exist");
+    assert_eq!(lane.title, "Portable lane");
+    assert_eq!(lane.intent, "Prove the first lane storage boundary");
+    assert_eq!(lane.state, "prepared");
+    assert_eq!(lane.execution_phase_id, phase_id);
+    assert_eq!(loader.load_workbench_lanes()?, vec![lane]);
+
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-a", &lane_id)?;
+    let focus = loader
+        .load_workspace_lane_focus("/tmp/exo-worktree-a")?
+        .expect("workspace focus should exist");
+    assert_eq!(focus.lane_id, lane_id);
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-b")?,
+        None
+    );
+
+    writer.start_workbench_lane(&lane_id)?;
+    assert_eq!(
+        loader
+            .load_workbench_lane(&lane_id)?
+            .expect("updated lane")
+            .state,
+        "executing"
+    );
+    assert!(
+        writer.start_workbench_lane(&lane_id).is_err(),
+        "an executing lane cannot be started again"
+    );
+
+    writer.clear_workspace_lane_focus("/tmp/exo-worktree-a")?;
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-a")?,
+        None
+    );
+
+    Ok(())
+}
+
+#[test]
+fn workspace_lane_focus_upsert_replaces_lane_without_crossing_workspaces() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let lane_a = writer.add_workbench_lane("Lane A", "Intent A", &phase_id)?;
+    let lane_b = writer.add_workbench_lane("Lane B", "Intent B", &phase_id)?;
+
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-a", &lane_a)?;
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-b", &lane_a)?;
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-a", &lane_b)?;
+
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus("/tmp/exo-worktree-a")?
+            .map(|focus| focus.lane_id),
+        Some(lane_b)
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus("/tmp/exo-worktree-b")?
+            .map(|focus| focus.lane_id),
+        Some(lane_a)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn composed_lane_focus_updates_phase_and_lane_atomically() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_a = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let phase_b = writer.add_phase(&epoch_id, "P2", "regular", None, &[])?;
+    let lane_a = writer.add_workbench_lane("Lane A", "Intent A", &phase_a)?;
+    let lane_b = writer.add_workbench_lane("Lane B", "Intent B", &phase_b)?;
+    let workspace = "/tmp/exo-worktree";
+
+    writer.focus_workbench_lane(workspace, &lane_a, &phase_a)?;
+    assert_eq!(
+        loader.load_workspace_active_phase(workspace)?,
+        Some(phase_a.clone())
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(workspace)?
+            .map(|focus| focus.lane_id),
+        Some(lane_a)
+    );
+
+    assert!(
+        writer
+            .focus_workbench_lane(workspace, "missing-lane", &phase_b)
+            .is_err(),
+        "a missing lane should fail the composed focus"
+    );
+    assert_eq!(
+        loader.load_workspace_active_phase(workspace)?,
+        Some(phase_a),
+        "the phase update must roll back when lane focus fails"
+    );
+
+    writer.focus_workbench_lane(workspace, &lane_b, &phase_b)?;
+    assert_eq!(
+        loader.load_workspace_active_phase(workspace)?,
+        Some(phase_b)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn composed_lane_start_rolls_back_before_focus_can_diverge() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let lane_id = writer.add_workbench_lane("Lane", "Intent", &phase_id)?;
+    let workspace = "/tmp/exo-worktree";
+
+    assert!(
+        writer
+            .start_and_focus_workbench_lane(workspace, &lane_id, "missing-phase")
+            .is_err(),
+        "an invalid phase should fail the composed start"
+    );
+    assert_eq!(
+        loader
+            .load_workbench_lane(&lane_id)?
+            .expect("lane remains")
+            .state,
+        "prepared",
+        "the lane transition must roll back when phase focus fails"
+    );
+    assert_eq!(loader.load_workspace_lane_focus(workspace)?, None);
+
+    writer.start_and_focus_workbench_lane(workspace, &lane_id, &phase_id)?;
+    assert_eq!(
+        loader
+            .load_workbench_lane(&lane_id)?
+            .expect("lane remains")
+            .state,
+        "executing"
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(workspace)?
+            .map(|focus| focus.lane_id),
+        Some(lane_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn phase_focus_preserves_only_a_matching_in_progress_lane() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_a = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let phase_b = writer.add_phase(&epoch_id, "P2", "regular", None, &[])?;
+    let lane_a = writer.add_workbench_lane("Lane A", "Intent A", &phase_a)?;
+    let lane_b = writer.add_workbench_lane("Lane B", "Intent B", &phase_b)?;
+    let workspace = "/tmp/exo-worktree";
+
+    writer.update_phase_status(&phase_a, "in-progress")?;
+    writer.set_workspace_lane_focus(workspace, &lane_a)?;
+    writer.focus_phase_for_workspace(workspace, &phase_a)?;
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(workspace)?
+            .map(|focus| focus.lane_id),
+        Some(lane_a.clone())
+    );
+
+    writer.focus_phase_for_workspace(workspace, &phase_b)?;
+    assert_eq!(
+        loader.load_workspace_active_phase(workspace)?,
+        Some(phase_b.clone())
+    );
+    assert_eq!(
+        loader.load_workspace_lane_focus(workspace)?,
+        None,
+        "a pending phase cannot retain lane focus"
+    );
+
+    writer.update_phase_status(&phase_b, "in-progress")?;
+    writer.set_workspace_lane_focus(workspace, &lane_a)?;
+    writer.focus_phase_for_workspace(workspace, &phase_b)?;
+    assert_eq!(
+        loader.load_workspace_lane_focus(workspace)?,
+        None,
+        "an in-progress phase cannot retain another phase's lane"
+    );
+
+    writer.set_workspace_lane_focus(workspace, &lane_b)?;
+    writer.focus_phase_for_workspace(workspace, &phase_b)?;
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(workspace)?
+            .map(|focus| focus.lane_id),
+        Some(lane_b.clone())
+    );
+
+    assert!(
+        writer
+            .focus_phase_for_workspace(workspace, "missing-phase")
+            .is_err(),
+        "an invalid phase must fail without disturbing either focus relation"
+    );
+    assert_eq!(
+        loader.load_workspace_active_phase(workspace)?,
+        Some(phase_b)
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus(workspace)?
+            .map(|focus| focus.lane_id),
+        Some(lane_b)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn completing_phase_clears_all_attached_lane_focus_rows() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let other_phase = writer.add_phase(&epoch_id, "P2", "regular", None, &[])?;
+    let lane_id = writer.add_workbench_lane("Lane", "Intent", &phase_id)?;
+    let other_lane = writer.add_workbench_lane("Other", "Other intent", &other_phase)?;
+
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-a", &lane_id)?;
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-b", &lane_id)?;
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-c", &other_lane)?;
+    writer.complete_phase_and_clear_lane_focus(&phase_id)?;
+
+    assert_eq!(
+        loader
+            .load_workbench_lane(&lane_id)?
+            .expect("completed phase keeps its lane")
+            .execution_phase_id,
+        phase_id
+    );
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-a")?,
+        None
+    );
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-b")?,
+        None
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus("/tmp/exo-worktree-c")?
+            .map(|focus| focus.lane_id),
+        Some(other_lane),
+        "another phase's lane focus must remain"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn prepared_lane_removal_clears_every_workspace_focus() -> Result<()> {
+    let (writer, loader, _tmp) = create_pair()?;
+    let epoch_id = writer.add_epoch("E1", None, &[])?;
+    let phase_id = writer.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+    let lane_id = writer.add_workbench_lane("Lane", "Intent", &phase_id)?;
+
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-a", &lane_id)?;
+    writer.set_workspace_lane_focus("/tmp/exo-worktree-b", &lane_id)?;
+    writer.remove_prepared_workbench_lane(&lane_id)?;
+
+    assert_eq!(loader.load_workbench_lane(&lane_id)?, None);
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-a")?,
+        None
+    );
+    assert_eq!(
+        loader.load_workspace_lane_focus("/tmp/exo-worktree-b")?,
+        None
+    );
+
+    let executing_lane = writer.add_workbench_lane("Executing", "Intent", &phase_id)?;
+    writer.start_workbench_lane(&executing_lane)?;
+    assert!(
+        writer
+            .remove_prepared_workbench_lane(&executing_lane)
+            .is_err(),
+        "executing lanes cannot be removed"
+    );
+    assert!(
+        loader.load_workbench_lane(&executing_lane)?.is_some(),
+        "failed removal must preserve the executing lane"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn phase_owner_round_trip() -> Result<()> {
     let (writer, loader, _tmp) = create_pair()?;
     let epoch_id = writer.add_epoch("E1", None, &[])?;

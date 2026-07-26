@@ -49,6 +49,8 @@ pub(crate) const REACTIVE_TABLES: &[(&str, &str)] = &[
     ),
     ("workspace_active_phase", "workspace_active_phase_data"),
     ("phase_ownership", "phase_ownership_data"),
+    ("workbench_lanes", "workbench_lanes_data"),
+    ("workspace_lane_focus", "workspace_lane_focus_data"),
 ];
 
 /// A wrapper around a SQLite connection with schema guarantees.

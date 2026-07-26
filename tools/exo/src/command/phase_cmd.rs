@@ -881,7 +881,7 @@ impl MutableCommand for PhaseStart {
                 writer.update_phase_status(&next_phase, "in-progress")?;
             }
             if let Some(workspace_root) = agent_ctx.workspace_root_key() {
-                writer.set_workspace_active_phase(&workspace_root, &next_phase)?;
+                writer.focus_phase_for_workspace(&workspace_root, &next_phase)?;
             }
 
             (next_phase, next_phase_title, owner_transition)
@@ -1039,7 +1039,7 @@ impl MutableCommand for PhaseFocus {
 
         let writer = SqliteWriter::open(ctx.db_path())?;
         if let Some(workspace_root) = agent_ctx.workspace_root_key() {
-            writer.set_workspace_active_phase(&workspace_root, &self.phase_id)?;
+            writer.focus_phase_for_workspace(&workspace_root, &self.phase_id)?;
         }
 
         #[derive(Serialize)]
@@ -1935,6 +1935,41 @@ impl Command for PhaseRemove {
 impl MutableCommand for PhaseRemove {
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput> {
         phase_owner::ensure_phase_write_allowed(ctx.root, ctx.project, &ctx.db_path(), &self.id)?;
+        let lanes = SqliteLoader::open(ctx.db_path())?
+            .load_workbench_lanes()?
+            .into_iter()
+            .filter(|lane| lane.execution_phase_id == self.id)
+            .collect::<Vec<_>>();
+        if !lanes.is_empty() {
+            let lane_ids = lanes
+                .iter()
+                .map(|lane| lane.text_id.clone())
+                .collect::<Vec<_>>();
+            return Err(ExoFailure::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "Phase '{}' cannot be removed while it has {} workbench lane{}",
+                    self.id,
+                    lane_ids.len(),
+                    if lane_ids.len() == 1 { "" } else { "s" }
+                ),
+                ExoFailure::orienting_steering(vec![SuggestedAction {
+                    label: "Inspect workbench lanes".to_string(),
+                    command: "exo lane list".to_string(),
+                    rationale:
+                        "Review the durable work identities that still reference this phase."
+                            .to_string(),
+                    intent: WorkIntent::Orient,
+                    confidence: Some(1.0),
+                }]),
+            )
+            .with_details(json!({
+                "kind": "phase.has_workbench_lanes",
+                "phase_id": self.id,
+                "lane_ids": lane_ids,
+            }))
+            .into());
+        }
         let writer = SqliteWriter::open(ctx.db_path())?;
         writer.remove_phase(&self.id)?;
 

@@ -127,6 +127,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rfc_workspace_observations",
         sql: include_str!("../migrations/V022__rfc_workspace_observations.sql"),
     },
+    Migration {
+        version: 23,
+        name: "workbench_lanes",
+        sql: include_str!("../migrations/V023__workbench_lanes.sql"),
+    },
 ];
 
 /// Run all pending migrations on the given connection.
@@ -324,6 +329,69 @@ mod tests {
             )
             .expect("query migration history");
         assert_eq!(migration_applied, 1, "V022 should be recorded");
+    }
+
+    #[test]
+    fn v023_adds_workbench_lane_storage_to_existing_databases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+
+        {
+            let conn = Connection::open(&db_path).expect("open db");
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE IF NOT EXISTS __schema_history (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .expect("create history");
+
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 22)
+            {
+                conn.execute_batch(migration.sql)
+                    .unwrap_or_else(|err| panic!("apply V{:03}: {err}", migration.version));
+                conn.execute(
+                    "INSERT INTO __schema_history (version, name) VALUES (?1, ?2)",
+                    (migration.version, migration.name),
+                )
+                .unwrap_or_else(|err| panic!("record V{:03}: {err}", migration.version));
+            }
+        }
+
+        let db = crate::open_database(&db_path).expect("upgrade db");
+        let conn = db.connection();
+
+        for table in [
+            "workbench_lanes_data",
+            "workbench_lanes",
+            "workbench_lanes_rev",
+            "workspace_lane_focus_data",
+            "workspace_lane_focus",
+            "workspace_lane_focus_rev",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(exists, 1, "{table} should exist after V023");
+        }
+
+        let migration_applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __schema_history
+                 WHERE version = 23 AND name = 'workbench_lanes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migration history");
+        assert_eq!(migration_applied, 1, "V023 should be recorded");
     }
 
     fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
