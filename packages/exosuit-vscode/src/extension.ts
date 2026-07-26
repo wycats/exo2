@@ -29,6 +29,7 @@ import {
   listWorkbenchLanes,
   workbenchLaneFocusTargetId,
   workbenchLaneListFrom,
+  workbenchLaneQuickPickItem,
 } from "./services/WorkLanesClient";
 
 import { ExosuitNotebookSerializer } from "./notebook/serializer";
@@ -738,12 +739,9 @@ export async function activate(context: vscode.ExtensionContext) {
                   workspaceRoot,
                   `vscode.lane.list.${Date.now()}`,
                 ));
-              const choices = focusableWorkbenchLanes(data).map((lane) => ({
-                label: lane.title,
-                description: `${lane.state} • ${lane.phase_title}`,
-                detail: lane.intent,
-                laneId: lane.id,
-              }));
+              const choices = focusableWorkbenchLanes(data).map(
+                workbenchLaneQuickPickItem,
+              );
               if (choices.length === 0) {
                 vscode.window.showInformationMessage(
                   "No other work lanes are available to focus.",

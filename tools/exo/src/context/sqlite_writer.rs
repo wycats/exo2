@@ -275,21 +275,22 @@ impl SqliteWriter {
 
     /// Remove a phase by `text_id`.
     pub fn remove_phase(&self, text_id: &str) -> Result<()> {
-        let conn = self.db.connection();
-        delete_entity_aliases(conn, "phase", "phases_data", text_id)?;
-        let rows = conn
+        let savepoint = SqliteSavepoint::begin(self.db.connection(), "remove_phase_savepoint")?;
+        delete_entity_aliases(&savepoint, "phase", "phases_data", text_id)?;
+        let rows = savepoint
             .execute("DELETE FROM phases WHERE text_id = ?", [text_id])
             .context("Failed to delete phase")?;
         if rows == 0 {
             return Err(anyhow!("Phase not found: {text_id}"));
         }
-        Ok(())
+        savepoint.commit()
     }
 
     /// Update a phase's status.
     pub fn update_phase_status(&self, text_id: &str, status: &str) -> Result<()> {
-        let conn = self.db.connection();
-        let rows = conn
+        let savepoint =
+            SqliteSavepoint::begin(self.db.connection(), "update_phase_status_savepoint")?;
+        let rows = savepoint
             .execute(
                 "UPDATE phases SET status = ?1 WHERE text_id = ?2",
                 (status, text_id),
@@ -298,7 +299,22 @@ impl SqliteWriter {
         if rows == 0 {
             return Err(anyhow!("Phase not found: {text_id}"));
         }
-        Ok(())
+        if status != "in-progress" {
+            savepoint
+                .execute(
+                    "DELETE FROM workspace_lane_focus
+                     WHERE lane_id IN (
+                         SELECT id
+                         FROM workbench_lanes_data
+                         WHERE execution_phase_id = (
+                             SELECT id FROM phases_data WHERE text_id = ?1
+                         )
+                     )",
+                    [text_id],
+                )
+                .context("Failed to clear lane focus for inactive phase")?;
+        }
+        savepoint.commit()
     }
 
     /// Update a phase's title.
@@ -2928,6 +2944,69 @@ mod tests {
             alias_count, 2,
             "failed epoch deletion must preserve epoch and descendant aliases"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_phase_rolls_back_alias_cleanup_when_lane_restricts_delete() -> Result<()> {
+        let w = SqliteWriter::open_memory()?;
+        let conn = w.database().connection();
+        let epoch_id = w.add_epoch("E1", None, &[])?;
+        let phase_id = w.add_phase(
+            &epoch_id,
+            "P1",
+            "regular",
+            None,
+            &["phase-alias".to_string()],
+        )?;
+        w.add_workbench_lane("Lane", "Keep the phase reachable", &phase_id)?;
+
+        assert!(
+            w.remove_phase(&phase_id).is_err(),
+            "a lane should restrict phase deletion"
+        );
+
+        let phase_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM phases_data WHERE text_id = ?1",
+            [&phase_id],
+            |row| row.get(0),
+        )?;
+        let alias_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM entity_aliases
+             WHERE entity_type = 'phase'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(phase_count, 1);
+        assert_eq!(
+            alias_count, 1,
+            "failed phase deletion must preserve its aliases"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_phase_status_clears_focus_when_phase_leaves_in_progress() -> Result<()> {
+        let w = SqliteWriter::open_memory()?;
+        let conn = w.database().connection();
+        let epoch_id = w.add_epoch("E1", None, &[])?;
+        let phase_id = w.add_phase(&epoch_id, "P1", "regular", None, &[])?;
+        let lane_id = w.add_workbench_lane("Lane", "Finish the phase", &phase_id)?;
+        w.update_phase_status(&phase_id, "in-progress")?;
+        w.set_workspace_lane_focus("/tmp/worktree-a", &lane_id)?;
+        w.set_workspace_lane_focus("/tmp/worktree-b", &lane_id)?;
+
+        w.update_phase_status(&phase_id, "completed")?;
+
+        let focus_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM workspace_lane_focus_data
+             WHERE workspace_root IN ('/tmp/worktree-a', '/tmp/worktree-b')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(focus_count, 0);
         Ok(())
     }
 

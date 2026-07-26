@@ -5,6 +5,7 @@ use exo::command::lane::{
     LaneCreate, LaneCurrent, LaneFocus, LaneList, LaneRemove, LaneShow, LaneStart,
 };
 use exo::command::phase_cmd::{PhaseFocus, PhaseRemove, PhaseStart};
+use exo::command::plan::PlanUpdateStatus;
 use exo::command::{Command, CommandContext, MutableCommand, MutableCommandContext, OutputFormat};
 use exo::context::{SqliteWriter, db_path};
 use exo::project::Project;
@@ -380,6 +381,49 @@ fn epoch_start_clears_lane_focus_from_another_epoch() {
             .expect("load lane focus"),
         None,
         "starting another epoch must clear the old epoch's lane focus"
+    );
+}
+
+#[test]
+fn plan_status_completion_clears_lane_focus_for_every_workspace() {
+    let (temp, project, _bootstrap_phase, execution_phase) = fixture();
+    let root = temp.path();
+    let writer = SqliteWriter::open(project.db_path()).expect("open writer");
+    writer
+        .update_phase_status(&execution_phase, "in-progress")
+        .expect("start execution phase");
+    let lane_id = writer
+        .add_workbench_lane(
+            "Current lane",
+            "Complete from plan status",
+            &execution_phase,
+        )
+        .expect("add lane");
+    writer
+        .set_workspace_lane_focus("/tmp/plan-status-primary", &lane_id)
+        .expect("focus primary");
+    writer
+        .set_workspace_lane_focus("/tmp/plan-status-linked", &lane_id)
+        .expect("focus linked");
+
+    execute_mut(
+        &PlanUpdateStatus::new(&execution_phase, "completed"),
+        root,
+        &project,
+    );
+
+    let loader = exo::context::SqliteLoader::open(project.db_path()).expect("open loader");
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus("/tmp/plan-status-primary")
+            .expect("load primary focus"),
+        None
+    );
+    assert_eq!(
+        loader
+            .load_workspace_lane_focus("/tmp/plan-status-linked")
+            .expect("load linked focus"),
+        None
     );
 }
 

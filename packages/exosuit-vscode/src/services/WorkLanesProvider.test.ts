@@ -11,6 +11,7 @@ import {
   listWorkbenchLanes,
   workbenchLaneFocusTargetId,
   type WorkbenchLaneList,
+  workbenchLaneQuickPickItem,
 } from "./WorkLanesClient";
 import type { TraceCacheRootDiagnostic } from "./TraceCache";
 
@@ -238,7 +239,7 @@ describe("Work Lanes machine-channel client", () => {
     ).rejects.toThrow("Phase is pending");
   });
 
-  it("selects only unfocused lanes whose phases are in progress", () => {
+  it("selects unfocused or mismatched lanes whose phases are in progress", () => {
     const pending = {
       ...preparedLane,
       id: "lane-pending-phase",
@@ -249,11 +250,43 @@ describe("Work Lanes machine-channel client", () => {
         laneList({ lanes: [preparedLane, focusedLane, pending] }),
       ).map((lane) => lane.id),
     ).toEqual([preparedLane.id]);
+    expect(
+      focusableWorkbenchLanes(
+        laneList({
+          lanes: [preparedLane, focusedLane, pending],
+          diagnostics: [
+            {
+              code: "lane.phase_focus_mismatch",
+              message: "Focused lane and phase do not match",
+              lane_id: focusedLane.id,
+              lane_phase_id: focusedLane.phase_id,
+              focused_phase_id: "other-phase",
+            },
+          ],
+        }),
+      ).map((lane) => lane.id),
+    ).toEqual([preparedLane.id, focusedLane.id]);
     expect(workbenchLaneFocusTargetId(preparedLane.id)).toBe(
       preparedLane.id,
     );
     expect(workbenchLaneFocusTargetId({ lane: preparedLane })).toBe(
       preparedLane.id,
     );
+  });
+
+  it("distinguishes duplicate lane titles with durable IDs", () => {
+    const duplicate = {
+      ...preparedLane,
+      id: "lane-duplicate",
+    };
+
+    expect(
+      [preparedLane, duplicate]
+        .map(workbenchLaneQuickPickItem)
+        .map((item) => item.detail),
+    ).toEqual([
+      `${preparedLane.intent}\nLane ID: ${preparedLane.id}`,
+      `${duplicate.intent}\nLane ID: ${duplicate.id}`,
+    ]);
   });
 });

@@ -32,6 +32,13 @@ export interface WorkbenchLaneList {
   diagnostics: WorkbenchLaneDiagnostic[];
 }
 
+export interface WorkbenchLaneQuickPickItem {
+  label: string;
+  description: string;
+  detail: string;
+  laneId: string;
+}
+
 export type WorkbenchLaneMachineChannel = (
   cwd: string,
   request: MachineChannelRequestEnvelope,
@@ -89,9 +96,27 @@ export function workbenchLaneListFrom(
 export function focusableWorkbenchLanes(
   data: WorkbenchLaneList,
 ): WorkbenchLaneSummary[] {
-  return data.lanes.filter(
-    (lane) => lane.phase_status === "in-progress" && !lane.focused_here,
+  const mismatchedLaneIds = new Set(
+    data.diagnostics
+      .filter((diagnostic) => diagnostic.code === "lane.phase_focus_mismatch")
+      .map((diagnostic) => diagnostic.lane_id),
   );
+  return data.lanes.filter(
+    (lane) =>
+      lane.phase_status === "in-progress" &&
+      (!lane.focused_here || mismatchedLaneIds.has(lane.id)),
+  );
+}
+
+export function workbenchLaneQuickPickItem(
+  lane: WorkbenchLaneSummary,
+): WorkbenchLaneQuickPickItem {
+  return {
+    label: lane.title,
+    description: `${lane.state} • ${lane.phase_title}`,
+    detail: `${lane.intent}\nLane ID: ${lane.id}`,
+    laneId: lane.id,
+  };
 }
 
 export function workbenchLaneFocusTargetId(target: unknown): string | null {
