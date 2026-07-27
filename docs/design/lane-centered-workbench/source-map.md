@@ -166,12 +166,11 @@ This section does not supersede implemented Stage 3+ behavior by implication. In
 
 ## Still open
 
-The design package intentionally leaves these as future implementation questions:
+The first proof settled the portable lane schema and migration, the public
+`exo lane` namespace, and focus-only VS Code integration. The design package
+intentionally leaves these broader implementation questions open:
 
-- exact lane schema and migration path;
-- final CLI/API namespace after checking validation-lane collisions;
 - whether lane observations are fully normalized or stored as typed JSON facts;
-- how to expose lane focus in VS Code without disrupting existing phase focus;
 - how much PR state to mirror locally vs. derive on sync;
 - how to represent RFC document observations across worktrees;
 - browser workbench architecture;
@@ -183,10 +182,10 @@ The design package intentionally leaves these as future implementation questions
 
 Do not rewrite RFC history. Keep RFCs as durable history and create a current architecture layer that says what the system believes now.
 
-[RFC 10202: Lane-Centered Workbench Adoption](../../rfcs/stage-2/10202-lane-centered-workbench-adoption.md)
-records the adoption decision and implementation-ready first-proof contract.
+[RFC 10202: Lane-Centered Workbench Adoption](../../rfcs/stage-3/10202-lane-centered-workbench-adoption.md)
+records the adopted and implemented first-proof contract.
 RFC 10202 is authoritative for that first proof, including its `exo lane`
 namespace and its deliberate deferral of attachments, signals, validation
 freshness, and derived status. This design package remains the broader product
 exploration and source material for later work; where it describes a larger or
-older implementation shape, the Stage 2 RFC controls.
+older implementation shape, the Stage 3 RFC controls.

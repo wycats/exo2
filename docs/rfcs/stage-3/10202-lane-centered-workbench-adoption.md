@@ -8,24 +8,27 @@
 
 ## Summary
 
-Exo will represent each durable stream of active work as a **workbench lane**.
-A lane gives a stream a stable identity, records the intent that began it, and
+Exo represents each durable stream of active work as a **workbench lane**. A
+lane gives a stream a stable identity, records the intent that began it, and
 connects it to the phase that supplies its planning and ownership boundary.
 Each workspace may focus a different lane without changing the lanes visible
 to the rest of the project.
 
-This revision defines the first implementation contract. It deliberately proves
-one narrow capability:
+This Stage 3 candidate records the first implemented contract. It proves one
+narrow capability:
 
 > An agent can create, focus, and resume a lane from Exo project state without
 > relying on chat history.
 
-The first proof adds portable lane identity, workspace-local focus, a shared
-`exo lane` command surface, and a compact focus-oriented VS Code view. It does
-not yet model attachments, observations, review state, validation provenance,
-parking, closure, or outcomes. Those concepts remain part of the broader
-[lane-centered workbench design package](../../design/lane-centered-workbench/README.md),
+The implementation provides portable lane identity, workspace-local focus, a
+shared `exo lane` command surface, and a compact focus-oriented VS Code view. It
+does not yet model attachments, observations, review state, validation
+provenance, parking, closure, or outcomes. Those concepts remain part of the
+broader [lane-centered workbench design package](../../design/lane-centered-workbench/README.md),
 but they are not prerequisites for making lane continuity real.
+
+Current operator guidance lives in the
+[Lane-Centered Workbench manual](../../manual/lane-centered-workbench.md).
 
 ## Motivation
 
@@ -91,8 +94,8 @@ history or branch-name convention is involved.
 
 ### Lane identity and lifecycle
 
-The first proof introduces one portable reactive table,
-`workbench_lanes_data`. Each row has this logical shape:
+The implementation stores portable lanes in the reactive
+`workbench_lanes_data` table. Each row has this logical shape:
 
 | Field | Contract |
 | --- | --- |
@@ -116,12 +119,12 @@ does not change the lane.
 The two-state lifecycle is intentionally incomplete. `prepared` means the
 stream has durable intent but has not begun execution. `executing` means work
 has begun. A lane may remain executing while its associated phase moves through
-review or completion because lane closure is not part of this proof. Later
-work will add parking, repair, readiness, closure, and outcome semantics rather
-than overloading either of these states.
+review or completion because lane closure is not part of this proof. Later work
+will add parking, repair, readiness, closure, and outcome semantics rather than
+overloading either of these states.
 
-No migration attempts to infer lanes from existing phases, branches, or
-worktrees. Existing projects begin with zero lanes.
+No migration infers lanes from existing phases, branches, or worktrees.
+Existing projects begin with zero lanes.
 
 ### Portable state and workspace focus
 
@@ -131,11 +134,12 @@ phase by its stable text ID rather than by SQLite row ID. The imported lane
 therefore preserves identity without depending on one database's row numbers
 or one checkout's path.
 
-The focused lane is stored separately in
-`workspace_lane_focus_data`. A focus row contains the normalized workspace
-root, the focused lane, and its update time. It is reactive machine-local state:
-it is never written to repository or sidecar SQL projections, and public
-command output never exposes the workspace path.
+The focused lane is stored separately in `workspace_lane_focus_data`. A focus
+row contains the normalized workspace root, the focused lane, and its update
+time. It is reactive machine-local state: it is never written to repository or
+sidecar SQL projections. Successful lane command results do not expose the
+workspace path; phase-ownership conflict diagnostics may identify the workspace
+that currently owns the phase.
 
 This split permits every linked worktree to observe the same lane identities
 while choosing its own focus. Removing or recreating one worktree cannot change
@@ -217,10 +221,12 @@ to recognize the stream and recover its current planning context.
 
 `lane current` is a successful read when no lane is focused and returns
 `lane: null`. Inconsistent focus returns data plus the stable diagnostic rather
-than mutating state during a read. Public results omit workspace roots,
-database paths, sidecar paths, and runtime identity details.
+than mutating state during a read. Successful public results omit workspace
+roots, database paths, sidecar paths, and runtime identity details.
+Phase-ownership conflict diagnostics may identify the workspace that currently
+owns the phase.
 
-### VS Code
+### VS Code and other clients
 
 The first editor surface is a focus client rather than a lane manager. A
 **Work Lanes** tree appears first in the existing Exosuit Run container while
@@ -233,15 +239,22 @@ action and a command-palette Quick Pick invoke `lane focus`.
 
 The extension does not store lane focus in VS Code workspace state. The focus
 action succeeds only when Exo has committed the canonical workspace relation,
-and reactive invalidation refreshes the tree from that result. Loading, no-lane,
-focus-mismatch, and transport-error states are rendered as states rather than
-guessed from stale editor memory.
+and reactive invalidation refreshes the tree from that result. Loading,
+no-lane, focus-mismatch, invalid-response, and transport-error states are
+rendered as states rather than guessed from stale editor memory.
+
+The VS Code tree is the first client of an adapter-neutral foundation, not the
+foundation itself. Portable lane state, workspace-local focus, and the public
+`exo lane` machine representation define the shared contract. A future browser,
+desktop, or other editor surface should consume that contract rather than
+introduce another focus store. This candidate does not claim that such a
+surface is implemented.
 
 Creation, start, and prepared-lane removal remain available through the CLI and
 `exo-run`. That is a complete first editor role: observe the work streams
-available to this workspace, see which one is current, and switch context.
-Rich creation, attachment, status explanation, and lifecycle actions belong to
-the later workbench UI.
+available to this workspace, see which one is current, and switch context. Rich
+creation, attachment, status explanation, and lifecycle actions belong to the
+later workbench UI.
 
 ## Compatibility and Migration
 
@@ -270,7 +283,7 @@ later revision introduces observation-backed lane status.
 
 This design introduces a new project object before the full workbench lifecycle
 exists. An executing lane cannot yet be parked or closed, and its associated
-phase remains the actual owner of mutations. Users will briefly encounter both
+phase remains the actual owner of mutations. Users therefore encounter both
 the adopted lane model and phase-centered execution.
 
 The focus invariant also couples two workspace-local relations. That coupling
@@ -288,11 +301,11 @@ together.
 
 ### Use phases as lanes
 
-Phases organize a sequence or campaign and carry the ownership boundary used
-by current commands. Treating them as workspace-focused streams would either
-make phase focus global again or overload phases with branch, review, and
-outcome semantics. The lane instead references a phase while establishing the
-identity that may eventually span several planning and review artifacts.
+Phases organize a sequence or campaign and carry the ownership boundary used by
+current commands. Treating them as workspace-focused streams would either make
+phase focus global again or overload phases with branch, review, and outcome
+semantics. The lane instead references a phase while establishing the identity
+that may eventually span several planning and review artifacts.
 
 ### Use branches or worktrees as lane identity
 
@@ -315,35 +328,36 @@ are valuable, but designing them together would prevent the project from
 testing the foundational identity and focus model. The narrow proof creates
 real state that those later contracts can extend.
 
-## Unresolved Questions
+## Deferred Work
 
-The first proof intentionally leaves several questions for later RFC revisions:
-how a lane is parked or closed, how accepted outcomes are recorded, how
-branches/worktrees/PRs/RFCs attach, how signals and validation observations
-carry provenance, and how richer workbench surfaces explain status. None of
-these questions changes the identity, portability, phase association, or
-workspace-focus contracts defined here.
+The first proof is complete at its boundary. It intentionally defers lane
+parking and closure, accepted outcomes, branch/worktree/PR/RFC attachments,
+signals and validation observations with provenance, and richer workbench
+surfaces that explain status. These concerns extend the implemented identity,
+portability, phase association, and workspace-focus contracts; they are not
+missing conditions for this candidate.
 
-## Stage 3 Readiness
+## Implementation Evidence
 
-RFC 10202 is ready to become a Stage 3 Candidate when the implementation and
-evidence establish all of the following:
+The implemented first proof follows this contract. V023 creates portable,
+reactive lane rows and machine-local focus rows; deterministic dump and import
+use stable phase text IDs and omit workspace focus. The seven `exo lane`
+operations share the generated CommandSpec surface, with replayable pure reads
+and atomic-project-state writes. Phase lifecycle and project relocation compose
+with lane focus transactionally, and phase removal reports lane references
+instead of deleting them.
 
-- portable lane state survives deterministic dump/import with stable phase
-  references and no workspace paths;
-- linked worktrees share lane records while retaining independent lane focus;
-- create, list, show, current, focus, start, and prepared-lane removal agree
-  across direct CLI, daemon, JSON machine channel, and MCP;
-- lane and phase focus remain atomic, and inconsistent rows are diagnosed
-  without read-time mutation;
-- daemon replacement, editor reload, and a new agent session recover the same
-  focused lane, intent, state, phase, and phase goals;
-- the focus-only VS Code tree renders canonical state and never owns a second
-  focus value;
-- existing phase, goal, task, sidecar, outcome-ledger, RFC, and Exohook
-  validation-lane suites remain green; and
-- two-worktree dogfood demonstrates independent focus without duplicate state
-  mutation or conversational reconstruction.
+Storage, command, transaction, phase lifecycle, move-root, sidecar, and daemon
+integration tests cover those invariants. A linked-worktree regression exercises
+one shared lane collection and project-authority daemon while two worktrees
+retain independent focus; direct and machine-channel reads agree and public
+results omit workspace roots. VS Code provider and client tests cover canonical
+rendering, focus requests, duplicate titles, mismatch diagnostics, and loading,
+empty, invalid-response, and transport-error states. Dogfood confirmed that an
+already-open Extension Development Host reactively replaced its empty state
+with the newly focused lane without retaining editor-owned focus.
 
-The Stage 3 reconciliation should describe the implementation that actually
-lands, including any reviewed deviations from this draft.
+This evidence establishes the candidate boundary: durable lane identity,
+portable state, workspace-local focus, phase integration, command recovery, and
+a first editor client are implemented. Rich lifecycle, observation-backed
+status, attachments, and non-VS Code workbench UIs remain follow-up work.

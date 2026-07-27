@@ -164,7 +164,8 @@ is the machine-oriented companion to this disposition.
 Reconstruction closes the recovery and coherence campaign. It does not decide
 later RFC lifecycle changes on their merits.
 
-RFC 10202 is the active Stage 2 contract for the lane-centered workbench
-direction. Its implementation remains a separate stream. Future RFC authoring,
-promotion, withdrawal, and stabilization continue through the ordinary staged
-RFC process, using this coherent corpus as their starting point.
+RFC 10202 is now an active Stage 3 Candidate for the implemented lane-centered
+workbench first proof. Richer lifecycle and workbench surfaces remain separate
+follow-up streams. Future RFC authoring, promotion, withdrawal, and
+stabilization continue through the ordinary staged RFC process, using this
+coherent corpus as their starting point.

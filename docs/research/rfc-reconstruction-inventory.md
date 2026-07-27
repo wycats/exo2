@@ -2,7 +2,7 @@
 
 Generated from the canonical Markdown tree and the effective Exo RFC view on
 clean `main` at `74d7c23bee5fad6b6a987aac8c44870b3daf316b`.
-Updated incrementally for RFC 10202's reviewed Stage 2 promotion.
+Updated incrementally for RFC 10202's reviewed Stage 3 promotion.
 
 This is the final reconstruction-execution inventory, not a lifecycle
 proposal. Directory placement records the current Markdown location. Metadata
@@ -25,8 +25,8 @@ archived history. Effective status records what Exo presents to readers.
 | --- | ---: |
 | `stage-0` | 67 |
 | `stage-1` | 67 |
-| `stage-2` | 13 |
-| `stage-3` | 17 |
+| `stage-2` | 12 |
+| `stage-3` | 18 |
 | `stage-4` | 25 |
 | `archive` | 3 |
 | `withdrawn` | 144 |
@@ -340,7 +340,6 @@ The coherence audit is complete:
 | `stage-2` | 10181 | 2 | `active` | Shared Perception: Inbox as a Steering Channel | `docs/rfcs/stage-2/10181-shared-perception-inbox-as-a-steering-channel.md` |
 | `stage-2` | 10182 | 2 | `active` | Contextual Steering: Every Command is a Perception Touchpoint | `docs/rfcs/stage-2/10182-contextual-steering-every-command-is-a-perception-touchpoint.md` |
 | `stage-2` | 10183 | 2 | `active` | Agent Activity Model: Event Sourcing for Steering Context | `docs/rfcs/stage-2/10183-agent-activity-model-event-sourcing-for-steering-context.md` |
-| `stage-2` | 10202 | 2 | `active` | Lane-Centered Workbench Adoption | `docs/rfcs/stage-2/10202-lane-centered-workbench-adoption.md` |
 | `stage-3` | 0069 | 3 | `active` | Canonical ULIDs, Scoped Slugs, and RFC Corpus Control | `docs/rfcs/stage-3/0069-canonical-ulids-scoped-slugs-and-rfc-corpus-control.md` |
 | `stage-3` | 0080 | 3 | `active` | Agent-first CLI Discovery Ladder | `docs/rfcs/stage-3/0080-agent-first-cli-discovery-ladder.md` |
 | `stage-3` | 0081 | 3 | `active` | Exohook: File Expansion Worked Examples | `docs/rfcs/stage-3/0081-exohook-file-expansion-worked-examples.md` |
@@ -358,6 +357,7 @@ The coherence audit is complete:
 | `stage-3` | 10176 | 3 | `active` | Project State Model | `docs/rfcs/stage-3/10176-project-state-model.md` |
 | `stage-3` | 10179 | 3 | `active` | Binary Re-exec: Workspace-Local Development Builds | `docs/rfcs/stage-3/10179-binary-re-exec-workspace-local-development-builds.md` |
 | `stage-3` | 10196 | 3 | `active` | Worktree-Aware Sidecar State and Branch-Local Document Overlays | `docs/rfcs/stage-3/10196-worktree-aware-sidecar-state-and-branch-local-document-overlays.md` |
+| `stage-3` | 10202 | 3 | `active` | Lane-Centered Workbench Adoption | `docs/rfcs/stage-3/10202-lane-centered-workbench-adoption.md` |
 | `stage-4` | 0002 | 4 | `superseded` | Design Axioms | `docs/rfcs/stage-4/0002-axioms.md` |
 | `stage-4` | 0004 | 4 | `superseded` | Modes of Collaboration | `docs/rfcs/stage-4/0004-modes.md` |
 | `stage-4` | 0006 | 4 | `active` | Workspace Cache | `docs/rfcs/stage-4/0006-workspace-cache.md` |

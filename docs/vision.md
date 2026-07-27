@@ -136,9 +136,11 @@ RFCs, phases, and chat sessions remain linked artifacts with distinct roles.
 The first proof is intentionally narrow: an agent can create, focus, and resume
 a lane from canonical project state without relying on chat history.
 
-This remains a design direction until the lane runtime model and user surfaces
-land. The detailed lane semantics, product hierarchy, interaction design, and
-implementation brief belong to the lane-centered workbench design package.
+The first proof has landed: portable lane state, the public `exo lane` command
+surface, and a focus-only VS Code client are implemented. The richer lane
+lifecycle and broader user surfaces remain a design direction. Their product
+hierarchy, interaction design, and implementation brief belong to the
+lane-centered workbench design package.
 
 ## Relationship To Design Records
 
@@ -152,7 +154,7 @@ specific contracts and implementations.
 | [RFC 10181: Shared Perception](rfcs/stage-2/10181-shared-perception-inbox-as-a-steering-channel.md) | Defines scoped feedback and observations delivered through inbox and steering. |
 | [RFC 10165: Reactive SQLite](rfcs/stage-3/10165-reactive-sqlite-virtual-table-integration-with-revision-algebra.md) | Defines how state observations and mutations support trace validation. |
 | [RFC 10200: CLI-Shaped MCP Transport](rfcs/stage-1/10200-cli-shaped-exo-run-mcp-transport.md) | Defines the common Exo command language exposed to MCP-capable clients. |
-| [RFC 10202: Lane-Centered Workbench Adoption](rfcs/stage-2/10202-lane-centered-workbench-adoption.md) | Specifies the lane-centered product direction and the first create, focus, and resume proof. |
+| [RFC 10202: Lane-Centered Workbench Adoption](rfcs/stage-3/10202-lane-centered-workbench-adoption.md) | Records the implemented lane-centered foundation and first create, focus, and resume proof. |
 
 Two existing RFCs need explicit alignment as the lane design advances:
 
