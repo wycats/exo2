@@ -10,10 +10,11 @@ Exo exposes a deliberately small language-model tool surface over its complete
 command system. `exo-run` is the shared, CLI-shaped project-tool surface backed
 by CommandSpec and the machine channel. MCP can address the complete current
 command inventory when an operation's inputs fit the tool request. VS Code
-presents the same tool shape and execution contract while its extension-local
-command-text adapter retains known coverage gaps. A small set of curated
-extension tools remains separate for capabilities that benefit from dedicated
-model visibility.
+presents the same tool shape and execution contract. Its extension-local
+command-text adapter discovers operations and arguments from the active Exo
+runtime, while tokenization and global presentation options retain
+transport-specific behavior. A small set of curated extension tools remains
+separate for capabilities that benefit from dedicated model visibility.
 
 The VS Code extension contributes exactly five public tools:
 `exo-ai-chat-history`, `exo-diagnostics`, `exo-logs`, `exo-ping`, and
@@ -40,10 +41,11 @@ Exo already has a command language with namespaces, help, typed arguments,
 effects, diagnostics, confirmation, and recovery. The model-facing architecture
 uses that language directly. The MCP project tool reaches operations whose
 inputs can be carried by its request schema while preserving the same execution
-semantics available to CLI users. Process-stdin-backed operations such as root
-`write <path>` require a dedicated content channel before they become usable
-through MCP. VS Code uses the same project-tool surface and machine execution
-model while its local parser converges on equivalent command coverage.
+semantics available to CLI users. VS Code represents the process-stdin body for
+root `write <path>` with the tool's dedicated `content` field. MCP exposes the
+same dedicated field and forwards it through the machine transport. VS Code
+otherwise uses the same project-tool surface and machine execution model while
+retaining its local tokenizer.
 
 Some useful capabilities deserve dedicated extension tools. Diagnostics,
 extension logs, and extension identity come directly from the VS Code process.
@@ -58,9 +60,8 @@ context-recovery work while `exo-run` remains the primary project surface.
 
 `exo-run` is the public entry point for Exo project work. It accepts a command
 string without the leading `exo` and optional placeholder values. Both
-transports accept workflow-completion confirmation data. MCP also accepts the
-hidden execution-approval ticket used by confirm-required external operations;
-the VS Code tool schema does not currently expose that `auth` field.
+transports accept workflow-completion confirmation data and the hidden
+execution-approval ticket used by confirm-required external operations.
 
 Examples include:
 
@@ -74,22 +75,24 @@ rfc show 0136
 The MCP tool tokenizes this text with Exo's Rust command-text compiler, removes
 global presentation options before operation validation, rejects shell syntax,
 and compiles the result against the current `CommandSpec`. The VS Code tool uses
-an extension-local tokenizer and router to construct the structured machine
-request. Its request still enters the same typed invocation and execution
-machinery, while its parsing errors and treatment of global options currently
-differ from MCP.
+an extension-local tokenizer, queries the active daemon's help hierarchy for
+the current operation and argument metadata, and constructs the structured
+machine request from that runtime contract. The packaged CommandSpec artifact
+is not an execution gate. Root operations such as `write <path>` and dotted
+operations such as `docs links check` and `phase execution tasks` therefore use
+the same machine-channel addresses for preview and execution. For `write`, the
+separate `content` field becomes machine-only transport input rather than a
+command argument. The request still enters the same typed invocation and
+execution machinery, while parsing errors and treatment of global presentation
+options remain transport-specific.
 
-The adapter difference also affects command coverage. The current VS Code root
-command table recognizes `status` and the stale name `version`, while omitting
-the implemented root operation `write <path>`. A positional root write is
-therefore misrouted as a namespaced operation, and `version` reaches the machine
-channel as an unknown root operation. The adapter also fixes a namespaced
-operation at one token during call and preview routing, so invocations such as
-`docs links check` and `phase execution tasks` do not compose into the dotted
-operations accepted by the Rust compiler. Help routing joins the operation tail
-into its dotted name, so those paths remain discoverable through commands such
-as `help docs links check`. These are implemented adapter gaps within the shared
-architecture, rather than separate command contracts.
+Project-backed VS Code tools select a workspace deliberately. A window with one
+Exo project uses that open workspace folder automatically. When multiple Exo
+projects or fallback workspace folders are open, `exo-run` and
+`exo-ai-chat-history` require `workspaceRoot` to name one of those exact open
+folders; arbitrary filesystem paths and filesystem roots are rejected. This
+keeps tool calls deterministic without changing the daemon's project and
+worktree identity validation.
 
 The two transports therefore share the command-address model, placeholder
 substitution, machine-channel validation, effect classification, and structured
@@ -121,9 +124,12 @@ direct model visibility.
 
 The model discovers project operations through the same hierarchy as a CLI
 user. General help describes root operations and namespaces. Namespace and
-operation help reveal accepted arguments and effects. `CommandSpec` compilation
-can return structured diagnostics and suggestions; tokenizer-level failures keep
-the transport-specific shape described by RFC 0132.
+operation help reveal accepted arguments and effects. VS Code uses this help
+from the selected workspace's active Exo runtime when it resolves a command,
+so an extension-bundled artifact cannot hide a newer runtime operation.
+`CommandSpec` compilation can return structured diagnostics and suggestions;
+tokenizer-level failures keep the transport-specific shape described by RFC
+0132.
 
 This help ladder provides progressive disclosure without introducing a second
 grouping system. Names such as `task`, `goal`, `phase`, and `rfc` remain
@@ -147,9 +153,11 @@ Pure operations can be repeated. Project-state mutations use the daemon's
 writer lane and durable outcome contract. External operations retain
 at-most-once behavior unless Exo has durable completion proof. Workflow
 completion commands can return confirmation data that both transports resubmit.
-Confirm-required external operations return an execution ticket that MCP can
-resubmit through its `auth` input; the current VS Code schema stops at the
-confirmation response.
+Confirm-required external operations return hidden `auth` data that both
+transports can resubmit after human approval. The ticket is derived from the
+operation, input, original request identity, and validated workspace. A
+confirmed retry preserves that request identity, and VS Code rejects replay if
+the selected workspace differs from the workspace that requested approval.
 
 A stable request identity follows a call through proxying and reconnects so
 completed outcomes can be replayed without repeating the mutation. Workspace

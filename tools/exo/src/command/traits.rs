@@ -37,6 +37,8 @@ pub struct CommandContext<'a> {
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
+    /// Optional content supplied by a machine transport for stdin-backed commands.
+    pub input_content: Option<String>,
 }
 
 /// Context for mutable command execution.
@@ -48,6 +50,8 @@ pub struct MutableCommandContext<'a> {
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
+    /// Optional content supplied by a machine transport for stdin-backed commands.
+    pub input_content: Option<String>,
 }
 
 impl CommandContext<'_> {
@@ -165,6 +169,7 @@ impl CommandBox {
                     format: ctx.format,
                     agent_id: ctx.agent_id.clone(),
                     workflow_confirmation: ctx.workflow_confirmation.clone(),
+                    input_content: ctx.input_content.clone(),
                 };
                 cmd.execute_mut(&mut mutable_ctx)
             }
@@ -476,6 +481,7 @@ pub fn invoke_command_box_json(
         format: transport.output_format(),
         agent_id: transport.agent_id().map(String::from),
         workflow_confirmation: transport.workflow_confirmation().cloned(),
+        input_content: transport.input_content().map(String::from),
     };
 
     let effect = cmd.effect();
@@ -675,6 +681,7 @@ pub trait Command: Send + Sync {
             format: transport.output_format(),
             agent_id: transport.agent_id().map(String::from),
             workflow_confirmation: transport.workflow_confirmation().cloned(),
+            input_content: transport.input_content().map(String::from),
         };
 
         let output = match self.execute(&ctx) {
@@ -966,6 +973,7 @@ mod tests {
             format: OutputFormat::Json,
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         };
         let cmd = CommandBox::mutable(MutableProjectEchoCommand);
 

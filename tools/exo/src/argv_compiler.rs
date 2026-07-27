@@ -466,6 +466,39 @@ mod tests {
     }
 
     #[test]
+    fn compile_root_operation_keeps_following_tokens_as_arguments() {
+        let mut spec = CommandSpec::new();
+        let mut operation = OperationSpec::new("write", "write", Effect::Write);
+        operation.args.push(ArgSpec {
+            id: "path".to_string(),
+            name: "path".to_string(),
+            description: String::new(),
+            kind: ArgKind::Positional,
+            value_type: ValueType::Path,
+            optional: false,
+            default: None,
+            short: None,
+            repeatable: false,
+        });
+        spec.root_operations.insert("write".to_string(), operation);
+
+        let compilation = compile_argv_v2(&spec, &["write".to_string(), "notes.md".to_string()]);
+
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            compilation.diagnostics
+        );
+        let invocation = compilation.invocation.expect("invocation");
+        assert_eq!(invocation.namespace(), "");
+        assert_eq!(invocation.operation(), "write");
+        assert_eq!(
+            invocation.args.get("path"),
+            Some(&TypedValue::Path("notes.md".to_string()))
+        );
+    }
+
+    #[test]
     fn compile_strips_global_format_flag_after_operation() {
         let mut spec = CommandSpec::new();
         let mut namespace = crate::command::command_spec::NamespaceSpec::new("dogfood", "dogfood");
@@ -599,6 +632,10 @@ fn route_tokens_from_argv(
 
     let namespace = tokens_with_index[0].0.clone();
     let namespace_index = tokens_with_index[0].1;
+
+    if flat_spec.root_operations.contains_key(&namespace) {
+        return (vec![namespace], vec![namespace_index], namespace_index + 1);
+    }
 
     let mut operation = None;
     let mut operation_len = 0usize;

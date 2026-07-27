@@ -1746,6 +1746,27 @@ fn replay_request_context(
     })
 }
 
+fn compatible_protocol_v1_approval_request_id(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> Option<String> {
+    let auth = request.auth.as_ref()?;
+    if !auth.confirm || auth.request_id.is_some() || auth.workspace_root.is_some() {
+        return None;
+    }
+    let crate::api::protocol::Op::Call(params) = &request.op else {
+        return None;
+    };
+    let context = replay_request_context(startup_workspace, startup_project, request).ok()?;
+    crate::command::transport::compatible_exec_ticket_request_id(
+        &params.address,
+        &params.input,
+        &context.workspace_root,
+        &auth.ticket,
+    )
+}
+
 fn atomic_request_context(
     startup_workspace: &Path,
     startup_project: &Project,
@@ -1770,17 +1791,25 @@ fn execute_ledgered_daemon_request(
     startup_workspace: &Path,
     startup_project: &Project,
     outcome_ledger: &RequestOutcomeLedger,
-    request: RequestEnvelope,
+    mut request: RequestEnvelope,
     effect: Effect,
     instance_id: &str,
     diagnostics: &DaemonDiagnostics,
 ) -> OutcomeExecution {
-    outcome_ledger.execute(
+    let response_id = request.id.clone();
+    if let Some(request_id) =
+        compatible_protocol_v1_approval_request_id(startup_workspace, startup_project, &request)
+    {
+        request.id = request_id;
+    }
+    let handler_response_id = response_id.clone();
+    let mut outcome = outcome_ledger.execute(
         request,
         effect,
         instance_id,
         Duration::from_secs(30),
-        |request| {
+        |mut request| {
+            request.id = handler_response_id;
             let request_id = request.id.clone();
             let context = match daemon_request_context(startup_workspace, startup_project, &request)
             {
@@ -1796,7 +1825,9 @@ fn execute_ledgered_daemon_request(
                 diagnostics,
             )
         },
-    )
+    );
+    outcome.response.id = response_id;
+    outcome
 }
 
 fn spawn_daemon_after_lock(
@@ -2725,14 +2756,27 @@ pub async fn run_daemon(
                         request_admission,
                         diagnostics.clone(),
                         move || {
-                        if let Ok(Some(outcome)) =
-                            outcome_ledger.terminal_outcome_before_preparation(&req)
+                        let recovery_request =
+                            compatible_protocol_v1_approval_request_id(
+                                &workspace,
+                                project.as_ref(),
+                                &req,
+                            )
+                            .map(|request_id| {
+                                let mut request = req.clone();
+                                request.id = request_id;
+                                request
+                            });
+                        let recovery_request = recovery_request.as_ref().unwrap_or(&req);
+                        if let Ok(Some(mut outcome)) =
+                            outcome_ledger.terminal_outcome_before_preparation(recovery_request)
                         {
+                            outcome.response.id = handler_request_id;
                             return outcome.response;
                         }
                         let declared_recovery = request_declared_recovery(&req);
                         let reserved_recovery = outcome_ledger
-                            .reserved_request_recovery_before_preparation(&req)
+                            .reserved_request_recovery_before_preparation(recovery_request)
                             .ok()
                             .flatten();
                         let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
@@ -3797,6 +3841,90 @@ mod tests {
         assert_eq!(context.workspace_root, primary);
         assert_eq!(context.project.id, startup.id);
         assert_eq!(context.project.state_root, startup.state_root);
+    }
+
+    #[test]
+    fn protocol_v1_approval_recovers_ticket_request_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let mut request = request_for_workspace(Some(&primary));
+        let crate::api::protocol::Op::Call(params) = &request.op else {
+            panic!("expected call request");
+        };
+        let ticket = crate::command::transport::ticket_for_exec_call(
+            &params.address,
+            &params.input,
+            &primary,
+            "original-request",
+        );
+        request.id = "replacement-request".to_string();
+        request.auth = Some(crate::api::protocol::Auth {
+            ticket,
+            confirm: true,
+            request_id: None,
+            workspace_root: None,
+        });
+
+        assert_eq!(
+            compatible_protocol_v1_approval_request_id(&primary, &startup, &request).as_deref(),
+            Some("original-request")
+        );
+    }
+
+    #[test]
+    fn protocol_v1_approval_retries_share_one_ledger_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = create_test_git_repo(&temp, "primary");
+        let startup = Project::resolve(&primary).expect("resolve primary project");
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open outcome ledger");
+        let mut first_request = request_for_workspace(Some(&primary));
+        let crate::api::protocol::Op::Call(params) = &first_request.op else {
+            panic!("expected call request");
+        };
+        let ticket = crate::command::transport::ticket_for_exec_call(
+            &params.address,
+            &params.input,
+            &primary,
+            "original-request",
+        );
+        first_request.id = "client-request-one".to_string();
+        first_request.auth = Some(crate::api::protocol::Auth {
+            ticket,
+            confirm: true,
+            request_id: None,
+            workspace_root: None,
+        });
+        let mut second_request = first_request.clone();
+        second_request.id = "client-request-two".to_string();
+        let diagnostics = DaemonDiagnostics::disabled();
+
+        let first = execute_ledgered_daemon_request(
+            &primary,
+            &startup,
+            &ledger,
+            first_request,
+            Effect::Exec,
+            "instance-a",
+            &diagnostics,
+        );
+        let second = execute_ledgered_daemon_request(
+            &primary,
+            &startup,
+            &ledger,
+            second_request,
+            Effect::Exec,
+            "instance-a",
+            &diagnostics,
+        );
+
+        assert!(!first.replayed);
+        assert_eq!(first.response.status, Status::Ok);
+        assert_eq!(first.response.id, "client-request-one");
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(second.response.id, "client-request-two");
     }
 
     #[test]

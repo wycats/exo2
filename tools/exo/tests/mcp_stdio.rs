@@ -1810,7 +1810,8 @@ fn exo_mcp_proxy_recovers_interrupted_write_and_exec_worker_calls() {
                         "command": command,
                         "auth": {
                             "ticket": "secret-ticket",
-                            "confirm": true
+                            "confirm": true,
+                            "requestId": "mcp.exo-run.proxy-recovery"
                         },
                         "workflowConfirmation": {
                             "kind": "workflow_completion_confirmation",
@@ -3057,9 +3058,8 @@ fn mcp_stdio_replays_execution_confirmation() {
     assert_eq!(needs_auth["result"]["isError"], true);
     let needs_auth_structured = structured_content(&needs_auth);
     assert_eq!(needs_auth_structured["status"], "confirm_required");
-    let ticket = needs_auth_structured["ticket"]
-        .as_str()
-        .expect("confirmation ticket");
+    let auth = needs_auth_structured["auth"].clone();
+    assert_eq!(auth["requestId"], needs_auth_structured["id"]);
 
     write_message(
         &mut stdin,
@@ -3071,7 +3071,7 @@ fn mcp_stdio_replays_execution_confirmation() {
                 "name": "exo-run",
                 "arguments": {
                     "command": "run task print-ok --format json",
-                    "auth": { "ticket": ticket, "confirm": true }
+                    "auth": auth
                 }
             }
         }),
@@ -3117,9 +3117,8 @@ fn mcp_stdio_dogfood_restart_does_not_kill_current_transport() {
         needs_auth_structured["status"], "confirm_required",
         "{needs_auth:?}"
     );
-    let ticket = needs_auth_structured["ticket"]
-        .as_str()
-        .expect("confirmation ticket");
+    let auth = needs_auth_structured["auth"].clone();
+    assert_eq!(auth["requestId"], needs_auth_structured["id"]);
 
     write_message(
         &mut stdin,
@@ -3131,7 +3130,7 @@ fn mcp_stdio_dogfood_restart_does_not_kill_current_transport() {
                 "name": "exo-run",
                 "arguments": {
                     "command": "dogfood restart --format json",
-                    "auth": { "ticket": ticket, "confirm": true }
+                    "auth": auth
                 }
             }
         }),

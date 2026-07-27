@@ -6,6 +6,7 @@
 mod test_support;
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -458,6 +459,44 @@ fn create_test_workspace(dir: &TempDir, backend: &str) -> PathBuf {
     git_init(&workspace);
     test_support::exo_init_with_storage(&workspace, backend);
     workspace
+}
+
+#[test_matrix(["sqlite"])]
+fn daemon_routed_write_forwards_cli_stdin(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_exo"))
+        .args(["--format", "json", "write", "notes.md"])
+        .current_dir(&workspace)
+        .env("EXO_NO_REEXEC", "1")
+        .env("HOME", workspace.join(".test-home"))
+        .env("XDG_CONFIG_HOME", workspace.join(".test-home/config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon-routed write");
+    child
+        .stdin
+        .take()
+        .expect("write stdin")
+        .write_all(b"body from CLI stdin\n")
+        .expect("send write content");
+
+    let output = child.wait_with_output().expect("wait for write");
+
+    assert!(
+        output.status.success(),
+        "daemon-routed write failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("docs/agent-context/notes.md"))
+            .expect("read written content"),
+        "body from CLI stdin\n"
+    );
 }
 
 #[test_matrix(["sqlite"])]

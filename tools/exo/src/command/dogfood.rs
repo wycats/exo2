@@ -365,6 +365,7 @@ impl Command for DogfoodRestartRuntimes {
             format: ctx.format,
             agent_id: ctx.agent_id.clone(),
             workflow_confirmation: ctx.workflow_confirmation.clone(),
+            input_content: ctx.input_content.clone(),
         };
         self.execute_mut(&mut mutable_ctx)
     }
@@ -422,6 +423,7 @@ impl Command for DogfoodReceipt {
             format: ctx.format,
             agent_id: ctx.agent_id.clone(),
             workflow_confirmation: ctx.workflow_confirmation.clone(),
+            input_content: ctx.input_content.clone(),
         };
         self.execute_mut(&mut mutable_ctx)
     }

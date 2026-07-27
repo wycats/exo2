@@ -59,8 +59,13 @@ impl Command for Write {
 
 impl MutableCommand for Write {
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput> {
-        let mut content = String::new();
-        std::io::stdin().read_to_string(&mut content)?;
+        let content = if let Some(content) = &ctx.input_content {
+            content.clone()
+        } else {
+            let mut content = String::new();
+            std::io::stdin().read_to_string(&mut content)?;
+            content
+        };
 
         if !self.raw {
             if self.path.ends_with(".toml") {
@@ -123,5 +128,35 @@ impl MutableCommand for Write {
                 ),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_transport_content_is_written_instead_of_process_stdin() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical tempdir");
+        std::fs::create_dir_all(root.join("docs/agent-context")).expect("create agent-context");
+        let mut ctx = MutableCommandContext {
+            root: &root,
+            project: None,
+            format: OutputFormat::Json,
+            agent_id: None,
+            workflow_confirmation: None,
+            input_content: Some("from the machine channel\n".to_string()),
+        };
+
+        Write::new("notes.md", false)
+            .execute_mut(&mut ctx)
+            .expect("write content");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("docs/agent-context/notes.md"))
+                .expect("read written file"),
+            "from the machine channel\n"
+        );
     }
 }

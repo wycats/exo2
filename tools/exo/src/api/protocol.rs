@@ -83,6 +83,20 @@ pub struct Auth {
     pub ticket: String,
     #[serde(default)]
     pub confirm: bool,
+    #[serde(
+        default,
+        rename = "requestId",
+        alias = "request_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_id: Option<String>,
+    #[serde(
+        default,
+        rename = "workspaceRoot",
+        alias = "workspace_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -10,15 +10,17 @@ import {
   isNoSummaryResponse,
   type AiChatHistoryOutput,
 } from "../types/chatHistory";
-import { selectCurrentWorkspaceRoot } from "../workspaceRoot";
+import { selectCurrentLmToolWorkspaceRoot } from "../workspaceRoot";
 
 /**
  * Input schema for the exo-ai-chat-history LM tool.
  *
- * Property names use kebab-case to match the package.json schema declaration
- * and the tool's public API surface.
+ * Query property names use kebab-case to match the underlying command.
+ * workspaceRoot follows the shared project-tool selector.
  */
 interface ChatHistoryToolInput {
+  /** Exact open VS Code workspace-folder path to use for Exo project state. */
+  workspaceRoot?: string;
   /** Number of recent turns (user + assistant pairs) to retrieve. Default: 10 */
   turns?: number;
   /** Whether to include extended thinking content. Default: false */
@@ -49,7 +51,9 @@ export function createChatHistoryTool(): vscode.LanguageModelTool<ChatHistoryToo
     ): Promise<vscode.LanguageModelToolResult> {
       const input = options.input ?? {};
 
-      const workspaceSelection = selectCurrentWorkspaceRoot();
+      const workspaceSelection = await selectCurrentLmToolWorkspaceRoot(
+        input.workspaceRoot,
+      );
       const workspacePath = workspaceSelection.rootPath;
       if (!workspacePath) {
         return new vscode.LanguageModelToolResult([

@@ -8,6 +8,35 @@ import {
 import { WORKFLOW_COMPLETION_CONFIRMATION_KIND } from "../types/machineChannel";
 
 describe("exo-run fallback formatting", () => {
+  it("keeps execution approval hidden while returning replay data", () => {
+    const result = formatMachineChannelResponse(
+      {
+        protocol_version: 1,
+        id: "confirm-required",
+        status: "confirm_required",
+        ticket: "opaque-ticket",
+      },
+      false,
+      "/workspace",
+    );
+
+    const [textPart, dataPart] = result.content as Array<{ value: unknown }>;
+    expect(textPart?.value).toContain("Execution confirmation required.");
+    expect(textPart?.value).toContain(
+      "Ask the human whether to approve this action.",
+    );
+    expect(textPart?.value).not.toContain("opaque-ticket");
+    expect(textPart?.value).not.toContain("auth");
+    expect(dataPart?.value).toEqual({
+      auth: {
+        ticket: "opaque-ticket",
+        confirm: true,
+        requestId: "confirm-required",
+        workspaceRoot: "/workspace",
+      },
+    });
+  });
+
   it("distinguishes abandoned goals from pending goals", () => {
     const text = formatCallResult({
       kind: "goal.list",
@@ -246,6 +275,7 @@ describe("exo-run fallback formatting", () => {
         },
       },
       false,
+      "/workspace",
     );
 
     const [textPart, dataPart] = result.content as Array<{ value: unknown }>;

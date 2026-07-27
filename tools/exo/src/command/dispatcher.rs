@@ -44,6 +44,7 @@ impl<'a> CommandDispatcher<'a> {
             format: self.ctx.format,
             agent_id: self.ctx.agent_id.clone(),
             workflow_confirmation: self.ctx.workflow_confirmation.clone(),
+            input_content: self.ctx.input_content.clone(),
         };
         let output = cmd.execute_mut(&mut mutable_ctx)?;
         self.render(output)?;

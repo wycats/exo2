@@ -1216,6 +1216,28 @@ describe("DaemonChannelServer", () => {
     expect(traceCache.notifyWrite).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves the ticket-bound request id for an approved replay", async () => {
+    const traceCache = { notifyWrite: vi.fn() };
+    const connection = createConnection(makeResponse("write"));
+    const connect = vi.fn(async () => connection);
+    const server = DaemonChannelServer.createForTesting("/tmp/exo2-daemon-auth", {
+      connect,
+      traceCache,
+    });
+    const request = makeTaskCompleteEnvelope();
+    request.auth = {
+      ticket: "opaque-ticket",
+      confirm: true,
+      requestId: request.id,
+      workspaceRoot: "/tmp/exo2-daemon-auth",
+    };
+
+    await expect(server.request(request)).resolves.toMatchObject({ status: "ok" });
+
+    expect(connection.request).toHaveBeenCalledTimes(1);
+    expect(connection.request.mock.calls[0]?.[0].id).toBe(request.id);
+  });
+
   it("enters reconnect cooldown after transient failures and self-heals after cooldown", async () => {
     const traceCache = { notifyWrite: vi.fn() };
     const fakeClock = createFakeClock();

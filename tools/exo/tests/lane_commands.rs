@@ -67,6 +67,7 @@ fn read_context<'a>(root: &'a Path, project: &'a Project) -> CommandContext<'a> 
         format: OutputFormat::Json,
         agent_id: None,
         workflow_confirmation: None,
+        input_content: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn write_context<'a>(root: &'a Path, project: &'a Project) -> MutableCommandCont
         format: OutputFormat::Json,
         agent_id: None,
         workflow_confirmation: None,
+        input_content: None,
     }
 }
 
@@ -95,6 +97,7 @@ fn execute_human<C: Command>(command: &C, root: &Path, project: &Project) -> Com
             format: OutputFormat::Human,
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         })
         .expect("human command succeeds")
 }

@@ -31,6 +31,8 @@ pub struct ExoRunInput {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default, rename = "workflowConfirmation")]
     pub workflow_confirmation: Option<McpWorkflowConfirmationInput>,
     #[serde(default)]
@@ -782,6 +784,14 @@ fn worker_tool_error_classification(
 
 fn tool_call_request_id(_id: &JsonValue, params: Option<&JsonValue>) -> String {
     if let Some(request_id) = params
+        .and_then(|params| params.get("arguments"))
+        .and_then(|arguments| arguments.get("auth"))
+        .and_then(|auth| auth.get("requestId").or_else(|| auth.get("request_id")))
+        .and_then(JsonValue::as_str)
+    {
+        return request_id.to_string();
+    }
+    if let Some(request_id) = params
         .and_then(|params| params.get(MCP_OUTCOME_REQUEST_ID_PARAM))
         .and_then(JsonValue::as_str)
     {
@@ -1145,7 +1155,14 @@ fn compile_exo_run_input(
             };
 
             let address = invocation_to_address(&invocation);
-            let call_input = invocation.to_json_input();
+            let mut call_input = invocation.to_json_input();
+            if invocation.namespace().is_empty()
+                && invocation.operation() == "write"
+                && let Some(content) = input.content.as_deref()
+                && let Some(call_input) = call_input.as_object_mut()
+            {
+                call_input.insert("__exo_transport".to_string(), json!({ "content": content }));
+            }
             return Ok(CompiledExoRunRequest {
                 request: RequestEnvelope {
                     protocol_version: PROTOCOL_VERSION,
@@ -1370,6 +1387,11 @@ fn structured_content_for_response(response: &ResponseEnvelope) -> JsonValue {
 
     if let Some(ticket) = &response.ticket {
         value["ticket"] = json!(ticket);
+        value["auth"] = json!({
+            "ticket": ticket,
+            "confirm": true,
+            "requestId": response.id,
+        });
     }
 
     if let Some(steering) = &response.steering {
@@ -2081,6 +2103,10 @@ fn exo_run_tool_definition() -> JsonValue {
                     "items": { "type": "string" },
                     "description": "Values for $1, $2, $3 placeholders."
                 },
+                "content": {
+                    "type": "string",
+                    "description": "Content for the root write operation. This is separate from command arguments."
+                },
                 "workflowConfirmation": {
                     "type": "object",
                     "description": "Machine-only completion confirmation returned by a previous goal or task review prompt. Do not display this object or its fields to the user.",
@@ -2134,9 +2160,13 @@ fn exo_run_tool_definition() -> JsonValue {
                             "type": "boolean",
                             "const": true,
                             "description": "Must be true to replay a confirmed command."
+                        },
+                        "requestId": {
+                            "type": "string",
+                            "description": "Original request identity returned by the confirm_required response."
                         }
                     },
-                    "required": ["ticket", "confirm"],
+                    "required": ["ticket", "confirm", "requestId"],
                     "additionalProperties": false
                 }
             },
@@ -2155,6 +2185,7 @@ mod tests {
         ExoRunInput {
             command: command.to_string(),
             args: Vec::new(),
+            content: None,
             workflow_confirmation: None,
             auth: None,
         }
@@ -2461,6 +2492,7 @@ mod tests {
         let exo_input = ExoRunInput {
             command: "task complete my-task --log $1".to_string(),
             args: vec!["Implemented\nwith details".to_string()],
+            content: None,
             workflow_confirmation: None,
             auth: None,
         };
@@ -2481,10 +2513,41 @@ mod tests {
     }
 
     #[test]
+    fn root_write_carries_separate_mcp_content() {
+        let mut exo_input = input("write notes.md");
+        exo_input.content = Some("Hello from MCP\n".to_string());
+
+        let request = build_exo_run_request(exo_input, "t1".to_string()).expect("request");
+        match request.op {
+            Op::Call(params) => {
+                assert_eq!(
+                    params.address,
+                    Address::Operation {
+                        path: vec!["write".to_string()]
+                    }
+                );
+                assert_eq!(params.input["path"], "notes.md");
+                assert_eq!(
+                    params.input["__exo_transport"]["content"],
+                    "Hello from MCP\n"
+                );
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+
+        let definition = exo_run_tool_definition();
+        assert_eq!(
+            definition["inputSchema"]["properties"]["content"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn maps_workflow_confirmation_to_machine_channel_shape() {
         let exo_input = ExoRunInput {
             command: "task complete my-task --log Done".to_string(),
             args: Vec::new(),
+            content: None,
             workflow_confirmation: Some(McpWorkflowConfirmationInput {
                 kind: "workflow_completion_confirmation".to_string(),
                 entity_type: "task".to_string(),
@@ -2691,6 +2754,7 @@ mod tests {
         let structured = structured(&result);
         assert_eq!(structured["status"], "ok");
         assert_eq!(structured["ticket"], "secret-ticket");
+        assert_eq!(structured["auth"]["requestId"], "t1");
         assert!(structured["display"]["body"].is_null());
         assert_eq!(structured["result"]["kind"], "task.list");
         assert!(structured["trace"].is_null());

@@ -218,8 +218,13 @@ async function handleConfirmationIfNeeded(
 
   const confirmedRequest: MachineChannelRequestEnvelope = {
     ...request,
-    id: `vscode.lmtool.confirm.${randomUUID()}`,
-    auth: { ticket: response.ticket, confirm: true },
+    id: response.id,
+    auth: {
+      ticket: response.ticket,
+      confirm: true,
+      requestId: response.id,
+      workspaceRoot: rootPath,
+    },
   };
 
   return exoMachineChannel(rootPath, confirmedRequest);

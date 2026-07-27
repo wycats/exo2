@@ -420,8 +420,10 @@ fn task_subprocess_receives_direct_mode_env(backend: &str) {
     let root = create_test_workspace(&dir, backend);
     append_task(&root, "print-direct-env", &task_print_direct_mode_command());
 
-    let request =
-        test_support::confirmed_machine_channel_request(run_task_request("print-direct-env"));
+    let request = test_support::confirmed_machine_channel_request(
+        run_task_request("print-direct-env"),
+        &root,
+    );
     let response = test_support::run_machine_channel_in_process(&root, &request);
 
     assert_eq!(response.status, Status::Ok);
@@ -452,7 +454,7 @@ async fn nested_exo_in_task_completes_without_daemon_deadlock(backend: &str) {
     );
 
     let request =
-        test_support::confirmed_machine_channel_request(run_task_request("nested-status"));
+        test_support::confirmed_machine_channel_request(run_task_request("nested-status"), &root);
     let response = send_daemon_request_with_timeout(&root, &request).await;
 
     assert_eq!(
@@ -677,7 +679,7 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
     let _guard = DaemonProcessGuard::new(daemon);
 
     let run_request =
-        test_support::confirmed_machine_channel_request(run_task_request("slow-build"));
+        test_support::confirmed_machine_channel_request(run_task_request("slow-build"), &root);
     let run_endpoint = endpoint.clone();
     let run_handle = tokio::spawn(async move {
         send_socket_request_with_timeout(&run_endpoint, &run_request, Duration::from_secs(45)).await

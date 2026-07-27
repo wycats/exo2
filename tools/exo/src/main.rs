@@ -30,7 +30,7 @@ use exo::project::Project;
 use exo::{command, context::AgentContext};
 use serde::Deserialize;
 use std::fmt::Write;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -522,6 +522,7 @@ fn dispatch_via_daemon_with_prompter(
 
     let mut args = args.to_vec();
     let mut workflow_confirmation = workflow_confirmation;
+    let mut write_content = None;
     let spec = exo::command::command_spec::CommandSpec::from_registry(
         &exo::command::registry::default_registry(),
     );
@@ -549,6 +550,24 @@ fn dispatch_via_daemon_with_prompter(
                 serde_json::json!({ "home": std::env::var("HOME").ok() }),
             );
         }
+        if invocation.namespace().is_empty() && invocation.operation() == "write" {
+            if write_content.is_none() {
+                let mut content = String::new();
+                if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+                    eprintln!("Failed to read write content from stdin: {error}");
+                    return 1;
+                }
+                write_content = Some(content);
+            }
+            if let Some(input) = input.as_object_mut()
+                && let Some(content) = write_content.as_deref()
+            {
+                input.insert(
+                    "__exo_transport".to_string(),
+                    serde_json::json!({ "content": content }),
+                );
+            }
+        }
         let op = Op::Call(CallParams {
             address: address.clone(),
             input: input.clone(),
@@ -556,14 +575,17 @@ fn dispatch_via_daemon_with_prompter(
         let effect = spec
             .operation(invocation.namespace(), invocation.operation())
             .map_or(Effect::Pure, |operation| operation.effect);
+        let request_id = generate_request_id();
         let request = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            id: generate_request_id(),
+            id: request_id.clone(),
             op,
             workspace_root: Some(daemon_workspace.clone()),
             auth: (effect == Effect::Exec).then(|| Auth {
-                ticket: ticket_for_exec_call(&address, &input),
+                ticket: ticket_for_exec_call(&address, &input, &daemon_workspace, &request_id),
                 confirm: true,
+                request_id: Some(request_id),
+                workspace_root: Some(daemon_workspace.clone()),
             }),
             workflow_confirmation: workflow_confirmation.clone(),
             agent_id: None,

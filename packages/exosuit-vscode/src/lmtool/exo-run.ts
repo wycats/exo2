@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import { exoMachineChannel } from "../agent/lmtool/machineChannel";
 import { getLogger } from "../logging";
-import { getOperation, getRootOperation } from "./command-spec.types";
+import type { ArgSpec } from "./command-spec.types";
 import {
   MACHINE_CHANNEL_PROTOCOL_VERSION,
   WORKFLOW_COMPLETION_CONFIRMATION_KIND,
@@ -12,11 +12,19 @@ import {
   type MachineChannelResponseEnvelope,
   type WorkflowCompletionConfirmation,
 } from "../types/machineChannel";
-import { selectCurrentWorkspaceRoot } from "../workspaceRoot";
+import { selectCurrentLmToolWorkspaceRoot } from "../workspaceRoot";
 
 export interface ExoRunInput {
   command: string;
   args?: string[];
+  workspaceRoot?: string;
+  content?: string;
+  auth?: {
+    ticket: string;
+    confirm: true;
+    requestId: string;
+    workspaceRoot: string;
+  };
   workflowConfirmation?: {
     kind: string;
     entityType: string;
@@ -33,7 +41,6 @@ export interface ExoRunInput {
 const OUTCOME_REVIEW_CONFIRMATION_ALIAS = "outcome_review";
 
 const logger = getLogger("lmtool");
-const ROOT_COMMANDS = new Set(["status", "version"]);
 
 /**
  * Extract agent session identity from the tool invocation token.
@@ -168,22 +175,7 @@ function substitutePlaceholders(tokens: string[], args: string[]): string[] {
   });
 }
 
-function buildHelpRequest(path: string[]): MachineChannelRequestEnvelope {
-  let address: MachineChannelAddress;
-
-  if (path.length === 0) {
-    address = { kind: "root" };
-  } else if (path.length === 1) {
-    address = getRootOperation(path[0])
-      ? { kind: "operation", path }
-      : { kind: "namespace", path };
-  } else {
-    address = {
-      kind: "operation",
-      path: [path[0], path.slice(1).join(".")],
-    };
-  }
-
+function helpRequest(address: MachineChannelAddress): MachineChannelRequestEnvelope {
   return {
     protocol_version: MACHINE_CHANNEL_PROTOCOL_VERSION,
     id: `vscode.lmtool.exo-run.help.${randomUUID()}`,
@@ -194,39 +186,249 @@ function buildHelpRequest(path: string[]): MachineChannelRequestEnvelope {
   };
 }
 
-function parseTokens(tokens: string[]): {
-  namespace: string;
-  operation: string;
+type RuntimeHelpOperation = {
+  path: string;
+  args?: ArgSpec[];
+};
+
+type RuntimeHelpResult = {
+  namespaces?: Array<{ path: string[] }>;
+  operations?: RuntimeHelpOperation[];
+};
+
+function runtimeHelpResult(
+  response: MachineChannelResponseEnvelope,
+): RuntimeHelpResult {
+  if (
+    response.status !== "ok" ||
+    !response.result ||
+    typeof response.result !== "object"
+  ) {
+    const message = response.error?.message ?? "Active Exo help is unavailable";
+    throw new Error(message);
+  }
+  return response.result as RuntimeHelpResult;
+}
+
+async function requestRuntimeHelp(
+  rootPath: string,
+  address: MachineChannelAddress,
+): Promise<RuntimeHelpResult> {
+  return runtimeHelpResult(
+    await exoMachineChannel(rootPath, helpRequest(address)),
+  );
+}
+
+function operationNameFromHelp(
+  namespace: string,
+  operation: RuntimeHelpOperation,
+): string | undefined {
+  if (namespace.length === 0) {
+    return operation.path;
+  }
+  const prefix = `${namespace} `;
+  return operation.path.startsWith(prefix)
+    ? operation.path.slice(prefix.length)
+    : undefined;
+}
+
+function matchRuntimeOperation(
+  namespace: string,
+  tokens: string[],
+  operations: RuntimeHelpOperation[],
+): {
+  path: string[];
+  args: ArgSpec[];
+  argumentStart: number;
+} | undefined {
+  const matches: Array<{
+    operationName: string;
+    operation: RuntimeHelpOperation;
+    argumentStart: number;
+    segmentCount: number;
+  }> = [];
+
+  for (const operation of operations) {
+    const operationName = operationNameFromHelp(namespace, operation);
+    if (!operationName) {
+      continue;
+    }
+    const operationStart = namespace.length === 0 ? 0 : 1;
+    if (tokens[operationStart] === operationName) {
+      matches.push({
+        operationName,
+        operation,
+        argumentStart: operationStart + 1,
+        segmentCount: operationName.split(".").length,
+      });
+    }
+
+    const segments = operationName.split(".");
+    if (
+      segments.length > 1 &&
+      segments.every(
+        (segment, index) => tokens[index + operationStart] === segment,
+      )
+    ) {
+      matches.push({
+        operationName,
+        operation,
+        argumentStart: segments.length + operationStart,
+        segmentCount: segments.length,
+      });
+    }
+  }
+
+  const match = matches.sort(
+    (left, right) =>
+      right.segmentCount - left.segmentCount ||
+      right.argumentStart - left.argumentStart,
+  )[0];
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    path:
+      namespace.length === 0
+        ? [match.operationName]
+        : [namespace, match.operationName],
+    args: match.operation.args ?? [],
+    argumentStart: match.argumentStart,
+  };
+}
+
+async function resolveOperation(
+  rootPath: string,
+  tokens: string[],
+): Promise<{
+  path: string[];
+  args: ArgSpec[];
+  argumentStart: number;
+}> {
+  const rootHelp = await requestRuntimeHelp(rootPath, { kind: "root" });
+  const rootMatch = matchRuntimeOperation(
+    "",
+    tokens,
+    rootHelp.operations ?? [],
+  );
+  if (rootMatch?.path[0] === tokens[0]) {
+    return rootMatch;
+  }
+
+  const namespace = rootHelp.namespaces?.find(
+    ({ path }) => path.length === 1 && path[0] === tokens[0],
+  );
+  if (!namespace) {
+    throw new Error(`Unknown command or namespace '${tokens[0]}'`);
+  }
+  if (tokens.length === 1) {
+    throw new Error(
+      `'${tokens[0]}' is a command namespace; try: help ${tokens[0]}`,
+    );
+  }
+
+  const namespaceHelp = await requestRuntimeHelp(rootPath, {
+    kind: "namespace",
+    path: namespace.path,
+  });
+  const match = matchRuntimeOperation(
+    tokens[0],
+    tokens,
+    namespaceHelp.operations ?? [],
+  );
+  if (!match) {
+    throw new Error(
+      `Unknown operation for namespace '${tokens[0]}': '${tokens[1]}'`,
+    );
+  }
+  return match;
+}
+
+async function resolveHelpAddress(
+  rootPath: string,
+  path: string[],
+): Promise<MachineChannelAddress> {
+  if (path.length === 0) {
+    return { kind: "root" };
+  }
+
+  const rootHelp = await requestRuntimeHelp(rootPath, { kind: "root" });
+  if (
+    path.length === 1 &&
+    rootHelp.operations?.some((operation) => operation.path === path[0])
+  ) {
+    return { kind: "operation", path: [path[0]] };
+  }
+
+  const namespace = rootHelp.namespaces?.find(
+    (candidate) => candidate.path.length === 1 && candidate.path[0] === path[0],
+  );
+  if (!namespace) {
+    throw new Error(`Unknown command or namespace '${path[0]}'`);
+  }
+  if (path.length === 1) {
+    return { kind: "namespace", path: namespace.path };
+  }
+
+  const namespaceHelp = await requestRuntimeHelp(rootPath, {
+    kind: "namespace",
+    path: namespace.path,
+  });
+  const match = matchRuntimeOperation(
+    path[0],
+    path,
+    namespaceHelp.operations ?? [],
+  );
+  if (!match || match.argumentStart !== path.length) {
+    throw new Error(
+      `Unknown help target '${path.join(" ")}'`,
+    );
+  }
+  return { kind: "operation", path: match.path };
+}
+
+async function buildHelpRequest(
+  rootPath: string,
+  path: string[],
+): Promise<MachineChannelRequestEnvelope> {
+  return helpRequest(await resolveHelpAddress(rootPath, path));
+}
+
+async function parseTokens(
+  rootPath: string,
+  tokens: string[],
+): Promise<{
+  path: string[];
   args: Record<string, unknown>;
-} {
+}> {
   if (tokens.length === 0) {
     throw new Error("Empty command");
   }
 
-  const first = tokens[0];
-  let namespace = "";
-  let operation = "";
-  let index = 0;
-
-  if (tokens.length === 1) {
-    operation = first;
-    index = 1;
-  } else if (first.startsWith("-")) {
+  if (tokens[0].startsWith("-")) {
     throw new Error("Empty command");
-  } else if (ROOT_COMMANDS.has(first)) {
-    operation = first;
-    index = 1;
-  } else if (tokens[1].startsWith("-")) {
-    operation = first;
-    index = 1;
-  } else {
-    namespace = first;
-    operation = tokens[1];
-    index = 2;
   }
 
+  const resolved = await resolveOperation(rootPath, tokens);
+  let index = resolved.argumentStart;
   const args: Record<string, unknown> = {};
   const positional: string[] = [];
+
+  const parseArgumentValue = (
+    argSpec: ArgSpec | undefined,
+    value: string,
+  ): unknown => {
+    if (argSpec?.value_type !== "json") {
+      return value;
+    }
+
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  };
 
   while (index < tokens.length) {
     const token = tokens[index];
@@ -234,34 +436,47 @@ function parseTokens(tokens: string[]): {
     if (token.startsWith("--") && token.length > 2) {
       const flag = token.slice(2);
       const equalsIndex = flag.indexOf("=");
+      const name = equalsIndex >= 0 ? flag.slice(0, equalsIndex) : flag;
+      const argSpec = resolved.args.find(
+        (arg) => arg.id === name || arg.name === name,
+      );
+      if (!argSpec) {
+        throw new Error(`Unknown argument '--${name}'`);
+      }
+
       if (equalsIndex >= 0) {
-        const name = flag.slice(0, equalsIndex);
         const value = flag.slice(equalsIndex + 1);
-        args[name] = value;
+        args[argSpec.id] = parseArgumentValue(argSpec, value);
+      } else if (argSpec.kind === "flag") {
+        args[argSpec.id] = true;
       } else {
         const next = tokens[index + 1];
         if (next === undefined) {
-          throw new Error(`Flag '${flag}' requires a value`);
+          throw new Error(`Argument '--${name}' requires a value`);
         }
-        if (next.startsWith("-")) {
-          args[flag] = true;
-        } else {
-          args[flag] = next;
-          index += 1;
-        }
+        args[argSpec.id] = parseArgumentValue(argSpec, next);
+        index += 1;
       }
     } else if (token.startsWith("-") && token.length > 1) {
       const flag = token.slice(1);
+      const argSpec = resolved.args.find(
+        (arg) => arg.short === flag,
+      );
+      if (!argSpec) {
+        throw new Error(`Unknown argument '-${flag}'`);
+      }
+      if (argSpec.kind === "flag") {
+        args[argSpec.id] = true;
+        index += 1;
+        continue;
+      }
+
       const next = tokens[index + 1];
       if (next === undefined) {
-        throw new Error(`Flag '${flag}' requires a value`);
+        throw new Error(`Argument '-${flag}' requires a value`);
       }
-      if (next.startsWith("-")) {
-        args[flag] = true;
-      } else {
-        args[flag] = next;
-        index += 1;
-      }
+      args[argSpec.id] = parseArgumentValue(argSpec, next);
+      index += 1;
     } else {
       positional.push(token);
     }
@@ -273,30 +488,45 @@ function parseTokens(tokens: string[]): {
   // Previously hardcoded as "id" and "label", which broke any operation
   // where the positional arg has a different name (e.g., "title" for idea add).
   if (positional.length > 0) {
-    const opSpec = namespace ? getOperation(namespace, operation) : undefined;
-    const positionalSpecs =
-      opSpec?.args.filter((a) => a.kind === "positional") ?? [];
+    const positionalSpecs = resolved.args.filter(
+      (arg) => arg.kind === "positional",
+    );
 
     for (let i = 0; i < positional.length; i++) {
-      const argName = positionalSpecs[i]?.id ?? (i === 0 ? "id" : "label");
-      args[argName] = positional[i];
+      const argSpec = positionalSpecs[i];
+      const argName = argSpec?.id ?? (i === 0 ? "id" : "label");
+      args[argName] = parseArgumentValue(argSpec, positional[i]);
     }
   }
 
-  return { namespace, operation, args };
+  return { path: resolved.path, args };
 }
 
-function buildCallRequest(
+async function buildCallRequest(
+  rootPath: string,
   tokens: string[],
   agentId?: string,
   workflowConfirmation?: ExoRunInput["workflowConfirmation"],
-): MachineChannelRequestEnvelope {
-  const { namespace, operation, args } = parseTokens(tokens);
-  const path = namespace ? [namespace, operation] : [operation];
+  auth?: ExoRunInput["auth"],
+  content?: string,
+): Promise<MachineChannelRequestEnvelope> {
+  const { path, args } = await parseTokens(rootPath, tokens);
+  const isRootWrite = path.length === 1 && path[0] === "write";
+  if (isRootWrite && content === undefined) {
+    throw new Error(
+      "Root write requires the exo-run content field; use args for placeholders inside the command.",
+    );
+  }
+  if (!isRootWrite && content !== undefined) {
+    throw new Error("The exo-run content field is only valid for root write");
+  }
+  if (isRootWrite) {
+    args.__exo_transport = { content };
+  }
 
   const request: MachineChannelRequestEnvelope = {
     protocol_version: MACHINE_CHANNEL_PROTOCOL_VERSION,
-    id: `vscode.lmtool.exo-run.call.${randomUUID()}`,
+    id: auth?.requestId ?? `vscode.lmtool.exo-run.call.${randomUUID()}`,
     op: {
       kind: "call",
       params: {
@@ -306,6 +536,14 @@ function buildCallRequest(
     },
     agent_id: agentId,
   };
+
+  if (auth) {
+    request.auth = {
+      ticket: auth.ticket,
+      confirm: auth.confirm,
+      requestId: auth.requestId,
+    };
+  }
 
   if (workflowConfirmation) {
     request.workflow_confirmation = {
@@ -330,9 +568,11 @@ export function normalizeWorkflowConfirmationKind(
   return WORKFLOW_COMPLETION_CONFIRMATION_KIND;
 }
 
-function buildPreviewRequest(tokens: string[]): MachineChannelRequestEnvelope {
-  const { namespace, operation, args } = parseTokens(tokens);
-  const path = namespace ? [namespace, operation] : [operation];
+async function buildPreviewRequest(
+  rootPath: string,
+  tokens: string[],
+): Promise<MachineChannelRequestEnvelope> {
+  const { path, args } = await parseTokens(rootPath, tokens);
 
   return {
     protocol_version: MACHINE_CHANNEL_PROTOCOL_VERSION,
@@ -347,20 +587,30 @@ function buildPreviewRequest(tokens: string[]): MachineChannelRequestEnvelope {
   };
 }
 
-function routeCommand(
+async function routeCommand(
+  rootPath: string,
   tokens: string[],
   agentId?: string,
   workflowConfirmation?: ExoRunInput["workflowConfirmation"],
-): MachineChannelRequestEnvelope {
+  auth?: ExoRunInput["auth"],
+  content?: string,
+): Promise<MachineChannelRequestEnvelope> {
   if (tokens.length === 0) {
     throw new Error("Empty command");
   }
 
   if (tokens[0] === "help") {
-    return buildHelpRequest(tokens.slice(1));
+    return buildHelpRequest(rootPath, tokens.slice(1));
   }
 
-  return buildCallRequest(tokens, agentId, workflowConfirmation);
+  return buildCallRequest(
+    rootPath,
+    tokens,
+    agentId,
+    workflowConfirmation,
+    auth,
+    content,
+  );
 }
 
 // ── Response Formatting ──────────────────────────────────────────────
@@ -764,6 +1014,7 @@ export function formatErrorResponse(response: MachineChannelResponseEnvelope): {
 export function formatMachineChannelResponse(
   response: MachineChannelResponseEnvelope,
   isHelp: boolean,
+  workspaceRoot: string,
 ): vscode.LanguageModelToolResult {
   if (response.status === "ok") {
     let text: string;
@@ -789,36 +1040,38 @@ export function formatMachineChannelResponse(
         reminders.map((r) => `- [${r.severity}] ${r.message}`).join("\n");
     }
 
-    // Pass through full steering data when present
+    // Pass through full steering data when present.
     const steering = response.steering;
-    let steeringPart: vscode.LanguageModelDataPart | undefined;
-
-    if (steering) {
-      if (typeof vscode.LanguageModelDataPart?.json === "function") {
-        steeringPart = vscode.LanguageModelDataPart.json(steering);
-      } else {
-        // Fallback: append as JSON code block if data parts unavailable
-        const steeringJson = JSON.stringify(steering, null, 2);
-        text += `\n\n---\nSteering JSON:\n\`\`\`json\n${steeringJson}\n\`\`\``;
-      }
-    }
+    const steeringPart = steering
+      ? vscode.LanguageModelDataPart.json(steering)
+      : undefined;
 
     return textResult(text, steeringPart);
   }
 
-  const { text, workflowConfirmation } = formatErrorResponse(response);
-  let workflowPart: vscode.LanguageModelDataPart | undefined;
-  if (
-    workflowConfirmation &&
-    typeof vscode.LanguageModelDataPart?.json === "function"
-  ) {
-    workflowPart = vscode.LanguageModelDataPart.json({
-      workflow_confirmation: workflowConfirmation,
-      workflowConfirmation: workflowConfirmation.completion_input
-        ? toExoRunWorkflowConfirmation(workflowConfirmation.completion_input)
-        : undefined,
+  if (response.status === "confirm_required" && response.ticket) {
+    const text =
+      "Execution confirmation required.\n\nAsk the human whether to approve this action. If they approve, continue with the confirmed action.";
+    const authPart = vscode.LanguageModelDataPart.json({
+      auth: {
+        ticket: response.ticket,
+        confirm: true,
+        requestId: response.id,
+        workspaceRoot,
+      },
     });
+    return textResult(text, authPart);
   }
+
+  const { text, workflowConfirmation } = formatErrorResponse(response);
+  const workflowPart = workflowConfirmation
+    ? vscode.LanguageModelDataPart.json({
+        workflow_confirmation: workflowConfirmation,
+        workflowConfirmation: workflowConfirmation.completion_input
+          ? toExoRunWorkflowConfirmation(workflowConfirmation.completion_input)
+          : undefined,
+      })
+    : undefined;
   return textResult(text, workflowPart);
 }
 
@@ -842,7 +1095,9 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return { invocationMessage: fallbackMessage };
       }
 
-      const rootPath = selectCurrentWorkspaceRoot().rootPath;
+      const rootPath = (
+        await selectCurrentLmToolWorkspaceRoot(options.input?.workspaceRoot)
+      ).rootPath;
       if (!rootPath) {
         return { invocationMessage: fallbackMessage };
       }
@@ -857,7 +1112,7 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
           tokens,
           options.input?.args ?? [],
         );
-        const request = buildPreviewRequest(substituted);
+        const request = await buildPreviewRequest(rootPath, substituted);
 
         logger.debug(`[exo-run] Requesting preview for: ${command}`);
         const response = await exoMachineChannel(rootPath, request);
@@ -914,11 +1169,18 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return errorResult("Missing command string");
       }
 
-      const workspaceSelection = selectCurrentWorkspaceRoot();
+      const workspaceSelection = await selectCurrentLmToolWorkspaceRoot(
+        input.workspaceRoot ?? input.auth?.workspaceRoot,
+      );
       const rootPath = workspaceSelection.rootPath;
       if (!rootPath) {
         return errorResult(
           `No usable Exosuit workspace root: ${workspaceSelection.reason}`,
+        );
+      }
+      if (input.auth && input.auth.workspaceRoot !== rootPath) {
+        return errorResult(
+          "Execution approval belongs to a different workspace; request confirmation again for the selected workspace.",
         );
       }
 
@@ -930,10 +1192,13 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
 
         const agentId = extractAgentId(options.toolInvocationToken);
         const substituted = substitutePlaceholders(tokens, input.args ?? []);
-        const request = routeCommand(
+        const request = await routeCommand(
+          rootPath,
           substituted,
           agentId,
           input.workflowConfirmation,
+          input.auth,
+          input.content,
         );
 
         logger.debug(
@@ -942,7 +1207,7 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
 
         const response = await exoMachineChannel(rootPath, request);
         const isHelp = request.op.kind === "help";
-        return formatMachineChannelResponse(response, isHelp);
+        return formatMachineChannelResponse(response, isHelp, rootPath);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return errorResult(message);

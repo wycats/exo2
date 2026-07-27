@@ -16,7 +16,9 @@ use crate::command::command_spec::CommandSpec as NewCommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::{DiagnosticCode, Invocation, RoutingDiagnostic};
 use crate::command::traits::{CommandInvokeResult, invoke_command_box_json};
-use crate::command::transport::{MachineChannelTransport, ticket_for_exec_call};
+use crate::command::transport::{
+    MachineChannelTransport, compatible_exec_ticket_request_id, ticket_for_exec_call,
+};
 use crate::daemon::DaemonEnsureState;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, effect_name, elapsed_ms, request_op_path, response_status,
@@ -143,27 +145,52 @@ fn make_display(
     })
 }
 
-fn split_update_transport_input(
+#[derive(Default)]
+struct RequestTransportInput {
+    caller_home: Option<Option<std::path::PathBuf>>,
+    input_content: Option<String>,
+}
+
+fn split_request_transport_input(
     namespace: &str,
     operation: &str,
     input: &JsonValue,
-) -> (JsonValue, Option<Option<std::path::PathBuf>>) {
+) -> (JsonValue, RequestTransportInput) {
     let mut command_input = input.clone();
-    if !namespace.is_empty() || operation != "update" {
-        return (command_input, None);
+    let supports_transport_input = namespace.is_empty() && matches!(operation, "update" | "write");
+    if !supports_transport_input {
+        return (command_input, RequestTransportInput::default());
     }
 
     let transport = command_input
         .as_object_mut()
         .and_then(|input| input.remove("__exo_transport"));
     let Some(transport) = transport else {
-        return (command_input, None);
+        return (command_input, RequestTransportInput::default());
     };
-    let home = transport
-        .get("home")
-        .and_then(JsonValue::as_str)
-        .map(std::path::PathBuf::from);
-    (command_input, Some(home))
+
+    let caller_home = (operation == "update").then(|| {
+        transport
+            .get("home")
+            .and_then(JsonValue::as_str)
+            .map(std::path::PathBuf::from)
+    });
+    let input_content = (operation == "write")
+        .then(|| {
+            transport
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .map(String::from)
+        })
+        .flatten();
+
+    (
+        command_input,
+        RequestTransportInput {
+            caller_home,
+            input_content,
+        },
+    )
 }
 
 /// Generate a summary from the result data when no human message is available.
@@ -2001,8 +2028,21 @@ fn handle_call_with_namespace_operation(
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
 ) -> ResponseEnvelope {
-    let (command_input, caller_home) =
-        split_update_transport_input(namespace, operation, &params.input);
+    let (command_input, transport_input) =
+        split_request_transport_input(namespace, operation, &params.input);
+    if namespace.is_empty() && operation == "write" && transport_input.input_content.is_none() {
+        return error(
+            id,
+            ErrorCode::MissingArg,
+            "Machine-channel write requires explicit content".to_string(),
+            Some(json!({
+                "argument": "content",
+                "mutation_performed": false,
+                "safe_next": "provide the write content through the transport content field"
+            })),
+            steer_help_root(),
+        );
+    }
     // Build the new CommandSpec from registry for Invocation::from_json
     let registry = default_registry();
     let new_spec = NewCommandSpec::from_registry(&registry);
@@ -2106,7 +2146,23 @@ fn handle_call_with_namespace_operation(
                 return command_construction_error_to_response(id, error);
             }
 
-            let expected_ticket = ticket_for_exec_call(&params.address, &params.input);
+            let ticket_request_id = auth
+                .as_ref()
+                .filter(|auth| auth.confirm && auth.request_id.is_none())
+                .and_then(|auth| {
+                    compatible_exec_ticket_request_id(
+                        &params.address,
+                        &params.input,
+                        workspace_root,
+                        &auth.ticket,
+                    )
+                });
+            let expected_ticket = ticket_for_exec_call(
+                &params.address,
+                &params.input,
+                workspace_root,
+                ticket_request_id.as_deref().unwrap_or(&id),
+            );
             let agent_id_for_log = agent_id.as_deref().map(String::from);
             let transport = MachineChannelTransport {
                 workspace_root,
@@ -2116,6 +2172,7 @@ fn handle_call_with_namespace_operation(
                 expected_ticket: Some(expected_ticket),
                 agent_id,
                 workflow_confirmation,
+                input_content: transport_input.input_content,
             };
 
             diagnostics.record(
@@ -2146,10 +2203,10 @@ fn handle_call_with_namespace_operation(
                 "request.invoke_start",
                 json!({ "namespace": namespace, "operation": operation }),
             );
-            let invoke_result =
-                crate::templates::with_global_prompts_home_override(caller_home, || {
-                    invoke_command_box_json(&cmd_box, &transport)
-                });
+            let invoke_result = crate::templates::with_global_prompts_home_override(
+                transport_input.caller_home,
+                || invoke_command_box_json(&cmd_box, &transport),
+            );
             match invoke_result {
                 Ok(invoke_result) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
@@ -2275,7 +2332,13 @@ fn handle_call_with_namespace_operation(
                             "elapsed_ms": elapsed_ms(start.elapsed()),
                         }),
                     );
-                    command_error_to_response(id, error_response, &params.address, &params.input)
+                    command_error_to_response(
+                        workspace_root,
+                        id,
+                        error_response,
+                        &params.address,
+                        &params.input,
+                    )
                 }
             }
         }
@@ -2444,6 +2507,7 @@ fn handle_list(
             expected_ticket: None,
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         };
 
         return match cmd.invoke_json(&input, &transport) {
@@ -2463,9 +2527,13 @@ fn handle_list(
                     make_display(workspace_root, namespace, operation, &input, &invoke_result);
                 ok_with_steering(id, invoke_result.data, steering, display)
             }
-            Err(error_response) => {
-                command_error_to_response(id, error_response, &params.address, &input)
-            }
+            Err(error_response) => command_error_to_response(
+                workspace_root,
+                id,
+                error_response,
+                &params.address,
+                &input,
+            ),
         };
     }
 
@@ -2570,6 +2638,7 @@ fn error(
 }
 
 fn command_error_to_response(
+    workspace_root: &Path,
     id: String,
     error_response: JsonValue,
     address: &Address,
@@ -2580,7 +2649,7 @@ fn command_error_to_response(
             .get("ticket")
             .and_then(JsonValue::as_str)
             .map_or_else(
-                || ticket_for_exec_call(address, input),
+                || ticket_for_exec_call(address, input, workspace_root, &id),
                 std::string::ToString::to_string,
             );
 
@@ -2905,6 +2974,20 @@ mod tests {
     use crate::api::protocol::{HelpParams, Op, RequestEnvelope};
     use crate::command_reference::ExoCommandReference;
     use crate::steering::{SuggestedAction, WorkIntent};
+
+    #[test]
+    fn write_transport_content_is_separate_from_command_arguments() {
+        let input = json!({
+            "path": "notes.md",
+            "__exo_transport": { "content": "Hello\n" }
+        });
+
+        let (command_input, transport_input) = split_request_transport_input("", "write", &input);
+
+        assert_eq!(command_input, json!({ "path": "notes.md" }));
+        assert_eq!(transport_input.input_content.as_deref(), Some("Hello\n"));
+        assert!(transport_input.caller_home.is_none());
+    }
 
     #[test]
     fn update_display_renders_detailed_human_report_from_machine_data() {
