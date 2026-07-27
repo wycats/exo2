@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 
 import { exoMachineChannel } from "../agent/lmtool/machineChannel";
 import { getLogger } from "../logging";
-import { getOperation, getRootOperation } from "./command-spec.types";
+import {
+  getNamespace,
+  getRootOperation,
+  type OperationSpec,
+} from "./command-spec.types";
 import {
   MACHINE_CHANNEL_PROTOCOL_VERSION,
   WORKFLOW_COMPLETION_CONFIRMATION_KIND,
@@ -12,11 +16,16 @@ import {
   type MachineChannelResponseEnvelope,
   type WorkflowCompletionConfirmation,
 } from "../types/machineChannel";
-import { selectCurrentWorkspaceRoot } from "../workspaceRoot";
+import { selectCurrentLmToolWorkspaceRoot } from "../workspaceRoot";
 
 export interface ExoRunInput {
   command: string;
   args?: string[];
+  workspaceRoot?: string;
+  auth?: {
+    ticket: string;
+    confirm: true;
+  };
   workflowConfirmation?: {
     kind: string;
     entityType: string;
@@ -33,7 +42,6 @@ export interface ExoRunInput {
 const OUTCOME_REVIEW_CONFIRMATION_ALIAS = "outcome_review";
 
 const logger = getLogger("lmtool");
-const ROOT_COMMANDS = new Set(["status", "version"]);
 
 /**
  * Extract agent session identity from the tool invocation token.
@@ -194,37 +202,95 @@ function buildHelpRequest(path: string[]): MachineChannelRequestEnvelope {
   };
 }
 
+function resolveOperation(tokens: string[]): {
+  path: string[];
+  operation: OperationSpec;
+  argumentStart: number;
+} {
+  const rootOperation = getRootOperation(tokens[0]);
+  if (rootOperation) {
+    return {
+      path: [tokens[0]],
+      operation: rootOperation,
+      argumentStart: 1,
+    };
+  }
+
+  const namespace = getNamespace(tokens[0]);
+  if (!namespace) {
+    throw new Error(`Unknown command or namespace '${tokens[0]}'`);
+  }
+  if (tokens.length === 1) {
+    throw new Error(
+      `'${tokens[0]}' is a command namespace; try: help ${tokens[0]}`,
+    );
+  }
+
+  const matches: Array<{
+    operationName: string;
+    operation: OperationSpec;
+    argumentStart: number;
+    segmentCount: number;
+  }> = [];
+
+  for (const [operationName, operation] of Object.entries(
+    namespace.operations,
+  )) {
+    if (tokens[1] === operationName) {
+      matches.push({
+        operationName,
+        operation,
+        argumentStart: 2,
+        segmentCount: operationName.split(".").length,
+      });
+    }
+
+    const segments = operationName.split(".");
+    if (
+      segments.length > 1 &&
+      segments.every((segment, index) => tokens[index + 1] === segment)
+    ) {
+      matches.push({
+        operationName,
+        operation,
+        argumentStart: segments.length + 1,
+        segmentCount: segments.length,
+      });
+    }
+  }
+
+  const match = matches.sort(
+    (left, right) =>
+      right.segmentCount - left.segmentCount ||
+      right.argumentStart - left.argumentStart,
+  )[0];
+  if (!match) {
+    throw new Error(
+      `Unknown operation for namespace '${tokens[0]}': '${tokens[1]}'`,
+    );
+  }
+
+  return {
+    path: [tokens[0], match.operationName],
+    operation: match.operation,
+    argumentStart: match.argumentStart,
+  };
+}
+
 function parseTokens(tokens: string[]): {
-  namespace: string;
-  operation: string;
+  path: string[];
   args: Record<string, unknown>;
 } {
   if (tokens.length === 0) {
     throw new Error("Empty command");
   }
 
-  const first = tokens[0];
-  let namespace = "";
-  let operation = "";
-  let index = 0;
-
-  if (tokens.length === 1) {
-    operation = first;
-    index = 1;
-  } else if (first.startsWith("-")) {
+  if (tokens[0].startsWith("-")) {
     throw new Error("Empty command");
-  } else if (ROOT_COMMANDS.has(first)) {
-    operation = first;
-    index = 1;
-  } else if (tokens[1].startsWith("-")) {
-    operation = first;
-    index = 1;
-  } else {
-    namespace = first;
-    operation = tokens[1];
-    index = 2;
   }
 
+  const resolved = resolveOperation(tokens);
+  let index = resolved.argumentStart;
   const args: Record<string, unknown> = {};
   const positional: string[] = [];
 
@@ -234,34 +300,47 @@ function parseTokens(tokens: string[]): {
     if (token.startsWith("--") && token.length > 2) {
       const flag = token.slice(2);
       const equalsIndex = flag.indexOf("=");
+      const name = equalsIndex >= 0 ? flag.slice(0, equalsIndex) : flag;
+      const argSpec = resolved.operation.args.find(
+        (arg) => arg.id === name || arg.name === name,
+      );
+      if (!argSpec) {
+        throw new Error(`Unknown argument '--${name}'`);
+      }
+
       if (equalsIndex >= 0) {
-        const name = flag.slice(0, equalsIndex);
         const value = flag.slice(equalsIndex + 1);
-        args[name] = value;
+        args[argSpec.id] = value;
+      } else if (argSpec.kind === "flag") {
+        args[argSpec.id] = true;
       } else {
         const next = tokens[index + 1];
         if (next === undefined) {
-          throw new Error(`Flag '${flag}' requires a value`);
+          throw new Error(`Argument '--${name}' requires a value`);
         }
-        if (next.startsWith("-")) {
-          args[flag] = true;
-        } else {
-          args[flag] = next;
-          index += 1;
-        }
+        args[argSpec.id] = next;
+        index += 1;
       }
     } else if (token.startsWith("-") && token.length > 1) {
       const flag = token.slice(1);
+      const argSpec = resolved.operation.args.find(
+        (arg) => arg.short === flag,
+      );
+      if (!argSpec) {
+        throw new Error(`Unknown argument '-${flag}'`);
+      }
+      if (argSpec.kind === "flag") {
+        args[argSpec.id] = true;
+        index += 1;
+        continue;
+      }
+
       const next = tokens[index + 1];
       if (next === undefined) {
-        throw new Error(`Flag '${flag}' requires a value`);
+        throw new Error(`Argument '-${flag}' requires a value`);
       }
-      if (next.startsWith("-")) {
-        args[flag] = true;
-      } else {
-        args[flag] = next;
-        index += 1;
-      }
+      args[argSpec.id] = next;
+      index += 1;
     } else {
       positional.push(token);
     }
@@ -273,9 +352,9 @@ function parseTokens(tokens: string[]): {
   // Previously hardcoded as "id" and "label", which broke any operation
   // where the positional arg has a different name (e.g., "title" for idea add).
   if (positional.length > 0) {
-    const opSpec = namespace ? getOperation(namespace, operation) : undefined;
-    const positionalSpecs =
-      opSpec?.args.filter((a) => a.kind === "positional") ?? [];
+    const positionalSpecs = resolved.operation.args.filter(
+      (arg) => arg.kind === "positional",
+    );
 
     for (let i = 0; i < positional.length; i++) {
       const argName = positionalSpecs[i]?.id ?? (i === 0 ? "id" : "label");
@@ -283,16 +362,16 @@ function parseTokens(tokens: string[]): {
     }
   }
 
-  return { namespace, operation, args };
+  return { path: resolved.path, args };
 }
 
 function buildCallRequest(
   tokens: string[],
   agentId?: string,
   workflowConfirmation?: ExoRunInput["workflowConfirmation"],
+  auth?: ExoRunInput["auth"],
 ): MachineChannelRequestEnvelope {
-  const { namespace, operation, args } = parseTokens(tokens);
-  const path = namespace ? [namespace, operation] : [operation];
+  const { path, args } = parseTokens(tokens);
 
   const request: MachineChannelRequestEnvelope = {
     protocol_version: MACHINE_CHANNEL_PROTOCOL_VERSION,
@@ -306,6 +385,10 @@ function buildCallRequest(
     },
     agent_id: agentId,
   };
+
+  if (auth) {
+    request.auth = auth;
+  }
 
   if (workflowConfirmation) {
     request.workflow_confirmation = {
@@ -331,8 +414,7 @@ export function normalizeWorkflowConfirmationKind(
 }
 
 function buildPreviewRequest(tokens: string[]): MachineChannelRequestEnvelope {
-  const { namespace, operation, args } = parseTokens(tokens);
-  const path = namespace ? [namespace, operation] : [operation];
+  const { path, args } = parseTokens(tokens);
 
   return {
     protocol_version: MACHINE_CHANNEL_PROTOCOL_VERSION,
@@ -351,6 +433,7 @@ function routeCommand(
   tokens: string[],
   agentId?: string,
   workflowConfirmation?: ExoRunInput["workflowConfirmation"],
+  auth?: ExoRunInput["auth"],
 ): MachineChannelRequestEnvelope {
   if (tokens.length === 0) {
     throw new Error("Empty command");
@@ -360,7 +443,7 @@ function routeCommand(
     return buildHelpRequest(tokens.slice(1));
   }
 
-  return buildCallRequest(tokens, agentId, workflowConfirmation);
+  return buildCallRequest(tokens, agentId, workflowConfirmation, auth);
 }
 
 // ── Response Formatting ──────────────────────────────────────────────
@@ -806,6 +889,18 @@ export function formatMachineChannelResponse(
     return textResult(text, steeringPart);
   }
 
+  if (response.status === "confirm_required" && response.ticket) {
+    const text =
+      "Execution confirmation required.\n\nAsk the human whether to approve this action. If they approve, continue with the confirmed action.";
+    const authPart =
+      typeof vscode.LanguageModelDataPart?.json === "function"
+        ? vscode.LanguageModelDataPart.json({
+            auth: { ticket: response.ticket, confirm: true },
+          })
+        : undefined;
+    return textResult(text, authPart);
+  }
+
   const { text, workflowConfirmation } = formatErrorResponse(response);
   let workflowPart: vscode.LanguageModelDataPart | undefined;
   if (
@@ -842,7 +937,9 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return { invocationMessage: fallbackMessage };
       }
 
-      const rootPath = selectCurrentWorkspaceRoot().rootPath;
+      const rootPath = selectCurrentLmToolWorkspaceRoot(
+        options.input?.workspaceRoot,
+      ).rootPath;
       if (!rootPath) {
         return { invocationMessage: fallbackMessage };
       }
@@ -914,7 +1011,9 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return errorResult("Missing command string");
       }
 
-      const workspaceSelection = selectCurrentWorkspaceRoot();
+      const workspaceSelection = selectCurrentLmToolWorkspaceRoot(
+        input.workspaceRoot,
+      );
       const rootPath = workspaceSelection.rootPath;
       if (!rootPath) {
         return errorResult(
@@ -934,6 +1033,7 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
           substituted,
           agentId,
           input.workflowConfirmation,
+          input.auth,
         );
 
         logger.debug(

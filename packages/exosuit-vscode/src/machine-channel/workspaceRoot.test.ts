@@ -53,6 +53,83 @@ describe("selectWorkspaceRoot", () => {
 
     expect(selection.candidates).toEqual([projectRoot]);
   });
+
+  it("requires an explicit selection when multiple Exosuit projects are open", () => {
+    const selection = selectWorkspaceRoot(
+      [{ fsPath: projectRoot }, { fsPath: otherRoot }],
+      {
+        hasExosuitToml: hasExosuitToml(
+          new Set([projectRoot, otherRoot]),
+        ),
+        requireExplicitSelection: true,
+      },
+    );
+
+    expect(selection.rootPath).toBeUndefined();
+    expect(selection.reason).toContain(
+      "multiple Exosuit project workspace folders are open",
+    );
+    expect(selection.reason).toContain(projectRoot);
+    expect(selection.reason).toContain(otherRoot);
+  });
+
+  it("accepts an explicitly requested open workspace folder", () => {
+    const selection = selectWorkspaceRoot(
+      [{ fsPath: projectRoot }, { fsPath: otherRoot }],
+      {
+        hasExosuitToml: hasExosuitToml(
+          new Set([projectRoot, otherRoot]),
+        ),
+        requestedRoot: path.join(otherRoot, "."),
+        requireExplicitSelection: true,
+      },
+    );
+
+    expect(selection.rootPath).toBe(otherRoot);
+    expect(selection.reason).toBe("requested open workspace folder");
+  });
+
+  it("rejects a requested path that is not an open workspace folder", () => {
+    const missingRoot = path.join(root, "Users", "example", "missing");
+    const selection = selectWorkspaceRoot([{ fsPath: projectRoot }], {
+      hasExosuitToml: hasExosuitToml(new Set([projectRoot])),
+      requestedRoot: missingRoot,
+    });
+
+    expect(selection.rootPath).toBeUndefined();
+    expect(selection.reason).toBe(
+      `requested workspaceRoot is not an open workspace folder: ${missingRoot}`,
+    );
+  });
+
+  it("does not silently choose between fallback workspace folders", () => {
+    const selection = selectWorkspaceRoot(
+      [{ fsPath: projectRoot }, { fsPath: otherRoot }],
+      {
+        hasExosuitToml: hasExosuitToml(new Set()),
+        requireExplicitSelection: true,
+      },
+    );
+
+    expect(selection.rootPath).toBeUndefined();
+    expect(selection.reason).toContain("multiple workspace folders are open");
+  });
+
+  it("preserves first-project selection for non-LM-tool callers", () => {
+    const selection = selectWorkspaceRoot(
+      [{ fsPath: projectRoot }, { fsPath: otherRoot }],
+      {
+        hasExosuitToml: hasExosuitToml(
+          new Set([projectRoot, otherRoot]),
+        ),
+      },
+    );
+
+    expect(selection.rootPath).toBe(projectRoot);
+    expect(selection.reason).toBe(
+      "first workspace folder containing exosuit.toml",
+    );
+  });
 });
 
 describe("isFilesystemRoot", () => {

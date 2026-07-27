@@ -15,6 +15,8 @@ export interface WorkspaceRootSelection {
 
 export interface WorkspaceRootSelectionOptions {
   hasExosuitToml?: (rootPath: string) => boolean;
+  requestedRoot?: string;
+  requireExplicitSelection?: boolean;
 }
 
 function normalizeRootPath(rootPath: string): string {
@@ -55,21 +57,75 @@ export function selectWorkspaceRoot(
     candidates.push(normalized);
   }
 
-  const projectRoot = candidates.find((candidate) => hasExosuitToml(candidate));
-  if (projectRoot) {
+  if (options.requestedRoot !== undefined) {
+    const requestedRoot = normalizeRootPath(options.requestedRoot);
+    if (!seen.has(requestedRoot)) {
+      return {
+        rootPath: undefined,
+        reason: `requested workspaceRoot is not an open workspace folder: ${requestedRoot}`,
+        candidates,
+      };
+    }
+    if (isFilesystemRoot(requestedRoot)) {
+      return {
+        rootPath: undefined,
+        reason: "requested workspaceRoot is a filesystem root",
+        candidates,
+      };
+    }
+
     return {
-      rootPath: projectRoot,
-      reason: "contains exosuit.toml",
+      rootPath: requestedRoot,
+      reason: "requested open workspace folder",
       candidates,
     };
   }
 
-  const nonFilesystemRoot = candidates.find(
+  const projectRoots = candidates.filter((candidate) =>
+    hasExosuitToml(candidate),
+  );
+  if (projectRoots.length === 1) {
+    return {
+      rootPath: projectRoots[0],
+      reason: "contains exosuit.toml",
+      candidates,
+    };
+  }
+  if (projectRoots.length > 1) {
+    if (options.requireExplicitSelection) {
+      return {
+        rootPath: undefined,
+        reason: `multiple Exosuit project workspace folders are open; provide workspaceRoot from: ${projectRoots.join(", ")}`,
+        candidates,
+      };
+    }
+    return {
+      rootPath: projectRoots[0],
+      reason: "first workspace folder containing exosuit.toml",
+      candidates,
+    };
+  }
+
+  const nonFilesystemRoots = candidates.filter(
     (candidate) => !isFilesystemRoot(candidate),
   );
-  if (nonFilesystemRoot) {
+  if (nonFilesystemRoots.length === 1) {
     return {
-      rootPath: nonFilesystemRoot,
+      rootPath: nonFilesystemRoots[0],
+      reason: "first non-filesystem-root workspace folder",
+      candidates,
+    };
+  }
+  if (nonFilesystemRoots.length > 1) {
+    if (options.requireExplicitSelection) {
+      return {
+        rootPath: undefined,
+        reason: `multiple workspace folders are open; provide workspaceRoot from: ${nonFilesystemRoots.join(", ")}`,
+        candidates,
+      };
+    }
+    return {
+      rootPath: nonFilesystemRoots[0],
       reason: "first non-filesystem-root workspace folder",
       candidates,
     };
@@ -90,6 +146,17 @@ export function selectCurrentWorkspaceRoot(): WorkspaceRootSelection {
     vscode.workspace.workspaceFolders?.map((folder) => ({
       fsPath: folder.uri.fsPath,
     })),
+  );
+}
+
+export function selectCurrentLmToolWorkspaceRoot(
+  requestedRoot?: string,
+): WorkspaceRootSelection {
+  return selectWorkspaceRoot(
+    vscode.workspace.workspaceFolders?.map((folder) => ({
+      fsPath: folder.uri.fsPath,
+    })),
+    { requestedRoot, requireExplicitSelection: true },
   );
 }
 

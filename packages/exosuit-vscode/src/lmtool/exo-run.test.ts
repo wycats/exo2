@@ -8,17 +8,14 @@ import {
 } from "../types/machineChannel";
 
 const machineChannelMock = vi.hoisted(() => vi.fn());
+const workspaceSelectionMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../agent/lmtool/machineChannel", () => ({
   exoMachineChannel: machineChannelMock,
 }));
 
 vi.mock("../workspaceRoot", () => ({
-  selectCurrentWorkspaceRoot: () => ({
-    rootPath: "/workspace",
-    reason: "test workspace",
-    candidates: ["/workspace"],
-  }),
+  selectCurrentLmToolWorkspaceRoot: workspaceSelectionMock,
 }));
 
 import {
@@ -26,6 +23,15 @@ import {
   normalizeWorkflowConfirmationKind,
   type ExoRunInput,
 } from "./exo-run";
+import { loadCommandSpec } from "./command-spec.types";
+
+function firstTextValue(result: vscode.LanguageModelToolResult): string {
+  const first = result.content[0];
+  if (!first || typeof first !== "object" || !("value" in first)) {
+    throw new Error("Expected first tool result part to contain text");
+  }
+  return String(first.value);
+}
 
 function workflowKindSchema(): Record<string, unknown> {
   const exoRunTool = manifest.contributes.languageModelTools.find(
@@ -51,6 +57,12 @@ describe("exo-run workflow confirmation", () => {
       status: "ok",
       result: { ok: true, kind: "task.complete" },
     });
+    workspaceSelectionMock.mockReset();
+    workspaceSelectionMock.mockReturnValue({
+      rootPath: "/workspace",
+      reason: "test workspace",
+      candidates: ["/workspace"],
+    });
   });
 
   it("constrains workflowConfirmation.kind to the canonical protocol kind", () => {
@@ -58,6 +70,21 @@ describe("exo-run workflow confirmation", () => {
       type: "string",
       const: WORKFLOW_COMPLETION_CONFIRMATION_KIND,
     });
+  });
+
+  it("publishes hidden execution approval and workspace selection inputs", () => {
+    const exoRunTool = manifest.contributes.languageModelTools.find(
+      (tool) => tool.name === "exo-run",
+    );
+    const properties = exoRunTool?.inputSchema.properties as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+
+    expect(properties?.workspaceRoot).toMatchObject({ type: "string" });
+    expect(properties?.auth).toMatchObject({ type: "object" });
+    expect(
+      (properties?.auth?.properties as Record<string, unknown>)?.confirm,
+    ).toMatchObject({ const: true });
   });
 
   it("guides agents to ask for human approval without displaying machine fields", () => {
@@ -69,6 +96,9 @@ describe("exo-run workflow confirmation", () => {
 
     expect(exoRunTool?.modelDescription).toContain(
       "ask the human the approval question and options in plain language",
+    );
+    expect(exoRunTool?.modelDescription).toContain(
+      "ask the human whether to approve the action",
     );
     expect(exoRunTool?.modelDescription).toContain(
       "Keep hidden approval data out of human-visible text",
@@ -197,5 +227,222 @@ describe("exo-run workflow confirmation", () => {
         address: { kind: "namespace", path: ["task"] },
       },
     });
+  });
+
+  it("addresses root operations from CommandSpec", async () => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command: "write notes.md" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toEqual({
+      kind: "call",
+      params: {
+        address: { kind: "operation", path: ["write"] },
+        input: { path: "notes.md" },
+      },
+    });
+  });
+
+  it.each([
+    ["map --next", { next: true }],
+    [
+      "task add Demo --label-file -",
+      { label: "Demo", "label-file": "-" },
+    ],
+    ["phase add -t Demo", { title: "Demo" }],
+  ])("parses CommandSpec argument kinds for %s", async (command, input) => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toMatchObject({
+      kind: "call",
+      params: { input },
+    });
+  });
+
+  it.each([
+    ["docs links check", ["docs", "links.check"]],
+    ["docs links.check", ["docs", "links.check"]],
+    ["phase execution tasks --limit 5", ["phase", "execution.tasks"]],
+  ])("addresses dotted operation call %s", async (command, path) => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toMatchObject({
+      kind: "call",
+      params: {
+        address: { kind: "operation", path },
+      },
+    });
+  });
+
+  it("addresses every generated CommandSpec operation", async () => {
+    const tool = createExoRunTool();
+    const spec = loadCommandSpec();
+    const cases: Array<{ command: string; path: string[] }> = [];
+
+    for (const operation of Object.keys(spec.root_operations)) {
+      cases.push({ command: operation, path: [operation] });
+    }
+    for (const [namespace, namespaceSpec] of Object.entries(spec.namespaces)) {
+      for (const operation of Object.keys(namespaceSpec.operations)) {
+        cases.push({
+          command: `${namespace} ${operation.replaceAll(".", " ")}`,
+          path: [namespace, operation],
+        });
+      }
+    }
+
+    for (const { command, path } of cases) {
+      await tool.invoke(
+        {
+          input: { command },
+          toolInvocationToken: undefined,
+        } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+        {} as never,
+      );
+
+      const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+        | MachineChannelRequestEnvelope
+        | undefined;
+      expect(request?.op).toMatchObject({
+        kind: "call",
+        params: {
+          address: { kind: "operation", path },
+        },
+      });
+    }
+  });
+
+  it("uses the same dotted address for preview", async () => {
+    machineChannelMock.mockResolvedValueOnce({
+      protocol_version: 1,
+      id: "preview.response",
+      status: "ok",
+      preview: { invocation_message: "Checking documentation links" },
+    });
+    const tool = createExoRunTool();
+
+    await tool.prepareInvocation?.(
+      {
+        input: { command: "docs links check" },
+      } satisfies vscode.LanguageModelToolInvocationPrepareOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toEqual({
+      kind: "preview",
+      params: {
+        address: { kind: "operation", path: ["docs", "links.check"] },
+        input: {},
+      },
+    });
+  });
+
+  it("forwards execution approval without exposing it in the command", async () => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: {
+          command: "update",
+          auth: { ticket: "opaque-ticket", confirm: true },
+        },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.auth).toEqual({
+      ticket: "opaque-ticket",
+      confirm: true,
+    });
+  });
+
+  it("uses an explicitly selected open workspace root", async () => {
+    workspaceSelectionMock.mockReturnValueOnce({
+      rootPath: "/workspace/two",
+      reason: "requested open workspace folder",
+      candidates: ["/workspace/one", "/workspace/two"],
+    });
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: {
+          command: "status",
+          workspaceRoot: "/workspace/two",
+        },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    expect(workspaceSelectionMock).toHaveBeenCalledWith("/workspace/two");
+    expect(machineChannelMock).toHaveBeenCalledWith(
+      "/workspace/two",
+      expect.any(Object),
+    );
+  });
+
+  it("returns the candidate-bearing ambiguity error without dispatching", async () => {
+    workspaceSelectionMock.mockReturnValueOnce({
+      rootPath: undefined,
+      reason:
+        "multiple Exosuit project workspace folders are open; provide workspaceRoot from: /workspace/one, /workspace/two",
+      candidates: ["/workspace/one", "/workspace/two"],
+    });
+    const tool = createExoRunTool();
+
+    const result = await tool.invoke(
+      {
+        input: { command: "status" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+    if (!result) {
+      throw new Error("Expected exo-run to return an ambiguity result");
+    }
+
+    expect(firstTextValue(result)).toContain(
+      "provide workspaceRoot from: /workspace/one, /workspace/two",
+    );
+    expect(machineChannelMock).not.toHaveBeenCalled();
   });
 });

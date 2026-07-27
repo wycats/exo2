@@ -58,9 +58,8 @@ context-recovery work while `exo-run` remains the primary project surface.
 
 `exo-run` is the public entry point for Exo project work. It accepts a command
 string without the leading `exo` and optional placeholder values. Both
-transports accept workflow-completion confirmation data. MCP also accepts the
-hidden execution-approval ticket used by confirm-required external operations;
-the VS Code tool schema does not currently expose that `auth` field.
+transports accept workflow-completion confirmation data and the hidden
+execution-approval ticket used by confirm-required external operations.
 
 Examples include:
 
@@ -74,22 +73,21 @@ rfc show 0136
 The MCP tool tokenizes this text with Exo's Rust command-text compiler, removes
 global presentation options before operation validation, rejects shell syntax,
 and compiles the result against the current `CommandSpec`. The VS Code tool uses
-an extension-local tokenizer and router to construct the structured machine
-request. Its request still enters the same typed invocation and execution
-machinery, while its parsing errors and treatment of global options currently
-differ from MCP.
+an extension-local tokenizer to construct the structured machine request, then
+resolves root and namespaced operation addresses from the generated
+`CommandSpec`. Root operations such as `write <path>` and dotted operations such
+as `docs links check` and `phase execution tasks` therefore use the same
+machine-channel addresses for preview and execution. The request still enters
+the same typed invocation and execution machinery, while parsing errors and
+treatment of global presentation options remain transport-specific.
 
-The adapter difference also affects command coverage. The current VS Code root
-command table recognizes `status` and the stale name `version`, while omitting
-the implemented root operation `write <path>`. A positional root write is
-therefore misrouted as a namespaced operation, and `version` reaches the machine
-channel as an unknown root operation. The adapter also fixes a namespaced
-operation at one token during call and preview routing, so invocations such as
-`docs links check` and `phase execution tasks` do not compose into the dotted
-operations accepted by the Rust compiler. Help routing joins the operation tail
-into its dotted name, so those paths remain discoverable through commands such
-as `help docs links check`. These are implemented adapter gaps within the shared
-architecture, rather than separate command contracts.
+Project-backed VS Code tools select a workspace deliberately. A window with one
+Exo project uses that open workspace folder automatically. When multiple Exo
+projects or fallback workspace folders are open, `exo-run` and
+`exo-ai-chat-history` require `workspaceRoot` to name one of those exact open
+folders; arbitrary filesystem paths and filesystem roots are rejected. This
+keeps tool calls deterministic without changing the daemon's project and
+worktree identity validation.
 
 The two transports therefore share the command-address model, placeholder
 substitution, machine-channel validation, effect classification, and structured
