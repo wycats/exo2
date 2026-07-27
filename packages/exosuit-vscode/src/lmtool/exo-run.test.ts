@@ -433,6 +433,34 @@ describe("exo-run workflow confirmation", () => {
     });
   });
 
+  it("parses runtime-declared JSON arguments before dispatch", async () => {
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: {
+          command:
+            "docs links check --targets='[\"docs/rfcs\"]' --options '{\"strict\":true}'",
+        },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toMatchObject({
+      kind: "call",
+      params: {
+        input: {
+          targets: ["docs/rfcs"],
+          options: { strict: true },
+        },
+      },
+    });
+  });
+
   it.each([
     ["docs links check", ["docs", "links.check"]],
     ["docs links.check", ["docs", "links.check"]],

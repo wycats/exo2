@@ -3,7 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { isFilesystemRoot, selectWorkspaceRoot } from "../workspaceRoot";
+import {
+  isFilesystemRoot,
+  selectLmToolWorkspaceRoot,
+  selectWorkspaceRoot,
+} from "../workspaceRoot";
 
 const hasExosuitProjectState = (roots: Set<string>) => (rootPath: string) =>
   roots.has(rootPath);
@@ -25,7 +29,7 @@ describe("selectWorkspaceRoot", () => {
   });
 
   it("recognizes database and SQL projection project state without a manifest", () => {
-    for (const marker of ["database", "projection"] as const) {
+    for (const marker of ["database", "legacy-database", "projection"] as const) {
       const tempRoot = mkdtempSync(
         path.join(tmpdir(), `exo-workspace-root-${marker}-`),
       );
@@ -35,6 +39,9 @@ describe("selectWorkspaceRoot", () => {
         mkdirSync(project);
         mkdirSync(unrelated);
         if (marker === "database") {
+          mkdirSync(path.join(project, ".exo", "cache"), { recursive: true });
+          writeFileSync(path.join(project, ".exo", "cache", "exo.db"), "");
+        } else if (marker === "legacy-database") {
           mkdirSync(path.join(project, ".cache"));
           writeFileSync(path.join(project, ".cache", "exo.db"), "");
         } else {
@@ -58,6 +65,19 @@ describe("selectWorkspaceRoot", () => {
         rmSync(tempRoot, { recursive: true, force: true });
       }
     }
+  });
+
+  it("uses Exo policy resolution to identify external project state", async () => {
+    const selection = await selectLmToolWorkspaceRoot(
+      [{ fsPath: projectRoot }, { fsPath: otherRoot }],
+      {
+        hasResolvedExosuitProjectState: async (rootPath) =>
+          rootPath === projectRoot,
+      },
+    );
+
+    expect(selection.rootPath).toBe(projectRoot);
+    expect(selection.reason).toBe("contains Exo project state");
   });
 
   it("rejects exact filesystem root when another candidate exists", () => {

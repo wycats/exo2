@@ -51,7 +51,7 @@ export function createChatHistoryTool(): vscode.LanguageModelTool<ChatHistoryToo
     ): Promise<vscode.LanguageModelToolResult> {
       const input = options.input ?? {};
 
-      const workspaceSelection = selectCurrentLmToolWorkspaceRoot(
+      const workspaceSelection = await selectCurrentLmToolWorkspaceRoot(
         input.workspaceRoot,
       );
       const workspacePath = workspaceSelection.rootPath;

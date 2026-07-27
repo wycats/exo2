@@ -415,6 +415,21 @@ async function parseTokens(
   const args: Record<string, unknown> = {};
   const positional: string[] = [];
 
+  const parseArgumentValue = (
+    argSpec: ArgSpec | undefined,
+    value: string,
+  ): unknown => {
+    if (argSpec?.value_type !== "json") {
+      return value;
+    }
+
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  };
+
   while (index < tokens.length) {
     const token = tokens[index];
 
@@ -431,7 +446,7 @@ async function parseTokens(
 
       if (equalsIndex >= 0) {
         const value = flag.slice(equalsIndex + 1);
-        args[argSpec.id] = value;
+        args[argSpec.id] = parseArgumentValue(argSpec, value);
       } else if (argSpec.kind === "flag") {
         args[argSpec.id] = true;
       } else {
@@ -439,7 +454,7 @@ async function parseTokens(
         if (next === undefined) {
           throw new Error(`Argument '--${name}' requires a value`);
         }
-        args[argSpec.id] = next;
+        args[argSpec.id] = parseArgumentValue(argSpec, next);
         index += 1;
       }
     } else if (token.startsWith("-") && token.length > 1) {
@@ -460,7 +475,7 @@ async function parseTokens(
       if (next === undefined) {
         throw new Error(`Argument '-${flag}' requires a value`);
       }
-      args[argSpec.id] = next;
+      args[argSpec.id] = parseArgumentValue(argSpec, next);
       index += 1;
     } else {
       positional.push(token);
@@ -478,8 +493,9 @@ async function parseTokens(
     );
 
     for (let i = 0; i < positional.length; i++) {
-      const argName = positionalSpecs[i]?.id ?? (i === 0 ? "id" : "label");
-      args[argName] = positional[i];
+      const argSpec = positionalSpecs[i];
+      const argName = argSpec?.id ?? (i === 0 ? "id" : "label");
+      args[argName] = parseArgumentValue(argSpec, positional[i]);
     }
   }
 
@@ -1079,8 +1095,8 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return { invocationMessage: fallbackMessage };
       }
 
-      const rootPath = selectCurrentLmToolWorkspaceRoot(
-        options.input?.workspaceRoot,
+      const rootPath = (
+        await selectCurrentLmToolWorkspaceRoot(options.input?.workspaceRoot)
       ).rootPath;
       if (!rootPath) {
         return { invocationMessage: fallbackMessage };
@@ -1153,7 +1169,7 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
         return errorResult("Missing command string");
       }
 
-      const workspaceSelection = selectCurrentLmToolWorkspaceRoot(
+      const workspaceSelection = await selectCurrentLmToolWorkspaceRoot(
         input.workspaceRoot ?? input.auth?.workspaceRoot,
       );
       const rootPath = workspaceSelection.rootPath;

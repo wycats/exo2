@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import { existsSync, readdirSync } from "node:fs";
 import * as path from "node:path";
+import { resolveDaemonRuntimePaths } from "./machine-channel/socket-client";
 
 export interface WorkspaceRootCandidate {
   fsPath: string;
@@ -19,6 +20,11 @@ export interface WorkspaceRootSelectionOptions {
   requireExplicitSelection?: boolean;
 }
 
+export interface LmToolWorkspaceRootSelectionOptions {
+  requestedRoot?: string;
+  hasResolvedExosuitProjectState?: (rootPath: string) => Promise<boolean>;
+}
+
 function normalizeRootPath(rootPath: string): string {
   return path.resolve(rootPath);
 }
@@ -31,6 +37,7 @@ export function isFilesystemRoot(rootPath: string): boolean {
 function defaultHasExosuitProjectState(rootPath: string): boolean {
   if (
     existsSync(path.join(rootPath, "exosuit.toml")) ||
+    existsSync(path.join(rootPath, ".exo", "cache", "exo.db")) ||
     existsSync(path.join(rootPath, ".cache", "exo.db"))
   ) {
     return true;
@@ -39,6 +46,18 @@ function defaultHasExosuitProjectState(rootPath: string): boolean {
   const projectionRoot = path.join(rootPath, "docs", "agent-context");
   try {
     return readdirSync(projectionRoot).some((entry) => entry.endsWith(".sql"));
+  } catch {
+    return false;
+  }
+}
+
+async function defaultHasResolvedExosuitProjectState(
+  rootPath: string,
+): Promise<boolean> {
+  try {
+    const paths = await resolveDaemonRuntimePaths(rootPath);
+    const stateRoot = path.dirname(paths.runtimeDir);
+    return existsSync(path.join(stateRoot, "cache", "exo.db"));
   } catch {
     return false;
   }
@@ -162,14 +181,53 @@ export function selectCurrentWorkspaceRoot(): WorkspaceRootSelection {
   );
 }
 
+export async function selectLmToolWorkspaceRoot(
+  folders: readonly WorkspaceRootCandidate[] | undefined,
+  options: LmToolWorkspaceRootSelectionOptions = {},
+): Promise<WorkspaceRootSelection> {
+  const initial = selectWorkspaceRoot(folders, {
+    requestedRoot: options.requestedRoot,
+    requireExplicitSelection: true,
+  });
+  if (options.requestedRoot !== undefined || initial.rootPath !== undefined) {
+    return initial;
+  }
+
+  const candidates = initial.candidates.filter(
+    (candidate) => !isFilesystemRoot(candidate),
+  );
+  if (candidates.length < 2) {
+    return initial;
+  }
+
+  const hasResolvedExosuitProjectState =
+    options.hasResolvedExosuitProjectState ??
+    defaultHasResolvedExosuitProjectState;
+  const resolvedProjectRoots = new Set<string>();
+  await Promise.all(
+    candidates.map(async (candidate) => {
+      if (await hasResolvedExosuitProjectState(candidate)) {
+        resolvedProjectRoots.add(candidate);
+      }
+    }),
+  );
+
+  return selectWorkspaceRoot(folders, {
+    requireExplicitSelection: true,
+    hasExosuitProjectState: (rootPath) =>
+      defaultHasExosuitProjectState(rootPath) ||
+      resolvedProjectRoots.has(rootPath),
+  });
+}
+
 export function selectCurrentLmToolWorkspaceRoot(
   requestedRoot?: string,
-): WorkspaceRootSelection {
-  return selectWorkspaceRoot(
+): Promise<WorkspaceRootSelection> {
+  return selectLmToolWorkspaceRoot(
     vscode.workspace.workspaceFolders?.map((folder) => ({
       fsPath: folder.uri.fsPath,
     })),
-    { requestedRoot, requireExplicitSelection: true },
+    { requestedRoot },
   );
 }
 
