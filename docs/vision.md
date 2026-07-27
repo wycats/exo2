@@ -136,9 +136,11 @@ RFCs, phases, and chat sessions remain linked artifacts with distinct roles.
 The first proof is intentionally narrow: an agent can create, focus, and resume
 a lane from canonical project state without relying on chat history.
 
-This remains a design direction until the lane runtime model and user surfaces
-land. The detailed lane semantics, product hierarchy, interaction design, and
-implementation brief belong to the lane-centered workbench design package.
+The first proof has landed: portable lane state, the public `exo lane` command
+surface, and a focus-only VS Code client are implemented. The richer lane
+lifecycle and broader user surfaces remain a design direction. Their product
+hierarchy, interaction design, and implementation brief belong to the
+lane-centered workbench design package.
 
 ## Relationship To Design Records
 

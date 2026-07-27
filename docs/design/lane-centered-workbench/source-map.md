@@ -166,12 +166,11 @@ This section does not supersede implemented Stage 3+ behavior by implication. In
 
 ## Still open
 
-The design package intentionally leaves these as future implementation questions:
+The first proof settled the portable lane schema and migration, the public
+`exo lane` namespace, and focus-only VS Code integration. The design package
+intentionally leaves these broader implementation questions open:
 
-- exact lane schema and migration path;
-- final CLI/API namespace after checking validation-lane collisions;
 - whether lane observations are fully normalized or stored as typed JSON facts;
-- how to expose lane focus in VS Code without disrupting existing phase focus;
 - how much PR state to mirror locally vs. derive on sync;
 - how to represent RFC document observations across worktrees;
 - browser workbench architecture;

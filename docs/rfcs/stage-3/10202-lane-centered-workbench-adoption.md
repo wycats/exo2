@@ -137,8 +137,9 @@ or one checkout's path.
 The focused lane is stored separately in `workspace_lane_focus_data`. A focus
 row contains the normalized workspace root, the focused lane, and its update
 time. It is reactive machine-local state: it is never written to repository or
-sidecar SQL projections, and public command output never exposes the workspace
-path.
+sidecar SQL projections. Successful lane command results do not expose the
+workspace path; phase-ownership conflict diagnostics may identify the workspace
+that currently owns the phase.
 
 This split permits every linked worktree to observe the same lane identities
 while choosing its own focus. Removing or recreating one worktree cannot change
