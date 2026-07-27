@@ -41,7 +41,10 @@ exo lane create "OAuth cleanup" \
   --phase oauth-hardening
 ```
 
-Creation records durable intent. It does not start the lane or focus it.
+Creation is a phase-scoped mutation. If the phase is unowned, Exo claims it for
+the current workspace; if another workspace owns it, creation returns an
+ownership conflict. Creation records durable intent. It does not start the lane
+or focus it.
 
 ## Focus and Resume Work
 
@@ -102,7 +105,9 @@ the same lane IDs, titles, intents, states, and phase associations.
 
 Focus is machine-local workspace state. Focusing a lane in one worktree does not
 change the focused lane in another worktree. Workspace paths are not included in
-portable SQL projections or public command output.
+portable SQL projections or successful lane command results. Existing
+phase-ownership conflict diagnostics may identify the workspace that currently
+owns the phase.
 
 ## VS Code
 

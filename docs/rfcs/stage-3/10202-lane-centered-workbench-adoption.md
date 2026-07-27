@@ -220,8 +220,10 @@ to recognize the stream and recover its current planning context.
 
 `lane current` is a successful read when no lane is focused and returns
 `lane: null`. Inconsistent focus returns data plus the stable diagnostic rather
-than mutating state during a read. Public results omit workspace roots,
-database paths, sidecar paths, and runtime identity details.
+than mutating state during a read. Successful public results omit workspace
+roots, database paths, sidecar paths, and runtime identity details.
+Phase-ownership conflict diagnostics may identify the workspace that currently
+owns the phase.
 
 ### VS Code and other clients
 
