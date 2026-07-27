@@ -218,7 +218,7 @@ async function handleConfirmationIfNeeded(
 
   const confirmedRequest: MachineChannelRequestEnvelope = {
     ...request,
-    id: `vscode.lmtool.confirm.${randomUUID()}`,
+    id: request.id,
     auth: { ticket: response.ticket, confirm: true },
   };
 

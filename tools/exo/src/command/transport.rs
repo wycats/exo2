@@ -107,6 +107,10 @@ pub trait TransportContext {
     fn workflow_confirmation(&self) -> Option<&WorkflowConfirmationInput> {
         None
     }
+    /// Optional content supplied by a machine transport for stdin-backed commands.
+    fn input_content(&self) -> Option<&str> {
+        None
+    }
     /// Whether semantic command error codes should be exposed to the caller.
     fn preserves_error_codes(&self) -> bool {
         false
@@ -119,11 +123,18 @@ pub trait TransportContext {
     fn render_steering(&self, suggestions: Vec<SuggestedAction>) -> SteeringOutput;
 }
 
-/// Generate a confirmation ticket for an exec-effect call.
-pub fn ticket_for_exec_call(address: &Address, input: &JsonValue) -> String {
+/// Generate a confirmation ticket for one exec-effect request in one workspace.
+pub fn ticket_for_exec_call(
+    address: &Address,
+    input: &JsonValue,
+    workspace_root: &Path,
+    request_id: &str,
+) -> String {
     let payload = serde_json::json!({
         "address": address,
         "input": input,
+        "workspace_root": workspace_root,
+        "request_id": request_id,
     });
 
     let digest = blake3::hash(payload.to_string().as_bytes());
@@ -151,6 +162,8 @@ pub struct MachineChannelTransport<'a> {
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
+    /// Explicit content for stdin-backed machine-channel commands.
+    pub input_content: Option<String>,
 }
 
 /// Transport context for CLI requests.
@@ -241,6 +254,10 @@ impl TransportContext for MachineChannelTransport<'_> {
         self.workflow_confirmation.as_ref()
     }
 
+    fn input_content(&self) -> Option<&str> {
+        self.input_content.as_deref()
+    }
+
     fn preserves_error_codes(&self) -> bool {
         true
     }
@@ -253,7 +270,16 @@ impl TransportContext for MachineChannelTransport<'_> {
 
         match &self.auth {
             Some(auth) if auth.confirm => {
-                if auth.ticket == ticket {
+                let request_matches = auth
+                    .request_id
+                    .as_deref()
+                    .is_none_or(|request_id| request_id == self.request_id);
+                let workspace_matches = auth
+                    .workspace_root
+                    .as_deref()
+                    .is_none_or(|workspace_root| workspace_root == self.workspace_root);
+
+                if auth.ticket == ticket && request_matches && workspace_matches {
                     ConfirmResult::Proceed
                 } else {
                     ConfirmResult::Denied("Invalid confirmation ticket".to_string())
@@ -478,10 +504,24 @@ mod tests {
     }
 
     #[test]
-    fn machine_channel_confirm_exec_checks_ticket() {
+    fn machine_channel_confirm_exec_binds_ticket_to_request_and_workspace() {
         let action = "run";
-        let expected_ticket = generate_exec_ticket(action);
+        let address = Address::Operation {
+            path: vec!["dogfood".to_string(), "restart".to_string()],
+        };
+        let input = serde_json::json!({ "all": true });
         let test_root = std::path::PathBuf::from("/test");
+        let other_root = std::path::PathBuf::from("/other");
+        let expected_ticket = ticket_for_exec_call(&address, &input, &test_root, "req-1");
+
+        assert_ne!(
+            expected_ticket,
+            ticket_for_exec_call(&address, &input, &test_root, "req-2")
+        );
+        assert_ne!(
+            expected_ticket,
+            ticket_for_exec_call(&address, &input, &other_root, "req-1")
+        );
 
         let transport = MachineChannelTransport {
             workspace_root: &test_root,
@@ -490,10 +530,13 @@ mod tests {
             auth: Some(Auth {
                 ticket: expected_ticket.clone(),
                 confirm: true,
+                request_id: Some("req-1".to_string()),
+                workspace_root: Some(test_root.clone()),
             }),
-            expected_ticket: None,
+            expected_ticket: Some(expected_ticket.clone()),
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         };
 
         assert_eq!(transport.confirm_exec(action), ConfirmResult::Proceed);
@@ -503,12 +546,15 @@ mod tests {
             project: None,
             request_id: "req-2".to_string(),
             auth: Some(Auth {
-                ticket: "bad-ticket".to_string(),
+                ticket: expected_ticket.clone(),
                 confirm: true,
+                request_id: Some("req-1".to_string()),
+                workspace_root: Some(test_root.clone()),
             }),
             expected_ticket: Some(expected_ticket.clone()),
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         };
 
         assert_eq!(
@@ -517,23 +563,24 @@ mod tests {
         );
 
         let transport = MachineChannelTransport {
-            workspace_root: &test_root,
+            workspace_root: &other_root,
             project: None,
-            request_id: "req-3".to_string(),
+            request_id: "req-1".to_string(),
             auth: Some(Auth {
                 ticket: expected_ticket,
-                confirm: false,
+                confirm: true,
+                request_id: Some("req-1".to_string()),
+                workspace_root: Some(test_root),
             }),
-            expected_ticket: None,
+            expected_ticket: Some(ticket_for_exec_call(&address, &input, &other_root, "req-1")),
             agent_id: None,
             workflow_confirmation: None,
+            input_content: None,
         };
 
         assert_eq!(
             transport.confirm_exec(action),
-            ConfirmResult::NeedConfirm {
-                ticket: generate_exec_ticket(action)
-            }
+            ConfirmResult::Denied("Invalid confirmation ticket".to_string())
         );
     }
 }

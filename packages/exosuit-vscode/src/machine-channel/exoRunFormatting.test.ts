@@ -17,6 +17,7 @@ describe("exo-run fallback formatting", () => {
         ticket: "opaque-ticket",
       },
       false,
+      "/workspace",
     );
 
     const [textPart, dataPart] = result.content as Array<{ value: unknown }>;
@@ -27,7 +28,12 @@ describe("exo-run fallback formatting", () => {
     expect(textPart?.value).not.toContain("opaque-ticket");
     expect(textPart?.value).not.toContain("auth");
     expect(dataPart?.value).toEqual({
-      auth: { ticket: "opaque-ticket", confirm: true },
+      auth: {
+        ticket: "opaque-ticket",
+        confirm: true,
+        requestId: "confirm-required",
+        workspaceRoot: "/workspace",
+      },
     });
   });
 
@@ -269,6 +275,7 @@ describe("exo-run fallback formatting", () => {
         },
       },
       false,
+      "/workspace",
     );
 
     const [textPart, dataPart] = result.content as Array<{ value: unknown }>;

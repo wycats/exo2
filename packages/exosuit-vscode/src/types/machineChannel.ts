@@ -48,6 +48,8 @@ export type MachineChannelRequestEnvelope = {
   auth?: {
     ticket: string;
     confirm?: boolean;
+    requestId?: string;
+    workspaceRoot?: string;
   };
   workflow_confirmation?: {
     kind: WorkflowCompletionConfirmationKind;

@@ -286,7 +286,7 @@
         "canBeReferencedInPrompt": true,
         "toolReferenceName": "exo-run",
         "userDescription": "Run any exo project management command",
-        "modelDescription": "Primary interface to the exo project management system. Use `help` to discover commands, `help <command>` for details.\n\nWhen multiple projects are open, provide `workspaceRoot` using one of the exact candidates returned by the tool.\n\nExecution confirmation workflow: when a response asks for execution confirmation, ask the human whether to approve the action. Keep hidden approval data out of human-visible text. If the human approves, call the same command again with the hidden auth data from the previous tool result.\n\nCompletion review workflow: when a goal or task completion response asks for outcome review, ask the human the approval question and options in plain language. Keep hidden approval data out of human-visible text; do not show raw JSON or internal fields. If the human approves recording the outcome, call the same completion command again with the hidden approval data from the previous tool result.\n\nCommon commands by intent:\n  Orient:  status, phase status, steering, context snapshot\n  Plan:    goal add, task add, rfc create, rfc list\n  Act:     task start, task complete, goal complete --log\n  Review:  plan review, verify, rfc status\n  Manage:  inbox add, idea add, epoch list\n\nExamples:\n  exo-run(\"status\")\n  exo-run(\"task complete my-task --log 'Done'\")\n  exo-run(\"rfc create --title 'My RFC' --body $1\", [\"Multi-line\\nbody text\"])\n  exo-run(\"help task\")",
+        "modelDescription": "Primary interface to the exo project management system. Use `help` to discover commands, `help <command>` for details.\n\nWhen multiple projects are open, provide `workspaceRoot` using one of the exact candidates returned by the tool. For root `write <path>`, provide the file body in the separate `content` field.\n\nExecution confirmation workflow: when a response asks for execution confirmation, ask the human whether to approve the action. Keep hidden approval data out of human-visible text. If the human approves, call the same command again with the complete hidden auth data from the previous tool result, preserving its request and workspace identity.\n\nCompletion review workflow: when a goal or task completion response asks for outcome review, ask the human the approval question and options in plain language. Keep hidden approval data out of human-visible text; do not show raw JSON or internal fields. If the human approves recording the outcome, call the same completion command again with the hidden approval data from the previous tool result.\n\nCommon commands by intent:\n  Orient:  status, phase status, steering, context snapshot\n  Plan:    goal add, task add, rfc create, rfc list\n  Act:     task start, task complete, goal complete --log\n  Review:  plan review, verify, rfc status\n  Manage:  inbox add, idea add, epoch list\n\nExamples:\n  exo-run(\"status\")\n  exo-run(\"task complete my-task --log 'Done'\")\n  exo-run(\"rfc create --title 'My RFC' --body $1\", [\"Multi-line\\nbody text\"])\n  exo-run(\"help task\")",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -305,6 +305,10 @@
               "type": "string",
               "description": "Exact open VS Code workspace-folder path to use when more than one project is open."
             },
+            "content": {
+              "type": "string",
+              "description": "Explicit file body for the root write command. Rejected for other commands."
+            },
             "auth": {
               "type": "object",
               "description": "Hidden execution approval returned by a previous confirm-required response. Do not display this object or its fields to the user. Only pass it after the human approved rerunning the same command.",
@@ -317,11 +321,21 @@
                   "type": "boolean",
                   "const": true,
                   "description": "Confirms the approved command replay."
+                },
+                "requestId": {
+                  "type": "string",
+                  "description": "Original request identity returned by the previous confirmation response."
+                },
+                "workspaceRoot": {
+                  "type": "string",
+                  "description": "Exact workspace for which the execution was approved."
                 }
               },
               "required": [
                 "ticket",
-                "confirm"
+                "confirm",
+                "requestId",
+                "workspaceRoot"
               ],
               "additionalProperties": false
             },

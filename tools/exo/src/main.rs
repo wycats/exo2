@@ -556,14 +556,17 @@ fn dispatch_via_daemon_with_prompter(
         let effect = spec
             .operation(invocation.namespace(), invocation.operation())
             .map_or(Effect::Pure, |operation| operation.effect);
+        let request_id = generate_request_id();
         let request = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            id: generate_request_id(),
+            id: request_id.clone(),
             op,
             workspace_root: Some(daemon_workspace.clone()),
             auth: (effect == Effect::Exec).then(|| Auth {
-                ticket: ticket_for_exec_call(&address, &input),
+                ticket: ticket_for_exec_call(&address, &input, &daemon_workspace, &request_id),
                 confirm: true,
+                request_id: Some(request_id),
+                workspace_root: Some(daemon_workspace.clone()),
             }),
             workflow_confirmation: workflow_confirmation.clone(),
             agent_id: None,

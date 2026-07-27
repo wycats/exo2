@@ -782,6 +782,14 @@ fn worker_tool_error_classification(
 
 fn tool_call_request_id(_id: &JsonValue, params: Option<&JsonValue>) -> String {
     if let Some(request_id) = params
+        .and_then(|params| params.get("arguments"))
+        .and_then(|arguments| arguments.get("auth"))
+        .and_then(|auth| auth.get("requestId").or_else(|| auth.get("request_id")))
+        .and_then(JsonValue::as_str)
+    {
+        return request_id.to_string();
+    }
+    if let Some(request_id) = params
         .and_then(|params| params.get(MCP_OUTCOME_REQUEST_ID_PARAM))
         .and_then(JsonValue::as_str)
     {
@@ -1370,6 +1378,11 @@ fn structured_content_for_response(response: &ResponseEnvelope) -> JsonValue {
 
     if let Some(ticket) = &response.ticket {
         value["ticket"] = json!(ticket);
+        value["auth"] = json!({
+            "ticket": ticket,
+            "confirm": true,
+            "requestId": response.id,
+        });
     }
 
     if let Some(steering) = &response.steering {
@@ -2134,9 +2147,13 @@ fn exo_run_tool_definition() -> JsonValue {
                             "type": "boolean",
                             "const": true,
                             "description": "Must be true to replay a confirmed command."
+                        },
+                        "requestId": {
+                            "type": "string",
+                            "description": "Original request identity returned by the confirm_required response."
                         }
                     },
-                    "required": ["ticket", "confirm"],
+                    "required": ["ticket", "confirm", "requestId"],
                     "additionalProperties": false
                 }
             },
@@ -2691,6 +2708,7 @@ mod tests {
         let structured = structured(&result);
         assert_eq!(structured["status"], "ok");
         assert_eq!(structured["ticket"], "secret-ticket");
+        assert_eq!(structured["auth"]["requestId"], "t1");
         assert!(structured["display"]["body"].is_null());
         assert_eq!(structured["result"]["kind"], "task.list");
         assert!(structured["trace"].is_null());

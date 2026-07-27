@@ -547,12 +547,23 @@ fn run_machine_channel_in_process_with_project_runtime(
 
 pub fn confirmed_machine_channel_request(
     mut request: exo::api::protocol::RequestEnvelope,
+    workspace_root: &std::path::Path,
 ) -> exo::api::protocol::RequestEnvelope {
     if let exo::api::protocol::Op::Call(params) = &request.op {
-        let ticket = exo::command::transport::ticket_for_exec_call(&params.address, &params.input);
+        let workspace_root = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
+        let ticket = exo::command::transport::ticket_for_exec_call(
+            &params.address,
+            &params.input,
+            &workspace_root,
+            &request.id,
+        );
         request.auth = Some(exo::api::protocol::Auth {
             ticket,
             confirm: true,
+            request_id: Some(request.id.clone()),
+            workspace_root: Some(workspace_root),
         });
     }
 

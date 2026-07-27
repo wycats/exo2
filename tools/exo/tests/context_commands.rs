@@ -13,6 +13,7 @@ fn context_paths_command_returns_expected_paths() {
         format: OutputFormat::Json,
         agent_id: None,
         workflow_confirmation: None,
+        input_content: None,
     };
 
     let output = ContextPaths::new()
@@ -76,6 +77,7 @@ fn context_paths_command_uses_sidecar_projection_for_sidecar_policy() {
         format: OutputFormat::Json,
         agent_id: None,
         workflow_confirmation: None,
+        input_content: None,
     };
 
     let output = ContextPaths::new()

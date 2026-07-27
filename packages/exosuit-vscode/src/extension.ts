@@ -1004,7 +1004,7 @@ export async function activate(context: vscode.ExtensionContext) {
               }
               const confirmed = await exoMachineChannel(workspaceRoot, {
                 protocol_version: 1,
-                id: `vscode.sidecar.${action.kind}.confirmed.${Date.now()}`,
+                id: response.id,
                 op: {
                   kind: "call",
                   params: {

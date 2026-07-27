@@ -400,6 +400,26 @@ impl RequestOutcomeLedger {
                             },
                         };
                     }
+                    if response.status == Status::ConfirmRequired {
+                        // Authorization changes on the approved replay, so the
+                        // pre-approval response cannot become a terminal outcome.
+                        return match self.abandon(&request_id, &request_hash, instance_id) {
+                            Ok(()) => OutcomeExecution {
+                                response,
+                                replayed: false,
+                            },
+                            Err(error) => OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_abandon_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            },
+                        };
+                    }
                     return match self.complete(&request_id, &request_hash, &response) {
                         Ok(()) => OutcomeExecution {
                             response,
@@ -1164,7 +1184,10 @@ fn contains_recorded_workflow_confirmation(value: &serde_json::Value) -> bool {
 }
 
 fn request_hash(request: &RequestEnvelope) -> Result<String> {
-    let bytes = serde_json::to_vec(request)?;
+    let mut replay_identity = request.clone();
+    // Auth advances from absent to approved without changing the operation.
+    replay_identity.auth = None;
+    let bytes = serde_json::to_vec(&replay_identity)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -1373,6 +1396,89 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn confirm_required_response(id: &str) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::ConfirmRequired,
+            result: None,
+            error: None,
+            ticket: Some("ticket".to_string()),
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Exec),
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn request_hash_ignores_authorization_but_preserves_workspace_identity() {
+        let mut original = request("approved-retry", "task-a");
+        original.workspace_root = Some(PathBuf::from("/workspace-a"));
+        let mut approved = original.clone();
+        approved.auth = Some(crate::api::protocol::Auth {
+            ticket: "ticket".to_string(),
+            confirm: true,
+            request_id: Some(original.id.clone()),
+            workspace_root: original.workspace_root.clone(),
+        });
+        let mut other_workspace = approved.clone();
+        other_workspace.workspace_root = Some(PathBuf::from("/workspace-b"));
+
+        assert_eq!(
+            request_hash(&original).unwrap(),
+            request_hash(&approved).unwrap()
+        );
+        assert_ne!(
+            request_hash(&approved).unwrap(),
+            request_hash(&other_workspace).unwrap()
+        );
+    }
+
+    #[test]
+    fn confirm_required_response_releases_reservation_for_approved_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let request = request("approved-retry", "task-a");
+        let invocations = Cell::new(0);
+
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                confirm_required_response(&request.id)
+            },
+        );
+        assert_eq!(first.response.status, Status::ConfirmRequired);
+
+        let mut approved = request;
+        approved.auth = Some(crate::api::protocol::Auth {
+            ticket: "ticket".to_string(),
+            confirm: true,
+            request_id: Some(approved.id.clone()),
+            workspace_root: None,
+        });
+        let second = ledger.execute(
+            approved,
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                response(&request.id)
+            },
+        );
+
+        assert_eq!(second.response.status, Status::Ok);
+        assert!(!second.replayed);
+        assert_eq!(invocations.get(), 2);
     }
 
     #[test]

@@ -366,7 +366,7 @@ export async function handleExosuitToolInput(
 
         const confirmedRequest: MachineChannelRequestEnvelope = {
           ...payload.request,
-          id: `${payload.request.id}.confirm`,
+          id: payload.request.id,
           auth: { ticket: payload.ticket, confirm: true },
         };
 

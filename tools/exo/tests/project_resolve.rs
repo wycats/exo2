@@ -1430,23 +1430,26 @@ fn machine_channel_exec_command_rewrites_sql_dumps() {
     let before = std::fs::read_to_string(&dump_path).expect("read initial goals dump");
     std::fs::write(&dump_path, "sentinel dump\n").expect("write sentinel dump");
 
-    let request = test_support::confirmed_machine_channel_request(RequestEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        id: "machine-exec-rewrite-dump".to_string(),
-        op: Op::Call(CallParams {
-            address: Address::Operation {
-                path: vec!["strike".to_string(), "start".to_string()],
-            },
-            input: json!({
-                "name": "dump-rewrite-regression",
-                "goal": "prove exec commands rewrite SQL dumps"
+    let request = test_support::confirmed_machine_channel_request(
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "machine-exec-rewrite-dump".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec!["strike".to_string(), "start".to_string()],
+                },
+                input: json!({
+                    "name": "dump-rewrite-regression",
+                    "goal": "prove exec commands rewrite SQL dumps"
+                }),
             }),
-        }),
-        workspace_root: None,
-        auth: None,
-        workflow_confirmation: None,
-        agent_id: None,
-    });
+            workspace_root: None,
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        },
+        root,
+    );
 
     let response = run_machine_channel_in_process(root, &request);
     assert_eq!(response.status, Status::Ok);

@@ -48,15 +48,106 @@ function workflowKindSchema(): Record<string, unknown> {
   return kind;
 }
 
+function activeHelpResponse(
+  request: MachineChannelRequestEnvelope,
+): Record<string, unknown> {
+  const spec = loadCommandSpec();
+  if (request.op.kind !== "help") {
+    return {
+      protocol_version: 1,
+      id: request.id,
+      status: "ok",
+      result: { ok: true, kind: "task.complete" },
+    };
+  }
+
+  const address = request.op.params.address;
+  const operationResult = (
+    namespace: string,
+    name: string,
+    operation: ReturnType<typeof loadCommandSpec>["root_operations"][string],
+  ) => ({
+    path: namespace ? `${namespace} ${name}` : name,
+    effect: operation.effect,
+    summary: operation.description,
+    args: operation.args,
+  });
+
+  if (address.kind === "root") {
+    return {
+      protocol_version: 1,
+      id: request.id,
+      status: "ok",
+      result: {
+        title: "exo",
+        namespaces: Object.keys(spec.namespaces).map((name) => ({
+          path: [name],
+        })),
+        operations: Object.entries(spec.root_operations).map(
+          ([name, operation]) => operationResult("", name, operation),
+        ),
+      },
+    };
+  }
+
+  if (address.kind === "namespace") {
+    const name = address.path[0];
+    const namespace = spec.namespaces[name];
+    return {
+      protocol_version: 1,
+      id: request.id,
+      status: namespace ? "ok" : "error",
+      result: namespace
+        ? {
+            title: name,
+            namespaces: [],
+            operations: Object.entries(namespace.operations).map(
+              ([operationName, operation]) =>
+                operationResult(name, operationName, operation),
+            ),
+          }
+        : undefined,
+      error: namespace
+        ? undefined
+        : { code: "unknown_address", message: "Unknown namespace" },
+    };
+  }
+
+  const [namespaceOrOperation, operationName] = address.path;
+  const operation =
+    operationName === undefined
+      ? spec.root_operations[namespaceOrOperation]
+      : spec.namespaces[namespaceOrOperation]?.operations[operationName];
+  return {
+    protocol_version: 1,
+    id: request.id,
+    status: operation ? "ok" : "error",
+    result: operation
+      ? {
+          title: operationName ?? namespaceOrOperation,
+          namespaces: [],
+          operations: [
+            operationResult(
+              operationName === undefined ? "" : namespaceOrOperation,
+              operationName ?? namespaceOrOperation,
+              operation,
+            ),
+          ],
+        }
+      : undefined,
+    error: operation
+      ? undefined
+      : { code: "unknown_address", message: "Unknown operation" },
+  };
+}
+
 describe("exo-run workflow confirmation", () => {
   beforeEach(() => {
     machineChannelMock.mockReset();
-    machineChannelMock.mockResolvedValue({
-      protocol_version: 1,
-      id: "test.response",
-      status: "ok",
-      result: { ok: true, kind: "task.complete" },
-    });
+    machineChannelMock.mockImplementation(
+      (_rootPath: string, request: MachineChannelRequestEnvelope) =>
+        Promise.resolve(activeHelpResponse(request)),
+    );
     workspaceSelectionMock.mockReset();
     workspaceSelectionMock.mockReturnValue({
       rootPath: "/workspace",
@@ -81,10 +172,14 @@ describe("exo-run workflow confirmation", () => {
       | undefined;
 
     expect(properties?.workspaceRoot).toMatchObject({ type: "string" });
+    expect(properties?.content).toMatchObject({ type: "string" });
     expect(properties?.auth).toMatchObject({ type: "object" });
-    expect(
-      (properties?.auth?.properties as Record<string, unknown>)?.confirm,
-    ).toMatchObject({ const: true });
+    const authProperties = properties?.auth?.properties as
+      | Record<string, unknown>
+      | undefined;
+    expect(authProperties?.confirm).toMatchObject({ const: true });
+    expect(authProperties?.requestId).toMatchObject({ type: "string" });
+    expect(authProperties?.workspaceRoot).toMatchObject({ type: "string" });
   });
 
   it("guides agents to ask for human approval without displaying machine fields", () => {
@@ -134,8 +229,7 @@ describe("exo-run workflow confirmation", () => {
       {} as never,
     );
 
-    expect(machineChannelMock).toHaveBeenCalledTimes(1);
-    const request = machineChannelMock.mock.calls[0]?.[1] as
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
       | MachineChannelRequestEnvelope
       | undefined;
     expect(request?.workflow_confirmation).toEqual({
@@ -170,8 +264,7 @@ describe("exo-run workflow confirmation", () => {
       {} as never,
     );
 
-    expect(machineChannelMock).toHaveBeenCalledTimes(1);
-    const request = machineChannelMock.mock.calls[0]?.[1] as
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
       | MachineChannelRequestEnvelope
       | undefined;
     expect(request?.op).toEqual({
@@ -229,12 +322,12 @@ describe("exo-run workflow confirmation", () => {
     });
   });
 
-  it("addresses root operations from CommandSpec", async () => {
+  it("provides explicit content when addressing root write", async () => {
     const tool = createExoRunTool();
 
     await tool.invoke(
       {
-        input: { command: "write notes.md" },
+        input: { command: "write notes.md", content: "Hello from exo-run\n" },
         toolInvocationToken: undefined,
       } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
       {} as never,
@@ -247,9 +340,37 @@ describe("exo-run workflow confirmation", () => {
       kind: "call",
       params: {
         address: { kind: "operation", path: ["write"] },
-        input: { path: "notes.md" },
+        input: {
+          path: "notes.md",
+          __exo_transport: { content: "Hello from exo-run\n" },
+        },
       },
     });
+  });
+
+  it("rejects root write without content before dispatch", async () => {
+    const tool = createExoRunTool();
+
+    const result = await tool.invoke(
+      {
+        input: { command: "write notes.md" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+    if (!result) {
+      throw new Error("Expected exo-run to reject missing write content");
+    }
+
+    expect(firstTextValue(result)).toContain(
+      "Root write requires the exo-run content field",
+    );
+    expect(
+      machineChannelMock.mock.calls.some((call) => {
+        const request = call[1] as MachineChannelRequestEnvelope | undefined;
+        return request?.op.kind === "call";
+      }),
+    ).toBe(false);
   });
 
   it.each([
@@ -325,7 +446,10 @@ describe("exo-run workflow confirmation", () => {
     for (const { command, path } of cases) {
       await tool.invoke(
         {
-          input: { command },
+          input: {
+            command,
+            content: path.length === 1 && path[0] === "write" ? "" : undefined,
+          },
           toolInvocationToken: undefined,
         } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
         {} as never,
@@ -344,12 +468,21 @@ describe("exo-run workflow confirmation", () => {
   });
 
   it("uses the same dotted address for preview", async () => {
-    machineChannelMock.mockResolvedValueOnce({
-      protocol_version: 1,
-      id: "preview.response",
-      status: "ok",
-      preview: { invocation_message: "Checking documentation links" },
-    });
+    machineChannelMock.mockImplementation(
+      (_rootPath: string, request: MachineChannelRequestEnvelope) =>
+        Promise.resolve(
+          request.op.kind === "preview"
+            ? {
+                protocol_version: 1,
+                id: "preview.response",
+                status: "ok",
+                preview: {
+                  invocation_message: "Checking documentation links",
+                },
+              }
+            : activeHelpResponse(request),
+        ),
+    );
     const tool = createExoRunTool();
 
     await tool.prepareInvocation?.(
@@ -378,7 +511,12 @@ describe("exo-run workflow confirmation", () => {
       {
         input: {
           command: "update",
-          auth: { ticket: "opaque-ticket", confirm: true },
+          auth: {
+            ticket: "opaque-ticket",
+            confirm: true,
+            requestId: "request-approved",
+            workspaceRoot: "/workspace",
+          },
         },
         toolInvocationToken: undefined,
       } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
@@ -391,6 +529,79 @@ describe("exo-run workflow confirmation", () => {
     expect(request?.auth).toEqual({
       ticket: "opaque-ticket",
       confirm: true,
+      requestId: "request-approved",
+    });
+    expect(request?.id).toBe("request-approved");
+  });
+
+  it("rejects execution approval from another workspace", async () => {
+    const tool = createExoRunTool();
+
+    const result = await tool.invoke(
+      {
+        input: {
+          command: "update",
+          auth: {
+            ticket: "opaque-ticket",
+            confirm: true,
+            requestId: "request-approved",
+            workspaceRoot: "/workspace/other",
+          },
+        },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+    if (!result) {
+      throw new Error("Expected workspace-bound approval rejection");
+    }
+
+    expect(firstTextValue(result)).toContain(
+      "Execution approval belongs to a different workspace",
+    );
+    expect(machineChannelMock).not.toHaveBeenCalled();
+  });
+
+  it("resolves operations added by the active Exo binary", async () => {
+    machineChannelMock.mockImplementation(
+      (_rootPath: string, request: MachineChannelRequestEnvelope) => {
+        const response = activeHelpResponse(request);
+        if (
+          request.op.kind === "help" &&
+          request.op.params.address.kind === "root"
+        ) {
+          const result = response.result as {
+            operations: Array<Record<string, unknown>>;
+          };
+          result.operations.push({
+            path: "future-command",
+            effect: "pure",
+            summary: "Operation from the active binary",
+            args: [],
+          });
+        }
+        return Promise.resolve(response);
+      },
+    );
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: { command: "future-command" },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    const request = machineChannelMock.mock.calls.at(-1)?.[1] as
+      | MachineChannelRequestEnvelope
+      | undefined;
+    expect(request?.op).toMatchObject({
+      kind: "call",
+      params: {
+        address: { kind: "operation", path: ["future-command"] },
+        input: {},
+      },
     });
   });
 
