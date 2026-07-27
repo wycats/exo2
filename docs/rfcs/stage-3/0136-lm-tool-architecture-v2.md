@@ -42,9 +42,10 @@ effects, diagnostics, confirmation, and recovery. The model-facing architecture
 uses that language directly. The MCP project tool reaches operations whose
 inputs can be carried by its request schema while preserving the same execution
 semantics available to CLI users. VS Code represents the process-stdin body for
-root `write <path>` with the tool's dedicated `content` field. MCP does not yet
-carry that process-only input. VS Code otherwise uses the same project-tool
-surface and machine execution model while retaining its local tokenizer.
+root `write <path>` with the tool's dedicated `content` field. MCP exposes the
+same dedicated field and forwards it through the machine transport. VS Code
+otherwise uses the same project-tool surface and machine execution model while
+retaining its local tokenizer.
 
 Some useful capabilities deserve dedicated extension tools. Diagnostics,
 extension logs, and extension identity come directly from the VS Code process.

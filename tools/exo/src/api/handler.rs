@@ -16,7 +16,9 @@ use crate::command::command_spec::CommandSpec as NewCommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::{DiagnosticCode, Invocation, RoutingDiagnostic};
 use crate::command::traits::{CommandInvokeResult, invoke_command_box_json};
-use crate::command::transport::{MachineChannelTransport, ticket_for_exec_call};
+use crate::command::transport::{
+    MachineChannelTransport, compatible_exec_ticket_request_id, ticket_for_exec_call,
+};
 use crate::daemon::DaemonEnsureState;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, effect_name, elapsed_ms, request_op_path, response_status,
@@ -2144,8 +2146,23 @@ fn handle_call_with_namespace_operation(
                 return command_construction_error_to_response(id, error);
             }
 
-            let expected_ticket =
-                ticket_for_exec_call(&params.address, &params.input, workspace_root, &id);
+            let ticket_request_id = auth
+                .as_ref()
+                .filter(|auth| auth.confirm && auth.request_id.is_none())
+                .and_then(|auth| {
+                    compatible_exec_ticket_request_id(
+                        &params.address,
+                        &params.input,
+                        workspace_root,
+                        &auth.ticket,
+                    )
+                });
+            let expected_ticket = ticket_for_exec_call(
+                &params.address,
+                &params.input,
+                workspace_root,
+                ticket_request_id.as_deref().unwrap_or(&id),
+            );
             let agent_id_for_log = agent_id.as_deref().map(String::from);
             let transport = MachineChannelTransport {
                 workspace_root,

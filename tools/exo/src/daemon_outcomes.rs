@@ -186,9 +186,22 @@ impl RequestOutcomeLedger {
                 }));
             }
             if let Some(response_json) = response_json {
+                let response: ResponseEnvelope = serde_json::from_str(response_json)
+                    .context("deserialize recorded daemon response")?;
+                if request.auth.as_ref().is_some_and(|auth| auth.confirm)
+                    && is_transient_execution_confirmation(&response)
+                {
+                    self.connection()?.execute(
+                        "DELETE FROM daemon_request_outcomes
+                         WHERE request_id = ?1
+                           AND request_hash = ?2
+                           AND response_json = ?3",
+                        params![request.id, stored_hash, response_json],
+                    )?;
+                    return Ok(None);
+                }
                 return Ok(Some(OutcomeExecution {
-                    response: serde_json::from_str(response_json)
-                        .context("deserialize recorded daemon response")?,
+                    response,
                     replayed: true,
                 }));
             }
@@ -1242,6 +1255,10 @@ fn is_rejected_execution_confirmation(response: &ResponseEnvelope) -> bool {
             .is_some_and(|error| error.code == ErrorCode::ConfirmRequired)
 }
 
+fn is_transient_execution_confirmation(response: &ResponseEnvelope) -> bool {
+    response.status == Status::ConfirmRequired || is_rejected_execution_confirmation(response)
+}
+
 fn request_hashes(request: &RequestEnvelope) -> Result<RequestHashes> {
     let legacy = legacy_request_hash(request)?;
     let current = request_hash(request)?;
@@ -1577,6 +1594,61 @@ mod tests {
         assert_eq!(replay.response.id, recorded_response.id);
         assert_eq!(replay.response.status, recorded_response.status);
         assert_eq!(replay.response.result, recorded_response.result);
+    }
+
+    #[test]
+    fn approved_retry_discards_legacy_terminal_confirmation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let mut approved = request("legacy-confirmation-retry", "task-a");
+        let stored_hash = request_hash(&approved).expect("request hash");
+        let stored_response =
+            serde_json::to_string(&confirm_required_response(&approved.id)).expect("serialize");
+        ledger
+            .connection()
+            .expect("open ledger connection")
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, recovery_class,
+                     response_json, started_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    approved.id,
+                    stored_hash,
+                    effect_name(Effect::Exec),
+                    "instance-before-upgrade",
+                    recovery_class_name(RecoveryClass::ExternalAtMostOnce),
+                    stored_response,
+                    now_timestamp(),
+                    now_timestamp(),
+                ],
+            )
+            .expect("insert legacy confirmation");
+        approved.auth = Some(crate::api::protocol::Auth {
+            ticket: "ticket".to_string(),
+            confirm: true,
+            request_id: Some(approved.id.clone()),
+            workspace_root: None,
+        });
+
+        assert!(
+            ledger
+                .terminal_outcome_before_preparation(&approved)
+                .expect("inspect terminal outcome")
+                .is_none(),
+            "approved retry must continue instead of replaying the old prompt"
+        );
+        let retained: i64 = ledger
+            .connection()
+            .expect("open ledger connection")
+            .query_row(
+                "SELECT COUNT(*) FROM daemon_request_outcomes WHERE request_id = ?1",
+                [&approved.id],
+                |row| row.get(0),
+            )
+            .expect("count retained outcomes");
+        assert_eq!(retained, 0);
     }
 
     #[test]

@@ -80,6 +80,36 @@ describe("selectWorkspaceRoot", () => {
     expect(selection.reason).toBe("contains Exo project state");
   });
 
+  it("does not prefer a local marker over another policy-resolved project", async () => {
+    const tempRoot = mkdtempSync(
+      path.join(tmpdir(), "exo-workspace-root-mixed-state-"),
+    );
+    try {
+      const localProject = path.join(tempRoot, "local-project");
+      const externalProject = path.join(tempRoot, "external-project");
+      mkdirSync(path.join(localProject, ".exo", "cache"), { recursive: true });
+      mkdirSync(externalProject);
+      writeFileSync(path.join(localProject, ".exo", "cache", "exo.db"), "");
+
+      const selection = await selectLmToolWorkspaceRoot(
+        [{ fsPath: localProject }, { fsPath: externalProject }],
+        {
+          hasResolvedExosuitProjectState: async (rootPath) =>
+            rootPath === externalProject,
+        },
+      );
+
+      expect(selection.rootPath).toBeUndefined();
+      expect(selection.reason).toContain(
+        "multiple Exosuit project workspace folders are open",
+      );
+      expect(selection.reason).toContain(localProject);
+      expect(selection.reason).toContain(externalProject);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects exact filesystem root when another candidate exists", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: root }, { fsPath: otherRoot }],

@@ -189,7 +189,7 @@ export async function selectLmToolWorkspaceRoot(
     requestedRoot: options.requestedRoot,
     requireExplicitSelection: true,
   });
-  if (options.requestedRoot !== undefined || initial.rootPath !== undefined) {
+  if (options.requestedRoot !== undefined) {
     return initial;
   }
 
@@ -205,11 +205,13 @@ export async function selectLmToolWorkspaceRoot(
     defaultHasResolvedExosuitProjectState;
   const resolvedProjectRoots = new Set<string>();
   await Promise.all(
-    candidates.map(async (candidate) => {
-      if (await hasResolvedExosuitProjectState(candidate)) {
-        resolvedProjectRoots.add(candidate);
-      }
-    }),
+    candidates
+      .filter((candidate) => !defaultHasExosuitProjectState(candidate))
+      .map(async (candidate) => {
+        if (await hasResolvedExosuitProjectState(candidate)) {
+          resolvedProjectRoots.add(candidate);
+        }
+      }),
   );
 
   return selectWorkspaceRoot(folders, {

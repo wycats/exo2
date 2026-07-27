@@ -138,7 +138,32 @@ pub fn ticket_for_exec_call(
     });
 
     let digest = blake3::hash(payload.to_string().as_bytes());
-    format!("blake3:{digest}")
+    let encoded_request_id =
+        serde_json::to_string(request_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!("exo-v2:{encoded_request_id}:blake3:{digest}")
+}
+
+/// Recover the request identity carried by a workspace-bound execution ticket.
+///
+/// Older protocol-v1 clients treat the ticket as opaque and do not copy the
+/// request identity into `auth`. The runtime can still validate the ticket
+/// against the current operation and workspace, then use this identity for
+/// durable replay.
+pub fn compatible_exec_ticket_request_id(
+    address: &Address,
+    input: &JsonValue,
+    workspace_root: &Path,
+    ticket: &str,
+) -> Option<String> {
+    let encoded = ticket.strip_prefix("exo-v2:")?;
+    let (encoded_request_id, digest) = encoded.rsplit_once(":blake3:")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let request_id: String = serde_json::from_str(encoded_request_id).ok()?;
+    (ticket_for_exec_call(address, input, workspace_root, &request_id) == ticket)
+        .then_some(request_id)
 }
 
 fn generate_exec_ticket(action: &str) -> String {
@@ -593,6 +618,44 @@ mod tests {
             transport.confirm_exec(action),
             ConfirmResult::Denied("Invalid confirmation ticket".to_string())
         );
+    }
+
+    #[test]
+    fn machine_channel_confirm_exec_accepts_validated_protocol_v1_replay() {
+        let action = "run";
+        let address = Address::Operation {
+            path: vec!["dogfood".to_string(), "restart".to_string()],
+        };
+        let input = serde_json::json!({ "all": true });
+        let workspace = std::path::PathBuf::from("/test");
+        let other_workspace = std::path::PathBuf::from("/other");
+        let ticket = ticket_for_exec_call(&address, &input, &workspace, "original-request");
+        let original_request_id =
+            compatible_exec_ticket_request_id(&address, &input, &workspace, &ticket)
+                .expect("ticket carries its validated request identity");
+        assert!(
+            compatible_exec_ticket_request_id(&address, &input, &other_workspace, &ticket)
+                .is_none(),
+            "protocol-v1 compatibility must preserve workspace binding"
+        );
+        let transport = MachineChannelTransport {
+            workspace_root: &workspace,
+            project: None,
+            request_id: "replacement-request".to_string(),
+            auth: Some(Auth {
+                ticket: ticket.clone(),
+                confirm: true,
+                request_id: None,
+                workspace_root: None,
+            }),
+            expected_ticket: Some(ticket),
+            agent_id: None,
+            workflow_confirmation: None,
+            input_content: None,
+        };
+
+        assert_eq!(original_request_id, "original-request");
+        assert_eq!(transport.confirm_exec(action), ConfirmResult::Proceed);
     }
 
     #[cfg(unix)]
