@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import * as path from "node:path";
 
 export interface WorkspaceRootCandidate {
@@ -14,7 +14,7 @@ export interface WorkspaceRootSelection {
 }
 
 export interface WorkspaceRootSelectionOptions {
-  hasExosuitToml?: (rootPath: string) => boolean;
+  hasExosuitProjectState?: (rootPath: string) => boolean;
   requestedRoot?: string;
   requireExplicitSelection?: boolean;
 }
@@ -28,8 +28,20 @@ export function isFilesystemRoot(rootPath: string): boolean {
   return normalized === path.parse(normalized).root;
 }
 
-function defaultHasExosuitToml(rootPath: string): boolean {
-  return existsSync(path.join(rootPath, "exosuit.toml"));
+function defaultHasExosuitProjectState(rootPath: string): boolean {
+  if (
+    existsSync(path.join(rootPath, "exosuit.toml")) ||
+    existsSync(path.join(rootPath, ".cache", "exo.db"))
+  ) {
+    return true;
+  }
+
+  const projectionRoot = path.join(rootPath, "docs", "agent-context");
+  try {
+    return readdirSync(projectionRoot).some((entry) => entry.endsWith(".sql"));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -37,14 +49,15 @@ function defaultHasExosuitToml(rootPath: string): boolean {
  *
  * VS Code dev hosts can expose `/` as the first workspace folder. That is never
  * a useful daemon root unless it is the only explicitly selected project root,
- * so project folders containing `exosuit.toml` win first, and filesystem roots
+ * so folders containing established Exo state win first, and filesystem roots
  * are only considered after all real folders have been exhausted.
  */
 export function selectWorkspaceRoot(
   folders: readonly WorkspaceRootCandidate[] | undefined,
   options: WorkspaceRootSelectionOptions = {},
 ): WorkspaceRootSelection {
-  const hasExosuitToml = options.hasExosuitToml ?? defaultHasExosuitToml;
+  const hasExosuitProjectState =
+    options.hasExosuitProjectState ?? defaultHasExosuitProjectState;
   const seen = new Set<string>();
   const candidates: string[] = [];
 
@@ -82,12 +95,12 @@ export function selectWorkspaceRoot(
   }
 
   const projectRoots = candidates.filter((candidate) =>
-    hasExosuitToml(candidate),
+    hasExosuitProjectState(candidate),
   );
   if (projectRoots.length === 1) {
     return {
       rootPath: projectRoots[0],
-      reason: "contains exosuit.toml",
+      reason: "contains Exo project state",
       candidates,
     };
   }
@@ -101,7 +114,7 @@ export function selectWorkspaceRoot(
     }
     return {
       rootPath: projectRoots[0],
-      reason: "first workspace folder containing exosuit.toml",
+      reason: "first workspace folder containing Exo project state",
       candidates,
     };
   }

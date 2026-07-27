@@ -1166,7 +1166,7 @@ export function createExoRunTool(): vscode.LanguageModelTool<ExoRunInput> {
       }
 
       const workspaceSelection = selectCurrentLmToolWorkspaceRoot(
-        input.workspaceRoot,
+        input.workspaceRoot ?? input.auth?.workspaceRoot,
       );
       const rootPath = workspaceSelection.rootPath;
       if (!rootPath) {

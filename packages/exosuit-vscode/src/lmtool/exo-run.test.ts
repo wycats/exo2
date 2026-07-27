@@ -511,6 +511,7 @@ describe("exo-run workflow confirmation", () => {
       {
         input: {
           command: "update",
+          workspaceRoot: "/workspace",
           auth: {
             ticket: "opaque-ticket",
             confirm: true,
@@ -560,6 +561,37 @@ describe("exo-run workflow confirmation", () => {
       "Execution approval belongs to a different workspace",
     );
     expect(machineChannelMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the approved workspace when replaying hidden auth", async () => {
+    workspaceSelectionMock.mockImplementation((requestedRoot?: string) => ({
+      rootPath: requestedRoot,
+      reason: "requested open workspace folder",
+      candidates: ["/workspace/one", "/workspace/two"],
+    }));
+    const tool = createExoRunTool();
+
+    await tool.invoke(
+      {
+        input: {
+          command: "update",
+          auth: {
+            ticket: "opaque-ticket",
+            confirm: true,
+            requestId: "request-approved",
+            workspaceRoot: "/workspace/two",
+          },
+        },
+        toolInvocationToken: undefined,
+      } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+      {} as never,
+    );
+
+    expect(workspaceSelectionMock).toHaveBeenCalledWith("/workspace/two");
+    expect(machineChannelMock).toHaveBeenCalledWith(
+      "/workspace/two",
+      expect.any(Object),
+    );
   });
 
   it("resolves operations added by the active Exo binary", async () => {

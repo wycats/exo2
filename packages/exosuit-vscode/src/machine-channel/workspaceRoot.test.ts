@@ -1,32 +1,70 @@
 import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 
 import { isFilesystemRoot, selectWorkspaceRoot } from "../workspaceRoot";
 
-const hasExosuitToml = (roots: Set<string>) => (rootPath: string) =>
+const hasExosuitProjectState = (roots: Set<string>) => (rootPath: string) =>
   roots.has(rootPath);
 const root = path.parse(process.cwd()).root;
 const projectRoot = path.join(root, "Users", "example", "project");
 const otherRoot = path.join(root, "Users", "example", "other");
 
 describe("selectWorkspaceRoot", () => {
-  it("prefers a workspace folder containing exosuit.toml", () => {
+  it("prefers a workspace folder containing Exo project state", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: root }, { fsPath: projectRoot }],
       {
-        hasExosuitToml: hasExosuitToml(new Set([projectRoot])),
+        hasExosuitProjectState: hasExosuitProjectState(new Set([projectRoot])),
       },
     );
 
     expect(selection.rootPath).toBe(projectRoot);
-    expect(selection.reason).toBe("contains exosuit.toml");
+    expect(selection.reason).toBe("contains Exo project state");
+  });
+
+  it("recognizes database and SQL projection project state without a manifest", () => {
+    for (const marker of ["database", "projection"] as const) {
+      const tempRoot = mkdtempSync(
+        path.join(tmpdir(), `exo-workspace-root-${marker}-`),
+      );
+      try {
+        const project = path.join(tempRoot, "project");
+        const unrelated = path.join(tempRoot, "unrelated");
+        mkdirSync(project);
+        mkdirSync(unrelated);
+        if (marker === "database") {
+          mkdirSync(path.join(project, ".cache"));
+          writeFileSync(path.join(project, ".cache", "exo.db"), "");
+        } else {
+          mkdirSync(path.join(project, "docs", "agent-context"), {
+            recursive: true,
+          });
+          writeFileSync(
+            path.join(project, "docs", "agent-context", "goals.sql"),
+            "",
+          );
+        }
+
+        const selection = selectWorkspaceRoot(
+          [{ fsPath: project }, { fsPath: unrelated }],
+          { requireExplicitSelection: true },
+        );
+
+        expect(selection.rootPath).toBe(project);
+        expect(selection.reason).toBe("contains Exo project state");
+      } finally {
+        rmSync(tempRoot, { recursive: true, force: true });
+      }
+    }
   });
 
   it("rejects exact filesystem root when another candidate exists", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: root }, { fsPath: otherRoot }],
       {
-        hasExosuitToml: hasExosuitToml(new Set()),
+        hasExosuitProjectState: hasExosuitProjectState(new Set()),
       },
     );
 
@@ -36,7 +74,7 @@ describe("selectWorkspaceRoot", () => {
 
   it("does not select filesystem root as a daemon workspace", () => {
     const selection = selectWorkspaceRoot([{ fsPath: root }], {
-      hasExosuitToml: hasExosuitToml(new Set()),
+      hasExosuitProjectState: hasExosuitProjectState(new Set()),
     });
 
     expect(selection.rootPath).toBeUndefined();
@@ -48,7 +86,7 @@ describe("selectWorkspaceRoot", () => {
   it("normalizes duplicate candidates", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: projectRoot }, { fsPath: path.join(projectRoot, ".") }],
-      { hasExosuitToml: hasExosuitToml(new Set()) },
+      { hasExosuitProjectState: hasExosuitProjectState(new Set()) },
     );
 
     expect(selection.candidates).toEqual([projectRoot]);
@@ -58,7 +96,7 @@ describe("selectWorkspaceRoot", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: projectRoot }, { fsPath: otherRoot }],
       {
-        hasExosuitToml: hasExosuitToml(
+        hasExosuitProjectState: hasExosuitProjectState(
           new Set([projectRoot, otherRoot]),
         ),
         requireExplicitSelection: true,
@@ -77,7 +115,7 @@ describe("selectWorkspaceRoot", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: projectRoot }, { fsPath: otherRoot }],
       {
-        hasExosuitToml: hasExosuitToml(
+        hasExosuitProjectState: hasExosuitProjectState(
           new Set([projectRoot, otherRoot]),
         ),
         requestedRoot: path.join(otherRoot, "."),
@@ -92,7 +130,7 @@ describe("selectWorkspaceRoot", () => {
   it("rejects a requested path that is not an open workspace folder", () => {
     const missingRoot = path.join(root, "Users", "example", "missing");
     const selection = selectWorkspaceRoot([{ fsPath: projectRoot }], {
-      hasExosuitToml: hasExosuitToml(new Set([projectRoot])),
+      hasExosuitProjectState: hasExosuitProjectState(new Set([projectRoot])),
       requestedRoot: missingRoot,
     });
 
@@ -106,7 +144,7 @@ describe("selectWorkspaceRoot", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: projectRoot }, { fsPath: otherRoot }],
       {
-        hasExosuitToml: hasExosuitToml(new Set()),
+        hasExosuitProjectState: hasExosuitProjectState(new Set()),
         requireExplicitSelection: true,
       },
     );
@@ -119,7 +157,7 @@ describe("selectWorkspaceRoot", () => {
     const selection = selectWorkspaceRoot(
       [{ fsPath: projectRoot }, { fsPath: otherRoot }],
       {
-        hasExosuitToml: hasExosuitToml(
+        hasExosuitProjectState: hasExosuitProjectState(
           new Set([projectRoot, otherRoot]),
         ),
       },
@@ -127,7 +165,7 @@ describe("selectWorkspaceRoot", () => {
 
     expect(selection.rootPath).toBe(projectRoot);
     expect(selection.reason).toBe(
-      "first workspace folder containing exosuit.toml",
+      "first workspace folder containing Exo project state",
     );
   });
 });
