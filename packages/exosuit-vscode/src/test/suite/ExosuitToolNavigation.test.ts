@@ -276,6 +276,51 @@ test-core = { cmd = "echo test", desc = "Run tests" }
     assert.strictEqual((out.result as any).type, "run");
   });
 
+  it("approved replay uses the request id returned with the ticket", async () => {
+    const requests: any[] = [];
+    const deps = makeDeps({
+      exoMachineChannel: async (_cwd: string, request: any) => {
+        requests.push(request);
+        if (request.auth?.confirm === true) {
+          return {
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: {
+              task_id: request.op.params?.input?.id,
+              stdout: "ok",
+            },
+          };
+        }
+
+        return {
+          protocol_version: 1,
+          id: `${request.id}.daemon`,
+          status: "confirm_required",
+          ticket: "blake3:test-ticket",
+        };
+      },
+    });
+
+    const confirmation = await handleExosuitToolInput(deps, {
+      run: { targetKind: "task", targetId: "build-ext" },
+    });
+    assert.strictEqual(confirmation.status, "needs_confirmation");
+
+    const result = await handleExosuitToolInput(deps, {
+      use: {
+        ticket: confirmation.ticket!,
+        confirm: true,
+      },
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(requests.length, 2);
+    assert.strictEqual(requests[1].id, `${requests[0].id}.daemon`);
+    assert.strictEqual(requests[1].auth.requestId, requests[1].id);
+    assert.strictEqual(requests[1].auth.workspaceRoot, deps.rootPath);
+  });
+
   it("request locate returns ok", async () => {
     const out = await handleExosuitToolInput(makeDeps(), {
       locate: { what: "context", id: null },

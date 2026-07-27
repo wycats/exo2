@@ -1021,19 +1021,11 @@ export function formatMachineChannelResponse(
         reminders.map((r) => `- [${r.severity}] ${r.message}`).join("\n");
     }
 
-    // Pass through full steering data when present
+    // Pass through full steering data when present.
     const steering = response.steering;
-    let steeringPart: vscode.LanguageModelDataPart | undefined;
-
-    if (steering) {
-      if (typeof vscode.LanguageModelDataPart?.json === "function") {
-        steeringPart = vscode.LanguageModelDataPart.json(steering);
-      } else {
-        // Fallback: append as JSON code block if data parts unavailable
-        const steeringJson = JSON.stringify(steering, null, 2);
-        text += `\n\n---\nSteering JSON:\n\`\`\`json\n${steeringJson}\n\`\`\``;
-      }
-    }
+    const steeringPart = steering
+      ? vscode.LanguageModelDataPart.json(steering)
+      : undefined;
 
     return textResult(text, steeringPart);
   }
@@ -1041,33 +1033,26 @@ export function formatMachineChannelResponse(
   if (response.status === "confirm_required" && response.ticket) {
     const text =
       "Execution confirmation required.\n\nAsk the human whether to approve this action. If they approve, continue with the confirmed action.";
-    const authPart =
-      typeof vscode.LanguageModelDataPart?.json === "function"
-        ? vscode.LanguageModelDataPart.json({
-            auth: {
-              ticket: response.ticket,
-              confirm: true,
-              requestId: response.id,
-              workspaceRoot,
-            },
-          })
-        : undefined;
+    const authPart = vscode.LanguageModelDataPart.json({
+      auth: {
+        ticket: response.ticket,
+        confirm: true,
+        requestId: response.id,
+        workspaceRoot,
+      },
+    });
     return textResult(text, authPart);
   }
 
   const { text, workflowConfirmation } = formatErrorResponse(response);
-  let workflowPart: vscode.LanguageModelDataPart | undefined;
-  if (
-    workflowConfirmation &&
-    typeof vscode.LanguageModelDataPart?.json === "function"
-  ) {
-    workflowPart = vscode.LanguageModelDataPart.json({
-      workflow_confirmation: workflowConfirmation,
-      workflowConfirmation: workflowConfirmation.completion_input
-        ? toExoRunWorkflowConfirmation(workflowConfirmation.completion_input)
-        : undefined,
-    });
-  }
+  const workflowPart = workflowConfirmation
+    ? vscode.LanguageModelDataPart.json({
+        workflow_confirmation: workflowConfirmation,
+        workflowConfirmation: workflowConfirmation.completion_input
+          ? toExoRunWorkflowConfirmation(workflowConfirmation.completion_input)
+          : undefined,
+      })
+    : undefined;
   return textResult(text, workflowPart);
 }
 

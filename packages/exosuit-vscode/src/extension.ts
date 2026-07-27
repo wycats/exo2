@@ -1012,7 +1012,12 @@ export async function activate(context: vscode.ExtensionContext) {
                     input: call.input,
                   },
                 },
-                auth: { ticket: response.ticket, confirm: true },
+                auth: {
+                  ticket: response.ticket,
+                  confirm: true,
+                  requestId: response.id,
+                  workspaceRoot,
+                },
               });
               if (confirmed.status === "ok") {
                 vscode.window.showInformationMessage(

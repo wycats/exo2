@@ -11,7 +11,7 @@
     "directory": "packages/exosuit-vscode"
   },
   "engines": {
-    "vscode": "^1.93.0"
+    "vscode": "^1.106.0"
   },
   "activationEvents": [
     "onStartupFinished",
@@ -808,7 +808,7 @@
     "@types/mdast": "^4.0.4",
     "@types/node": "20.2.5",
     "@types/picomatch": "^4.0.2",
-    "@types/vscode": "^1.93.0",
+    "@types/vscode": "^1.106.0",
     "@typescript-eslint/eslint-plugin": "^8.50.0",
     "@typescript-eslint/parser": "^8.50.0",
     "@vscode/test-electron": "^2.5.2",

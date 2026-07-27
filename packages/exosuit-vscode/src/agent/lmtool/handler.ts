@@ -181,7 +181,7 @@ export async function handleExosuitToolInput(
       ) {
         const mcTicket = encodeMachineChannelTicket({
           kind: "mc.v1",
-          request: req,
+          request: { ...req, id: resp.id },
           ticket: resp.ticket,
         });
         return needsConfirmation(
@@ -367,7 +367,12 @@ export async function handleExosuitToolInput(
         const confirmedRequest: MachineChannelRequestEnvelope = {
           ...payload.request,
           id: payload.request.id,
-          auth: { ticket: payload.ticket, confirm: true },
+          auth: {
+            ticket: payload.ticket,
+            confirm: true,
+            requestId: payload.request.id,
+            workspaceRoot: deps.rootPath,
+          },
         };
 
         const resp = await callMachineChannel(deps, confirmedRequest);

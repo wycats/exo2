@@ -163,6 +163,10 @@ describe("exo-run workflow confirmation", () => {
     });
   });
 
+  it("requires the stable VS Code JSON data-part API", () => {
+    expect(manifest.engines.vscode).toBe("^1.106.0");
+  });
+
   it("publishes hidden execution approval and workspace selection inputs", () => {
     const exoRunTool = manifest.contributes.languageModelTools.find(
       (tool) => tool.name === "exo-run",

@@ -400,9 +400,11 @@ impl RequestOutcomeLedger {
                             },
                         };
                     }
-                    if response.status == Status::ConfirmRequired {
+                    if response.status == Status::ConfirmRequired
+                        || is_rejected_execution_confirmation(&response)
+                    {
                         // Authorization changes on the approved replay, so the
-                        // pre-approval response cannot become a terminal outcome.
+                        // pre-execution response cannot become a terminal outcome.
                         return match self.abandon(&request_id, &request_hash, instance_id) {
                             Ok(()) => OutcomeExecution {
                                 response,
@@ -1183,6 +1185,14 @@ fn contains_recorded_workflow_confirmation(value: &serde_json::Value) -> bool {
     }
 }
 
+fn is_rejected_execution_confirmation(response: &ResponseEnvelope) -> bool {
+    response.status == Status::Error
+        && response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == ErrorCode::ConfirmRequired)
+}
+
 fn request_hash(request: &RequestEnvelope) -> Result<String> {
     let mut replay_identity = request.clone();
     // Auth advances from absent to approved without changing the operation.
@@ -1415,6 +1425,27 @@ mod tests {
         }
     }
 
+    fn rejected_confirmation_response(id: &str) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::Error,
+            result: None,
+            error: Some(ErrorBody {
+                code: ErrorCode::ConfirmRequired,
+                message: "Invalid confirmation ticket".to_string(),
+                details: None,
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Exec),
+            trace: None,
+        }
+    }
+
     #[test]
     fn request_hash_ignores_authorization_but_preserves_workspace_identity() {
         let mut original = request("approved-retry", "task-a");
@@ -1467,6 +1498,53 @@ mod tests {
         });
         let second = ledger.execute(
             approved,
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                response(&request.id)
+            },
+        );
+
+        assert_eq!(second.response.status, Status::Ok);
+        assert!(!second.replayed);
+        assert_eq!(invocations.get(), 2);
+    }
+
+    #[test]
+    fn rejected_confirmation_releases_reservation_for_corrected_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let mut request = request("corrected-approval", "task-a");
+        request.auth = Some(crate::api::protocol::Auth {
+            ticket: "wrong-ticket".to_string(),
+            confirm: true,
+            request_id: Some(request.id.clone()),
+            workspace_root: None,
+        });
+        let invocations = Cell::new(0);
+
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Exec,
+            "instance-a",
+            Duration::ZERO,
+            |request| {
+                invocations.set(invocations.get() + 1);
+                rejected_confirmation_response(&request.id)
+            },
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(
+            first.response.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::ConfirmRequired)
+        );
+
+        let mut corrected = request;
+        corrected.auth.as_mut().expect("approved auth").ticket = "correct-ticket".to_string();
+        let second = ledger.execute(
+            corrected,
             Effect::Exec,
             "instance-a",
             Duration::ZERO,

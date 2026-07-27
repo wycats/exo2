@@ -448,11 +448,15 @@ export class DaemonChannelServer {
       throw new Error("DaemonChannelServer is shutting down");
     }
 
-    // Bind one globally unique identity to this logical invocation. Every
-    // socket reconnect below reuses this exact envelope.
+    // Bind one globally unique identity to a new logical invocation. Approved
+    // replays already carry the exact request ID bound into their ticket.
+    const requestId =
+      envelope.auth?.confirm === true
+        ? envelope.id
+        : `${envelope.id}.${randomUUID()}`;
     envelope = {
       ...envelope,
-      id: `${envelope.id}.${randomUUID()}`,
+      id: requestId,
       workspace_root: undefined,
     };
 
