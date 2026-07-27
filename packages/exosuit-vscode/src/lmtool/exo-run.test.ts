@@ -326,6 +326,35 @@ describe("exo-run workflow confirmation", () => {
     });
   });
 
+  it.each(["help status typo", "help task complete typo"])(
+    "rejects trailing help target segments for %s",
+    async (command) => {
+      const tool = createExoRunTool();
+
+      const result = await tool.invoke(
+        {
+          input: { command },
+          toolInvocationToken: undefined,
+        } satisfies vscode.LanguageModelToolInvocationOptions<ExoRunInput>,
+        {} as never,
+      );
+      if (!result) {
+        throw new Error("Expected exo-run to reject the help target");
+      }
+
+      expect(firstTextValue(result)).toContain("Unknown");
+      expect(
+        machineChannelMock.mock.calls.some((call) => {
+          const request = call[1] as MachineChannelRequestEnvelope | undefined;
+          return (
+            request?.op.kind === "help" &&
+            request.op.params.address.kind === "operation"
+          );
+        }),
+      ).toBe(false);
+    },
+  );
+
   it("provides explicit content when addressing root write", async () => {
     const tool = createExoRunTool();
 

@@ -146,6 +146,17 @@ fn generate_exec_ticket(action: &str) -> String {
     format!("blake3:{digest}")
 }
 
+fn workspace_roots_match(first: &Path, second: &Path) -> bool {
+    if first == second {
+        return true;
+    }
+
+    matches!(
+        (first.canonicalize(), second.canonicalize()),
+        (Ok(first), Ok(second)) if first == second
+    )
+}
+
 /// Transport context for machine-channel requests.
 #[derive(Debug, Clone)]
 pub struct MachineChannelTransport<'a> {
@@ -274,10 +285,10 @@ impl TransportContext for MachineChannelTransport<'_> {
                     .request_id
                     .as_deref()
                     .is_none_or(|request_id| request_id == self.request_id);
-                let workspace_matches = auth
-                    .workspace_root
-                    .as_deref()
-                    .is_none_or(|workspace_root| workspace_root == self.workspace_root);
+                let workspace_matches =
+                    auth.workspace_root.as_deref().is_none_or(|workspace_root| {
+                        workspace_roots_match(workspace_root, self.workspace_root)
+                    });
 
                 if auth.ticket == ticket && request_matches && workspace_matches {
                     ConfirmResult::Proceed
@@ -582,5 +593,40 @@ mod tests {
             transport.confirm_exec(action),
             ConfirmResult::Denied("Invalid confirmation ticket".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_channel_confirm_exec_accepts_symlinked_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let alias = temp.path().join("workspace-alias");
+        symlink(&workspace, &alias).expect("create workspace symlink");
+        let address = Address::Operation {
+            path: vec!["dogfood".to_string(), "restart".to_string()],
+        };
+        let input = serde_json::json!({ "all": true });
+        let expected_ticket = ticket_for_exec_call(&address, &input, &workspace, "req-1");
+        let transport = MachineChannelTransport {
+            workspace_root: &workspace,
+            project: None,
+            request_id: "req-1".to_string(),
+            auth: Some(Auth {
+                ticket: expected_ticket.clone(),
+                confirm: true,
+                request_id: Some("req-1".to_string()),
+                workspace_root: Some(alias),
+            }),
+            expected_ticket: Some(expected_ticket),
+            agent_id: None,
+            workflow_confirmation: None,
+            input_content: None,
+        };
+
+        assert_eq!(transport.confirm_exec("run"), ConfirmResult::Proceed);
     }
 }

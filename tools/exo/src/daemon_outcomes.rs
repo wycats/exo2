@@ -77,6 +77,18 @@ struct AtomicCoreExecution {
     request_id_conflict: bool,
 }
 
+#[derive(Debug)]
+struct RequestHashes {
+    current: String,
+    legacy: String,
+}
+
+impl RequestHashes {
+    fn matches(&self, stored: &str) -> bool {
+        stored == self.current || stored == self.legacy
+    }
+}
+
 impl RequestOutcomeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let ledger = Self { path: path.into() };
@@ -132,7 +144,7 @@ impl RequestOutcomeLedger {
         &self,
         request: &RequestEnvelope,
     ) -> Result<Option<OutcomeExecution>> {
-        let request_hash = request_hash(request)?;
+        let request_hashes = request_hashes(request)?;
         let runtime_outcome =
             Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))
@@ -159,7 +171,7 @@ impl RequestOutcomeLedger {
 
         if let Ok(Some((stored_hash, effect, recovery_class, response_json))) = &runtime_outcome {
             let effect = effect_from_name(&effect)?;
-            if stored_hash != &request_hash {
+            if !request_hashes.matches(stored_hash) {
                 let response = request_id_conflict_response(request.id.clone(), effect);
                 return Ok(Some(OutcomeExecution {
                     response: if matches!(
@@ -193,7 +205,7 @@ impl RequestOutcomeLedger {
         &self,
         request: &RequestEnvelope,
     ) -> Result<Option<ResolvedRequestRecovery>> {
-        let request_hash = request_hash(request)?;
+        let request_hashes = request_hashes(request)?;
         let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))?;
         connection.pragma_update(None, "busy_timeout", 5_000)?;
@@ -217,7 +229,7 @@ impl RequestOutcomeLedger {
         let Some((stored_hash, effect, recovery_class, None)) = reserved else {
             return Ok(None);
         };
-        if stored_hash != request_hash {
+        if !request_hashes.matches(&stored_hash) {
             return Ok(None);
         }
 
@@ -239,8 +251,8 @@ impl RequestOutcomeLedger {
         project_db_path: &Path,
         instance_id: &str,
     ) -> Result<bool> {
-        let request_hash = request_hash(request)?;
-        let runtime_outcome = self.runtime_outcome_state(&request.id, &request_hash);
+        let request_hashes = request_hashes(request)?;
+        let runtime_outcome = self.runtime_outcome_state(&request.id, &request_hashes);
         if matches!(runtime_outcome, Ok(RuntimeOutcomeState::Terminal))
             || matches!(
                 &runtime_outcome,
@@ -291,8 +303,8 @@ impl RequestOutcomeLedger {
         F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
     {
         let request_id = request.id.clone();
-        let request_hash = match request_hash(&request) {
-            Ok(hash) => hash,
+        let request_hashes = match request_hashes(&request) {
+            Ok(hashes) => hashes,
             Err(error) => {
                 return OutcomeExecution {
                     response: ledger_error_response(
@@ -306,13 +318,14 @@ impl RequestOutcomeLedger {
                 };
             }
         };
+        let request_hash = request_hashes.current.clone();
 
         let mut request = Some(request);
         let mut execute = Some(execute);
         loop {
-            match self.reserve(
+            match self.reserve_compatible(
                 &request_id,
-                &request_hash,
+                &request_hashes,
                 effect,
                 RecoveryClass::ExternalAtMostOnce,
                 instance_id,
@@ -477,8 +490,8 @@ impl RequestOutcomeLedger {
         G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
     {
         let request_id = request.id.clone();
-        let request_hash = match request_hash(&request) {
-            Ok(hash) => hash,
+        let request_hashes = match request_hashes(&request) {
+            Ok(hashes) => hashes,
             Err(error) => {
                 return OutcomeExecution {
                     response: without_committed_effect(ledger_error_response(
@@ -492,10 +505,11 @@ impl RequestOutcomeLedger {
                 };
             }
         };
+        let request_hash = request_hashes.current.clone();
 
-        let owns_runtime_reservation = match self.reserve(
+        let owns_runtime_reservation = match self.reserve_compatible(
             &request_id,
-            &request_hash,
+            &request_hashes,
             effect,
             RecoveryClass::AtomicProjectState,
             instance_id,
@@ -673,7 +687,7 @@ impl RequestOutcomeLedger {
     fn runtime_outcome_state(
         &self,
         request_id: &str,
-        request_hash: &str,
+        request_hashes: &RequestHashes,
     ) -> Result<RuntimeOutcomeState> {
         let connection = self.connection()?;
         let existing = connection
@@ -694,7 +708,7 @@ impl RequestOutcomeLedger {
             .optional()?;
         Ok(match existing {
             None => RuntimeOutcomeState::Missing,
-            Some((stored_hash, _, _, _)) if stored_hash != request_hash => {
+            Some((stored_hash, _, _, _)) if !request_hashes.matches(&stored_hash) => {
                 RuntimeOutcomeState::Terminal
             }
             Some((_, _, _, Some(_))) => RuntimeOutcomeState::Terminal,
@@ -705,10 +719,31 @@ impl RequestOutcomeLedger {
         })
     }
 
+    #[cfg(test)]
     fn reserve(
         &self,
         request_id: &str,
         request_hash: &str,
+        effect: Effect,
+        recovery_class: RecoveryClass,
+        instance_id: &str,
+    ) -> Result<Reservation> {
+        self.reserve_compatible(
+            request_id,
+            &RequestHashes {
+                current: request_hash.to_string(),
+                legacy: request_hash.to_string(),
+            },
+            effect,
+            recovery_class,
+            instance_id,
+        )
+    }
+
+    fn reserve_compatible(
+        &self,
+        request_id: &str,
+        request_hashes: &RequestHashes,
         effect: Effect,
         recovery_class: RecoveryClass,
         instance_id: &str,
@@ -732,8 +767,22 @@ impl RequestOutcomeLedger {
             )
             .optional()?;
 
+        if let Some((stored_hash, _, _, _)) = &existing
+            && request_hashes.matches(stored_hash)
+            && stored_hash != &request_hashes.current
+        {
+            transaction.execute(
+                "UPDATE daemon_request_outcomes
+                 SET request_hash = ?2
+                 WHERE request_id = ?1 AND request_hash = ?3",
+                params![request_id, request_hashes.current, stored_hash],
+            )?;
+        }
+
         let reservation = match existing {
-            Some((stored_hash, _, _, _)) if stored_hash != request_hash => Reservation::Conflict,
+            Some((stored_hash, _, _, _)) if !request_hashes.matches(&stored_hash) => {
+                Reservation::Conflict
+            }
             Some((_, _, _, Some(response_json))) => Reservation::Replay(Box::new(
                 serde_json::from_str(&response_json)
                     .context("deserialize recorded daemon response")?,
@@ -751,7 +800,7 @@ impl RequestOutcomeLedger {
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         request_id,
-                        request_hash,
+                        request_hashes.current,
                         effect_name(effect),
                         instance_id,
                         recovery_class_name(recovery_class),
@@ -1193,11 +1242,22 @@ fn is_rejected_execution_confirmation(response: &ResponseEnvelope) -> bool {
             .is_some_and(|error| error.code == ErrorCode::ConfirmRequired)
 }
 
+fn request_hashes(request: &RequestEnvelope) -> Result<RequestHashes> {
+    let legacy = legacy_request_hash(request)?;
+    let current = request_hash(request)?;
+    Ok(RequestHashes { current, legacy })
+}
+
 fn request_hash(request: &RequestEnvelope) -> Result<String> {
     let mut replay_identity = request.clone();
     // Auth advances from absent to approved without changing the operation.
     replay_identity.auth = None;
     let bytes = serde_json::to_vec(&replay_identity)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn legacy_request_hash(request: &RequestEnvelope) -> Result<String> {
+    let bytes = serde_json::to_vec(request)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -1468,6 +1528,55 @@ mod tests {
             request_hash(&approved).unwrap(),
             request_hash(&other_workspace).unwrap()
         );
+    }
+
+    #[test]
+    fn completed_legacy_authenticated_hash_replays_after_upgrade() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let mut approved = request("legacy-approved-retry", "task-a");
+        approved.auth = Some(crate::api::protocol::Auth {
+            ticket: "legacy-ticket".to_string(),
+            confirm: true,
+            request_id: Some(approved.id.clone()),
+            workspace_root: None,
+        });
+        let current_hash = request_hash(&approved).expect("current request hash");
+        let legacy_hash = legacy_request_hash(&approved).expect("legacy request hash");
+        assert_ne!(current_hash, legacy_hash);
+        let recorded_response = response(&approved.id);
+        let response_json = serde_json::to_string(&recorded_response).expect("serialize response");
+        ledger
+            .connection()
+            .expect("open ledger connection")
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, recovery_class,
+                     response_json, started_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    approved.id,
+                    legacy_hash,
+                    effect_name(Effect::Exec),
+                    "instance-before-upgrade",
+                    recovery_class_name(RecoveryClass::ExternalAtMostOnce),
+                    response_json,
+                    now_timestamp(),
+                    now_timestamp(),
+                ],
+            )
+            .expect("insert legacy outcome");
+
+        let replay = ledger
+            .terminal_outcome_before_preparation(&approved)
+            .expect("read legacy outcome")
+            .expect("legacy outcome should match");
+
+        assert!(replay.replayed);
+        assert_eq!(replay.response.id, recorded_response.id);
+        assert_eq!(replay.response.status, recorded_response.status);
+        assert_eq!(replay.response.result, recorded_response.result);
     }
 
     #[test]

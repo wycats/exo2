@@ -354,7 +354,10 @@ async function resolveHelpAddress(
   }
 
   const rootHelp = await requestRuntimeHelp(rootPath, { kind: "root" });
-  if (rootHelp.operations?.some((operation) => operation.path === path[0])) {
+  if (
+    path.length === 1 &&
+    rootHelp.operations?.some((operation) => operation.path === path[0])
+  ) {
     return { kind: "operation", path: [path[0]] };
   }
 
@@ -377,9 +380,9 @@ async function resolveHelpAddress(
     path,
     namespaceHelp.operations ?? [],
   );
-  if (!match) {
+  if (!match || match.argumentStart !== path.length) {
     throw new Error(
-      `Unknown operation for namespace '${path[0]}': '${path[1]}'`,
+      `Unknown help target '${path.join(" ")}'`,
     );
   }
   return { kind: "operation", path: match.path };
