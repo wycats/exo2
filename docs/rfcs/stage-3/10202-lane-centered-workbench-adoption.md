@@ -27,6 +27,9 @@ provenance, parking, closure, or outcomes. Those concepts remain part of the
 broader [lane-centered workbench design package](../../design/lane-centered-workbench/README.md),
 but they are not prerequisites for making lane continuity real.
 
+Current operator guidance lives in the
+[Lane-Centered Workbench manual](../../manual/lane-centered-workbench.md).
+
 ## Motivation
 
 Exo already has durable objects for planning and execution. Phases organize a
