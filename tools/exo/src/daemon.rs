@@ -1753,6 +1753,10 @@ where
     }
 }
 
+fn response_committed_write(response: &ResponseEnvelope) -> bool {
+    response.effect == Some(Effect::Write)
+}
+
 fn replay_request_context(
     startup_workspace: &Path,
     startup_project: &Project,
@@ -2941,7 +2945,7 @@ pub async fn run_daemon(
                 },
             )
             .await;
-            if response.status == Status::Ok && response.effect == Some(Effect::Write) {
+            if response_committed_write(&response) {
                 runtime_services.revision_after_write();
                 let _ = write_tx.send(());
             }
@@ -3401,6 +3405,22 @@ mod tests {
             }
         }))
         .expect("workspace request")
+    }
+
+    #[test]
+    fn committed_write_error_response_still_requires_client_notification() {
+        let mut response = daemon_handler_error_response(
+            "committed-write-error".to_string(),
+            ErrorCode::PreconditionFailed,
+            "post-commit finalization failed".to_string(),
+        );
+        response.effect = Some(Effect::Write);
+
+        assert_eq!(response.status, Status::Error);
+        assert!(response_committed_write(&response));
+
+        response.effect = None;
+        assert!(!response_committed_write(&response));
     }
 
     #[tokio::test]

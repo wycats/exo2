@@ -91,17 +91,17 @@ fn git_success(root: &std::path::Path, args: &[&str]) {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 struct McpDaemonGuard(PathBuf);
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 impl McpDaemonGuard {
     fn new(workspace: &Path) -> Self {
         Self(workspace.to_path_buf())
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 impl Drop for McpDaemonGuard {
     fn drop(&mut self) {
         let Ok(paths) = exo::daemon::paths_for_workspace(&self.0) else {
@@ -3030,7 +3030,7 @@ fn mcp_stdio_serves_exo_run_status() {
     assert!(status.success(), "mcp server exited with {status}");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "ui"))]
 #[test]
 fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
     let temp = tempfile::tempdir().expect("tempdir");

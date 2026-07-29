@@ -3,7 +3,8 @@ use super::{
     WorkbenchSession, assets,
 };
 use crate::api::protocol::{
-    Address, CallParams, Op, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope,
+    Address, CallParams, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RequestEnvelope,
+    ResponseEnvelope, Status,
 };
 use async_stream::stream;
 use axum::Json;
@@ -198,7 +199,7 @@ async fn run_command(
             "The workbench session does not allow this operation",
         );
     }
-    let workspace_root = match inner.validate_workspace(&session.workspace_root) {
+    let workspace_root = match inner.validate_session_workspace(&session.workspace_root) {
         Ok(root) => root,
         Err(_) => {
             return error_response(
@@ -216,7 +217,7 @@ async fn run_command(
         );
     };
     inner.touch_daemon_activity();
-    let response: ResponseEnvelope = dispatcher
+    let response = dispatcher
         .dispatch(RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             id: request.id,
@@ -227,10 +228,48 @@ async fn run_command(
             agent_id: None,
         })
         .await;
+    let response = browser_safe_response(response, capability);
     let mut response = Json(response).into_response();
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn browser_safe_response(mut response: ResponseEnvelope, capability: &str) -> ResponseEnvelope {
+    response.ticket = None;
+    response.steering = None;
+    response.reminders = None;
+    response.display = None;
+    response.preview = None;
+    response.trace = None;
+
+    if response.status == Status::Ok {
+        if let Some(result) = response
+            .result
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            result.remove("post_write");
+        }
+        return response;
+    }
+
+    let code = response
+        .error
+        .as_ref()
+        .map_or(ErrorCode::Internal, |error| error.code);
+    let message = match capability {
+        "workbench.snapshot" => "The workbench snapshot is temporarily unavailable",
+        "lane.focus" => "The lane focus request could not be completed",
+        _ => "The workbench command could not be completed",
+    };
+    response.result = None;
+    response.error = Some(ErrorBody {
+        code,
+        message: message.to_string(),
+        details: None,
+    });
     response
 }
 
@@ -448,5 +487,89 @@ fn json_rejection_response(error: JsonRejection) -> AxumResponse {
             "workbench.invalid_request",
             "The workbench request body is invalid",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::protocol::Effect;
+
+    fn response(
+        status: Status,
+        result: Option<serde_json::Value>,
+        error: Option<ErrorBody>,
+    ) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "browser-redaction".to_string(),
+            status,
+            result,
+            error,
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Write),
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn browser_safe_response_redacts_dispatch_failures_and_post_write_reports() {
+        let local_path = "/private/project/cache/exo.db";
+        let failed = browser_safe_response(
+            response(
+                Status::Error,
+                None,
+                Some(ErrorBody {
+                    code: ErrorCode::Internal,
+                    message: format!("Failed to open database at {local_path}"),
+                    details: Some(json!({ "database_path": local_path })),
+                }),
+            ),
+            "lane.focus",
+        );
+        let failed_json = serde_json::to_string(&failed).expect("serialize browser error");
+        assert!(!failed_json.contains(local_path));
+        assert_eq!(failed.effect, Some(Effect::Write));
+        assert_eq!(
+            failed.error.as_ref().map(|error| error.message.as_str()),
+            Some("The lane focus request could not be completed")
+        );
+        assert!(
+            failed
+                .error
+                .as_ref()
+                .is_some_and(|error| error.details.is_none())
+        );
+
+        let succeeded = browser_safe_response(
+            response(
+                Status::Ok,
+                Some(json!({
+                    "kind": "lane.focus",
+                    "ok": true,
+                    "lane": { "id": "lane-one" },
+                    "post_write": { "issue": format!("checkpoint failed at {local_path}") },
+                })),
+                None,
+            ),
+            "lane.focus",
+        );
+        let succeeded_json = serde_json::to_string(&succeeded).expect("serialize browser success");
+        assert!(!succeeded_json.contains(local_path));
+        assert!(
+            succeeded
+                .result
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|result| !result.contains_key("post_write"))
+        );
+        assert_eq!(
+            succeeded.result.as_ref().expect("result")["lane"]["id"],
+            "lane-one"
+        );
     }
 }

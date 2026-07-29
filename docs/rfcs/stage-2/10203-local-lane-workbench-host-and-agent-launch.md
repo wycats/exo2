@@ -357,17 +357,21 @@ a workspace root, arbitrary command text, Exo confirmation ticket, or workflow
 confirmation. The event stream passes the same selector as
 `GET /api/events?session_key=<session-key>`.
 
-A well-formed authenticated command returns the normal Exo `ResponseEnvelope`
-with HTTP status 200, including Exo errors such as an invalid lane, phase
-precondition, policy failure, or `daemon.busy`. Transport, origin, session, body
-shape, and capability failures use HTTP status and a small error object before
-Exo dispatch. A browser retry after connection loss or `daemon.busy` preserves
-the same request ID for `lane_focus`; the daemon outcome ledger remains the
-recovery authority.
+A well-formed authenticated command returns a browser-safe projection of the
+Exo `ResponseEnvelope` with HTTP status 200. Successful results retain the
+snapshot or lane result but omit post-write persistence reports and
+operator-facing trace or steering fields. Exo errors retain their status and
+error code while replacing messages and details with stable path-free browser
+text. Transport, origin, session, body shape, and capability failures use HTTP
+status and a small error object before Exo dispatch. A browser retry after
+connection loss or `daemon.busy` preserves the same request ID for
+`lane_focus`; the daemon outcome ledger remains the recovery authority.
 
 Each session command revalidates the retained workspace root against the
-current project ID and state root before dispatch. A removed linked worktree or
-a path reused by a foreign repository returns
+current project ID and state root before dispatch and requires the resolved
+worktree root to equal the root retained by the session. A removed linked
+worktree, a path reused by a foreign repository, or a retained path that now
+resolves to another linked worktree returns
 `workbench.workspace_unavailable`. The server never falls back to the daemon's
 startup workspace.
 
@@ -455,12 +459,12 @@ TypeScript types plus runtime decoders, and both suites consume checked JSON
 contract fixtures emitted by Rust tests. A schema change increments
 `schema_version` and updates both fixture consumers in the same change.
 
-Snapshot composition validates the workspace once, opens one SQLite loader for
-lane and plan state, and samples Git from that same root. It does not claim a
-transaction across SQLite and Git. `observed_at` records when sampling
-completed. Results expose branch and commit identity but omit workspace root,
-Git directory, database path, state root, sidecar path, runtime path, and
-process identity.
+Snapshot composition validates the workspace once, reads all lane, focus,
+phase, goal, and task state through one SQLite read transaction, and then
+samples Git from that same root. It does not claim a transaction across SQLite
+and Git. `observed_at` records when sampling completed. Results expose branch
+and commit identity but omit workspace root, Git directory, database path,
+state root, sidecar path, runtime path, and process identity.
 
 `phase` is the phase associated with the focused lane. When no lane is focused,
 `focused_lane` and `phase` are null while the lane rail remains available. An
@@ -470,9 +474,11 @@ inconsistent legacy lane/phase focus is returned as a diagnostic using RFC
 ### Events and freshness
 
 The daemon keeps an in-memory `u64` workbench revision initialized to zero. It
-increments after every successful write notification and broadcasts the new
-value. Existing machine clients still receive the current `write_happened`
-notification; the event payload expansion is internal to the daemon.
+increments after every response whose effect records a committed write,
+including a response that reports post-commit persistence or outcome-finalizing
+failure, and broadcasts the new value. Existing machine clients still receive
+the current `write_happened` notification; the event payload expansion is
+internal to the daemon.
 
 An authenticated `GET /api/events` stream first sends:
 

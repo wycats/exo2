@@ -5,8 +5,10 @@
 #[macro_use]
 mod test_support;
 
+#[cfg(feature = "ui")]
 use std::collections::HashMap;
 use std::ffi::OsStr;
+#[cfg(feature = "ui")]
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_matrix;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(feature = "ui")]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(feature = "ui")]
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Kill any daemon running for a workspace. Must be called at the end of
@@ -238,18 +243,21 @@ async fn send_machine_operation(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "ui")]
 struct RawHttpResponse {
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
+#[cfg(feature = "ui")]
 impl RawHttpResponse {
     fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).expect("valid JSON response")
     }
 }
 
+#[cfg(feature = "ui")]
 async fn send_workbench_http(
     origin: &str,
     method: &str,
@@ -283,6 +291,7 @@ async fn send_workbench_http(
     parse_workbench_http_response(&bytes)
 }
 
+#[cfg(feature = "ui")]
 fn parse_workbench_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
     let split = bytes
         .windows(4)
@@ -314,6 +323,7 @@ fn parse_workbench_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
     })
 }
 
+#[cfg(feature = "ui")]
 fn decode_workbench_chunked(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut remaining = bytes;
     let mut decoded = Vec::new();
@@ -340,6 +350,7 @@ fn decode_workbench_chunked(bytes: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
+#[cfg(feature = "ui")]
 async fn open_workbench_events(
     origin: &str,
     cookie: &str,
@@ -381,6 +392,7 @@ async fn open_workbench_events(
     Ok((reader, write))
 }
 
+#[cfg(feature = "ui")]
 async fn read_workbench_event(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<(String, u64)> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut event = None;
@@ -2457,6 +2469,7 @@ async fn linked_worktree_lane_focus_agrees_across_direct_and_daemon_adapters(bac
     );
 }
 
+#[cfg(feature = "ui")]
 #[test_matrix(["sqlite"])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_sessions(backend: &str) {

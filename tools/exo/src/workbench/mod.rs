@@ -835,6 +835,17 @@ impl WorkbenchHostInner {
         })
     }
 
+    pub(crate) fn validate_session_workspace(&self, retained_root: &Path) -> Result<PathBuf> {
+        let resolved_root = self.validate_workspace(retained_root)?;
+        if resolved_root != retained_root {
+            return Err(anyhow::Error::new(workbench_failure(
+                "workbench.workspace_unavailable",
+                "The workbench workspace is no longer available",
+            )));
+        }
+        Ok(resolved_root)
+    }
+
     fn server_stopped(&self, error: Option<String>) {
         if let Ok(mut state) = self.state.lock()
             && let Some(host) = state.host.as_mut()

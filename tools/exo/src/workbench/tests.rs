@@ -4,13 +4,18 @@ use super::*;
 use crate::api::protocol::{Effect, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
 use crate::context::SqliteWriter;
 use serde_json::{Value as JsonValue, json};
+#[cfg(feature = "ui")]
 use std::collections::HashMap;
 use std::fs;
+#[cfg(feature = "ui")]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+#[cfg(feature = "ui")]
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "ui")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Fixture {
@@ -19,6 +24,7 @@ struct Fixture {
     project: Arc<Project>,
 }
 
+#[cfg(feature = "ui")]
 #[derive(Debug)]
 struct RawHttpResponse {
     status: u16,
@@ -26,6 +32,7 @@ struct RawHttpResponse {
     body: Vec<u8>,
 }
 
+#[cfg(feature = "ui")]
 impl RawHttpResponse {
     fn json(&self) -> JsonValue {
         serde_json::from_slice(&self.body).expect("HTTP response body is JSON")
@@ -123,6 +130,7 @@ fn test_manager(project: Arc<Project>) -> WorkbenchHostManager {
     manager
 }
 
+#[cfg(feature = "ui")]
 fn launch_parts(launch: &WorkbenchLaunchResult) -> (&str, &str) {
     launch
         .url
@@ -130,6 +138,7 @@ fn launch_parts(launch: &WorkbenchLaunchResult) -> (&str, &str) {
         .expect("launch URL contains ticket fragment")
 }
 
+#[cfg(feature = "ui")]
 fn ticket_payload(ticket: &str) -> WorkbenchTicketV1 {
     let payload = ticket.split('.').nth(1).expect("ticket payload");
     let bytes = URL_SAFE_NO_PAD
@@ -228,6 +237,7 @@ async fn ui_disabled_launch_returns_the_stable_unavailable_error() {
     );
 }
 
+#[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
 async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     let fixture = fixture();
@@ -301,6 +311,7 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     );
 }
 
+#[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_tickets() {
     let fixture = fixture();
@@ -425,6 +436,56 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
     manager.shutdown().await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_workspace_validation_rejects_same_project_root_substitution() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-root-substitution",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    let retained_root = linked.canonicalize().expect("canonical linked worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    assert_eq!(
+        manager
+            .inner
+            .validate_session_workspace(&retained_root)
+            .expect("original linked worktree is valid"),
+        retained_root
+    );
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    std::os::unix::fs::symlink(&fixture.root, &linked)
+        .expect("replace linked worktree with primary-worktree symlink");
+
+    let error = manager
+        .inner
+        .validate_session_workspace(&retained_root)
+        .expect_err("a retained path resolving to another worktree must fail");
+    let failure = error
+        .downcast_ref::<crate::failure::ExoFailure>()
+        .expect("structured workspace failure");
+    assert_eq!(
+        failure.error.details.as_ref().expect("details")["kind"],
+        "workbench.workspace_unavailable"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn event_stream_admission_is_bounded() {
     let fixture = fixture();
@@ -545,6 +606,68 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn snapshot_database_reads_share_one_sqlite_snapshot() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Snapshot Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Snapshot Phase", "regular", None, &[])
+        .expect("add phase");
+    let lane = writer
+        .add_workbench_lane("Snapshot lane", "Prove one read view", &phase)
+        .expect("add lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let registered = manager
+        .register_workspace(&fixture.root)
+        .expect("register workspace");
+    let workspace_root = registered.root.to_string_lossy().into_owned();
+    let snapshot = snapshot::build_with_after_state_hook(
+        &fixture.project,
+        &registered,
+        manager.inner.current_revision(),
+        || {
+            let writer =
+                SqliteWriter::open(fixture.project.db_path()).expect("open concurrent writer");
+            writer
+                .update_phase_status(&phase, "in-progress")
+                .expect("start phase after snapshot state read");
+            writer
+                .focus_workbench_lane(&workspace_root, &lane, &phase)
+                .expect("focus lane after snapshot state read");
+        },
+    )
+    .expect("read transactionally consistent snapshot");
+
+    assert!(
+        snapshot.focused_lane.is_none(),
+        "the snapshot must not combine focus committed after its plan read"
+    );
+    assert!(snapshot.phase.is_none());
+
+    let refreshed = snapshot::build(
+        &fixture.project,
+        &registered,
+        manager.inner.current_revision(),
+    )
+    .expect("read refreshed snapshot");
+    assert_eq!(
+        refreshed
+            .focused_lane
+            .as_ref()
+            .map(|lane| lane.summary.id.as_str()),
+        Some(lane.as_str())
+    );
+    assert_eq!(
+        refreshed.phase.as_ref().map(|phase| phase.id.as_str()),
+        Some(phase.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn snapshot_storage_failures_are_stable_and_path_free() {
     let fixture = fixture();
     let database_path = fixture.project.db_path();
@@ -577,6 +700,7 @@ async fn snapshot_storage_failures_are_stable_and_path_free() {
     }
 }
 
+#[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
 async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     let fixture = fixture();
@@ -810,6 +934,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     manager.shutdown().await;
 }
 
+#[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
 async fn matching_host_record_is_removed_but_foreign_generation_is_preserved() {
     let fixture = fixture();
@@ -837,6 +962,7 @@ async fn matching_host_record_is_removed_but_foreign_generation_is_preserved() {
     );
 }
 
+#[cfg(feature = "ui")]
 async fn raw_http(
     origin: &str,
     method: &str,
@@ -872,6 +998,7 @@ async fn raw_http(
     parse_http_response(&bytes)
 }
 
+#[cfg(feature = "ui")]
 fn parse_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
     let split = bytes
         .windows(4)
@@ -903,6 +1030,7 @@ fn parse_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
     })
 }
 
+#[cfg(feature = "ui")]
 fn decode_chunked(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut remaining = bytes;
     let mut decoded = Vec::new();

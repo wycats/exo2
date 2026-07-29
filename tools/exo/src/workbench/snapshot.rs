@@ -6,7 +6,7 @@ use super::{
 use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
 use crate::project::Project;
 use crate::steering::derive_phase_steering;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -37,24 +37,29 @@ pub(super) fn build(
     registered: &WorkspaceRegistration,
     revision: u64,
 ) -> Result<WorkbenchSnapshot> {
+    build_with_after_state_hook(project, registered, revision, || {})
+}
+
+pub(super) fn build_with_after_state_hook(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    after_state: impl FnOnce(),
+) -> Result<WorkbenchSnapshot> {
     let loader = SqliteLoader::open(project.db_path())?;
+    let transaction = loader
+        .database()
+        .connection()
+        .unchecked_transaction()
+        .context("Failed to begin workbench snapshot read transaction")?;
     let plan = loader.load_state()?;
+    after_state();
     let lanes = loader.load_workbench_lanes()?;
     let workspace_root = registered.root.to_string_lossy();
     let focused_lane_id = loader
         .load_workspace_lane_focus(&workspace_root)?
         .map(|focus| focus.lane_id);
     let focused_phase_id = loader.load_workspace_active_phase(&workspace_root)?;
-    let git = sample_git(&registered.root);
-    let label = git
-        .branch
-        .clone()
-        .or_else(|| {
-            git.head
-                .as_deref()
-                .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
-        })
-        .unwrap_or_else(|| registered.label.clone());
 
     let lane_summaries = lanes
         .iter()
@@ -141,6 +146,20 @@ pub(super) fn build(
             },
         );
     let diagnostics = focus_diagnostics(focused_lane.as_ref(), focused_phase_id.as_deref());
+    transaction
+        .commit()
+        .context("Failed to finish workbench snapshot read transaction")?;
+
+    let git = sample_git(&registered.root);
+    let label = git
+        .branch
+        .clone()
+        .or_else(|| {
+            git.head
+                .as_deref()
+                .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
+        })
+        .unwrap_or_else(|| registered.label.clone());
 
     Ok(WorkbenchSnapshot {
         kind: "workbench.snapshot",
