@@ -37,6 +37,35 @@ class TestEventSource {
   close(): void {}
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function sessionResponse(sessionKey: string): Response {
+  return new Response(
+    JSON.stringify({
+      kind: "workbench.session",
+      ok: true,
+      schema_version: 1,
+      session_key: sessionKey,
+      project_id: "project-fixture",
+      workspace_key: "workspace-fixture",
+      expires_at: "2026-07-29T22:00:00Z",
+    }),
+    { status: 200 },
+  );
+}
+
 beforeEach(() => {
   history.replaceState({}, "", "/");
   TestEventSource.instances = [];
@@ -251,6 +280,62 @@ describe("cockpit page", () => {
     expect(TestEventSource.instances).toHaveLength(1);
   });
 
+  for (const staleResult of ["completion", "failure"] as const) {
+    it(`ignores a superseded ticket exchange ${staleResult}`, async () => {
+      history.replaceState({}, "", "/#ticket=v1.stale-ticket");
+      const staleExchange = deferred<Response>();
+      let sessionAttempts = 0;
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (path, init) => {
+          if (path === "/api/session") {
+            sessionAttempts += 1;
+            return sessionAttempts === 1
+              ? staleExchange.promise
+              : sessionResponse("fresh-session");
+          }
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        });
+      vi.stubGlobal("fetch", fetcher);
+      render(Page);
+      await waitFor(() => expect(sessionAttempts).toBe(1));
+
+      history.replaceState(history.state, "", "/#ticket=v1.fresh-ticket");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+      expect(
+        await screen.findByRole("heading", { name: "Local workbench host" }),
+      ).toBeTruthy();
+      expect(history.state.exoWorkbenchSessionKey).toBe("fresh-session");
+
+      if (staleResult === "completion") {
+        staleExchange.resolve(sessionResponse("stale-session"));
+      } else {
+        staleExchange.reject(new TypeError("stale connection reset"));
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(history.state.exoWorkbenchSessionKey).toBe("fresh-session");
+      expect(
+        screen.getByRole("heading", { name: "Local workbench host" }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole("heading", { name: "Launch link required" }),
+      ).toBeNull();
+      expect(TestEventSource.instances).toHaveLength(1);
+    });
+  }
+
   it("uses a new request ID for deliberate retry after a command response", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const snapshot = structuredClone(snapshotFixture);
@@ -326,5 +411,71 @@ describe("cockpit page", () => {
 
     await waitFor(() => expect(focusRequestIds).toHaveLength(2));
     expect(focusRequestIds[1]).not.toBe(focusRequestIds[0]);
+  });
+
+  it("clears an ambiguous focus failure when the snapshot confirms success", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    const ambiguousLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-ambiguous",
+      title: "Ambiguous lane",
+      focused_here: false,
+    };
+    initialSnapshot.lanes.push(ambiguousLane);
+    const focusedSnapshot = {
+      ...initialSnapshot,
+      focused_lane: {
+        ...initialSnapshot.focused_lane!,
+        id: ambiguousLane.id,
+        title: ambiguousLane.title,
+      },
+      lanes: initialSnapshot.lanes.map((lane) => ({
+        ...lane,
+        focused_here: lane.id === ambiguousLane.id,
+      })),
+    };
+    let focusAttempts = 0;
+    let snapshotReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.operation.kind === "lane_focus") {
+          focusAttempts += 1;
+          throw new TypeError("response lost");
+        }
+        snapshotReads += 1;
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: snapshotReads === 1 ? initialSnapshot : focusedSnapshot,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus Ambiguous lane" }),
+    );
+
+    await waitFor(() => expect(focusAttempts).toBe(2));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Ambiguous lane" }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByText("The workbench command could not reach Exo"),
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
   });
 });

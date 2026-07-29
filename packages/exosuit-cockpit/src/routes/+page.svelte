@@ -49,6 +49,7 @@
   let retryBootstrap = $state<(() => void) | null>(null);
 
   let client: WorkbenchClient | null = null;
+  let ambiguousFocus: FocusRequest | null = null;
   let refreshQueued = false;
   let startLiveUpdates: (() => void) | null = null;
   let stopLiveUpdates: (() => void) | null = null;
@@ -57,6 +58,7 @@
     let events: EventSource | null = null;
     let pollTimer: number | null = null;
     let liveUpdatesStarted = false;
+    let bootstrapGeneration = 0;
 
     const refreshForVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -116,6 +118,8 @@
     stopLiveUpdates = stopUpdates;
 
     const bootstrap = async () => {
+      const generation = ++bootstrapGeneration;
+      const isCurrent = () => generation === bootstrapGeneration;
       screen = "loading";
       screenMessage = null;
       try {
@@ -127,12 +131,19 @@
           snapshot = null;
           pendingFocus = null;
           retryFocus = null;
+          ambiguousFocus = null;
           focusFailure = null;
           refreshFailure = null;
           prepareWorkbenchTicketExchange(history, location);
           const session = await exchangeWorkbenchTicket(ticket);
+          if (!isCurrent()) {
+            return;
+          }
           sessionKey = session.session_key;
           retainSessionSelector(history, location, sessionKey);
+        }
+        if (!isCurrent()) {
+          return;
         }
         if (!sessionKey) {
           screen = "session_required";
@@ -142,7 +153,9 @@
         client = new WorkbenchClient(sessionKey);
         await refreshSnapshot(false);
       } catch (error) {
-        applyTerminalFailure(error);
+        if (isCurrent()) {
+          applyTerminalFailure(error);
+        }
       }
     };
 
@@ -156,6 +169,7 @@
     void bootstrap();
 
     return () => {
+      bootstrapGeneration += 1;
       retryBootstrap = null;
       startLiveUpdates = null;
       window.removeEventListener("hashchange", bootstrapFreshTicket);
@@ -187,6 +201,14 @@
       screen = "ready";
       screenMessage = null;
       refreshFailure = null;
+      if (
+        ambiguousFocus &&
+        nextSnapshot.focused_lane?.id === ambiguousFocus.laneId
+      ) {
+        ambiguousFocus = null;
+        focusFailure = null;
+        retryFocus = null;
+      }
       retryBootstrap = null;
       startLiveUpdates?.();
     } catch (error) {
@@ -222,6 +244,7 @@
     const request = { laneId, requestId };
     pendingFocus = request;
     retryFocus = null;
+    ambiguousFocus = null;
     focusFailure = null;
     try {
       await activeClient.focusLane(laneId, requestId);
@@ -234,6 +257,9 @@
       } else {
         focusFailure = messageFrom(error);
         if (error instanceof WorkbenchClientError && error.retryable) {
+          if (error.retryWithSameRequestId) {
+            ambiguousFocus = request;
+          }
           retryFocus = {
             laneId,
             requestId: error.retryWithSameRequestId

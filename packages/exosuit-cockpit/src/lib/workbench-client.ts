@@ -224,40 +224,42 @@ async function request(
 ): Promise<unknown> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response: Response;
   try {
-    response = await fetcher(path, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } catch {
-    throw new WorkbenchClientError(
-      "transport_error",
-      transportMessage,
-      true,
-    );
+    let response: Response;
+    try {
+      response = await fetcher(path, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch {
+      throw new WorkbenchClientError(
+        "transport_error",
+        transportMessage,
+        true,
+      );
+    }
+
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      throw new WorkbenchClientError(
+        "transport_error",
+        "Exo returned an unreadable workbench response",
+        true,
+      );
+    }
+
+    if (!response.ok) {
+      throw httpFailure(response.status, value);
+    }
+    return value;
   } finally {
     clearTimeout(timeout);
   }
-
-  let value: unknown;
-  try {
-    value = await response.json();
-  } catch {
-    throw new WorkbenchClientError(
-      "transport_error",
-      "Exo returned an unreadable workbench response",
-      true,
-    );
-  }
-
-  if (!response.ok) {
-    throw httpFailure(response.status, value);
-  }
-  return value;
 }
 
 function httpFailure(status: number, value: unknown): WorkbenchClientError {

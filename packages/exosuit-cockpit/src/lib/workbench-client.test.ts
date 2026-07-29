@@ -249,6 +249,39 @@ describe("workbench browser client", () => {
     }
   });
 
+  it("keeps the timeout active while reading a response body", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (_path, init) => {
+          const signal = init?.signal;
+          return {
+            ok: true,
+            status: 200,
+            json: () =>
+              new Promise<unknown>((_resolve, reject) => {
+                signal?.addEventListener(
+                  "abort",
+                  () => reject(new DOMException("Aborted", "AbortError")),
+                  { once: true },
+                );
+              }),
+          } as Response;
+        });
+      const result = new WorkbenchClient("stalled-body", fetcher).snapshot();
+      const assertion = expect(result).rejects.toMatchObject({
+        kind: "transport_error",
+        retryable: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("generates ULID-shaped browser request IDs", () => {
     expect(createWorkbenchRequestId(0)).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
   });
