@@ -1,0 +1,400 @@
+use super::{
+    MAX_REQUEST_BODY_BYTES, SESSION_COOKIE_NAME, TicketExchangeError, WorkbenchHostInner,
+    WorkbenchSession, assets,
+};
+use crate::api::protocol::{
+    Address, CallParams, Op, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope,
+};
+use async_stream::stream;
+use axum::Json;
+use axum::Router;
+use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::HeaderName;
+use axum::http::header::{CACHE_CONTROL, COOKIE, HOST, ORIGIN, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, Uri};
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response as AxumResponse};
+use axum::routing::{get, post};
+use futures_core::Stream;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::convert::Infallible;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+#[derive(Clone)]
+struct HttpState {
+    inner: Weak<WorkbenchHostInner>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRequest {
+    ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserCommandRequest {
+    protocol_version: u32,
+    id: String,
+    operation: BrowserOperation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BrowserOperation {
+    Snapshot,
+    LaneFocus { lane_id: String },
+}
+
+#[derive(Debug, Serialize)]
+struct HttpErrorBody {
+    kind: &'static str,
+    ok: bool,
+    message: &'static str,
+}
+
+pub(super) async fn serve(
+    listener: TcpListener,
+    inner: Weak<WorkbenchHostInner>,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let app = Router::new()
+        .route("/api/session", post(create_session))
+        .route("/api/command", post(run_command))
+        .route("/api/events", get(events))
+        .fallback(get(static_asset))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(HttpState { inner });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+}
+
+async fn create_session(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<SessionRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.host_unavailable",
+            "The workbench host is no longer available",
+        );
+    };
+    if !origin_matches(&inner, &headers) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "workbench.origin_mismatch",
+            "The workbench request origin is not accepted",
+        );
+    }
+    let (session_id, result) = match inner.redeem_ticket(&request.ticket) {
+        Ok(result) => result,
+        Err(TicketExchangeError::Invalid) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "workbench.ticket_invalid",
+                "The workbench launch ticket is invalid",
+            );
+        }
+        Err(TicketExchangeError::Busy) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "workbench.busy",
+                "The workbench session limit is reached",
+            );
+        }
+    };
+    inner.touch_daemon_activity();
+    let mut response = Json(result).into_response();
+    let cookie = format!(
+        "{SESSION_COOKIE_NAME}={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
+    );
+    if let Ok(value) = cookie.parse() {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn run_command(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<BrowserCommandRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.host_unavailable",
+            "The workbench host is no longer available",
+        );
+    };
+    if !origin_matches(&inner, &headers) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "workbench.origin_mismatch",
+            "The workbench request origin is not accepted",
+        );
+    }
+    let Some(session) = authenticated_session(&inner, &headers) else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "workbench.session_invalid",
+            "The workbench session is invalid",
+        );
+    };
+    if request.protocol_version != PROTOCOL_VERSION || request.id.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "workbench.invalid_request",
+            "The workbench command request is invalid",
+        );
+    }
+    let (capability, address, input) = match request.operation {
+        BrowserOperation::Snapshot => (
+            "workbench.snapshot",
+            Address::Operation {
+                path: vec!["workbench".to_string(), "snapshot".to_string()],
+            },
+            json!({}),
+        ),
+        BrowserOperation::LaneFocus { lane_id } => (
+            "lane.focus",
+            Address::Operation {
+                path: vec!["lane".to_string(), "focus".to_string()],
+            },
+            json!({ "id": lane_id }),
+        ),
+    };
+    if !session.allows(capability) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "workbench.capability_denied",
+            "The workbench session does not allow this operation",
+        );
+    }
+    let workspace_root = match inner.validate_workspace(&session.workspace_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return error_response(
+                StatusCode::GONE,
+                "workbench.workspace_unavailable",
+                "The workbench workspace is no longer available",
+            );
+        }
+    };
+    let Some(dispatcher) = inner.dispatcher().cloned() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.host_unavailable",
+            "The workbench command dispatcher is unavailable",
+        );
+    };
+    inner.touch_daemon_activity();
+    let response: ResponseEnvelope = dispatcher
+        .dispatch(RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: request.id,
+            op: Op::Call(CallParams { address, input }),
+            workspace_root: Some(workspace_root),
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        })
+        .await;
+    let mut response = Json(response).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn events(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AxumResponse> {
+    let Some(inner) = state.inner.upgrade() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.host_unavailable",
+            "The workbench host is no longer available",
+        ));
+    };
+    if !origin_matches(&inner, &headers) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "workbench.origin_mismatch",
+            "The workbench request origin is not accepted",
+        ));
+    }
+    let Some(session) = authenticated_session(&inner, &headers) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "workbench.session_invalid",
+            "The workbench session is invalid",
+        ));
+    };
+    let permit = inner.event_admission().try_acquire_owned().map_err(|_| {
+        error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "workbench.busy",
+            "The workbench event stream limit is reached",
+        )
+    })?;
+    let last_event_id = headers
+        .get(HeaderName::from_static("last-event-id"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut write_events = inner.subscribe();
+    let initial_revision = inner.current_revision();
+    let session_id = session.id;
+    let stream_inner = Arc::clone(&inner);
+    let event_stream = stream! {
+        let _permit = permit;
+        yield Ok(Event::default()
+            .event("ready")
+            .id(initial_revision.to_string())
+            .json_data(json!({
+                "kind": "workbench.ready",
+                "revision": initial_revision,
+            }))
+            .unwrap_or_else(|_| Event::default().event("ready")));
+        if last_event_id.is_some_and(|revision| revision != initial_revision) {
+            yield Ok(invalidation_event(initial_revision));
+        }
+        let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+        keepalive.tick().await;
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if stream_inner.session(&session_id).is_none() {
+                        break;
+                    }
+                    stream_inner.touch_daemon_activity();
+                    yield Ok(Event::default().comment("keepalive"));
+                }
+                event = write_events.recv() => {
+                    let revision = match event {
+                        Ok(revision) => revision,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            stream_inner.current_revision()
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    yield Ok(invalidation_event(revision));
+                }
+            }
+        }
+    };
+    Ok(Sse::new(event_stream))
+}
+
+async fn static_asset(State(_state): State<HttpState>, uri: Uri) -> Response<Body> {
+    if uri.path().starts_with("/api/") {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "workbench.invalid_request",
+            "The workbench API route does not exist",
+        );
+    }
+    assets::response(uri.path())
+}
+
+fn authenticated_session(
+    inner: &WorkbenchHostInner,
+    headers: &HeaderMap,
+) -> Option<WorkbenchSession> {
+    let session_id = cookie_value(headers, SESSION_COOKIE_NAME)?;
+    inner.session(session_id)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(candidate, value)| (candidate == name).then_some(value))
+}
+
+fn origin_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
+    let Some(expected_host) = inner.expected_host() else {
+        return false;
+    };
+    let Some(expected_origin) = inner.origin() else {
+        return false;
+    };
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected_host)
+        && headers
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == expected_origin)
+}
+
+fn invalidation_event(revision: u64) -> Event {
+    Event::default()
+        .event("invalidate")
+        .id(revision.to_string())
+        .json_data(json!({
+            "kind": "workbench.invalidate",
+            "revision": revision,
+        }))
+        .unwrap_or_else(|_| Event::default().event("invalidate"))
+}
+
+fn error_response(status: StatusCode, kind: &'static str, message: &'static str) -> AxumResponse {
+    let mut response = (
+        status,
+        Json(HttpErrorBody {
+            kind,
+            ok: false,
+            message,
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn json_rejection_response(error: JsonRejection) -> AxumResponse {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "workbench.busy",
+            "The workbench request body limit is exceeded",
+        )
+    } else {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "workbench.invalid_request",
+            "The workbench request body is invalid",
+        )
+    }
+}

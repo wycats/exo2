@@ -462,6 +462,11 @@ pub fn default_registry() -> CommandRegistry {
     registry.register(Box::new(LaneStart::new("placeholder")));
     registry.register(Box::new(LaneRemove::new("placeholder")));
 
+    // Local workbench namespace
+    use super::workbench::{WorkbenchLaunch, WorkbenchSnapshot};
+    registry.register(Box::new(WorkbenchLaunch));
+    registry.register(Box::new(WorkbenchSnapshot));
+
     // Phase namespace (Wave 7)
     use super::phase_cmd::{
         PhaseAdd, PhaseExecutionTasks, PhaseFinish, PhaseFocus, PhaseHistory, PhaseList, PhaseMove,
@@ -594,6 +599,9 @@ pub fn build_command_from_invocation(
         )),
         "verify" => Ok(Some(
             super::verify::VerifyCommands::from_invocation(inv)?.to_command_box(root)?,
+        )),
+        "workbench" => Ok(Some(
+            super::workbench::WorkbenchCommands::from_invocation(inv)?.to_command_box(root)?,
         )),
         _ => Ok(None),
     }
@@ -858,6 +866,8 @@ mod tests {
         ] {
             assert!(registry.find("lane", operation).is_some());
         }
+        assert!(registry.find("workbench", "launch").is_some());
+        assert!(registry.find("workbench", "snapshot").is_some());
 
         // Check goal namespace (Wave 3.5)
         assert!(registry.find("goal", "add").is_some());
@@ -883,7 +893,7 @@ mod tests {
         assert!(registry.find("verify", "run").is_some());
 
         // Verify total count: registry.len() gives actual count - update as commands are added
-        assert_eq!(registry.len(), 125);
+        assert_eq!(registry.len(), 127);
     }
 
     #[test]

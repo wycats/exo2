@@ -16,6 +16,7 @@ use crate::command::unified_diagnostics::IntoDiagnosticSteering;
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::steering::SuggestedAction;
+use crate::workbench::DaemonRuntimeServices;
 use anyhow::Result as ExoResult;
 use exosuit_storage::TraceScope;
 use serde::Serialize;
@@ -39,6 +40,8 @@ pub struct CommandContext<'a> {
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
+    /// Daemon-only runtime capabilities such as the local workbench host.
+    pub runtime_services: Option<&'a DaemonRuntimeServices>,
 }
 
 /// Context for mutable command execution.
@@ -52,6 +55,8 @@ pub struct MutableCommandContext<'a> {
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
+    /// Daemon-only runtime capabilities such as the local workbench host.
+    pub runtime_services: Option<&'a DaemonRuntimeServices>,
 }
 
 impl CommandContext<'_> {
@@ -170,6 +175,7 @@ impl CommandBox {
                     agent_id: ctx.agent_id.clone(),
                     workflow_confirmation: ctx.workflow_confirmation.clone(),
                     input_content: ctx.input_content.clone(),
+                    runtime_services: ctx.runtime_services,
                 };
                 cmd.execute_mut(&mut mutable_ctx)
             }
@@ -482,6 +488,7 @@ pub fn invoke_command_box_json(
         agent_id: transport.agent_id().map(String::from),
         workflow_confirmation: transport.workflow_confirmation().cloned(),
         input_content: transport.input_content().map(String::from),
+        runtime_services: transport.runtime_services(),
     };
 
     let effect = cmd.effect();
@@ -682,6 +689,7 @@ pub trait Command: Send + Sync {
             agent_id: transport.agent_id().map(String::from),
             workflow_confirmation: transport.workflow_confirmation().cloned(),
             input_content: transport.input_content().map(String::from),
+            runtime_services: transport.runtime_services(),
         };
 
         let output = match self.execute(&ctx) {
@@ -974,6 +982,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
         let cmd = CommandBox::mutable(MutableProjectEchoCommand);
 

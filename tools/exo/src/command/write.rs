@@ -147,6 +147,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: Some("from the machine channel\n".to_string()),
+            runtime_services: None,
         };
 
         Write::new("notes.md", false)

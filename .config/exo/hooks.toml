@@ -83,7 +83,7 @@ command = "node scripts/ci/check-rust-coverage-workflow-security.mjs && pnpm -r 
 
 [check."rust-test"]
 label = "Rust Test"
-command = "CARGO_INCREMENTAL=0 RUSTFLAGS='-C debuginfo=0' cargo test --workspace --locked"
+command = "pnpm --filter exosuit-cockpit build && CARGO_INCREMENTAL=0 RUSTFLAGS='-C debuginfo=0' cargo test --workspace --locked"
 
 [check."rust-coverage"]
 label = "Rust Coverage"

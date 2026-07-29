@@ -520,6 +520,7 @@ impl CommandSpec {
         spec.merge_exospec::<super::commit::CommitCommands>();
         spec.merge_exospec::<super::idea::IdeaCommands>();
         spec.merge_exospec::<super::lane::LaneCommands>();
+        spec.merge_exospec::<super::workbench::WorkbenchCommands>();
         spec.merge_exospec::<super::plan::PlanCommands>();
         spec.merge_exospec::<super::project::ProjectCommands>();
         spec.merge_exospec::<super::sidecar::SidecarCommands>();

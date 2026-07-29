@@ -497,7 +497,7 @@ fn emit_job(yaml: &mut String, check: &CheckSpec, needs: Option<&str>) {
 
         // Install dependencies
         let install_cmd = if check.reqs.needs_pnpm {
-            "pnpm install"
+            "pnpm install --frozen-lockfile"
         } else {
             "npm ci"
         };
@@ -910,7 +910,7 @@ cwd = 'packages/foo #1: bar'
         assert!(yaml.contains(r#"cache-dependency-path: "pnpm-lock.yaml""#));
         assert!(!yaml.contains(r#"packages/foo #1: bar/pnpm-lock.yaml"#));
         assert!(yaml.contains(
-            "      - name: Install dependencies\n        run: pnpm install\n        working-directory: \"packages/foo #1: bar\"\n"
+            "      - name: Install dependencies\n        run: pnpm install --frozen-lockfile\n        working-directory: \"packages/foo #1: bar\"\n"
         ));
     }
 

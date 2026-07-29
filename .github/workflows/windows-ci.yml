@@ -52,7 +52,7 @@ jobs:
           if [[ "${EVENT_NAME}" == "pull_request" && "${run_windows}" != "true" ]]; then
             git fetch --no-tags --prune --depth=1 origin "${BASE_REF}"
             changed_files="$(git diff --name-only "origin/${BASE_REF}"...HEAD)"
-            if grep -Eq '^(\.cargo/|\.github/workflows/windows-ci\.yml|Cargo\.lock|Cargo\.toml|crates/|tools/exo/|tools/exo-workspace/)' <<<"${changed_files}"; then
+            if grep -Eq '^(\.cargo/|\.github/workflows/windows-ci\.yml|Cargo\.lock|Cargo\.toml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|crates/|packages/exosuit-cockpit/|tools/exo/|tools/exo-workspace/)' <<<"${changed_files}"; then
               run_windows=true
             fi
           fi
@@ -71,6 +71,20 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -88,7 +102,9 @@ jobs:
         run: cargo check --locked -p exo-workspace --bins --keep-going
 
       - name: Check exo binaries
-        run: cargo check --locked -p exo --bins --keep-going
+        run: |
+          pnpm --filter exosuit-cockpit build
+          cargo check --locked -p exo --bins --keep-going
 
       - name: Test exo-workspace helpers
         run: cargo test --locked -p exo-workspace --lib

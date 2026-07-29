@@ -26,6 +26,7 @@ use crate::daemon_diagnostics::{
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::router::compile_argv;
+use crate::workbench::DaemonRuntimeServices;
 
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 
@@ -1548,6 +1549,7 @@ pub fn handle_request_with_project_and_diagnostics(
         request,
         diagnostics,
         HandlerRuntime::External,
+        None,
     )
 }
 
@@ -1563,6 +1565,24 @@ pub fn handle_request_with_project_and_diagnostics_as_writer(
         request,
         diagnostics,
         HandlerRuntime::SidecarWriter,
+        None,
+    )
+}
+
+pub fn handle_request_with_project_and_diagnostics_as_daemon_writer(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    request: RequestEnvelope,
+    diagnostics: &DaemonDiagnostics,
+    runtime_services: &DaemonRuntimeServices,
+) -> ResponseEnvelope {
+    handle_request_with_project_and_diagnostics_in_runtime(
+        workspace_root,
+        project,
+        request,
+        diagnostics,
+        HandlerRuntime::SidecarWriter,
+        Some(runtime_services),
     )
 }
 
@@ -1578,6 +1598,7 @@ pub fn handle_request_with_project_and_diagnostics_as_atomic_writer(
         request,
         diagnostics,
         HandlerRuntime::AtomicStateWriter,
+        None,
     )
 }
 
@@ -1587,6 +1608,7 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
     request: RequestEnvelope,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     let request_id = request.id.clone();
     let op_path = request_op_path(&request);
@@ -1596,7 +1618,14 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
         json!({ "request_id": request_id, "op_path": op_path }),
     );
 
-    let response = handle_request_inner(workspace_root, project, request, diagnostics, runtime);
+    let response = handle_request_inner(
+        workspace_root,
+        project,
+        request,
+        diagnostics,
+        runtime,
+        runtime_services,
+    );
 
     diagnostics.record(
         "request.handler_end",
@@ -1618,6 +1647,7 @@ fn handle_request_inner(
     request: RequestEnvelope,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     if request.protocol_version != protocol::PROTOCOL_VERSION {
         return error(
@@ -1651,6 +1681,7 @@ fn handle_request_inner(
             request.workflow_confirmation,
             diagnostics,
             runtime,
+            runtime_services,
         ),
         Op::Preview(params) => handle_preview(request.id, &params),
     }
@@ -1953,6 +1984,7 @@ fn handle_call(
     workflow_confirmation: Option<crate::api::protocol::WorkflowConfirmationInput>,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     // Extract namespace and operation from address
     let (namespace, operation) = match &params.address {
@@ -1977,6 +2009,7 @@ fn handle_call(
                     &compound_op,
                     diagnostics,
                     runtime,
+                    runtime_services,
                 );
             } else {
                 return error(
@@ -2011,6 +2044,7 @@ fn handle_call(
         operation,
         diagnostics,
         runtime,
+        runtime_services,
     )
 }
 
@@ -2027,6 +2061,7 @@ fn handle_call_with_namespace_operation(
     operation: &str,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     let (command_input, transport_input) =
         split_request_transport_input(namespace, operation, &params.input);
@@ -2173,6 +2208,7 @@ fn handle_call_with_namespace_operation(
                 agent_id,
                 workflow_confirmation,
                 input_content: transport_input.input_content,
+                runtime_services,
             };
 
             diagnostics.record(
@@ -2508,6 +2544,7 @@ fn handle_list(
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         return match cmd.invoke_json(&input, &transport) {

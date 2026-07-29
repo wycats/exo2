@@ -50,7 +50,7 @@ jobs:
           if [[ "${EVENT_NAME}" == "pull_request" && "${run_binaries}" != "true" ]]; then
             git fetch --no-tags --prune --depth=1 origin "${BASE_REF}"
             changed_files="$(git diff --name-only "origin/${BASE_REF}"...HEAD)"
-            if grep -Eq '^(\.github/workflows/exo-binaries\.yml|Cargo\.lock|Cargo\.toml|crates/|plugins/exo/|scripts/dev/install-latest-exo-binaries\.sh|tools/exo/)' <<<"${changed_files}"; then
+            if grep -Eq '^(\.github/workflows/exo-binaries\.yml|Cargo\.lock|Cargo\.toml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|crates/|packages/exosuit-cockpit/|plugins/exo/|scripts/dev/install-latest-exo-binaries\.sh|tools/exo/)' <<<"${changed_files}"; then
               run_binaries=true
             fi
           fi
@@ -92,6 +92,20 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -110,7 +124,9 @@ jobs:
             ${{ runner.os }}-${{ matrix.label }}-exo-binaries-
 
       - name: Build exo and exo-mcp
-        run: cargo build --locked -p exo --bins --release
+        run: |
+          pnpm --filter exosuit-cockpit build
+          cargo build --locked -p exo --bins --release
 
       - name: Package binaries
         shell: bash
