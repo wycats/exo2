@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
 anyhow = "1.0"
+async-stream = "0.3.6"
+axum = "0.8.6"
+base64 = "0.22.1"
 blake3 = "1.8.2"
 exo-reexec = { path = "../../crates/exo-reexec" }
 exosuit-process-host = { path = "../../crates/exosuit-process-host" }
@@ -45,8 +49,13 @@ tokio = { version = "1", features = [
   "time",
 ] }
 fractional_index = "2.0.2"
+futures-core = "0.3.31"
+getrandom = "0.3.4"
+hmac = "0.12.1"
+include_dir = { version = "0.7.4", optional = true }
 libc = "0.2"
 fs2 = "0.4.3"
+mime_guess = "2.0.5"
 nix = { version = "0.31.1", features = ["process", "signal"] }
 tempfile = "3.10"
 [dev-dependencies]
@@ -56,8 +65,9 @@ proptest = "1.7.0"
 test-case = "3.3"
 
 [features]
-default = ["pretty-print"]
+default = ["pretty-print", "ui"]
 pretty-print = ["comfy-table/tty"]
+ui = ["dep:include_dir"]
 
 [[bin]]
 name = "exo"

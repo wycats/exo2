@@ -290,6 +290,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         let output = StorageMaintain::new(false, 4)
@@ -321,6 +322,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         let output = StorageMaintain::new(false, 4)
@@ -359,6 +361,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         let output = StorageMaintain::new(true, 4)

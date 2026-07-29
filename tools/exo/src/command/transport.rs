@@ -9,6 +9,7 @@ use crate::api::protocol::{Address, Auth, ErrorCode, WorkflowConfirmationInput};
 use crate::command::traits::{CommandOutput, OutputFormat};
 use crate::project::Project;
 use crate::steering::SuggestedAction;
+use crate::workbench::DaemonRuntimeServices;
 use serde_json::Value as JsonValue;
 
 /// Result of an execution confirmation check.
@@ -111,6 +112,10 @@ pub trait TransportContext {
     fn input_content(&self) -> Option<&str> {
         None
     }
+    /// Optional daemon runtime services available to daemon-dispatched commands.
+    fn runtime_services(&self) -> Option<&DaemonRuntimeServices> {
+        None
+    }
     /// Whether semantic command error codes should be exposed to the caller.
     fn preserves_error_codes(&self) -> bool {
         false
@@ -200,6 +205,8 @@ pub struct MachineChannelTransport<'a> {
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Explicit content for stdin-backed machine-channel commands.
     pub input_content: Option<String>,
+    /// Daemon-only runtime services for commands that require runtime authority.
+    pub runtime_services: Option<&'a DaemonRuntimeServices>,
 }
 
 /// Transport context for CLI requests.
@@ -292,6 +299,10 @@ impl TransportContext for MachineChannelTransport<'_> {
 
     fn input_content(&self) -> Option<&str> {
         self.input_content.as_deref()
+    }
+
+    fn runtime_services(&self) -> Option<&DaemonRuntimeServices> {
+        self.runtime_services
     }
 
     fn preserves_error_codes(&self) -> bool {
@@ -573,6 +584,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         assert_eq!(transport.confirm_exec(action), ConfirmResult::Proceed);
@@ -591,6 +603,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         assert_eq!(
@@ -612,6 +625,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         assert_eq!(
@@ -652,6 +666,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         assert_eq!(original_request_id, "original-request");
@@ -688,6 +703,7 @@ mod tests {
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         assert_eq!(transport.confirm_exec("run"), ConfirmResult::Proceed);

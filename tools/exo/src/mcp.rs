@@ -74,7 +74,24 @@ pub struct McpToolResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpContent {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    ResourceLink {
+        name: String,
+        title: Option<String>,
+        uri: String,
+        description: Option<String>,
+        #[serde(rename = "mimeType")]
+        mime_type: Option<String>,
+        annotations: Option<McpAnnotations>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpAnnotations {
+    pub audience: Vec<String>,
+    pub priority: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1019,8 +1036,7 @@ fn call_exo_run_tool_with_request_id(
         return machine_response_to_tool_result(&response);
     }
 
-    let mut response =
-        handler::handle_request_with_project(workspace_root, project, compiled.request);
+    let mut response = dispatch_exo_run_request(workspace_root, project, compiled.request);
     let reminders = crate::verifiers::run_global_verifiers(workspace_root);
     if !reminders.is_empty() {
         response.reminders = Some(reminders);
@@ -1044,8 +1060,7 @@ fn call_prepared_exo_run_tool(
         return machine_response_to_tool_result(&response);
     }
 
-    let mut response =
-        handler::handle_request_with_project(workspace_root, project, prepared.request);
+    let mut response = dispatch_exo_run_request(workspace_root, project, prepared.request);
     let reminders = crate::verifiers::run_global_verifiers(workspace_root);
     if !reminders.is_empty() {
         response.reminders = Some(reminders);
@@ -1092,8 +1107,51 @@ fn invocation_uses_lightweight_context(invocation: &Invocation) -> bool {
             true
         }
         ("rfc", "list" | "show" | "status") => true,
+        ("workbench", "launch" | "snapshot") => true,
         _ => false,
     }
+}
+
+fn dispatch_exo_run_request(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    request: RequestEnvelope,
+) -> ResponseEnvelope {
+    if !request_is_workbench_call(&request) {
+        return handler::handle_request_with_project(workspace_root, project, request);
+    }
+
+    let request_id = request.id.clone();
+    let outcome = match project {
+        Some(project) => crate::daemon_client::send_request_with_project_recovery_report(
+            workspace_root,
+            project,
+            &request,
+        ),
+        None => crate::daemon_client::send_request_with_recovery_report(workspace_root, &request),
+    };
+    match outcome {
+        Ok((response, _)) => response,
+        Err(_) => error_response(
+            request_id,
+            ErrorCode::PreconditionFailed,
+            "Workbench commands require the project daemon; retry after the daemon is available"
+                .to_string(),
+            Some(json!({
+                "kind": "workbench.daemon_required",
+            })),
+        ),
+    }
+}
+
+fn request_is_workbench_call(request: &RequestEnvelope) -> bool {
+    matches!(
+        &request.op,
+        Op::Call(CallParams {
+            address: Address::Operation { path },
+            ..
+        }) if path.first().map(String::as_str) == Some("workbench")
+    )
 }
 
 fn normalize_project_repair_apply_shorthand(tokens: &mut Vec<String>) {
@@ -1339,11 +1397,50 @@ fn machine_response_to_tool_result_with_profile(
     include_structured: bool,
 ) -> McpToolResult {
     let text = format_machine_response_text(response);
+    let mut content = vec![McpContent::Text { text }];
+    if let Some(uri) = workbench_launch_uri(response) {
+        content.push(McpContent::ResourceLink {
+            name: "exo-workbench".to_string(),
+            title: Some("Open Exo workbench".to_string()),
+            uri: uri.to_string(),
+            description: Some(
+                "Lane workspace for the selected Exo project and worktree".to_string(),
+            ),
+            mime_type: Some("text/html".to_string()),
+            annotations: Some(McpAnnotations {
+                audience: vec!["user".to_string()],
+                priority: 1.0,
+            }),
+        });
+    }
     McpToolResult {
-        content: vec![McpContent::Text { text }],
-        structured_content: structured_content_for_tool_response(response, include_structured),
+        content,
+        structured_content: structured_content_for_tool_response(
+            response,
+            include_structured
+                || workbench_launch_uri(response).is_some()
+                || response_has_result_kind(response, "workbench.snapshot"),
+        ),
         is_error: response.status != Status::Ok,
     }
+}
+
+fn response_has_result_kind(response: &ResponseEnvelope, kind: &str) -> bool {
+    response.status == Status::Ok
+        && response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some(kind)
+}
+
+fn workbench_launch_uri(response: &ResponseEnvelope) -> Option<&str> {
+    (response.status == Status::Ok)
+        .then_some(response.result.as_ref()?)
+        .filter(|result| result.get("kind").and_then(JsonValue::as_str) == Some("workbench.launch"))
+        .and_then(|result| result.get("url"))
+        .and_then(JsonValue::as_str)
 }
 
 fn structured_content_for_tool_response(
@@ -2626,6 +2723,7 @@ mod tests {
         let result = machine_response_to_tool_result(&response);
         let text = match &result.content[0] {
             McpContent::Text { text } => text,
+            McpContent::ResourceLink { .. } => panic!("first MCP content block must be text"),
         };
 
         assert!(text.contains("Suggestion: Show namespace help -> task --help"));
@@ -2714,6 +2812,153 @@ mod tests {
         assert!(result.structured_content.is_none());
         let serialized = serde_json::to_value(&result).expect("serialize result");
         assert!(serialized.get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn workbench_launch_returns_text_structured_content_and_exact_resource_link() {
+        let response = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "workbench-launch".to_string(),
+            status: Status::Ok,
+            result: Some(json!({
+                "kind": "workbench.launch",
+                "ok": true,
+                "schema_version": 1,
+                "url": "http://127.0.0.1:49152/#ticket=secret",
+                "expires_at": "2026-07-28T20:05:00Z",
+                "expires_in_seconds": 300,
+                "reused_host": false,
+                "project": { "id": "project-1" },
+                "workspace": {
+                    "key": "workspace-key",
+                    "label": "main",
+                    "branch": "main",
+                    "head": "deadbeef"
+                },
+                "daemon": { "instance_id": "daemon-1" }
+            })),
+            error: None,
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: Some(Effect::Pure),
+            trace: None,
+        };
+
+        let result = machine_response_to_tool_result(&response);
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 2);
+        assert!(matches!(result.content[0], McpContent::Text { .. }));
+        let serialized = serde_json::to_value(&result).expect("serialize MCP tool result");
+        assert_eq!(
+            serialized["content"][1],
+            json!({
+                "type": "resource_link",
+                "name": "exo-workbench",
+                "title": "Open Exo workbench",
+                "uri": "http://127.0.0.1:49152/#ticket=secret",
+                "description": "Lane workspace for the selected Exo project and worktree",
+                "mimeType": "text/html",
+                "annotations": {
+                    "audience": ["user"],
+                    "priority": 1.0
+                }
+            })
+        );
+        assert_eq!(
+            serialized["structuredContent"]["result"]["kind"],
+            "workbench.launch"
+        );
+    }
+
+    #[test]
+    fn workbench_snapshot_returns_structured_content_without_explicit_json() {
+        let response = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "workbench-snapshot".to_string(),
+            status: Status::Ok,
+            result: Some(json!({
+                "kind": "workbench.snapshot",
+                "ok": true,
+                "schema_version": 1,
+                "revision": 7,
+                "project": { "id": "project-1" },
+                "workspace": { "key": "workspace-1", "label": "main" },
+                "lanes": [],
+                "focused_lane": null,
+                "phase": null,
+                "steering": { "situation": "No lane is focused.", "next_actions": [] },
+                "diagnostics": [],
+            })),
+            error: None,
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: Some(Display {
+                invocation_message: "Reading workbench snapshot".to_string(),
+                summary: "Workbench snapshot".to_string(),
+                body: None,
+            }),
+            preview: None,
+            effect: Some(Effect::Pure),
+            trace: None,
+        };
+
+        let result = machine_response_to_tool_result(&response);
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .expect("workbench snapshot structured content")["result"]["kind"],
+            "workbench.snapshot"
+        );
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn workbench_errors_never_return_resource_links() {
+        let response = error_response(
+            "workbench-launch".to_string(),
+            ErrorCode::PreconditionFailed,
+            "Workbench unavailable".to_string(),
+            Some(json!({ "kind": "workbench.host_unavailable" })),
+        );
+        let result = machine_response_to_tool_result(&response);
+        assert!(result.is_error);
+        assert_eq!(result.content.len(), 1);
+        assert!(matches!(result.content[0], McpContent::Text { .. }));
+    }
+
+    #[test]
+    fn only_workbench_calls_use_daemon_runtime_dispatch() {
+        let workbench = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "workbench".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec!["workbench".to_string(), "snapshot".to_string()],
+                },
+                input: json!({}),
+            }),
+            workspace_root: None,
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        };
+        let lane = RequestEnvelope {
+            id: "lane".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec!["lane".to_string(), "current".to_string()],
+                },
+                input: json!({}),
+            }),
+            ..workbench.clone()
+        };
+        assert!(request_is_workbench_call(&workbench));
+        assert!(!request_is_workbench_call(&lane));
     }
 
     #[test]
@@ -2821,6 +3066,7 @@ mod tests {
         assert!(result.structured_content.is_none());
         let text = match &result.content[0] {
             McpContent::Text { text } => text,
+            McpContent::ResourceLink { .. } => panic!("first MCP content block must be text"),
         };
         assert!(text.contains("Usage: task complete <id> [--log <string>]"));
     }

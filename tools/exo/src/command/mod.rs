@@ -58,6 +58,7 @@ pub mod storage;
 
 // Namespace modules (Wave 8)
 pub mod verify;
+pub mod workbench;
 
 // Namespace modules (Wave 9 - Phase D)
 pub mod commit;

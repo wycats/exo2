@@ -91,6 +91,36 @@ fn git_success(root: &std::path::Path, args: &[&str]) {
     );
 }
 
+#[cfg(all(unix, feature = "ui"))]
+struct McpDaemonGuard(PathBuf);
+
+#[cfg(all(unix, feature = "ui"))]
+impl McpDaemonGuard {
+    fn new(workspace: &Path) -> Self {
+        Self(workspace.to_path_buf())
+    }
+}
+
+#[cfg(all(unix, feature = "ui"))]
+impl Drop for McpDaemonGuard {
+    fn drop(&mut self) {
+        let Ok(paths) = exo::daemon::paths_for_workspace(&self.0) else {
+            return;
+        };
+        let Some(pid) = std::fs::read_to_string(paths.pid_path())
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+        else {
+            return;
+        };
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn commit_sidecar_baseline(root: &std::path::Path) {
     git_success(root, &["add", "-A"]);
     git_success(
@@ -2994,6 +3024,110 @@ fn mcp_stdio_serves_exo_run_status() {
             }
         }
     }
+
+    drop(stdin);
+    let status = child.wait().expect("wait for mcp server");
+    assert!(status.success(), "mcp server exited with {status}");
+}
+
+#[cfg(all(unix, feature = "ui"))]
+#[test]
+fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git_init(temp.path());
+    test_support::exo_init_with_storage(temp.path(), "sqlite");
+    git_success(temp.path(), &["add", "."]);
+    git_success(
+        temp.path(),
+        &["commit", "-m", "Initialize workbench fixture"],
+    );
+    let _daemon = McpDaemonGuard::new(temp.path());
+
+    let home = test_support::test_home();
+    let config_home = home.join("config");
+    let mut child = spawn_mcp_server_with_env(
+        temp.path(),
+        [("HOME", home), ("XDG_CONFIG_HOME", config_home.as_path())],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": exo::mcp::MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }
+        }),
+    );
+    let initialize = read_message(&mut stdout);
+    assert_eq!(
+        initialize["result"]["protocolVersion"],
+        exo::mcp::MCP_PROTOCOL_VERSION
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    );
+
+    let launch = call_exo_run(&mut stdin, &mut stdout, 2, "workbench launch");
+    assert_eq!(launch["result"]["isError"], false, "{launch}");
+    assert_eq!(launch["result"]["content"][0]["type"], "text", "{launch}");
+    assert_eq!(
+        launch["result"]["content"][1]["type"], "resource_link",
+        "{launch}"
+    );
+    assert_eq!(
+        launch["result"]["content"][1]["name"], "exo-workbench",
+        "{launch}"
+    );
+    let uri = launch["result"]["content"][1]["uri"]
+        .as_str()
+        .expect("workbench resource URI");
+    assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
+    assert!(uri.contains("/#ticket="), "{uri}");
+    let launch_text = launch["result"]["content"][0]["text"]
+        .as_str()
+        .expect("workbench launch fallback text");
+    assert!(launch_text.contains(uri), "{launch_text}");
+    assert!(
+        launch_text.contains("expires in five minutes"),
+        "{launch_text}"
+    );
+    assert_eq!(
+        structured_content(&launch)["result"]["kind"],
+        "workbench.launch"
+    );
+    assert_eq!(
+        structured_content(&launch)["result"]["url"],
+        launch["result"]["content"][1]["uri"]
+    );
+    assert!(
+        !serde_json::to_string(&launch)
+            .expect("serialize launch result")
+            .contains(&temp.path().display().to_string()),
+        "MCP launch result must not expose the local workspace path: {launch}"
+    );
+
+    let snapshot = call_exo_run(&mut stdin, &mut stdout, 3, "workbench snapshot");
+    assert_eq!(snapshot["result"]["isError"], false, "{snapshot}");
+    assert_eq!(
+        structured_content(&snapshot)["result"]["kind"],
+        "workbench.snapshot"
+    );
+    assert_eq!(
+        structured_content(&snapshot)["result"]["workspace"]["key"],
+        structured_content(&launch)["result"]["workspace"]["key"]
+    );
 
     drop(stdin);
     let status = child.wait().expect("wait for mcp server");

@@ -26,6 +26,7 @@ use crate::daemon_diagnostics::{
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::router::compile_argv;
+use crate::workbench::DaemonRuntimeServices;
 
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 
@@ -130,7 +131,12 @@ fn make_display(
     let invocation_message =
         generate_display_message(namespace, operation, input, &invoke_result.data);
     let summary = generate_summary_from_data(namespace, operation, input, &invoke_result.data);
-    let body = if namespace.is_empty() && operation == "update" {
+    let body = if namespace == "workbench" && operation == "launch" {
+        invoke_result
+            .human_message
+            .clone()
+            .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
+    } else if namespace.is_empty() && operation == "update" {
         crate::command::update::format_update_human_data(workspace_root, &invoke_result.data)
             .or_else(|| invoke_result.human_message.clone())
             .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
@@ -200,6 +206,15 @@ fn generate_summary_from_data(
     input: &JsonValue,
     data: &JsonValue,
 ) -> String {
+    if namespace == "workbench" && operation == "launch" {
+        let workspace = data
+            .get("workspace")
+            .and_then(|workspace| workspace.get("label"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("this workspace");
+        return format!("Open the Exo workbench for {workspace}");
+    }
+
     // Root status → phase title + progress mode
     if namespace.is_empty() && operation == "status" {
         let phase = data
@@ -1548,6 +1563,7 @@ pub fn handle_request_with_project_and_diagnostics(
         request,
         diagnostics,
         HandlerRuntime::External,
+        None,
     )
 }
 
@@ -1563,6 +1579,24 @@ pub fn handle_request_with_project_and_diagnostics_as_writer(
         request,
         diagnostics,
         HandlerRuntime::SidecarWriter,
+        None,
+    )
+}
+
+pub fn handle_request_with_project_and_diagnostics_as_daemon_writer(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    request: RequestEnvelope,
+    diagnostics: &DaemonDiagnostics,
+    runtime_services: &DaemonRuntimeServices,
+) -> ResponseEnvelope {
+    handle_request_with_project_and_diagnostics_in_runtime(
+        workspace_root,
+        project,
+        request,
+        diagnostics,
+        HandlerRuntime::SidecarWriter,
+        Some(runtime_services),
     )
 }
 
@@ -1578,6 +1612,7 @@ pub fn handle_request_with_project_and_diagnostics_as_atomic_writer(
         request,
         diagnostics,
         HandlerRuntime::AtomicStateWriter,
+        None,
     )
 }
 
@@ -1587,6 +1622,7 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
     request: RequestEnvelope,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     let request_id = request.id.clone();
     let op_path = request_op_path(&request);
@@ -1596,7 +1632,14 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
         json!({ "request_id": request_id, "op_path": op_path }),
     );
 
-    let response = handle_request_inner(workspace_root, project, request, diagnostics, runtime);
+    let response = handle_request_inner(
+        workspace_root,
+        project,
+        request,
+        diagnostics,
+        runtime,
+        runtime_services,
+    );
 
     diagnostics.record(
         "request.handler_end",
@@ -1618,6 +1661,7 @@ fn handle_request_inner(
     request: RequestEnvelope,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     if request.protocol_version != protocol::PROTOCOL_VERSION {
         return error(
@@ -1651,6 +1695,7 @@ fn handle_request_inner(
             request.workflow_confirmation,
             diagnostics,
             runtime,
+            runtime_services,
         ),
         Op::Preview(params) => handle_preview(request.id, &params),
     }
@@ -1953,6 +1998,7 @@ fn handle_call(
     workflow_confirmation: Option<crate::api::protocol::WorkflowConfirmationInput>,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     // Extract namespace and operation from address
     let (namespace, operation) = match &params.address {
@@ -1977,6 +2023,7 @@ fn handle_call(
                     &compound_op,
                     diagnostics,
                     runtime,
+                    runtime_services,
                 );
             } else {
                 return error(
@@ -2011,6 +2058,7 @@ fn handle_call(
         operation,
         diagnostics,
         runtime,
+        runtime_services,
     )
 }
 
@@ -2027,6 +2075,7 @@ fn handle_call_with_namespace_operation(
     operation: &str,
     diagnostics: &DaemonDiagnostics,
     runtime: HandlerRuntime,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
     let (command_input, transport_input) =
         split_request_transport_input(namespace, operation, &params.input);
@@ -2173,6 +2222,7 @@ fn handle_call_with_namespace_operation(
                 agent_id,
                 workflow_confirmation,
                 input_content: transport_input.input_content,
+                runtime_services,
             };
 
             diagnostics.record(
@@ -2508,6 +2558,7 @@ fn handle_list(
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         };
 
         return match cmd.invoke_json(&input, &transport) {
@@ -3022,6 +3073,44 @@ mod tests {
             Some(
                 "Updating Exosuit project in /workspace\n\nApplied 1 upgrade(s):\n  ✓ example\n    - Changed example state\n    ⚠ Example warning\n\nSkipped 2 already up-to-date upgrade(s)\n\nProject updated successfully!"
             )
+        );
+    }
+
+    #[test]
+    fn workbench_launch_display_keeps_the_url_and_expiration() {
+        let invoke_result = CommandInvokeResult {
+            data: json!({
+                "kind": "workbench.launch",
+                "ok": true,
+                "url": "http://127.0.0.1:49152/#ticket=secret",
+                "workspace": { "label": "feature/lane-ui" },
+            }),
+            human_message: Some(
+                "Open the Exo workbench for feature/lane-ui:\nhttp://127.0.0.1:49152/#ticket=secret\n\nThis link expires in five minutes."
+                    .to_string(),
+            ),
+            effect: Effect::Pure,
+            trace: exosuit_storage::Trace::default(),
+        };
+
+        let display = make_display(
+            Path::new("/workspace"),
+            "workbench",
+            "launch",
+            &json!({}),
+            &invoke_result,
+        )
+        .expect("workbench launch display");
+
+        assert_eq!(
+            display.summary,
+            "Open the Exo workbench for feature/lane-ui"
+        );
+        assert!(
+            display
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("http://127.0.0.1:49152/#ticket=secret"))
         );
     }
 

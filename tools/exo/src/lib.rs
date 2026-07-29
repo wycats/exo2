@@ -106,6 +106,7 @@ pub mod upgrade;
 pub mod utils;
 pub mod verifiers;
 pub mod verify;
+pub mod workbench;
 pub mod world_state;
 
 pub type ExoResult<T> = anyhow::Result<T>;

@@ -5,14 +5,22 @@
 #[macro_use]
 mod test_support;
 
+#[cfg(feature = "ui")]
+use std::collections::HashMap;
 use std::ffi::OsStr;
+#[cfg(feature = "ui")]
+use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_matrix;
+#[cfg(feature = "ui")]
+use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(feature = "ui")]
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Kill any daemon running for a workspace. Must be called at the end of
 /// every test that spawns a daemon to prevent contamination of subsequent tests.
@@ -232,6 +240,192 @@ async fn send_machine_operation(
         }
     });
     send_machine_request(stream, &request.to_string()).await
+}
+
+#[derive(Debug)]
+#[cfg(feature = "ui")]
+struct RawHttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[cfg(feature = "ui")]
+impl RawHttpResponse {
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).expect("valid JSON response")
+    }
+}
+
+#[cfg(feature = "ui")]
+async fn send_workbench_http(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+    cookie: Option<&str>,
+) -> io::Result<RawHttpResponse> {
+    let authority = origin
+        .strip_prefix("http://")
+        .ok_or_else(|| io::Error::other("workbench test origin is not HTTP"))?;
+    let mut stream = tokio::net::TcpStream::connect(authority).await?;
+    let body = body.unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nOrigin: {origin}\r\nConnection: close\r\n"
+    );
+    if let Some(cookie) = cookie {
+        request.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(&body);
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP response timed out"))??;
+    parse_workbench_http_response(&bytes)
+}
+
+#[cfg(feature = "ui")]
+fn parse_workbench_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
+    let split = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("HTTP response has no header terminator"))?;
+    let head = std::str::from_utf8(&bytes[..split])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| io::Error::other("HTTP response has no status"))?;
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+        .collect::<HashMap<_, _>>();
+    let mut body = bytes[split + 4..].to_vec();
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        body = decode_workbench_chunked(&body)?;
+    }
+    Ok(RawHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+#[cfg(feature = "ui")]
+fn decode_workbench_chunked(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut remaining = bytes;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = remaining
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| io::Error::other("chunk has no size terminator"))?;
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&remaining[..line_end])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            16,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        remaining = &remaining[line_end + 2..];
+        if size == 0 {
+            return Ok(decoded);
+        }
+        if remaining.len() < size + 2 {
+            return Err(io::Error::other("chunk body is truncated"));
+        }
+        decoded.extend_from_slice(&remaining[..size]);
+        remaining = &remaining[size + 2..];
+    }
+}
+
+#[cfg(feature = "ui")]
+async fn open_workbench_events(
+    origin: &str,
+    cookie: &str,
+    session_key: &str,
+    last_event_id: Option<u64>,
+) -> io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
+    let authority = origin
+        .strip_prefix("http://")
+        .ok_or_else(|| io::Error::other("workbench test origin is not HTTP"))?;
+    let stream = tokio::net::TcpStream::connect(authority).await?;
+    let (read, mut write) = stream.into_split();
+    let last_event_id = last_event_id
+        .map(|revision| format!("Last-Event-ID: {revision}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET /api/events?session_key={session_key} HTTP/1.1\r\nHost: {authority}\r\nCookie: {cookie}\r\nAccept: text/event-stream\r\n{last_event_id}Connection: keep-alive\r\n\r\n"
+    );
+    write.write_all(request.as_bytes()).await?;
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSE status timed out"))??;
+    if !line.contains(" 200 ") {
+        return Err(io::Error::other(format!(
+            "workbench SSE returned {}",
+            line.trim()
+        )));
+    }
+    loop {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSE headers timed out"))??;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+    }
+    Ok((reader, write))
+}
+
+#[cfg(feature = "ui")]
+async fn read_workbench_event(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<(String, u64)> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut event = None;
+        let mut id = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "workbench SSE closed",
+                ));
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if let (Some(event), Some(id)) = (event.take(), id.take()) {
+                    return Ok((event, id));
+                }
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event:") {
+                event = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("id:") {
+                id = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                );
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSE event timed out"))?
 }
 
 async fn send_machine_request_with_timeout(
@@ -2272,6 +2466,373 @@ async fn linked_worktree_lane_focus_agrees_across_direct_and_daemon_adapters(bac
             .expect("load linked focus")
             .map(|focus| focus.lane_id),
         Some(linked_lane_id)
+    );
+}
+
+#[cfg(feature = "ui")]
+#[test_matrix(["sqlite"])]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_sessions(backend: &str) {
+    assert_eq!(backend, "sqlite");
+    let dir = TempDir::new().unwrap();
+    let (primary, linked) = create_primary_and_linked_worktree(&dir);
+    let _guard = DaemonGuard::new(&primary);
+
+    let primary_project =
+        exo::project::Project::resolve(&primary).expect("resolve primary project");
+    let writer =
+        exo::context::SqliteWriter::open(primary_project.db_path()).expect("open project writer");
+    let epoch_id = writer
+        .add_epoch("Workbench Host Epoch", None, &[])
+        .expect("add workbench epoch");
+    let phase_id = writer
+        .add_phase(&epoch_id, "Workbench Host Phase", "regular", None, &[])
+        .expect("add workbench phase");
+    writer
+        .update_phase_status(&phase_id, "in-progress")
+        .expect("start workbench phase");
+    let primary_lane_id = writer
+        .add_workbench_lane("Primary lane", "Stay focused in primary", &phase_id)
+        .expect("add primary lane");
+    let linked_lane_id = writer
+        .add_workbench_lane("Linked lane", "Stay focused in linked", &phase_id)
+        .expect("add linked lane");
+    drop(writer);
+
+    let direct = test_support::exo_cmd(&primary)
+        .args(["--direct", "--format", "json", "workbench", "snapshot"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let direct: serde_json::Value =
+        serde_json::from_slice(&direct).expect("direct workbench error JSON");
+    assert_eq!(direct["error"]["code"], "precondition_failed", "{direct}");
+    assert_eq!(
+        direct["error"]["details"]["kind"], "workbench.daemon_required",
+        "{direct}"
+    );
+
+    let primary_stream = exo::daemon::ensure_daemon(&primary)
+        .await
+        .expect("primary should spawn daemon");
+    drop(primary_stream);
+
+    for (workspace, request_id, lane_id) in [
+        (&primary, "workbench-primary-focus", &primary_lane_id),
+        (&linked, "workbench-linked-focus", &linked_lane_id),
+    ] {
+        let response = send_machine_operation(
+            workspace,
+            request_id,
+            &["lane", "focus"],
+            serde_json::json!({ "id": lane_id }),
+        )
+        .await;
+        assert_eq!(response["status"], "ok", "{response}");
+    }
+
+    let primary_launch = send_machine_operation(
+        &primary,
+        "workbench-primary-launch",
+        &["workbench", "launch"],
+        serde_json::json!({}),
+    )
+    .await;
+    let linked_launch = send_machine_operation(
+        &linked,
+        "workbench-linked-launch",
+        &["workbench", "launch"],
+        serde_json::json!({}),
+    )
+    .await;
+    for response in [&primary_launch, &linked_launch] {
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["result"]["kind"], "workbench.launch", "{response}");
+        let launch_url = response["result"]["url"]
+            .as_str()
+            .expect("workbench launch URL");
+        assert!(
+            response["display"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(launch_url)),
+            "human display must preserve the launch URL: {response}"
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains(&primary.display().to_string()),
+            "launch response must not expose primary path: {response}"
+        );
+        assert!(
+            !response.to_string().contains(&linked.display().to_string()),
+            "launch response must not expose linked path: {response}"
+        );
+    }
+    assert_eq!(
+        primary_launch["result"]["project"]["id"],
+        linked_launch["result"]["project"]["id"]
+    );
+    assert_eq!(
+        primary_launch["result"]["daemon"]["instance_id"],
+        linked_launch["result"]["daemon"]["instance_id"]
+    );
+    assert_ne!(
+        primary_launch["result"]["workspace"]["key"],
+        linked_launch["result"]["workspace"]["key"]
+    );
+    assert_eq!(primary_launch["result"]["reused_host"], false);
+    assert_eq!(linked_launch["result"]["reused_host"], true);
+
+    let launch_parts = |response: &serde_json::Value| {
+        let url = response["result"]["url"]
+            .as_str()
+            .expect("workbench launch URL");
+        url.split_once("/#ticket=")
+            .map(|(origin, ticket)| (origin.to_string(), ticket.to_string()))
+            .expect("workbench URL has fragment ticket")
+    };
+    let (origin, primary_ticket) = launch_parts(&primary_launch);
+    let (linked_origin, linked_ticket) = launch_parts(&linked_launch);
+    assert_eq!(origin, linked_origin);
+
+    let exchange = |ticket: String| {
+        let origin = origin.clone();
+        async move {
+            send_workbench_http(
+                &origin,
+                "POST",
+                "/api/session",
+                Some(serde_json::json!({ "ticket": ticket }).to_string()),
+                None,
+            )
+            .await
+            .expect("exchange workbench launch ticket")
+        }
+    };
+    let primary_session = exchange(primary_ticket).await;
+    let linked_session = exchange(linked_ticket).await;
+    assert_eq!(primary_session.status, 200, "{primary_session:?}");
+    assert_eq!(linked_session.status, 200, "{linked_session:?}");
+    assert_ne!(
+        primary_session.json()["workspace_key"],
+        linked_session.json()["workspace_key"]
+    );
+    let primary_session_key = primary_session.json()["session_key"]
+        .as_str()
+        .expect("primary workbench session key")
+        .to_string();
+    let linked_session_key = linked_session.json()["session_key"]
+        .as_str()
+        .expect("linked workbench session key")
+        .to_string();
+    assert_ne!(primary_session_key, linked_session_key);
+    let cookie_pair = |response: &RawHttpResponse| {
+        response
+            .headers
+            .get("set-cookie")
+            .expect("workbench session cookie")
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_string()
+    };
+    let primary_cookie = cookie_pair(&primary_session);
+    let linked_cookie = cookie_pair(&linked_session);
+    assert_ne!(
+        primary_cookie
+            .split_once('=')
+            .expect("primary cookie name")
+            .0,
+        linked_cookie.split_once('=').expect("linked cookie name").0,
+        "concurrent worktree sessions need distinct browser cookies"
+    );
+    let browser_cookies = format!("{primary_cookie}; {linked_cookie}");
+
+    let (mut events, _events_write) =
+        open_workbench_events(&origin, &browser_cookies, &primary_session_key, None)
+            .await
+            .expect("open workbench event stream without an Origin header");
+    let (ready_event, ready_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("workbench ready event");
+    assert_eq!(ready_event, "ready");
+
+    let snapshot = |id: &'static str, cookie: String, session_key: String| {
+        let origin = origin.clone();
+        async move {
+            send_workbench_http(
+                &origin,
+                "POST",
+                "/api/command",
+                Some(
+                    serde_json::json!({
+                        "protocol_version": 1,
+                        "id": id,
+                        "session_key": session_key,
+                        "operation": { "kind": "snapshot" },
+                    })
+                    .to_string(),
+                ),
+                Some(&cookie),
+            )
+            .await
+            .expect("read browser workbench snapshot")
+            .json()
+        }
+    };
+    let primary_snapshot = snapshot(
+        "browser-primary-snapshot",
+        browser_cookies.clone(),
+        primary_session_key.clone(),
+    )
+    .await;
+    let linked_snapshot = snapshot(
+        "browser-linked-snapshot",
+        browser_cookies.clone(),
+        linked_session_key.clone(),
+    )
+    .await;
+    for response in [&primary_snapshot, &linked_snapshot] {
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            response["result"]["kind"], "workbench.snapshot",
+            "{response}"
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains(&primary.display().to_string()),
+            "snapshot must not expose primary path: {response}"
+        );
+        assert!(
+            !response.to_string().contains(&linked.display().to_string()),
+            "snapshot must not expose linked path: {response}"
+        );
+    }
+    assert_eq!(
+        primary_snapshot["result"]["focused_lane"]["id"],
+        primary_lane_id
+    );
+    assert_eq!(
+        linked_snapshot["result"]["focused_lane"]["id"],
+        linked_lane_id
+    );
+    assert_ne!(
+        primary_snapshot["result"]["workspace"]["key"],
+        linked_snapshot["result"]["workspace"]["key"]
+    );
+
+    let focus = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(
+            serde_json::json!({
+                "protocol_version": 1,
+                "id": "browser-primary-refocus",
+                "session_key": primary_session_key,
+                "operation": {
+                    "kind": "lane_focus",
+                    "lane_id": linked_lane_id,
+                },
+            })
+            .to_string(),
+        ),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("focus lane through workbench")
+    .json();
+    assert_eq!(focus["status"], "ok", "{focus}");
+    assert_eq!(focus["id"], "browser-primary-refocus", "{focus}");
+    assert_eq!(focus["result"]["lane"]["id"], linked_lane_id, "{focus}");
+
+    let (invalidate_event, invalidate_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("workbench invalidation event");
+    assert_eq!(invalidate_event, "invalidate");
+    assert!(invalidate_revision > ready_revision);
+
+    let refreshed = snapshot(
+        "browser-primary-refreshed",
+        browser_cookies.clone(),
+        primary_session_key.clone(),
+    )
+    .await;
+    assert_eq!(refreshed["status"], "ok", "{refreshed}");
+    assert_eq!(
+        refreshed["result"]["focused_lane"]["id"], linked_lane_id,
+        "{refreshed}"
+    );
+    assert_eq!(
+        refreshed["result"]["revision"], invalidate_revision,
+        "{refreshed}"
+    );
+
+    let (mut reconnected_events, _reconnected_write) = open_workbench_events(
+        &origin,
+        &browser_cookies,
+        &primary_session_key,
+        Some(ready_revision),
+    )
+    .await
+    .expect("reconnect workbench event stream with stale revision");
+    let (reconnected_ready, reconnected_revision) = read_workbench_event(&mut reconnected_events)
+        .await
+        .expect("reconnected workbench ready event");
+    assert_eq!(reconnected_ready, "ready");
+    assert_eq!(reconnected_revision, invalidate_revision);
+    let (reconnected_invalidate, reconnected_invalidate_revision) =
+        read_workbench_event(&mut reconnected_events)
+            .await
+            .expect("immediate reconnect invalidation");
+    assert_eq!(reconnected_invalidate, "invalidate");
+    assert_eq!(reconnected_invalidate_revision, invalidate_revision);
+
+    let status = exo::daemon::daemon_status(&linked);
+    assert!(status.ok, "{status:?}");
+    assert_eq!(status.identity_matches_project, Some(true));
+    let host = status
+        .workbench_host
+        .expect("matching workbench host status");
+    assert_eq!(host.origin, origin);
+    assert!(host.server_task_alive);
+    assert!(host.last_error.is_none());
+
+    run_git_ok(
+        &primary,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    std::fs::create_dir(&linked).expect("recreate former linked-worktree path");
+    git_init(&linked);
+    std::fs::write(linked.join("FOREIGN.md"), "# Foreign repository\n")
+        .expect("write foreign repository");
+    git_commit_all(&linked);
+
+    let unavailable = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(
+            serde_json::json!({
+                "protocol_version": 1,
+                "id": "browser-reused-workspace",
+                "session_key": linked_session_key,
+                "operation": { "kind": "snapshot" },
+            })
+            .to_string(),
+        ),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("reject a session whose workspace path was reused");
+    assert_eq!(unavailable.status, 410, "{unavailable:?}");
+    let unavailable = unavailable.json();
+    assert_eq!(
+        unavailable["kind"], "workbench.workspace_unavailable",
+        "{unavailable}"
     );
 }
 

@@ -210,6 +210,7 @@ impl Command for RunTaskCommand {
             agent_id: ctx.agent_id.clone(),
             workflow_confirmation: ctx.workflow_confirmation.clone(),
             input_content: ctx.input_content.clone(),
+            runtime_services: ctx.runtime_services,
         };
         self.execute_mut(&mut ctx)
     }

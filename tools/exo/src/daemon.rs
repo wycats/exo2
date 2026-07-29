@@ -31,6 +31,7 @@
 use crate::api::handler::{
     finalize_atomic_response_after_commit,
     handle_request_with_project_and_diagnostics_as_atomic_writer,
+    handle_request_with_project_and_diagnostics_as_daemon_writer,
     handle_request_with_project_and_diagnostics_as_writer,
 };
 use crate::api::protocol::{
@@ -49,6 +50,10 @@ use crate::daemon_outcomes::{
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::{Project, ProjectResolver, git_common_dir_from_filesystem};
+use crate::workbench::{
+    DaemonRequestDispatcher, DaemonRuntimeServices, WorkbenchHostManager, WorkbenchHostRecord,
+    WorkbenchHostStatus,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, Metadata};
@@ -113,6 +118,7 @@ pub struct LocalRuntimePaths {
     lock_path: PathBuf,
     identity_path: PathBuf,
     health_path: PathBuf,
+    workbench_host_path: PathBuf,
     config_home: Option<PathBuf>,
 }
 
@@ -124,6 +130,7 @@ impl LocalRuntimePaths {
         let lock_path = runtime_dir.join("daemon.lock");
         let identity_path = runtime_dir.join("daemon.identity.json");
         let health_path = runtime_dir.join("daemon.health.json");
+        let workbench_host_path = runtime_dir.join("workbench.host.json");
         let config_home = project
             .projects_config_path
             .as_ref()
@@ -140,6 +147,7 @@ impl LocalRuntimePaths {
             lock_path,
             identity_path,
             health_path,
+            workbench_host_path,
             config_home,
         }
     }
@@ -183,6 +191,11 @@ impl LocalRuntimePaths {
     /// Daemon accept-loop health path: `{state_root}/runtime/daemon.health.json`
     pub fn health_path(&self) -> PathBuf {
         self.health_path.clone()
+    }
+
+    /// Local workbench host record: `{state_root}/runtime/workbench.host.json`
+    pub fn workbench_host_path(&self) -> PathBuf {
+        self.workbench_host_path.clone()
     }
 
     /// Durable request/outcome ledger used to recover interrupted mutations.
@@ -298,6 +311,7 @@ pub struct DaemonStatusReport {
     pub last_accept_at: Option<String>,
     pub last_accept_error: Option<String>,
     pub health_updated_at: Option<String>,
+    pub workbench_host: Option<WorkbenchHostStatus>,
     pub recorded_identity: Option<serde_json::Value>,
     pub current_identity: Option<serde_json::Value>,
     pub state: DaemonStatusState,
@@ -877,6 +891,7 @@ pub fn daemon_status(workspace_path: &Path) -> DaemonStatusReport {
             last_accept_at: None,
             last_accept_error: None,
             health_updated_at: None,
+            workbench_host: None,
             recorded_identity: None,
             current_identity: None,
             state: DaemonStatusState::InvalidWorkspace,
@@ -915,6 +930,7 @@ pub fn daemon_status_for_project(workspace_path: &Path, project: &Project) -> Da
             last_accept_at: None,
             last_accept_error: None,
             health_updated_at: None,
+            workbench_host: None,
             recorded_identity: None,
             current_identity: None,
             state: DaemonStatusState::InvalidWorkspace,
@@ -1007,6 +1023,9 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         && recorded_identity_result
             .as_ref()
             .is_ok_and(|identity| identity.diagnostics_active);
+    let workbench_host = exact_runtime_identity
+        .then(|| read_workbench_host_status(&paths, recorded_identity_result.as_ref().ok()?))
+        .flatten();
 
     let state = if socket_connectable {
         if identity_matches_project == Some(true)
@@ -1078,11 +1097,33 @@ fn daemon_status_for_paths(paths: LocalRuntimePaths) -> DaemonStatusReport {
         last_accept_error: matching_health_after
             .and_then(|health| health.last_accept_error.clone()),
         health_updated_at: matching_health_after.map(|health| health.health_updated_at.clone()),
+        workbench_host,
         recorded_identity,
         current_identity,
         state,
         issue,
     }
+}
+
+fn read_workbench_host_status(
+    paths: &LocalRuntimePaths,
+    identity: &RuntimeDaemonIdentity,
+) -> Option<WorkbenchHostStatus> {
+    let content = std::fs::read(paths.workbench_host_path()).ok()?;
+    let record: WorkbenchHostRecord = serde_json::from_slice(&content).ok()?;
+    if identity.instance_id.as_deref() != Some(record.instance_id.as_str())
+        || identity.pid != Some(record.pid)
+        || identity.process_start_id.as_deref() != Some(record.process_start_id.as_str())
+    {
+        return None;
+    }
+    Some(WorkbenchHostStatus {
+        origin: record.origin,
+        assets_hash: record.assets_hash,
+        server_task_alive: record.server_task_alive,
+        updated_at: record.updated_at,
+        last_error: record.last_error,
+    })
 }
 
 fn daemon_health_matches_identity(
@@ -1710,6 +1751,10 @@ where
             format!("daemon handler task failed: {error}"),
         ),
     }
+}
+
+fn response_committed_write(response: &ResponseEnvelope) -> bool {
+    response.effect == Some(Effect::Write)
 }
 
 fn replay_request_context(
@@ -2714,21 +2759,211 @@ pub async fn run_daemon(
     // connected clients receive a notification so they can revalidate
     // their cached traces.
     let (write_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+    let workbench_host = WorkbenchHostManager::new(
+        Arc::clone(&project),
+        Arc::clone(&instance_id),
+        Arc::clone(&process_start_id),
+        paths.runtime_dir(),
+        Arc::clone(&last_activity),
+        tokio::runtime::Handle::current(),
+    );
+    let runtime_services = DaemonRuntimeServices::new(workbench_host);
+
+    // Build one daemon request dispatcher shared by IPC and the workbench HTTP adapter.
+    let handler_diagnostics = diagnostics.clone();
+    let request_workspace = Arc::clone(&workspace);
+    let request_project = Arc::clone(&project);
+    let request_outcome_ledger = Arc::clone(&outcome_ledger);
+    let request_instance_id = Arc::clone(&instance_id);
+    let request_runtime_services = runtime_services.clone();
+    let request_write_tx = write_tx.clone();
+    let request_admission = Arc::new(tokio::sync::Semaphore::new(
+        DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
+    ));
+    let dispatcher = DaemonRequestDispatcher::new(move |req: RequestEnvelope| {
+        let workspace = Arc::clone(&request_workspace);
+        let project = Arc::clone(&request_project);
+        let diagnostics = handler_diagnostics.clone();
+        let outcome_ledger = Arc::clone(&request_outcome_ledger);
+        let instance_id = Arc::clone(&request_instance_id);
+        let request_admission = Arc::clone(&request_admission);
+        let runtime_services = request_runtime_services.clone();
+        let write_tx = request_write_tx.clone();
+        async move {
+            let handler_runtime_services = runtime_services.clone();
+            let request_id = req.id.clone();
+            let handler_request_id = request_id.clone();
+            let response = dispatch_bounded_daemon_request(
+                request_id,
+                request_admission,
+                diagnostics.clone(),
+                move || {
+                    let recovery_request =
+                        compatible_protocol_v1_approval_request_id(
+                            &workspace,
+                            project.as_ref(),
+                            &req,
+                        )
+                        .map(|request_id| {
+                            let mut request = req.clone();
+                            request.id = request_id;
+                            request
+                        });
+                    let recovery_request = recovery_request.as_ref().unwrap_or(&req);
+                    if let Ok(Some(mut outcome)) =
+                        outcome_ledger.terminal_outcome_before_preparation(recovery_request)
+                    {
+                        outcome.response.id = handler_request_id;
+                        return outcome.response;
+                    }
+                    let declared_recovery = request_declared_recovery(&req);
+                    let reserved_recovery = outcome_ledger
+                        .reserved_request_recovery_before_preparation(recovery_request)
+                        .ok()
+                        .flatten();
+                    let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
+                        recovery.recovery_class == RecoveryClass::AtomicProjectState
+                            && outcome_ledger
+                                .atomic_request_needs_preparation(
+                                    &req,
+                                    &project.db_path(),
+                                    &instance_id,
+                                )
+                                .is_ok_and(|needs_preparation| !needs_preparation)
+                    });
+                    let recovery = if canonical_atomic_replay {
+                        declared_recovery
+                    } else if reserved_recovery.is_some() {
+                        reserved_recovery
+                    } else {
+                        let request_workspace = match validated_request_workspace(
+                            &workspace,
+                            project.as_ref(),
+                            &req,
+                        ) {
+                            Ok(workspace) => workspace,
+                            Err(error) => {
+                                return daemon_workspace_error_response(
+                                    handler_request_id,
+                                    &error,
+                                );
+                            }
+                        };
+                        resolved_request_recovery(&request_workspace, &req)
+                    };
+                    match recovery {
+                        Some(recovery)
+                            if recovery.recovery_class == RecoveryClass::AtomicProjectState =>
+                        {
+                            let Some((namespace, operation)) = request_command_path(&req) else {
+                                return daemon_handler_error_response(
+                                    handler_request_id,
+                                    ErrorCode::InvalidInput,
+                                    "atomic request is missing a command path".to_string(),
+                                );
+                            };
+                            let request_context = match atomic_request_context(
+                                &workspace,
+                                project.as_ref(),
+                                &outcome_ledger,
+                                &req,
+                                &instance_id,
+                            ) {
+                                Ok(project) => project,
+                                Err(error) => {
+                                    return daemon_workspace_error_response(
+                                        handler_request_id,
+                                        &error,
+                                    );
+                                }
+                            };
+                            let request_workspace = request_context.workspace_root;
+                            let request_project = request_context.project;
+                            outcome_ledger
+                                .execute_atomic_project_state(
+                                    req,
+                                    recovery.effect,
+                                    &instance_id,
+                                    Duration::from_secs(30),
+                                    &request_project.db_path(),
+                                    |req| {
+                                        handle_request_with_project_and_diagnostics_as_atomic_writer(
+                                            &request_workspace,
+                                            Some(&request_project),
+                                            req,
+                                            &diagnostics,
+                                        )
+                                    },
+                                    |response| {
+                                        finalize_atomic_response_after_commit(
+                                            &request_workspace,
+                                            Some(&request_project),
+                                            &namespace,
+                                            &operation,
+                                            recovery.effect,
+                                            response,
+                                            &diagnostics,
+                                        )
+                                    },
+                                )
+                                .response
+                        }
+                        Some(recovery) if matches!(recovery.effect, Effect::Write | Effect::Exec) => {
+                            execute_ledgered_daemon_request(
+                                &workspace,
+                                project.as_ref(),
+                                &outcome_ledger,
+                                req,
+                                recovery.effect,
+                                &instance_id,
+                                &diagnostics,
+                            )
+                            .response
+                        }
+                        _ => {
+                            let request_context =
+                                match daemon_request_context(&workspace, project.as_ref(), &req) {
+                                    Ok(context) => context,
+                                    Err(error) => {
+                                        return daemon_workspace_error_response(
+                                            handler_request_id,
+                                            &error,
+                                        );
+                                    }
+                                };
+                            normalize_retryable_daemon_busy_response_if_needed(
+                                handle_request_with_project_and_diagnostics_as_daemon_writer(
+                                    &request_context.workspace_root,
+                                    Some(&request_context.project),
+                                    req,
+                                    &diagnostics,
+                                    &handler_runtime_services,
+                                ),
+                            )
+                        }
+                    }
+                },
+            )
+            .await;
+            if response_committed_write(&response) {
+                runtime_services.revision_after_write();
+                let _ = write_tx.send(());
+            }
+            response
+        }
+    });
+    if let Err(error) = runtime_services.set_dispatcher(dispatcher.clone()) {
+        eprintln!("exo daemon: failed to install workbench dispatcher: {error}");
+        return;
+    }
 
     // Run the socket server
     let paths_clone = paths.clone();
     let diagnostics_clone = diagnostics.clone();
     let server_health = health.clone();
-    let handler_diagnostics = diagnostics.clone();
     let last_activity_clone = Arc::clone(&last_activity);
     let cleanup_workspace = Arc::clone(&workspace);
     let cleanup_project = Arc::clone(&project);
-    let request_project = Arc::clone(&project);
-    let request_outcome_ledger = Arc::clone(&outcome_ledger);
-    let request_instance_id = Arc::clone(&instance_id);
-    let request_admission = Arc::new(tokio::sync::Semaphore::new(
-        DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
-    ));
     let server_handle = tokio::spawn(async move {
         let _health_guard = DaemonServerTaskHealthGuard(server_health.clone());
         run_socket_server(
@@ -2741,175 +2976,9 @@ pub async fn run_daemon(
             write_tx,
             diagnostics_clone,
             server_health.clone(),
-            move |req: RequestEnvelope| {
-                let workspace = Arc::clone(&workspace);
-                let project = Arc::clone(&request_project);
-                let diagnostics = handler_diagnostics.clone();
-                let outcome_ledger = Arc::clone(&request_outcome_ledger);
-                let instance_id = Arc::clone(&request_instance_id);
-                let request_admission = Arc::clone(&request_admission);
-                async move {
-                    let request_id = req.id.clone();
-                    let handler_request_id = request_id.clone();
-                    dispatch_bounded_daemon_request(
-                        request_id,
-                        request_admission,
-                        diagnostics.clone(),
-                        move || {
-                        let recovery_request =
-                            compatible_protocol_v1_approval_request_id(
-                                &workspace,
-                                project.as_ref(),
-                                &req,
-                            )
-                            .map(|request_id| {
-                                let mut request = req.clone();
-                                request.id = request_id;
-                                request
-                            });
-                        let recovery_request = recovery_request.as_ref().unwrap_or(&req);
-                        if let Ok(Some(mut outcome)) =
-                            outcome_ledger.terminal_outcome_before_preparation(recovery_request)
-                        {
-                            outcome.response.id = handler_request_id;
-                            return outcome.response;
-                        }
-                        let declared_recovery = request_declared_recovery(&req);
-                        let reserved_recovery = outcome_ledger
-                            .reserved_request_recovery_before_preparation(recovery_request)
-                            .ok()
-                            .flatten();
-                        let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
-                            recovery.recovery_class == RecoveryClass::AtomicProjectState
-                                && outcome_ledger
-                                    .atomic_request_needs_preparation(
-                                        &req,
-                                        &project.db_path(),
-                                        &instance_id,
-                                    )
-                                    .is_ok_and(|needs_preparation| !needs_preparation)
-                        });
-                        let recovery = if canonical_atomic_replay {
-                            declared_recovery
-                        } else if reserved_recovery.is_some() {
-                            reserved_recovery
-                        } else {
-                            let request_workspace = match validated_request_workspace(
-                                &workspace,
-                                project.as_ref(),
-                                &req,
-                            ) {
-                                Ok(workspace) => workspace,
-                                Err(error) => {
-                                    return daemon_workspace_error_response(
-                                        handler_request_id,
-                                        &error,
-                                    );
-                                }
-                            };
-                            resolved_request_recovery(&request_workspace, &req)
-                        };
-                        match recovery {
-                            Some(recovery)
-                                if recovery.recovery_class
-                                    == RecoveryClass::AtomicProjectState =>
-                            {
-                                let Some((namespace, operation)) = request_command_path(&req)
-                                else {
-                                    return daemon_handler_error_response(
-                                        handler_request_id,
-                                        ErrorCode::InvalidInput,
-                                        "atomic request is missing a command path".to_string(),
-                                    );
-                                };
-                                let request_context = match atomic_request_context(
-                                    &workspace,
-                                    project.as_ref(),
-                                    &outcome_ledger,
-                                    &req,
-                                    &instance_id,
-                                ) {
-                                    Ok(project) => project,
-                                    Err(error) => {
-                                        return daemon_workspace_error_response(
-                                            handler_request_id,
-                                            &error,
-                                        );
-                                    }
-                                };
-                                let request_workspace = request_context.workspace_root;
-                                let request_project = request_context.project;
-                                outcome_ledger
-                                    .execute_atomic_project_state(
-                                        req,
-                                        recovery.effect,
-                                        &instance_id,
-                                        Duration::from_secs(30),
-                                        &request_project.db_path(),
-                                        |req| {
-                                            handle_request_with_project_and_diagnostics_as_atomic_writer(
-                                                &request_workspace,
-                                                Some(&request_project),
-                                                req,
-                                                &diagnostics,
-                                            )
-                                        },
-                                        |response| {
-                                            finalize_atomic_response_after_commit(
-                                                &request_workspace,
-                                                Some(&request_project),
-                                                &namespace,
-                                                &operation,
-                                                recovery.effect,
-                                                response,
-                                                &diagnostics,
-                                            )
-                                        },
-                                    )
-                                    .response
-                            }
-                            Some(recovery)
-                                if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
-                            {
-                                execute_ledgered_daemon_request(
-                                    &workspace,
-                                    project.as_ref(),
-                                    &outcome_ledger,
-                                    req,
-                                    recovery.effect,
-                                    &instance_id,
-                                    &diagnostics,
-                                )
-                                    .response
-                            }
-                            _ => {
-                                let request_context = match daemon_request_context(
-                                    &workspace,
-                                    project.as_ref(),
-                                    &req,
-                                ) {
-                                    Ok(context) => context,
-                                    Err(error) => {
-                                        return daemon_workspace_error_response(
-                                            handler_request_id,
-                                            &error,
-                                        );
-                                    }
-                                };
-                                normalize_retryable_daemon_busy_response_if_needed(
-                                    handle_request_with_project_and_diagnostics_as_writer(
-                                        &request_context.workspace_root,
-                                        Some(&request_context.project),
-                                        req,
-                                        &diagnostics,
-                                    ),
-                                )
-                            }
-                        }
-                    },
-                    )
-                    .await
-                }
+            move |request: RequestEnvelope| {
+                let dispatcher = dispatcher.clone();
+                async move { dispatcher.dispatch(request).await }
             },
         )
         .await;
@@ -2980,6 +3049,8 @@ pub async fn run_daemon(
             eprintln!("exo daemon: shutting down (CTRL-C)");
         }
     }
+
+    runtime_services.shutdown().await;
 
     // Cleanup: remove endpoint and PID files, then release lock
     eprintln!("exo daemon: cleaning up");
@@ -3204,11 +3275,6 @@ async fn run_socket_server<F, Fut>(
 
                         let response = handler(request).await;
 
-                        // If this was a write, notify all other clients
-                        if response.effect == Some(Effect::Write) {
-                            let _ = write_tx.send(());
-                        }
-
                         let mut data = match serde_json::to_vec(&response) {
                             Ok(d) => d,
                             Err(e) => {
@@ -3339,6 +3405,22 @@ mod tests {
             }
         }))
         .expect("workspace request")
+    }
+
+    #[test]
+    fn committed_write_error_response_still_requires_client_notification() {
+        let mut response = daemon_handler_error_response(
+            "committed-write-error".to_string(),
+            ErrorCode::PreconditionFailed,
+            "post-commit finalization failed".to_string(),
+        );
+        response.effect = Some(Effect::Write);
+
+        assert_eq!(response.status, Status::Error);
+        assert!(response_committed_write(&response));
+
+        response.effect = None;
+        assert!(!response_committed_write(&response));
     }
 
     #[tokio::test]

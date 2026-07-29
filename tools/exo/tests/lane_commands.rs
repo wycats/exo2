@@ -68,6 +68,7 @@ fn read_context<'a>(root: &'a Path, project: &'a Project) -> CommandContext<'a> 
         agent_id: None,
         workflow_confirmation: None,
         input_content: None,
+        runtime_services: None,
     }
 }
 
@@ -79,6 +80,7 @@ fn write_context<'a>(root: &'a Path, project: &'a Project) -> MutableCommandCont
         agent_id: None,
         workflow_confirmation: None,
         input_content: None,
+        runtime_services: None,
     }
 }
 
@@ -98,6 +100,7 @@ fn execute_human<C: Command>(command: &C, root: &Path, project: &Project) -> Com
             agent_id: None,
             workflow_confirmation: None,
             input_content: None,
+            runtime_services: None,
         })
         .expect("human command succeeds")
 }

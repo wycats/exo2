@@ -3696,6 +3696,28 @@
           "args": []
         }
       }
+    },
+    "workbench": {
+      "name": "workbench",
+      "description": "Local lane workbench commands",
+      "operations": {
+        "launch": {
+          "name": "launch",
+          "description": "Launch the local lane workbench",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "snapshot": {
+          "name": "snapshot",
+          "description": "Read the current lane workbench snapshot",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": []
+        }
+      }
     }
   },
   "root_operations": {
@@ -3797,5 +3819,5 @@
       ]
     }
   },
-  "operation_count": 132
+  "operation_count": 134
 }

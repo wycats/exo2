@@ -1,0 +1,73 @@
+{
+  "kind": "workbench.snapshot",
+  "ok": true,
+  "schema_version": 1,
+  "observed_at": "2026-07-28T20:00:00.000Z",
+  "revision": 7,
+  "project": {
+    "id": "project-fixture"
+  },
+  "workspace": {
+    "key": "workspace-fixture",
+    "label": "main",
+    "branch": "main",
+    "head": "0123456789abcdef",
+    "detached": false,
+    "dirty": true
+  },
+  "lanes": [
+    {
+      "id": "lane-fixture",
+      "title": "Local workbench host",
+      "state": "executing",
+      "phase_id": "phase-fixture",
+      "phase_title": "Workbench foundation",
+      "phase_status": "in-progress",
+      "focused_here": true
+    }
+  ],
+  "focused_lane": {
+    "id": "lane-fixture",
+    "title": "Local workbench host",
+    "state": "executing",
+    "phase_id": "phase-fixture",
+    "phase_title": "Workbench foundation",
+    "phase_status": "in-progress",
+    "focused_here": true,
+    "intent": "Build the host and launch substrate",
+    "created_at": "2026-07-28T19:00:00Z",
+    "updated_at": "2026-07-28T19:30:00Z"
+  },
+  "phase": {
+    "id": "phase-fixture",
+    "title": "Workbench foundation",
+    "status": "in-progress",
+    "goals": [
+      {
+        "id": "host-goal",
+        "title": "Establish local host and launch",
+        "status": "in-progress",
+        "tasks": [
+          {
+            "id": "implement-host",
+            "title": "Implement host",
+            "status": "in-progress"
+          }
+        ]
+      }
+    ]
+  },
+  "steering": {
+    "situation": "The local host implementation is active.",
+    "next_actions": [
+      {
+        "label": "Continue implementation",
+        "command": "task log host-goal::implement-host --message <message>",
+        "rationale": "Keep the active task current.",
+        "intent": "record",
+        "confidence": 0.95
+      }
+    ]
+  },
+  "diagnostics": []
+}

@@ -14,11 +14,12 @@
     "build": "svelte-kit sync && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test": "svelte-kit sync && vitest run"
+    "test": "svelte-kit sync && vitest run",
+    "test:unit": "svelte-kit sync && vitest run"
   },
   "devDependencies": {
     "@lucide/svelte": "1.18.0",
-    "@sveltejs/adapter-node": "5.5.4",
+    "@sveltejs/adapter-static": "3.0.10",
     "@sveltejs/kit": "2.65.0",
     "@sveltejs/vite-plugin-svelte": "6.2.1",
     "@testing-library/dom": "10.4.1",

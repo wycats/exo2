@@ -48,6 +48,26 @@ for (const name of executionJobs) {
   const body = job(name);
   requireText(body, "contents: read", `${name} must have contents: read`);
   requireText(body, "cargo llvm-cov", `${name} must execute coverage`);
+  requireText(
+    body,
+    "uses: pnpm/action-setup@v4",
+    `${name} must provision the pinned pnpm toolchain`,
+  );
+  requireText(
+    body,
+    "uses: actions/setup-node@v4",
+    `${name} must provision Node for the embedded workbench build`,
+  );
+  requireText(
+    body,
+    "pnpm install --frozen-lockfile",
+    `${name} must install the locked workspace dependencies`,
+  );
+  requireText(
+    body,
+    "pnpm --filter exosuit-cockpit build",
+    `${name} must build the embedded workbench before coverage`,
+  );
   for (const permission of ["contents", "issues", "pull-requests", "statuses"]) {
     rejectText(body, `${permission}: write`, `${name} must not have ${permission}: write`);
   }
