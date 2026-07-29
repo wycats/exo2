@@ -1417,10 +1417,22 @@ fn machine_response_to_tool_result_with_profile(
         content,
         structured_content: structured_content_for_tool_response(
             response,
-            include_structured || workbench_launch_uri(response).is_some(),
+            include_structured
+                || workbench_launch_uri(response).is_some()
+                || response_has_result_kind(response, "workbench.snapshot"),
         ),
         is_error: response.status != Status::Ok,
     }
+}
+
+fn response_has_result_kind(response: &ResponseEnvelope, kind: &str) -> bool {
+    response.status == Status::Ok
+        && response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some(kind)
 }
 
 fn workbench_launch_uri(response: &ResponseEnvelope) -> Option<&str> {
@@ -2859,6 +2871,50 @@ mod tests {
             serialized["structuredContent"]["result"]["kind"],
             "workbench.launch"
         );
+    }
+
+    #[test]
+    fn workbench_snapshot_returns_structured_content_without_explicit_json() {
+        let response = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: "workbench-snapshot".to_string(),
+            status: Status::Ok,
+            result: Some(json!({
+                "kind": "workbench.snapshot",
+                "ok": true,
+                "schema_version": 1,
+                "revision": 7,
+                "project": { "id": "project-1" },
+                "workspace": { "key": "workspace-1", "label": "main" },
+                "lanes": [],
+                "focused_lane": null,
+                "phase": null,
+                "steering": { "situation": "No lane is focused.", "next_actions": [] },
+                "diagnostics": [],
+            })),
+            error: None,
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: Some(Display {
+                invocation_message: "Reading workbench snapshot".to_string(),
+                summary: "Workbench snapshot".to_string(),
+                body: None,
+            }),
+            preview: None,
+            effect: Some(Effect::Pure),
+            trace: None,
+        };
+
+        let result = machine_response_to_tool_result(&response);
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .expect("workbench snapshot structured content")["result"]["kind"],
+            "workbench.snapshot"
+        );
+        assert_eq!(result.content.len(), 1);
     }
 
     #[test]

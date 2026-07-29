@@ -1,5 +1,5 @@
 use super::{
-    MAX_REQUEST_BODY_BYTES, SESSION_COOKIE_NAME, TicketExchangeError, WorkbenchHostInner,
+    MAX_REQUEST_BODY_BYTES, SESSION_COOKIE_PREFIX, TicketExchangeError, WorkbenchHostInner,
     WorkbenchSession, assets,
 };
 use crate::api::protocol::{
@@ -40,6 +40,7 @@ struct SessionRequest {
 struct BrowserCommandRequest {
     protocol_version: u32,
     id: String,
+    session_key: String,
     operation: BrowserOperation,
 }
 
@@ -121,10 +122,10 @@ async fn create_session(
         }
     };
     inner.touch_daemon_activity();
+    let cookie_name = session_cookie_name(&result.session_key);
+    let cookie =
+        format!("{cookie_name}={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200");
     let mut response = Json(result).into_response();
-    let cookie = format!(
-        "{SESSION_COOKIE_NAME}={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
-    );
     if let Ok(value) = cookie.parse() {
         response.headers_mut().insert(SET_COOKIE, value);
     }
@@ -157,20 +158,23 @@ async fn run_command(
             "The workbench request origin is not accepted",
         );
     }
-    let Some(session) = authenticated_session(&inner, &headers) else {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "workbench.session_invalid",
-            "The workbench session is invalid",
-        );
-    };
-    if request.protocol_version != PROTOCOL_VERSION || request.id.trim().is_empty() {
+    if request.protocol_version != PROTOCOL_VERSION
+        || request.id.trim().is_empty()
+        || !valid_session_key(&request.session_key)
+    {
         return error_response(
             StatusCode::BAD_REQUEST,
             "workbench.invalid_request",
             "The workbench command request is invalid",
         );
     }
+    let Some(session) = authenticated_session(&inner, &headers, &request.session_key) else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "workbench.session_invalid",
+            "The workbench session is invalid",
+        );
+    };
     let (capability, address, input) = match request.operation {
         BrowserOperation::Snapshot => (
             "workbench.snapshot",
@@ -233,6 +237,7 @@ async fn run_command(
 async fn events(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AxumResponse> {
     let Some(inner) = state.inner.upgrade() else {
         return Err(error_response(
@@ -241,14 +246,21 @@ async fn events(
             "The workbench host is no longer available",
         ));
     };
-    if !origin_matches(&inner, &headers) {
+    if !event_origin_matches(&inner, &headers) {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "workbench.origin_mismatch",
             "The workbench request origin is not accepted",
         ));
     }
-    let Some(session) = authenticated_session(&inner, &headers) else {
+    let Some(session_key) = session_key_from_uri(&uri) else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "workbench.invalid_request",
+            "The workbench event request is invalid",
+        ));
+    };
+    let Some(session) = authenticated_session(&inner, &headers, session_key) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
             "workbench.session_invalid",
@@ -269,6 +281,7 @@ async fn events(
     let mut write_events = inner.subscribe();
     let initial_revision = inner.current_revision();
     let session_id = session.id;
+    let session_key = session.selector;
     let stream_inner = Arc::clone(&inner);
     let event_stream = stream! {
         let _permit = permit;
@@ -288,7 +301,7 @@ async fn events(
         loop {
             tokio::select! {
                 _ = keepalive.tick() => {
-                    if stream_inner.session(&session_id).is_none() {
+                    if stream_inner.session(&session_key, &session_id).is_none() {
                         break;
                     }
                     stream_inner.touch_daemon_activity();
@@ -324,9 +337,34 @@ async fn static_asset(State(_state): State<HttpState>, uri: Uri) -> Response<Bod
 fn authenticated_session(
     inner: &WorkbenchHostInner,
     headers: &HeaderMap,
+    session_key: &str,
 ) -> Option<WorkbenchSession> {
-    let session_id = cookie_value(headers, SESSION_COOKIE_NAME)?;
-    inner.session(session_id)
+    let cookie_name = session_cookie_name(session_key);
+    let session_id = cookie_value(headers, &cookie_name)?;
+    inner.session(session_key, session_id)
+}
+
+fn session_cookie_name(session_key: &str) -> String {
+    format!("{SESSION_COOKIE_PREFIX}{session_key}")
+}
+
+fn session_key_from_uri(uri: &Uri) -> Option<&str> {
+    let mut values = uri
+        .query()?
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .filter_map(|(name, value)| {
+            (name == "session_key" && valid_session_key(value)).then_some(value)
+        });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn valid_session_key(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -340,20 +378,34 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn origin_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
+    host_matches(inner, headers)
+        && headers
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| inner.origin().as_deref() == Some(value))
+}
+
+fn event_origin_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
+    host_matches(inner, headers)
+        && headers
+            .get(ORIGIN)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .is_some_and(|value| inner.origin().as_deref() == Some(value))
+            })
+            .unwrap_or(true)
+}
+
+fn host_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
     let Some(expected_host) = inner.expected_host() else {
-        return false;
-    };
-    let Some(expected_origin) = inner.origin() else {
         return false;
     };
     headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == expected_host)
-        && headers
-            .get(ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == expected_origin)
 }
 
 fn invalidation_event(revision: u64) -> Event {

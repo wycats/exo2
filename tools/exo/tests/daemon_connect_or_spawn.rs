@@ -343,6 +343,7 @@ fn decode_workbench_chunked(bytes: &[u8]) -> io::Result<Vec<u8>> {
 async fn open_workbench_events(
     origin: &str,
     cookie: &str,
+    session_key: &str,
     last_event_id: Option<u64>,
 ) -> io::Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
     let authority = origin
@@ -354,7 +355,7 @@ async fn open_workbench_events(
         .map(|revision| format!("Last-Event-ID: {revision}\r\n"))
         .unwrap_or_default();
     let request = format!(
-        "GET /api/events HTTP/1.1\r\nHost: {authority}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nAccept: text/event-stream\r\n{last_event_id}Connection: keep-alive\r\n\r\n"
+        "GET /api/events?session_key={session_key} HTTP/1.1\r\nHost: {authority}\r\nCookie: {cookie}\r\nAccept: text/event-stream\r\n{last_event_id}Connection: keep-alive\r\n\r\n"
     );
     write.write_all(request.as_bytes()).await?;
     let mut reader = BufReader::new(read);
@@ -2536,6 +2537,15 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
     for response in [&primary_launch, &linked_launch] {
         assert_eq!(response["status"], "ok", "{response}");
         assert_eq!(response["result"]["kind"], "workbench.launch", "{response}");
+        let launch_url = response["result"]["url"]
+            .as_str()
+            .expect("workbench launch URL");
+        assert!(
+            response["display"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(launch_url)),
+            "human display must preserve the launch URL: {response}"
+        );
         assert!(
             !response
                 .to_string()
@@ -2596,6 +2606,15 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         primary_session.json()["workspace_key"],
         linked_session.json()["workspace_key"]
     );
+    let primary_session_key = primary_session.json()["session_key"]
+        .as_str()
+        .expect("primary workbench session key")
+        .to_string();
+    let linked_session_key = linked_session.json()["session_key"]
+        .as_str()
+        .expect("linked workbench session key")
+        .to_string();
+    assert_ne!(primary_session_key, linked_session_key);
     let cookie_pair = |response: &RawHttpResponse| {
         response
             .headers
@@ -2608,16 +2627,26 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
     };
     let primary_cookie = cookie_pair(&primary_session);
     let linked_cookie = cookie_pair(&linked_session);
+    assert_ne!(
+        primary_cookie
+            .split_once('=')
+            .expect("primary cookie name")
+            .0,
+        linked_cookie.split_once('=').expect("linked cookie name").0,
+        "concurrent worktree sessions need distinct browser cookies"
+    );
+    let browser_cookies = format!("{primary_cookie}; {linked_cookie}");
 
-    let (mut events, _events_write) = open_workbench_events(&origin, &primary_cookie, None)
-        .await
-        .expect("open workbench event stream");
+    let (mut events, _events_write) =
+        open_workbench_events(&origin, &browser_cookies, &primary_session_key, None)
+            .await
+            .expect("open workbench event stream without an Origin header");
     let (ready_event, ready_revision) = read_workbench_event(&mut events)
         .await
         .expect("workbench ready event");
     assert_eq!(ready_event, "ready");
 
-    let snapshot = |id: &'static str, cookie: String| {
+    let snapshot = |id: &'static str, cookie: String, session_key: String| {
         let origin = origin.clone();
         async move {
             send_workbench_http(
@@ -2628,6 +2657,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
                     serde_json::json!({
                         "protocol_version": 1,
                         "id": id,
+                        "session_key": session_key,
                         "operation": { "kind": "snapshot" },
                     })
                     .to_string(),
@@ -2639,8 +2669,18 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             .json()
         }
     };
-    let primary_snapshot = snapshot("browser-primary-snapshot", primary_cookie.clone()).await;
-    let linked_snapshot = snapshot("browser-linked-snapshot", linked_cookie.clone()).await;
+    let primary_snapshot = snapshot(
+        "browser-primary-snapshot",
+        browser_cookies.clone(),
+        primary_session_key.clone(),
+    )
+    .await;
+    let linked_snapshot = snapshot(
+        "browser-linked-snapshot",
+        browser_cookies.clone(),
+        linked_session_key.clone(),
+    )
+    .await;
     for response in [&primary_snapshot, &linked_snapshot] {
         assert_eq!(response["status"], "ok", "{response}");
         assert_eq!(
@@ -2679,6 +2719,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             serde_json::json!({
                 "protocol_version": 1,
                 "id": "browser-primary-refocus",
+                "session_key": primary_session_key,
                 "operation": {
                     "kind": "lane_focus",
                     "lane_id": linked_lane_id,
@@ -2686,7 +2727,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             })
             .to_string(),
         ),
-        Some(&primary_cookie),
+        Some(&browser_cookies),
     )
     .await
     .expect("focus lane through workbench")
@@ -2701,7 +2742,12 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
     assert_eq!(invalidate_event, "invalidate");
     assert!(invalidate_revision > ready_revision);
 
-    let refreshed = snapshot("browser-primary-refreshed", primary_cookie.clone()).await;
+    let refreshed = snapshot(
+        "browser-primary-refreshed",
+        browser_cookies.clone(),
+        primary_session_key.clone(),
+    )
+    .await;
     assert_eq!(refreshed["status"], "ok", "{refreshed}");
     assert_eq!(
         refreshed["result"]["focused_lane"]["id"], linked_lane_id,
@@ -2712,10 +2758,14 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "{refreshed}"
     );
 
-    let (mut reconnected_events, _reconnected_write) =
-        open_workbench_events(&origin, &primary_cookie, Some(ready_revision))
-            .await
-            .expect("reconnect workbench event stream with stale revision");
+    let (mut reconnected_events, _reconnected_write) = open_workbench_events(
+        &origin,
+        &browser_cookies,
+        &primary_session_key,
+        Some(ready_revision),
+    )
+    .await
+    .expect("reconnect workbench event stream with stale revision");
     let (reconnected_ready, reconnected_revision) = read_workbench_event(&mut reconnected_events)
         .await
         .expect("reconnected workbench ready event");
@@ -2756,11 +2806,12 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             serde_json::json!({
                 "protocol_version": 1,
                 "id": "browser-reused-workspace",
+                "session_key": linked_session_key,
                 "operation": { "kind": "snapshot" },
             })
             .to_string(),
         ),
-        Some(&linked_cookie),
+        Some(&browser_cookies),
     )
     .await
     .expect("reject a session whose workspace path was reused");

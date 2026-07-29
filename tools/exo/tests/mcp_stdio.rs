@@ -3095,6 +3095,14 @@ fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
         .expect("workbench resource URI");
     assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
     assert!(uri.contains("/#ticket="), "{uri}");
+    let launch_text = launch["result"]["content"][0]["text"]
+        .as_str()
+        .expect("workbench launch fallback text");
+    assert!(launch_text.contains(uri), "{launch_text}");
+    assert!(
+        launch_text.contains("expires in five minutes"),
+        "{launch_text}"
+    );
     assert_eq!(
         structured_content(&launch)["result"]["kind"],
         "workbench.launch"
@@ -3108,6 +3116,17 @@ fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
             .expect("serialize launch result")
             .contains(&temp.path().display().to_string()),
         "MCP launch result must not expose the local workspace path: {launch}"
+    );
+
+    let snapshot = call_exo_run(&mut stdin, &mut stdout, 3, "workbench snapshot");
+    assert_eq!(snapshot["result"]["isError"], false, "{snapshot}");
+    assert_eq!(
+        structured_content(&snapshot)["result"]["kind"],
+        "workbench.snapshot"
+    );
+    assert_eq!(
+        structured_content(&snapshot)["result"]["workspace"]["key"],
+        structured_content(&launch)["result"]["workspace"]["key"]
     );
 
     drop(stdin);

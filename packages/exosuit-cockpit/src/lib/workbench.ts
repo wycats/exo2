@@ -103,6 +103,7 @@ export interface WorkbenchSessionResult {
   kind: "workbench.session";
   ok: true;
   schema_version: 1;
+  session_key: string;
   project_id: string;
   workspace_key: string;
   expires_at: string;
@@ -111,6 +112,7 @@ export interface WorkbenchSessionResult {
 export interface WorkbenchCommandRequest {
   protocol_version: 1;
   id: string;
+  session_key: string;
   operation:
     | { kind: "snapshot" }
     | { kind: "lane_focus"; lane_id: string };

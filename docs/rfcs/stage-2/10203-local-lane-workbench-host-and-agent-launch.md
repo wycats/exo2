@@ -274,11 +274,15 @@ the endpoint from becoming an oracle for local workspace existence.
 The static application reads the fragment and immediately exchanges the ticket
 through `POST /api/session`. On success it calls `history.replaceState` to
 remove the fragment and stores no ticket in JavaScript persistence. The server
-sets a random 256-bit session identifier in a cookie named
-`exo_workbench_session` with `HttpOnly`, `SameSite=Strict`, `Path=/`, no
-`Domain`, and `Max-Age=43200`. The initial transport is HTTP loopback, so the
-first version does not claim a `Secure` cookie that the server cannot
-portably enforce.
+returns a public random session key and sets an independent random 256-bit
+session identifier in a cookie named
+`exo_workbench_session_<session-key>`. The cookie has `HttpOnly`,
+`SameSite=Strict`, `Path=/`, no `Domain`, and `Max-Age=43200`. The session key
+selects the matching cookie; it is not authorization without the independent
+secret cookie value. Per-session names prevent two linked-worktree tabs on the
+same loopback host from replacing each other's credentials. The initial
+transport is HTTP loopback, so the first version does not claim a `Secure`
+cookie that the server cannot portably enforce.
 
 A session has a twelve-hour absolute lifetime and a thirty-minute idle
 lifetime. An authenticated command, snapshot poll, or SSE keepalive refreshes
@@ -293,9 +297,12 @@ Request bodies are limited to 64 KiB. Exceeding any bound returns
 `workbench.busy` without entering Exo command dispatch.
 
 The host binds the numeric loopback address and requires the exact expected
-`Host` and `Origin` values on session and command requests. It emits no
-permissive CORS headers. A missing or foreign origin, session, or capability
-fails before workspace resolution or command dispatch.
+`Host` on every API request. Session exchange and command requests also require
+the exact `Origin`. EventSource GET requests may omit `Origin`, as browsers
+commonly do for same-origin streams, but a supplied origin must match exactly.
+The server emits no permissive CORS headers. A missing required origin, foreign
+origin, missing session, or unavailable capability fails before workspace
+resolution or command dispatch.
 
 ### HTTP surface
 
@@ -324,6 +331,7 @@ interface WorkbenchSessionResult {
   schema_version: 1;
   project_id: string;
   workspace_key: string;
+  session_key: string;
   expires_at: string;
 }
 ```
@@ -334,6 +342,7 @@ interface WorkbenchSessionResult {
 interface WorkbenchCommandRequest {
   protocol_version: 1;
   id: string;
+  session_key: string;
   operation:
     | { kind: "snapshot" }
     | { kind: "lane_focus"; lane_id: string };
@@ -345,7 +354,8 @@ registered `workbench snapshot` command and `lane_focus` to `lane focus
 <lane_id>`. It constructs an ordinary `RequestEnvelope` with the session's
 validated workspace root and the browser's request ID. The client cannot submit
 a workspace root, arbitrary command text, Exo confirmation ticket, or workflow
-confirmation.
+confirmation. The event stream passes the same selector as
+`GET /api/events?session_key=<session-key>`.
 
 A well-formed authenticated command returns the normal Exo `ResponseEnvelope`
 with HTTP status 200, including Exo errors such as an invalid lane, phase

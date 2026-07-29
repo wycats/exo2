@@ -31,7 +31,7 @@ const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
 const MAX_SESSIONS: usize = 64;
 const MAX_EVENT_STREAMS: usize = 32;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
-pub(crate) const SESSION_COOKIE_NAME: &str = "exo_workbench_session";
+pub(crate) const SESSION_COOKIE_PREFIX: &str = "exo_workbench_session_";
 
 type DispatchFuture = Pin<Box<dyn Future<Output = ResponseEnvelope> + Send>>;
 type DispatchFn = dyn Fn(RequestEnvelope) -> DispatchFuture + Send + Sync;
@@ -183,6 +183,7 @@ struct PendingCapability {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkbenchSession {
     pub(crate) id: String,
+    pub(crate) selector: String,
     pub(crate) instance_id: String,
     pub(crate) project_id: String,
     pub(crate) workspace_key: String,
@@ -356,6 +357,7 @@ pub(crate) struct WorkbenchSessionResult {
     pub(crate) kind: &'static str,
     pub(crate) ok: bool,
     pub(crate) schema_version: u8,
+    pub(crate) session_key: String,
     pub(crate) project_id: String,
     pub(crate) workspace_key: String,
     pub(crate) expires_at: String,
@@ -473,6 +475,12 @@ impl WorkbenchHostManager {
             &workspace,
             self.inner.revision.load(Ordering::Acquire),
         )
+        .map_err(|_| {
+            anyhow::Error::new(workbench_failure(
+                "workbench.snapshot_unavailable",
+                "The workbench snapshot is temporarily unavailable",
+            ))
+        })
     }
 
     pub fn revision_after_write(&self) -> u64 {
@@ -736,11 +744,13 @@ impl WorkbenchHostInner {
             .cloned()
             .ok_or(TicketExchangeError::Invalid)?;
         let session_id = random_token().map_err(|_| TicketExchangeError::Invalid)?;
+        let session_key = random_token().map_err(|_| TicketExchangeError::Invalid)?;
         let session_expires_at = now.saturating_add(SESSION_ABSOLUTE_LIFETIME.as_secs());
         state.sessions.insert(
             session_id.clone(),
             WorkbenchSession {
                 id: session_id.clone(),
+                selector: session_key.clone(),
                 instance_id: payload.instance_id,
                 project_id: payload.project_id.clone(),
                 workspace_key: payload.workspace_key.clone(),
@@ -757,6 +767,7 @@ impl WorkbenchHostInner {
                 kind: "workbench.session",
                 ok: true,
                 schema_version: 1,
+                session_key,
                 project_id: payload.project_id,
                 workspace_key: payload.workspace_key,
                 expires_at: timestamp_for_unix_seconds(session_expires_at),
@@ -766,12 +777,13 @@ impl WorkbenchHostInner {
         Ok(result)
     }
 
-    pub(crate) fn session(&self, session_id: &str) -> Option<WorkbenchSession> {
+    pub(crate) fn session(&self, session_key: &str, session_id: &str) -> Option<WorkbenchSession> {
         let now = unix_seconds();
         let mut state = self.state.lock().ok()?;
         state.sessions.retain(|_, session| session.is_live(now));
         let session_is_bound = state.sessions.get(session_id).is_some_and(|session| {
-            session.instance_id == self.instance_id.as_ref()
+            session.selector == session_key
+                && session.instance_id == self.instance_id.as_ref()
                 && session.project_id == self.project.id.as_str()
                 && state
                     .workspaces_by_key

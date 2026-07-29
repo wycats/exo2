@@ -131,7 +131,12 @@ fn make_display(
     let invocation_message =
         generate_display_message(namespace, operation, input, &invoke_result.data);
     let summary = generate_summary_from_data(namespace, operation, input, &invoke_result.data);
-    let body = if namespace.is_empty() && operation == "update" {
+    let body = if namespace == "workbench" && operation == "launch" {
+        invoke_result
+            .human_message
+            .clone()
+            .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
+    } else if namespace.is_empty() && operation == "update" {
         crate::command::update::format_update_human_data(workspace_root, &invoke_result.data)
             .or_else(|| invoke_result.human_message.clone())
             .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
@@ -201,6 +206,15 @@ fn generate_summary_from_data(
     input: &JsonValue,
     data: &JsonValue,
 ) -> String {
+    if namespace == "workbench" && operation == "launch" {
+        let workspace = data
+            .get("workspace")
+            .and_then(|workspace| workspace.get("label"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("this workspace");
+        return format!("Open the Exo workbench for {workspace}");
+    }
+
     // Root status → phase title + progress mode
     if namespace.is_empty() && operation == "status" {
         let phase = data
@@ -3059,6 +3073,44 @@ mod tests {
             Some(
                 "Updating Exosuit project in /workspace\n\nApplied 1 upgrade(s):\n  ✓ example\n    - Changed example state\n    ⚠ Example warning\n\nSkipped 2 already up-to-date upgrade(s)\n\nProject updated successfully!"
             )
+        );
+    }
+
+    #[test]
+    fn workbench_launch_display_keeps_the_url_and_expiration() {
+        let invoke_result = CommandInvokeResult {
+            data: json!({
+                "kind": "workbench.launch",
+                "ok": true,
+                "url": "http://127.0.0.1:49152/#ticket=secret",
+                "workspace": { "label": "feature/lane-ui" },
+            }),
+            human_message: Some(
+                "Open the Exo workbench for feature/lane-ui:\nhttp://127.0.0.1:49152/#ticket=secret\n\nThis link expires in five minutes."
+                    .to_string(),
+            ),
+            effect: Effect::Pure,
+            trace: exosuit_storage::Trace::default(),
+        };
+
+        let display = make_display(
+            Path::new("/workspace"),
+            "workbench",
+            "launch",
+            &json!({}),
+            &invoke_result,
+        )
+        .expect("workbench launch display");
+
+        assert_eq!(
+            display.summary,
+            "Open the Exo workbench for feature/lane-ui"
+        );
+        assert!(
+            display
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("http://127.0.0.1:49152/#ticket=secret"))
         );
     }
 

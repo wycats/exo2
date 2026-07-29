@@ -277,7 +277,10 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         .expect("redeemed session")
         .instance_id = "replacement-daemon".to_string();
     assert!(
-        manager.inner.session(&session_id).is_none(),
+        manager
+            .inner
+            .session(&session.session_key, &session_id)
+            .is_none(),
         "a session from another daemon generation is invalid"
     );
 
@@ -342,6 +345,7 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
                 session_id.clone(),
                 WorkbenchSession {
                     id: session_id,
+                    selector: format!("bounded-selector-{index}"),
                     instance_id: manager.inner.instance_id.to_string(),
                     project_id: fixture.project.id.to_string(),
                     workspace_key: payload.workspace_key.clone(),
@@ -375,7 +379,7 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
         .expect("workbench state")
         .sessions
         .remove("bounded-session-0");
-    let (session_id, _) = manager
+    let (session_id, session) = manager
         .inner
         .redeem_ticket(ticket)
         .expect("ticket remains redeemable after capacity returns");
@@ -389,13 +393,16 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
         drop(state);
     }
     assert!(
-        manager.inner.session(&session_id).is_none(),
+        manager
+            .inner
+            .session(&session.session_key, &session_id)
+            .is_none(),
         "sessions expire at the absolute lifetime even when recently active"
     );
 
     let idle_launch = manager.launch(&fixture.root).expect("launch idle session");
     let (_, idle_ticket) = launch_parts(&idle_launch);
-    let (idle_session_id, _) = manager
+    let (idle_session_id, idle_session) = manager
         .inner
         .redeem_ticket(idle_ticket)
         .expect("redeem idle session ticket");
@@ -409,7 +416,10 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
         drop(state);
     }
     assert!(
-        manager.inner.session(&idle_session_id).is_none(),
+        manager
+            .inner
+            .session(&idle_session.session_key, &idle_session_id)
+            .is_none(),
         "idle sessions expire"
     );
     manager.shutdown().await;
@@ -535,6 +545,39 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn snapshot_storage_failures_are_stable_and_path_free() {
+    let fixture = fixture();
+    let database_path = fixture.project.db_path();
+    fs::remove_file(&database_path).expect("remove fixture database");
+    fs::create_dir(&database_path).expect("replace fixture database with a directory");
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let error = manager
+        .snapshot(&fixture.root)
+        .expect_err("broken snapshot storage must fail");
+    let failure = error
+        .downcast_ref::<crate::failure::ExoFailure>()
+        .expect("structured workbench snapshot failure");
+    assert_eq!(
+        failure.error.details.as_ref().expect("details")["kind"],
+        "workbench.snapshot_unavailable"
+    );
+    let serialized =
+        serde_json::to_string(&failure.error).expect("serialize workbench error response");
+    for forbidden in [
+        fixture.root.as_path(),
+        fixture.project.state_root.as_path(),
+        database_path.as_path(),
+    ] {
+        assert!(
+            !serialized.contains(&forbidden.display().to_string()),
+            "snapshot failure must not expose {}: {serialized}",
+            forbidden.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     let fixture = fixture();
     let seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
@@ -619,6 +662,10 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     .expect("exchange launch ticket");
     assert_eq!(session.status, 200, "{session:?}");
     assert_eq!(session.json()["kind"], "workbench.session");
+    let session_key = session.json()["session_key"]
+        .as_str()
+        .expect("workbench session key")
+        .to_string();
     let cookie = session
         .headers
         .get("set-cookie")
@@ -655,6 +702,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
             json!({
                 "protocol_version": PROTOCOL_VERSION,
                 "id": "browser-snapshot",
+                "session_key": session_key,
                 "operation": { "kind": "snapshot" },
             })
             .to_string(),
@@ -681,7 +729,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     );
 
     let session_id = cookie_pair
-        .strip_prefix(&format!("{SESSION_COOKIE_NAME}="))
+        .strip_prefix(&format!("{SESSION_COOKIE_PREFIX}{session_key}="))
         .expect("session cookie name");
     manager
         .inner
@@ -701,6 +749,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
             json!({
                 "protocol_version": PROTOCOL_VERSION,
                 "id": "browser-denied-focus",
+                "session_key": session_key,
                 "operation": {
                     "kind": "lane_focus",
                     "lane_id": "lane-denied",
@@ -745,6 +794,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
             json!({
                 "protocol_version": PROTOCOL_VERSION,
                 "id": "browser-arbitrary",
+                "session_key": session_key,
                 "operation": { "kind": "task_complete", "task_id": "nope" },
             })
             .to_string(),
