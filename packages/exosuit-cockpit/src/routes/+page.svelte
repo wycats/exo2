@@ -16,6 +16,7 @@
     createWorkbenchRequestId,
     exchangeWorkbenchTicket,
     launchTicketFromHash,
+    prepareWorkbenchTicketExchange,
     retainSessionSelector,
     sessionKeyFromHistory,
     WorkbenchClient,
@@ -121,6 +122,14 @@
         let sessionKey = sessionKeyFromHistory(history.state);
         const ticket = launchTicketFromHash(location.hash);
         if (ticket) {
+          stopUpdates();
+          client = null;
+          snapshot = null;
+          pendingFocus = null;
+          retryFocus = null;
+          focusFailure = null;
+          refreshFailure = null;
+          prepareWorkbenchTicketExchange(history, location);
           const session = await exchangeWorkbenchTicket(ticket);
           sessionKey = session.session_key;
           retainSessionSelector(history, location, sessionKey);
@@ -138,11 +147,18 @@
     };
 
     retryBootstrap = () => void bootstrap();
+    const bootstrapFreshTicket = () => {
+      if (launchTicketFromHash(location.hash)) {
+        void bootstrap();
+      }
+    };
+    window.addEventListener("hashchange", bootstrapFreshTicket);
     void bootstrap();
 
     return () => {
       retryBootstrap = null;
       startLiveUpdates = null;
+      window.removeEventListener("hashchange", bootstrapFreshTicket);
       stopUpdates();
       stopLiveUpdates = null;
     };
@@ -161,14 +177,22 @@
     if (!quiet && snapshot === null) {
       screen = "loading";
     }
+    const activeClient = client;
     try {
-      snapshot = await client.snapshot();
+      const nextSnapshot = await activeClient.snapshot();
+      if (client !== activeClient) {
+        return;
+      }
+      snapshot = nextSnapshot;
       screen = "ready";
       screenMessage = null;
       refreshFailure = null;
       retryBootstrap = null;
       startLiveUpdates?.();
     } catch (error) {
+      if (client !== activeClient) {
+        return;
+      }
       if (terminalFailure(error)) {
         applyTerminalFailure(error);
       } else if (snapshot === null) {
@@ -194,24 +218,35 @@
       return;
     }
 
+    const activeClient = client;
     const request = { laneId, requestId };
     pendingFocus = request;
     retryFocus = null;
     focusFailure = null;
     try {
-      await client.focusLane(laneId, requestId);
+      await activeClient.focusLane(laneId, requestId);
     } catch (error) {
+      if (client !== activeClient) {
+        return;
+      }
       if (terminalFailure(error)) {
         applyTerminalFailure(error);
       } else {
         focusFailure = messageFrom(error);
         if (error instanceof WorkbenchClientError && error.retryable) {
-          retryFocus = request;
+          retryFocus = {
+            laneId,
+            requestId: error.retryWithSameRequestId
+              ? requestId
+              : createWorkbenchRequestId(),
+          };
         }
       }
     } finally {
-      pendingFocus = null;
-      await refreshSnapshot(true);
+      if (client === activeClient) {
+        pendingFocus = null;
+        await refreshSnapshot(true);
+      }
     }
   }
 
@@ -247,6 +282,8 @@
 
   function screenForFailure(kind: WorkbenchFailureKind): ScreenState {
     switch (kind) {
+      case "session_required":
+        return "session_required";
       case "session_expired":
         return "session_expired";
       case "workspace_unavailable":
@@ -267,7 +304,9 @@
       case "session_required":
         return {
           title: "Launch link required",
-          body: "Open a current Exo workbench link for this workspace.",
+          body:
+            screenMessage ??
+            "Open a current Exo workbench link for this workspace.",
         };
       case "session_expired":
         return {

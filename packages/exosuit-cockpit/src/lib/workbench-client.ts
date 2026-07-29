@@ -25,6 +25,10 @@ export class WorkbenchClientError extends Error {
     super(message);
     this.name = "WorkbenchClientError";
   }
+
+  get retryWithSameRequestId(): boolean {
+    return this.kind === "transport_error";
+  }
 }
 
 type Fetcher = typeof fetch;
@@ -79,17 +83,44 @@ export function retainSessionSelector(
   );
 }
 
+export function prepareWorkbenchTicketExchange(
+  history: Pick<History, "replaceState" | "state">,
+  location: Pick<Location, "pathname" | "search">,
+): void {
+  const prior =
+    typeof history.state === "object" &&
+    history.state !== null &&
+    !Array.isArray(history.state)
+      ? { ...history.state }
+      : {};
+  delete prior[SESSION_HISTORY_KEY];
+  history.replaceState(prior, "", `${location.pathname}${location.search}`);
+}
+
 export async function exchangeWorkbenchTicket(
   ticket: string,
   fetcher: Fetcher = fetch,
 ): Promise<WorkbenchSessionResult> {
-  const response = await request(
-    fetcher,
-    "/api/session",
-    { ticket },
-    "The workbench session could not be opened",
-  );
-  return decodeSession(response);
+  try {
+    const response = await request(
+      fetcher,
+      "/api/session",
+      { ticket },
+      "The workbench session could not be opened",
+    );
+    return decodeSession(response);
+  } catch (error) {
+    if (
+      error instanceof WorkbenchClientError &&
+      error.kind === "transport_error"
+    ) {
+      throw new WorkbenchClientError(
+        "session_required",
+        "The launch link could not be confirmed. Open a fresh Exo workbench link.",
+      );
+    }
+    throw error;
+  }
 }
 
 export function createWorkbenchRequestId(now = Date.now()): string {

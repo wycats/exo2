@@ -283,11 +283,16 @@ the endpoint from becoming an oracle for local workspace existence.
 
 ### Browser session
 
-The static application reads the fragment and immediately exchanges the ticket
-through `POST /api/session`. On success it calls `history.replaceState` to
-remove the fragment and stores no ticket in JavaScript persistence. The server
-returns a public random session key and sets an independent random 256-bit
-session identifier in a cookie named
+The static application reads the fragment, clears the retained session selector,
+and calls `history.replaceState` to remove the fragment before exchanging the
+ticket through `POST /api/session`. It never submits the same one-time ticket
+again. If delivery of the exchange response is ambiguous, the application asks
+for a fresh launch link. A later ticket fragment in the same browser tab starts
+a fresh exchange through `hashchange`.
+
+On success the application retains the returned public random session key in
+same-entry history state. The server sets an independent random 256-bit session
+identifier in a cookie named
 `exo_workbench_session_<session-key>`. The cookie has `HttpOnly`,
 `SameSite=Strict`, `Path=/`, no `Domain`, and `Max-Age=43200`. The session key
 selects the matching cookie; it is not authorization without the independent
@@ -377,7 +382,9 @@ error code while replacing messages and details with stable path-free browser
 text. Transport, origin, session, body shape, and capability failures use HTTP
 status and a small error object before Exo dispatch. A browser retry after
 connection loss or `daemon.busy` preserves the same request ID for
-`lane_focus`; the daemon outcome ledger remains the recovery authority.
+`lane_focus`; the daemon outcome ledger remains the recovery authority. Once an
+Exo response is received, any deliberate re-execution uses a new request ID
+rather than replaying that terminal response.
 
 Each session command revalidates the retained workspace root against the
 current project ID and state root before dispatch and requires the resolved
@@ -544,8 +551,9 @@ The first browser screen is the current lane workspace, not a landing page. A
 compact lane rail shows all existing lanes, their state and phase, and which one
 is focused here. The main surface gives the focused lane's intent first visual
 priority, then shows branch, HEAD, dirty state, phase, goals, and tasks in a
-dense work-oriented layout. Completed-phase lanes remain available as context
-but their focus controls are disabled.
+dense work-oriented layout. Only lanes whose phase is `in-progress` can be
+focused. Pending and completed-phase lanes remain available as context but
+their focus controls are disabled.
 
 An optional Coordination rail contains secondary machine context. If steering
 contains a suggested action, the rail shows only the first action's label and
@@ -558,8 +566,9 @@ Only lane focus is mutable. The UI has no lane creation, start, removal,
 parking, closure, task completion, phase lifecycle, pull-request management,
 RFC management, validation history, daemon recovery, or settings controls. A
 focus action remains pending until the `lane.focus` response commits. The UI
-preserves the request ID across transport retries, renders Exo failures as
-failures, and then refreshes the complete snapshot.
+preserves the request ID across ambiguous transport retries. Once Exo returns a
+terminal failure, an explicit user retry receives a new request ID. The UI
+renders failures as failures and then refreshes the complete snapshot.
 
 The cockpit has explicit loading, no-lane, no-focus, session-expired,
 workspace-unavailable, transport-error, and diagnostic states. Missing state is
@@ -624,8 +633,9 @@ status and recovery remain the operator path.
 Snapshot is replayable. `lane_focus` uses the existing atomic-project-state
 recovery contract. The browser treats a connection loss as an unknown delivery
 state and retries the same request ID after reconnecting; it never substitutes a
-new request ID until the terminal response is known. The HTTP adapter neither
-persists its own outcomes nor translates a retryable Exo response into success.
+new request ID until the terminal response is known. A deliberate retry after a
+known terminal response is a new request. The HTTP adapter neither persists its
+own outcomes nor translates a retryable Exo response into success.
 
 ## Security Considerations
 

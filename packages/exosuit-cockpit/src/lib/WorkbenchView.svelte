@@ -95,8 +95,8 @@
   const diagnosticIcon = (diagnostic: WorkbenchDiagnostic) =>
     diagnostic.severity;
 
-  const lanePhaseCompleted = (lane: WorkbenchLaneSummary): boolean =>
-    statusTone(lane.phase_status) === "complete";
+  const lanePhaseActive = (lane: WorkbenchLaneSummary): boolean =>
+    lane.phase_status === "in-progress";
 
   const laneTitle = (lane: WorkbenchLaneSummary): string => {
     if (pendingLaneId === lane.id) {
@@ -105,8 +105,8 @@
     if (lane.focused_here) {
       return `${lane.title}, focused`;
     }
-    if (lanePhaseCompleted(lane)) {
-      return `${lane.title}, phase completed`;
+    if (!lanePhaseActive(lane)) {
+      return `${lane.title}, phase ${displayStatus(lane.phase_status)}`;
     }
     return `Focus ${lane.title}`;
   };
@@ -205,12 +205,12 @@
               type="button"
               aria-current={lane.focused_here ? "page" : undefined}
               aria-label={laneTitle(lane)}
-              title={lanePhaseCompleted(lane)
-                ? "This lane’s phase is complete"
+              title={!lanePhaseActive(lane)
+                ? "This lane’s phase is not active"
                 : undefined}
               disabled={pendingLaneId !== null ||
                 lane.focused_here ||
-                lanePhaseCompleted(lane)}
+                !lanePhaseActive(lane)}
               onclick={() => onFocus(lane.id)}
             >
               <span class="lane-state" aria-hidden="true">
@@ -218,8 +218,10 @@
                   <LoaderCircle class="spin" size={17} />
                 {:else if lane.focused_here}
                   <Target size={17} />
-                {:else if lanePhaseCompleted(lane)}
+                {:else if statusTone(lane.phase_status) === "complete"}
                   <CheckCircle2 size={17} />
+                {:else if !lanePhaseActive(lane)}
+                  <CircleDashed size={17} />
                 {:else if lane.state === "executing"}
                   <CirclePlay size={17} />
                 {:else}

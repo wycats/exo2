@@ -5,6 +5,7 @@ import {
   createWorkbenchRequestId,
   exchangeWorkbenchTicket,
   launchTicketFromHash,
+  prepareWorkbenchTicketExchange,
   retainSessionSelector,
   sessionKeyFromHistory,
   WorkbenchClient,
@@ -78,6 +79,42 @@ describe("workbench browser client", () => {
         exoWorkbenchSessionKey: "session-selector",
       }),
     ).toBe("session-selector");
+  });
+
+  it("clears the fragment and retained selector before ticket exchange", () => {
+    const replaceState = vi.fn();
+    prepareWorkbenchTicketExchange(
+      {
+        state: {
+          unrelated: "kept",
+          exoWorkbenchSessionKey: "old-session",
+        },
+        replaceState,
+      },
+      { pathname: "/workbench", search: "?view=current" },
+    );
+
+    expect(replaceState).toHaveBeenCalledWith(
+      { unrelated: "kept" },
+      "",
+      "/workbench?view=current",
+    );
+  });
+
+  it("requires a fresh link after an ambiguous ticket exchange", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new TypeError("connection reset"));
+
+    await expect(
+      exchangeWorkbenchTicket("v1.ticket", fetcher),
+    ).rejects.toMatchObject({
+      kind: "session_required",
+      retryable: false,
+      message:
+        "The launch link could not be confirmed. Open a fresh Exo workbench link.",
+    } satisfies Partial<WorkbenchClientError>);
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("decodes a snapshot from the browser-safe command envelope", async () => {
@@ -157,6 +194,35 @@ describe("workbench browser client", () => {
       kind: "session_expired",
       message: "The workbench session is invalid",
     } satisfies Partial<WorkbenchClientError>);
+  });
+
+  it("marks a received retryable command failure for a new request ID", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (_path, init) => {
+        const request = JSON.parse(String(init?.body));
+        return jsonResponse({
+          protocol_version: 1,
+          id: request.id,
+          status: "error",
+          error: {
+            code: "precondition_failed",
+            message: "The lane phase is not active",
+          },
+        });
+      });
+
+    await expect(
+      new WorkbenchClient("session-selector", fetcher).focusLane(
+        "lane-two",
+        "01FIRSTREQUESTID00000000000",
+      ),
+    ).rejects.toMatchObject({
+      kind: "command_failed",
+      retryable: true,
+      retryWithSameRequestId: false,
+    } satisfies Partial<WorkbenchClientError>);
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("bounds a command that never receives a response", async () => {

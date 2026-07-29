@@ -15,7 +15,7 @@ const fixture = () => {
     state: "prepared",
     phase_id: "phase-next",
     phase_title: "Lane workspace delivery",
-    phase_status: "pending",
+    phase_status: "in-progress",
     focused_here: false,
   });
   return decodeWorkbenchSnapshot(value);
@@ -213,9 +213,39 @@ describe("focus-only lane workbench", () => {
     });
     expect(completedLane).toHaveProperty("disabled", true);
     expect(completedLane.getAttribute("title")).toBe(
-      "This lane’s phase is complete",
+      "This lane’s phase is not active",
     );
     await fireEvent.click(completedLane);
+    expect(onFocus).not.toHaveBeenCalled();
+  });
+
+  it("keeps pending-phase lanes visible without making them focusable", async () => {
+    const snapshot = fixture();
+    snapshot.lanes.push({
+      id: "lane-future",
+      title: "Future lane",
+      state: "prepared",
+      phase_id: "phase-future",
+      phase_title: "Future phase",
+      phase_status: "pending",
+      focused_here: false,
+    });
+    const onFocus = vi.fn();
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus,
+      onRefresh: vi.fn(),
+    });
+
+    const futureLane = screen.getByRole("button", {
+      name: "Future lane, phase pending",
+    });
+    expect(futureLane).toHaveProperty("disabled", true);
+    expect(futureLane.getAttribute("title")).toBe(
+      "This lane’s phase is not active",
+    );
+    await fireEvent.click(futureLane);
     expect(onFocus).not.toHaveBeenCalled();
   });
 });
