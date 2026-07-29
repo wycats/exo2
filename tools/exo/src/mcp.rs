@@ -74,24 +74,7 @@ pub struct McpToolResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpContent {
-    Text {
-        text: String,
-    },
-    ResourceLink {
-        name: String,
-        title: Option<String>,
-        uri: String,
-        description: Option<String>,
-        #[serde(rename = "mimeType")]
-        mime_type: Option<String>,
-        annotations: Option<McpAnnotations>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct McpAnnotations {
-    pub audience: Vec<String>,
-    pub priority: f32,
+    Text { text: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1397,24 +1380,8 @@ fn machine_response_to_tool_result_with_profile(
     include_structured: bool,
 ) -> McpToolResult {
     let text = format_machine_response_text(response);
-    let mut content = vec![McpContent::Text { text }];
-    if let Some(uri) = workbench_launch_uri(response) {
-        content.push(McpContent::ResourceLink {
-            name: "exo-workbench".to_string(),
-            title: Some("Open Exo workbench".to_string()),
-            uri: uri.to_string(),
-            description: Some(
-                "Lane workspace for the selected Exo project and worktree".to_string(),
-            ),
-            mime_type: Some("text/html".to_string()),
-            annotations: Some(McpAnnotations {
-                audience: vec!["user".to_string()],
-                priority: 1.0,
-            }),
-        });
-    }
     McpToolResult {
-        content,
+        content: vec![McpContent::Text { text }],
         structured_content: structured_content_for_tool_response(
             response,
             include_structured
@@ -2723,7 +2690,6 @@ mod tests {
         let result = machine_response_to_tool_result(&response);
         let text = match &result.content[0] {
             McpContent::Text { text } => text,
-            McpContent::ResourceLink { .. } => panic!("first MCP content block must be text"),
         };
 
         assert!(text.contains("Suggestion: Show namespace help -> task --help"));
@@ -2815,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn workbench_launch_returns_text_structured_content_and_exact_resource_link() {
+    fn workbench_launch_returns_text_and_structured_url_without_rich_content() {
         let response = ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             id: "workbench-launch".to_string(),
@@ -2849,27 +2815,27 @@ mod tests {
 
         let result = machine_response_to_tool_result(&response);
         assert!(!result.is_error);
-        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content.len(), 1);
         assert!(matches!(result.content[0], McpContent::Text { .. }));
         let serialized = serde_json::to_value(&result).expect("serialize MCP tool result");
-        assert_eq!(
-            serialized["content"][1],
-            json!({
-                "type": "resource_link",
-                "name": "exo-workbench",
-                "title": "Open Exo workbench",
-                "uri": "http://127.0.0.1:49152/#ticket=secret",
-                "description": "Lane workspace for the selected Exo project and worktree",
-                "mimeType": "text/html",
-                "annotations": {
-                    "audience": ["user"],
-                    "priority": 1.0
-                }
-            })
+        assert!(
+            serialized["content"][0]["text"]
+                .as_str()
+                .expect("workbench launch text")
+                .contains("http://127.0.0.1:49152/#ticket=secret")
         );
         assert_eq!(
             serialized["structuredContent"]["result"]["kind"],
             "workbench.launch"
+        );
+        assert_eq!(
+            serialized["structuredContent"]["result"]["url"],
+            "http://127.0.0.1:49152/#ticket=secret"
+        );
+        assert!(
+            !serde_json::to_string(&serialized)
+                .expect("serialize workbench launch")
+                .contains("resource_link")
         );
     }
 
@@ -2918,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn workbench_errors_never_return_resource_links() {
+    fn workbench_errors_return_only_text_content() {
         let response = error_response(
             "workbench-launch".to_string(),
             ErrorCode::PreconditionFailed,
@@ -3066,7 +3032,6 @@ mod tests {
         assert!(result.structured_content.is_none());
         let text = match &result.content[0] {
             McpContent::Text { text } => text,
-            McpContent::ResourceLink { .. } => panic!("first MCP content block must be text"),
         };
         assert!(text.contains("Usage: task complete <id> [--log <string>]"));
     }

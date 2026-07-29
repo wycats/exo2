@@ -3032,7 +3032,7 @@ fn mcp_stdio_serves_exo_run_status() {
 
 #[cfg(all(unix, feature = "ui"))]
 #[test]
-fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
+fn mcp_stdio_workbench_launch_returns_text_and_structured_url() {
     let temp = tempfile::tempdir().expect("tempdir");
     git_init(temp.path());
     test_support::exo_init_with_storage(temp.path(), "sqlite");
@@ -3081,18 +3081,18 @@ fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
 
     let launch = call_exo_run(&mut stdin, &mut stdout, 2, "workbench launch");
     assert_eq!(launch["result"]["isError"], false, "{launch}");
+    assert_eq!(
+        launch["result"]["content"]
+            .as_array()
+            .expect("workbench launch content")
+            .len(),
+        1,
+        "{launch}"
+    );
     assert_eq!(launch["result"]["content"][0]["type"], "text", "{launch}");
-    assert_eq!(
-        launch["result"]["content"][1]["type"], "resource_link",
-        "{launch}"
-    );
-    assert_eq!(
-        launch["result"]["content"][1]["name"], "exo-workbench",
-        "{launch}"
-    );
-    let uri = launch["result"]["content"][1]["uri"]
+    let uri = structured_content(&launch)["result"]["url"]
         .as_str()
-        .expect("workbench resource URI");
+        .expect("structured workbench URL");
     assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
     assert!(uri.contains("/#ticket="), "{uri}");
     let launch_text = launch["result"]["content"][0]["text"]
@@ -3107,9 +3107,11 @@ fn mcp_stdio_workbench_launch_returns_the_live_agent_resource_link() {
         structured_content(&launch)["result"]["kind"],
         "workbench.launch"
     );
-    assert_eq!(
-        structured_content(&launch)["result"]["url"],
-        launch["result"]["content"][1]["uri"]
+    assert!(
+        !serde_json::to_string(&launch)
+            .expect("serialize launch result")
+            .contains("resource_link"),
+        "{launch}"
     );
     assert!(
         !serde_json::to_string(&launch)

@@ -11,14 +11,17 @@ workbench is hosted by the project-authority Exo daemon, opened through a
 short-lived workspace-bound capability, and usable from an ordinary browser or
 from an agent host that can present a link. Its first screen is the current
 workbench lane: the durable intent, current Git state, associated phase, goals,
-tasks, steering, and diagnostics for the workspace that launched it.
+and tasks for the workspace that launched it. Agent guidance and diagnostics,
+when present, are secondary coordination context rather than the user's task
+list.
 
 The design adds two pure, replayable Exo commands. `exo workbench launch`
 starts or reuses the daemon's loopback HTTP host and returns a capability-scoped
 URL. `exo workbench snapshot` returns the data model behind the screen. MCP
-presents a successful launch as both text and a standard `resource_link`, so an
-agent can give the user an openable workbench without opening a browser on the
-user's behalf.
+presents a successful launch as normal text containing the URL and as structured
+launch data, so an agent can give the user an openable workbench without opening
+a browser on the user's behalf. Rich link presentation is deferred until the
+agent host and Exo negotiate a content shape that host accepts.
 
 The first implementation is deliberately narrow. It lets a user inspect the
 focused lane and focus a different existing lane. It does not create lanes,
@@ -68,10 +71,11 @@ starts the host; later launches reuse it and issue a fresh capability. Neither
 case changes canonical project state or opens a browser.
 
 An agent invokes the same command through `exo-run`. MCP clients receive a
-normal text result and, under the protocol revision Exo already implements, a
-`resource_link` named `exo-workbench`. A client that renders resource links can
-offer a direct open action. A client that does not still receives the complete
-textual URL. The user remains in control of opening it.
+normal text result containing the complete URL and expiration, plus structured
+launch data containing the same URL. This baseline works in hosts that reject
+unknown rich-content variants. A future adapter may present a richer open action
+after it has established that the host accepts that content shape. The user
+remains in control of opening the link.
 
 The URL selects one Exo project and one validated workspace. The browser opens
 on that workspace's focused lane. If two linked worktrees focus different
@@ -79,11 +83,19 @@ lanes, launching from each worktree produces a workbench for the same project
 but a different current stream. Neither link contains the raw workspace path,
 and opening one cannot silently switch the focus of the other.
 
-The first screen answers four connected questions: what lane this workspace is
-advancing, which branch and commit it is advancing from, which phase and tasks
-supply the planning context, and what Exo recommends next. A lane rail makes
-other existing lanes visible. Selecting one invokes the existing `lane focus`
-operation and refreshes the screen from the committed result.
+The first screen answers three connected questions: what lane this workspace is
+advancing, which branch and commit it is advancing from, and which phase and
+tasks supply the planning context. A lane rail makes other existing lanes
+visible. Selecting a lane whose phase is still active invokes the existing
+`lane focus` operation and refreshes the screen from the committed result.
+Completed-phase lanes remain visible as history but cannot be focused.
+
+When Exo supplies steering, the workbench may show the first suggested action as
+a quiet agent-next-step summary. The steering situation and raw command stay
+behind an agent-details disclosure, and diagnostics appear only when Exo reports
+them. Neither surface is presented as a human attention queue. Exo does not yet
+have enough explicit state to tell the user reliably what needs their attention,
+so the first workbench makes no all-clear claim when those fields are empty.
 
 An agent can obtain the same orientation without opening the browser:
 
@@ -508,57 +520,39 @@ watcher in the first slice.
 
 ### MCP presentation
 
-Exo already negotiates MCP protocol revision `2025-06-18`, whose tool result
-content includes
-[`ResourceLink`](https://modelcontextprotocol.io/specification/2025-06-18/schema).
-`McpContent` gains this variant:
+A successful `workbench launch` MCP result has one ordinary text content block.
+That text contains the complete launch URL and its expiration. The result also
+includes `structuredContent`, whose `result` is the same versioned
+`workbench.launch` value returned by the command, including the exact URL. An
+agent can therefore show or link the textual URL, while an adapter can use the
+structured value without scraping prose.
 
-```rust
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum McpContent {
-    Text { text: String },
-    ResourceLink {
-        name: String,
-        title: Option<String>,
-        uri: String,
-        description: Option<String>,
-        #[serde(rename = "mimeType")]
-        mime_type: Option<String>,
-        annotations: Option<McpAnnotations>,
-    },
-}
-```
+The baseline adapter does not add an unconditional `resource_link` content
+block. Although the negotiated MCP protocol revision defines that content type,
+real hosts may reject a tool result containing a variant they do not implement.
+Rich-link presentation requires a later host-capability contract or another
+negotiated extension. Adding it in a capable host must preserve the text and
+structured URL contract defined here.
 
-A successful `workbench launch` result always includes structured content and
-adds a second content block with:
-
-```json
-{
-  "type": "resource_link",
-  "name": "exo-workbench",
-  "title": "Open Exo workbench",
-  "uri": "<launch url>",
-  "description": "Lane workspace for the selected Exo project and worktree",
-  "mimeType": "text/html",
-  "annotations": {
-    "audience": ["user"],
-    "priority": 1.0
-  }
-}
-```
-
-The text block remains first and contains the URL and expiration. The adapter
-does not add the link on errors, previews, expired cached results, or other
-commands. The launch URL is not added to `resources/list`, and the server does
-not require `resources/read` support.
+The launch URL is not added to `resources/list`, and the server does not require
+`resources/read` support. Errors, previews, expired cached results, and other
+commands never receive workbench launch presentation.
 
 ### Focus-only browser experience
 
 The first browser screen is the current lane workspace, not a landing page. A
 compact lane rail shows all existing lanes, their state and phase, and which one
 is focused here. The main surface gives the focused lane's intent first visual
-priority, then shows branch, HEAD, dirty state, phase, goals, tasks, steering,
-and diagnostics in a dense work-oriented layout.
+priority, then shows branch, HEAD, dirty state, phase, goals, and tasks in a
+dense work-oriented layout. Completed-phase lanes remain available as context
+but their focus controls are disabled.
+
+An optional Coordination rail contains secondary machine context. If steering
+contains a suggested action, the rail shows only the first action's label and
+rationale as **Agent next step**. Its situation and raw command are collapsed
+under **Agent details**. Diagnostics render only when non-empty, and the whole
+rail is absent when neither signal exists. The workbench does not derive or
+display a human-attention queue in this version.
 
 Only lane focus is mutable. The UI has no lane creation, start, removal,
 parking, closure, task completion, phase lifecycle, pull-request management,
@@ -569,8 +563,9 @@ failures, and then refreshes the complete snapshot.
 
 The cockpit has explicit loading, no-lane, no-focus, session-expired,
 workspace-unavailable, transport-error, and diagnostic states. Missing state is
-not filled from local storage. The session cookie is the only browser-retained
-identity in the first slice.
+not filled from local storage. The browser retains only the public session
+selector in same-entry history state and the independent HttpOnly session
+cookie; the selector is not authorization on its own.
 
 ### Frontend development and embedded distribution
 
@@ -665,9 +660,9 @@ and never enter portable or reactive SQL projection.
 
 Existing CLI, MCP, machine-channel, VS Code, lane, daemon authority, admission,
 outcome recovery, and workspace-validation behavior remains valid. The MCP
-adapter's daemon routing change is limited to the `workbench` namespace. Adding
-`ResourceLink` is backward compatible because every launch still includes a
-text content block.
+adapter's daemon routing change is limited to the `workbench` namespace. Text
+content and structured launch data use existing tool-result fields and avoid
+requiring a client to accept a new content variant.
 
 The workbench schema starts at version 1. Rust serialization is normative;
 TypeScript runtime decoding and shared fixtures prevent silent drift. Future
@@ -726,8 +721,9 @@ product model.
 
 An embedded MCP App could provide a richer in-host experience. Host support is
 not universal, and it would make the foundational UI depend on one presentation
-protocol. A normal local web application plus a standard resource link works in
-an ordinary browser and can later be wrapped by embedded hosts.
+protocol. A normal local web application plus a textual and structured launch
+URL works in an ordinary browser and can later be wrapped by embedded hosts or
+presented as a negotiated rich link.
 
 The browser could call a broad CLI-shaped HTTP endpoint. That would make future
 features easy to expose, but possession of a workbench session would become
@@ -743,8 +739,9 @@ retaining one host for the daemon lifetime.
 The host and launch task proceeds in four internal steps. First, add the
 Workbench CommandSpec, runtime-service injection, shared daemon dispatcher, host
 manager, capability/session model, HTTP routes, and runtime host record. Second,
-route MCP workbench requests through the daemon and add resource-link output.
-Third, convert and embed the cockpit build and update all relevant CI
+route MCP workbench requests through the daemon and return the launch URL in
+text and structured output. Third, convert and embed the cockpit build and
+update all relevant CI
 classifiers and toolchain setup. Fourth, add installed-binary, security,
 linked-worktree, and contract-fixture coverage before exposing the UI task.
 
@@ -759,7 +756,7 @@ one-time redemption, session idle and absolute expiry, origin and host checks,
 capability denial, resource bounds, path redaction, runtime-record generation
 matching, and cleanup. Command and MCP tests cover pure/replayable metadata,
 daemon-only execution, request workspace forwarding, textual fallback,
-structured content, and the exact resource-link shape.
+structured launch content, and the absence of unsupported content variants.
 
 Daemon integration starts one project daemon, launches from two linked
 worktrees, and proves one origin with distinct opaque workspace keys and
@@ -787,7 +784,7 @@ asset hash, and confirms that no Node process is required at runtime. Linux,
 macOS, and Windows compilation all exercise the cockpit build prerequisites.
 
 The end-to-end agent proof invokes `exo-run workbench launch` from a known Codex
-workspace, verifies the text and resource-link results, opens the link, and
+workspace, verifies the text and structured URL results, opens the link, and
 compares the rendered project, workspace, branch, head and focused lane with
 `exo-run workbench snapshot`. The same proof repeats from a linked worktree with
 a different focus.
@@ -800,12 +797,14 @@ Windows, formatting, lint, and diff gates remain required.
 
 This Stage 2 RFC is implementation-ready for the local host, launch and
 focus-only workbench tasks described above. Reaching Stage 3 requires landed
-code, installed-binary acceptance, linked-worktree isolation evidence, exact
-MCP resource-link proof, frontend visual validation, terminal CI, and clean
-exact-head review.
+code, installed-binary acceptance, linked-worktree isolation evidence, exact MCP
+text-and-structured launch proof, frontend visual validation, terminal CI, and
+clean exact-head review.
 
 Lane creation, start and closure; task and phase mutation; attachments,
 observations, validation freshness, review state, pull requests, RFCs, daemon
 recovery, remote access, multi-user identity, and cloud hosting remain future
-work. They must extend the lane model and capability surface explicitly rather
-than arriving as incidental controls in the first browser client.
+work. A trustworthy human-attention queue and negotiated rich-link presentation
+also remain future work. They must extend the lane model and capability surface
+explicitly rather than arriving as incidental controls in the first browser
+client.
