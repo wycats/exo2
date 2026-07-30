@@ -286,9 +286,11 @@ the endpoint from becoming an oracle for local workspace existence.
 The static application reads the fragment, clears the retained session selector,
 and calls `history.replaceState` to remove the fragment before exchanging the
 ticket through `POST /api/session`. It never submits the same one-time ticket
-again. If delivery of the exchange response is ambiguous, the application asks
-for a fresh launch link. A later ticket fragment in the same browser tab starts
-a fresh exchange through `hashchange`.
+again after an ambiguous transport outcome. If the server explicitly returns
+`workbench.busy`, it has not consumed the ticket, so the application may retry
+that ticket while it remains valid. If delivery of the exchange response is
+ambiguous, the application asks for a fresh launch link. A later ticket fragment
+in the same browser tab starts a fresh exchange through `hashchange`.
 
 On success the application retains the returned public random session key in
 same-entry history state. The server sets an independent random 256-bit session

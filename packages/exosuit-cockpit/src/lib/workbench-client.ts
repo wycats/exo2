@@ -12,6 +12,7 @@ const REQUEST_TIMEOUT_MS = 10_000;
 export type WorkbenchFailureKind =
   | "session_required"
   | "session_expired"
+  | "server_busy"
   | "workspace_unavailable"
   | "transport_error"
   | "command_failed";
@@ -275,7 +276,7 @@ function httpFailure(status: number, value: unknown): WorkbenchClientError {
     case "workbench.workspace_unavailable":
       return new WorkbenchClientError("workspace_unavailable", message);
     case "workbench.busy":
-      return new WorkbenchClientError("transport_error", message, true);
+      return new WorkbenchClientError("server_busy", message, true);
     default:
       return new WorkbenchClientError(
         status >= 500 ? "transport_error" : "command_failed",

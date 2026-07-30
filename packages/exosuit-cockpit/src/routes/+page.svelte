@@ -29,6 +29,7 @@
     | "ready"
     | "session_required"
     | "session_expired"
+    | "workbench_busy"
     | "workspace_unavailable"
     | "transport_error";
 
@@ -117,14 +118,15 @@
     startLiveUpdates = startUpdates;
     stopLiveUpdates = stopUpdates;
 
-    const bootstrap = async () => {
+    const bootstrap = async (retryTicket?: string) => {
       const generation = ++bootstrapGeneration;
       const isCurrent = () => generation === bootstrapGeneration;
+      const ticket = retryTicket ?? launchTicketFromHash(location.hash);
       screen = "loading";
       screenMessage = null;
+      retryBootstrap = null;
       try {
         let sessionKey = sessionKeyFromHistory(history.state);
-        const ticket = launchTicketFromHash(location.hash);
         if (ticket) {
           stopUpdates();
           client = null;
@@ -154,12 +156,18 @@
         await refreshSnapshot(false);
       } catch (error) {
         if (isCurrent()) {
+          if (
+            ticket &&
+            error instanceof WorkbenchClientError &&
+            error.kind === "server_busy"
+          ) {
+            retryBootstrap = () => void bootstrap(ticket);
+          }
           applyTerminalFailure(error);
         }
       }
     };
 
-    retryBootstrap = () => void bootstrap();
     const bootstrapFreshTicket = () => {
       if (launchTicketFromHash(location.hash)) {
         void bootstrap();
@@ -312,6 +320,8 @@
         return "session_required";
       case "session_expired":
         return "session_expired";
+      case "server_busy":
+        return "workbench_busy";
       case "workspace_unavailable":
         return "workspace_unavailable";
       default:
@@ -338,6 +348,13 @@
         return {
           title: "Session expired",
           body: "Open a fresh Exo workbench link to continue.",
+        };
+      case "workbench_busy":
+        return {
+          title: "Workbench is busy",
+          body:
+            screenMessage ??
+            "Wait for capacity, then retry this launch ticket.",
         };
       case "workspace_unavailable":
         return {
@@ -393,6 +410,8 @@
           <Link2Off size={24} />
         {:else if screen === "session_expired"}
           <Route size={24} />
+        {:else if screen === "workbench_busy"}
+          <AlertTriangle size={24} />
         {:else if screen === "workspace_unavailable"}
           <FolderX size={24} />
         {:else}
@@ -401,7 +420,7 @@
       </div>
       <h1 id="state-title">{content.title}</h1>
       <p>{content.body}</p>
-      {#if screen === "transport_error"}
+      {#if screen === "transport_error" || screen === "workbench_busy"}
         <button type="button" onclick={retryTransport}>
           <RefreshCw size={16} aria-hidden="true" />
           Retry
@@ -478,6 +497,7 @@
   }
 
   .state-panel.session_expired .state-mark,
+  .state-panel.workbench_busy .state-mark,
   .state-panel.workspace_unavailable .state-mark {
     background: #f7edd8;
     color: #946314;

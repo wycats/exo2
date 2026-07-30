@@ -238,6 +238,57 @@ describe("cockpit page", () => {
     expect(history.state.exoWorkbenchSessionKey).toBeUndefined();
   });
 
+  it("retries the same ticket after an authoritative busy response", async () => {
+    history.replaceState({}, "", "/#ticket=v1.busy-ticket");
+    const submittedTickets: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          const request = JSON.parse(String(init?.body));
+          submittedTickets.push(request.ticket);
+          return submittedTickets.length === 1
+            ? new Response(
+                JSON.stringify({
+                  kind: "workbench.busy",
+                  ok: false,
+                  message: "The workbench session limit is busy",
+                }),
+                { status: 429 },
+              )
+            : sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: snapshotFixture,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Workbench is busy" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("The workbench session limit is busy"),
+    ).toBeTruthy();
+    expect(location.hash).toBe("");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(submittedTickets).toEqual(["v1.busy-ticket", "v1.busy-ticket"]);
+    expect(history.state.exoWorkbenchSessionKey).toBe("session-selector");
+  });
+
   it("exchanges a fresh ticket delivered through same-tab fragment navigation", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session") {

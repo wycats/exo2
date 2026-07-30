@@ -117,6 +117,27 @@ describe("workbench browser client", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("keeps a ticket retryable after an authoritative busy response", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        {
+          kind: "workbench.busy",
+          ok: false,
+          message: "The workbench session limit is busy",
+        },
+        429,
+      ),
+    );
+
+    await expect(
+      exchangeWorkbenchTicket("v1.ticket", fetcher),
+    ).rejects.toMatchObject({
+      kind: "server_busy",
+      retryable: true,
+      message: "The workbench session limit is busy",
+    } satisfies Partial<WorkbenchClientError>);
+  });
+
   it("decodes a snapshot from the browser-safe command envelope", async () => {
     const fetcher = vi.fn<typeof fetch>();
     fetcher.mockImplementation(async (_path, init) => {
