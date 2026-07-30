@@ -384,12 +384,16 @@ Exo `ResponseEnvelope` with HTTP status 200. Successful results retain the
 snapshot or lane result but omit post-write persistence reports and
 operator-facing trace or steering fields. Exo errors retain their status and
 error code while replacing messages and details with stable path-free browser
-text. Transport, origin, session, body shape, and capability failures use HTTP
-status and a small error object before Exo dispatch. A browser retry after
-connection loss or `daemon.busy` preserves the same request ID for
-`lane_focus`; the daemon outcome ledger remains the recovery authority. Once an
-Exo response is received, any deliberate re-execution uses a new request ID
-rather than replaying that terminal response.
+text. Transport, origin, session, body shape, capability, and HTTP-admission
+failures use HTTP status and a small error object before Exo dispatch.
+
+When delivery of a `lane_focus` request is ambiguous, the browser retries with
+the same request ID so the daemon outcome ledger remains the recovery authority.
+A `workbench.busy` response from the HTTP adapter is known not to have entered
+Exo dispatch; it is retryable without claiming a ledger reservation, and a
+session exchange may reuse its unconsumed ticket. Once the browser receives an
+Exo response, that response is terminal. A deliberate later re-execution uses a
+new request ID.
 
 Each session command revalidates the retained workspace root against the
 current project ID and state root before dispatch and requires the resolved
@@ -604,8 +608,11 @@ a restrictive same-origin content security policy. Assets are addressed only
 from the embedded manifest.
 
 Development uses Vite on `127.0.0.1` with hot module replacement and proxies
-`/api` to a diagnostic Exo daemon host. The capability and session flow remains
-active in development; Vite is not an unauthenticated alternate API.
+`/api` to the Exo workbench origin selected by
+`EXO_WORKBENCH_DEV_ORIGIN`. That origin may belong to any compatible
+project-authority daemon; diagnostics are not a prerequisite. The capability
+and session flow remains active in development, so Vite is not an
+unauthenticated alternate API.
 
 Because UI is a default Exo feature, every CI job that compiles the Exo binary
 must have the pinned Node and pnpm toolchain and a frozen workspace install.
@@ -696,9 +703,10 @@ host-neutral local workbench server and capability that a Codex adapter may
 present.
 
 RFC 10200 and RFC 10190 continue to own the CLI-shaped MCP transport and durable
-MCP proxy. This RFC adds one standard content variant and requires the two
-workbench commands to reach project daemon runtime services. It does not create
-a second MCP server or a workbench-specific tool surface.
+MCP proxy. This RFC uses their existing text and structured-result fields and
+requires the two workbench commands to reach project daemon runtime services.
+It adds no MCP content variant, second MCP server, or workbench-specific tool
+surface.
 
 ## Drawbacks
 
@@ -749,72 +757,66 @@ The daemon could start the HTTP listener eagerly. Lazy startup avoids another
 open port and frontend task for users who never launch the workbench while
 retaining one host for the daemon lifetime.
 
-## Implementation Plan
+## Implementation
 
-The host and launch task proceeds in four internal steps. First, add the
-Workbench CommandSpec, runtime-service injection, shared daemon dispatcher, host
-manager, capability/session model, HTTP routes, and runtime host record. Second,
-route MCP workbench requests through the daemon and return the launch URL in
-text and structured output. Third, convert and embed the cockpit build and
-update all relevant CI
-classifiers and toolchain setup. Fourth, add installed-binary, security,
-linked-worktree, and contract-fixture coverage before exposing the UI task.
+The implementation landed in two bounded slices. PR #57 established the
+`workbench` commands, shared daemon dispatcher, lazy loopback host, capability
+and session model, closed HTTP API, runtime observability record, embedded
+adapter-static cockpit assets, MCP daemon routing, and the text-plus-structured
+launch result. It also added the security, artifact, and linked-worktree
+contract coverage needed to make the host usable outside the source tree.
 
-The focus-only UI task then implements the snapshot decoder, session bootstrap,
-lane rail, current-lane workspace, SSE invalidation, visible polling, focus
-mutation, and all empty/error states. It does not widen the HTTP capability.
+PR #58 completed the focus-only workspace. It added the version-one snapshot
+decoder, workspace session bootstrap, lane rail, current-lane workspace, SSE
+invalidation, visible-state polling, request-ID-preserving focus mutation, and
+explicit empty and error states. The same slice made agent guidance secondary
+Coordination context and removed the unsupported MCP `resource_link` content
+block while preserving the launch URL in text and structured output.
 
-## Validation Strategy
+Both slices retain Exo as the only project, session, and command authority. The
+browser does not own a parallel state model, and the implemented HTTP
+capability remains limited to snapshot reads and lane focus.
 
-Rust unit tests cover token signing and constant-time verification, expiration,
-one-time redemption, session idle and absolute expiry, origin and host checks,
-capability denial, resource bounds, path redaction, runtime-record generation
-matching, and cleanup. Command and MCP tests cover pure/replayable metadata,
-daemon-only execution, request workspace forwarding, textual fallback,
-structured launch content, and the absence of unsupported content variants.
+## Validation Evidence
 
-Daemon integration starts one project daemon, launches from two linked
-worktrees, and proves one origin with distinct opaque workspace keys and
-snapshots. It focuses a lane in one workspace with a retained request ID and
-shows that the other focus is unchanged. Removing a worktree and reusing its
-path for another repository invalidates its session. Daemon replacement
-invalidates both sessions without changing project authority or silently
-restarting again.
+Rust unit and integration coverage exercises ticket signing and redemption,
+session expiry, origin and host checks, capability denial, resource bounds,
+path redaction, runtime-record generation matching, daemon-only command
+execution, MCP presentation, snapshot coherence, event invalidation, and host
+cleanup. The linked-worktree daemon suite proves that two worktrees share one
+project host while retaining distinct workspace keys, snapshots, and focus.
 
-Event tests cover ready and invalidate revisions, broadcast lag, `Last-Event-ID`,
-reconnect, session expiry, stream bounds, idle keepalive, and graceful host
-shutdown. Snapshot tests cover no lanes, no focus, focus mismatch diagnostics,
-detached HEAD, dirty worktree, Git changes within five seconds, and complete
-path redaction.
+The cockpit is covered by Vitest protocol and interaction tests, Svelte
+validation, and a production build. Post-merge dogfooding then ran the Vite
+application through machine-local locald against the real project-authority
+host. A real browser rendered authoritative merged-main state at desktop and
+mobile widths, and an approved Exo write advanced the visible revision through
+SSE without a page reload.
 
-Frontend tests use Vitest for protocol decoding, bootstrap, focus retries,
-loading and error states. Playwright runs the embedded or production-equivalent
-build at desktop and mobile sizes and checks nonblank rendering, text fit,
-control overlap, lane switching, reconnect, expired session, and workspace
-removal. Canvas is not part of the first UI.
+PR #57 artifact acceptance copied the release binary outside the source tree,
+launched its embedded UI, verified the embedded asset hash, and exercised the
+session and snapshot flow without a runtime Node process. PR #58 post-merge
+acceptance installed the merged binary, rebuilt the selected workspace
+development binary, established matching daemon authority, and invoked
+`exo-run workbench launch` through Codex. The result contained an openable URL
+in ordinary text and the same versioned value in structured output.
 
-Artifact acceptance builds and installs the default UI-enabled Exo binary,
-runs it outside the source tree, launches a workbench, verifies the embedded
-asset hash, and confirms that no Node process is required at runtime. Linux,
-macOS, and Windows compilation all exercise the cockpit build prerequisites.
-
-The end-to-end agent proof invokes `exo-run workbench launch` from a known Codex
-workspace, verifies the text and structured URL results, opens the link, and
-compares the rendered project, workspace, branch, head and focused lane with
-`exo-run workbench snapshot`. The same proof repeats from a linked worktree with
-a different focus.
-
-Existing Exo library, daemon lifecycle, request outcome, context/RFC,
-CommandSpec, machine-channel artifact, MCP stdio, TypeScript, Svelte, binary,
-Windows, formatting, lint, and diff gates remain required.
+A disposable linked-worktree project supplied the isolation proof. Both
+worktrees used one daemon and host while preserving separate focus. Replaying
+the retained request ID did not repeat the mutation, SSE delivered the committed
+invalidation, polling observed a later Git change, and the sibling worktree's
+focus remained unchanged. The two merged slices also passed their required
+platform, artifact, formatting, and exact-head review gates.
 
 ## Stage and Future Work
 
-This Stage 2 RFC is implementation-ready for the local host, launch and
-focus-only workbench tasks described above. Reaching Stage 3 requires landed
-code, installed-binary acceptance, linked-worktree isolation evidence, exact MCP
-text-and-structured launch proof, frontend visual validation, terminal CI, and
-clean exact-head review.
+This RFC is a Stage 3 Candidate. PR #57 landed the local host and launch
+substrate as `f058ff6d8e21c8f07c759e1bf5f5da205b5439fe`; PR #58 landed the
+focus-only workspace and Codex-compatible launch result as
+`b99e568ec6dbdbda118d0f6f46dc63a07d960866`. The implementation and evidence
+above cover the candidate contract across installed binaries, linked
+worktrees, the real browser, locald-supervised development, required CI, and
+exact-head review.
 
 Lane creation, start and closure; task and phase mutation; attachments,
 observations, validation freshness, review state, pull requests, RFCs, daemon

@@ -122,15 +122,40 @@ a lane. Creation, starting, and removal remain available through `exo lane` and
 VS Code does not keep a second focus value. The tree reads canonical Exo state
 and refreshes after Exo commits a focus change.
 
+## Browser Workbench
+
+Launch the focus-only browser workbench for the current workspace:
+
+```text
+exo workbench launch
+```
+
+The command returns a local URL backed by the project-authority daemon. Opening
+that URL exchanges a short-lived launch ticket for a workspace-bound browser
+session. The browser does not become a second project or command authority.
+
+The workbench makes the focused lane and its intent primary, alongside the
+workspace's branch, HEAD, dirty state, active phase, goals, and tasks. Agent
+guidance appears as secondary coordination context rather than as the user's
+task list. Committed Exo writes invalidate the current snapshot through the
+event stream, while visible-state polling keeps Git identity fresh.
+
+The browser can focus an eligible lane. Lane creation, starting, removal, and
+other project mutations remain available through `exo` and `exo-run`.
+
 ## Current Boundary
 
 The current workbench supports durable lane identity, `prepared` and
 `executing` states, workspace-local focus, phase integration, linked-worktree
-continuity, and the focus-oriented VS Code client.
+continuity, the focus-oriented VS Code client, and the focus-only browser
+workbench.
 
 It does not yet provide parking, closure, accepted outcomes, attachments to
 branches or review artifacts, observation-backed status, validation provenance,
-or a non-VS Code workbench UI.
+browser controls for the broader lane lifecycle, or a trustworthy
+human-attention queue.
 
-This manual page codifies the behavior established by
-[RFC 10202: Lane-Centered Workbench Adoption](../rfcs/stage-3/10202-lane-centered-workbench-adoption.md).
+This manual page codifies the lane model established by
+[RFC 10202: Lane-Centered Workbench Adoption](../rfcs/stage-3/10202-lane-centered-workbench-adoption.md)
+and the local browser host and launch contract established by
+[RFC 10203: Local Lane Workbench Host and Agent Launch](../rfcs/stage-3/10203-local-lane-workbench-host-and-agent-launch.md).
