@@ -358,6 +358,52 @@ describe("cockpit page", () => {
     expect(TestEventSource.instances).toHaveLength(1);
   });
 
+  it("reboots from a session selector restored through browser history", async () => {
+    history.replaceState({}, "", "/#ticket=v1.current-ticket");
+    const commandSessionKeys: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("current-session");
+        }
+        const request = JSON.parse(String(init?.body));
+        commandSessionKeys.push(request.session_key);
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: snapshotFixture,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    expect(commandSessionKeys).toEqual(["current-session"]);
+
+    window.dispatchEvent(
+      new PopStateEvent("popstate", {
+        state: { exoWorkbenchSessionKey: "restored-session" },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(commandSessionKeys).toEqual([
+        "current-session",
+        "restored-session",
+      ]);
+      expect(TestEventSource.instances.at(-1)?.url).toBe(
+        "/api/events?session_key=restored-session",
+      );
+    });
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+  });
+
   for (const staleResult of ["completion", "failure"] as const) {
     it(`ignores a superseded ticket exchange ${staleResult}`, async () => {
       history.replaceState({}, "", "/#ticket=v1.stale-ticket");

@@ -291,6 +291,9 @@ again after an ambiguous transport outcome. If the server explicitly returns
 that ticket while it remains valid. If delivery of the exchange response is
 ambiguous, the application asks for a fresh launch link. A later ticket fragment
 in the same browser tab starts a fresh exchange through `hashchange`.
+History traversal starts a fresh client bootstrap through `popstate` whenever
+the restored session selector differs from the current client, so Back and
+Forward cannot leave the screen attached to the session from another entry.
 
 On success the application retains the returned public random session key in
 same-entry history state. The server sets an independent random 256-bit session

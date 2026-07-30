@@ -120,7 +120,21 @@
     startLiveUpdates = startUpdates;
     stopLiveUpdates = stopUpdates;
 
-    const bootstrap = async (retryTicket?: string) => {
+    const resetClientState = () => {
+      stopUpdates();
+      client = null;
+      snapshot = null;
+      pendingFocus = null;
+      retryFocus = null;
+      ambiguousFocus = null;
+      focusFailure = null;
+      refreshFailure = null;
+    };
+
+    const bootstrap = async (
+      retryTicket?: string,
+      restoredSessionKey?: string | null,
+    ) => {
       const generation = ++bootstrapGeneration;
       const isCurrent = () => generation === bootstrapGeneration;
       const ticket = retryTicket ?? launchTicketFromHash(location.hash);
@@ -129,16 +143,14 @@
       screenRetryable = false;
       retryBootstrap = null;
       try {
-        let sessionKey = sessionKeyFromHistory(history.state);
+        let sessionKey =
+          restoredSessionKey === undefined
+            ? sessionKeyFromHistory(history.state)
+            : restoredSessionKey;
+        if (ticket || sessionKey !== client?.sessionKey) {
+          resetClientState();
+        }
         if (ticket) {
-          stopUpdates();
-          client = null;
-          snapshot = null;
-          pendingFocus = null;
-          retryFocus = null;
-          ambiguousFocus = null;
-          focusFailure = null;
-          refreshFailure = null;
           prepareWorkbenchTicketExchange(history, location);
           const session = await exchangeWorkbenchTicket(ticket);
           if (!isCurrent()) {
@@ -176,7 +188,14 @@
         void bootstrap();
       }
     };
+    const bootstrapRestoredSession = (event: PopStateEvent) => {
+      const restoredSessionKey = sessionKeyFromHistory(event.state);
+      if (restoredSessionKey !== client?.sessionKey) {
+        void bootstrap(undefined, restoredSessionKey);
+      }
+    };
     window.addEventListener("hashchange", bootstrapFreshTicket);
+    window.addEventListener("popstate", bootstrapRestoredSession);
     void bootstrap();
 
     return () => {
@@ -184,6 +203,7 @@
       retryBootstrap = null;
       startLiveUpdates = null;
       window.removeEventListener("hashchange", bootstrapFreshTicket);
+      window.removeEventListener("popstate", bootstrapRestoredSession);
       stopUpdates();
       stopLiveUpdates = null;
     };
