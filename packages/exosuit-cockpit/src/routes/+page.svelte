@@ -30,6 +30,7 @@
     | "session_required"
     | "session_expired"
     | "workbench_busy"
+    | "request_rejected"
     | "workspace_unavailable"
     | "transport_error";
 
@@ -47,6 +48,7 @@
   let focusFailure = $state<string | null>(null);
   let refreshFailure = $state<string | null>(null);
   let screenMessage = $state<string | null>(null);
+  let screenRetryable = $state(false);
   let retryBootstrap = $state<(() => void) | null>(null);
 
   let client: WorkbenchClient | null = null;
@@ -124,6 +126,7 @@
       const ticket = retryTicket ?? launchTicketFromHash(location.hash);
       screen = "loading";
       screenMessage = null;
+      screenRetryable = false;
       retryBootstrap = null;
       try {
         let sessionKey = sessionKeyFromHistory(history.state);
@@ -208,6 +211,7 @@
       snapshot = nextSnapshot;
       screen = "ready";
       screenMessage = null;
+      screenRetryable = false;
       refreshFailure = null;
       if (
         ambiguousFocus &&
@@ -226,8 +230,14 @@
       if (terminalFailure(error)) {
         applyTerminalFailure(error);
       } else if (snapshot === null) {
-        screen = "transport_error";
+        const kind =
+          error instanceof WorkbenchClientError
+            ? error.kind
+            : "transport_error";
+        screen = screenForFailure(kind);
         screenMessage = messageFrom(error);
+        screenRetryable =
+          error instanceof WorkbenchClientError && error.retryable;
       } else {
         refreshFailure = messageFrom(error);
       }
@@ -289,6 +299,8 @@
       error instanceof WorkbenchClientError ? error.kind : "transport_error";
     screen = screenForFailure(kind);
     screenMessage = messageFrom(error);
+    screenRetryable =
+      error instanceof WorkbenchClientError && error.retryable;
     stopLiveUpdates?.();
   }
 
@@ -322,6 +334,8 @@
         return "session_expired";
       case "server_busy":
         return "workbench_busy";
+      case "command_failed":
+        return "request_rejected";
       case "workspace_unavailable":
         return "workspace_unavailable";
       default:
@@ -355,6 +369,13 @@
           body:
             screenMessage ??
             "Wait for capacity, then retry this launch ticket.",
+        };
+      case "request_rejected":
+        return {
+          title: "Workbench request rejected",
+          body:
+            screenMessage ??
+            "Exo rejected this workbench request.",
         };
       case "workspace_unavailable":
         return {
@@ -412,6 +433,8 @@
           <Route size={24} />
         {:else if screen === "workbench_busy"}
           <AlertTriangle size={24} />
+        {:else if screen === "request_rejected"}
+          <AlertTriangle size={24} />
         {:else if screen === "workspace_unavailable"}
           <FolderX size={24} />
         {:else}
@@ -420,7 +443,7 @@
       </div>
       <h1 id="state-title">{content.title}</h1>
       <p>{content.body}</p>
-      {#if screen === "transport_error" || screen === "workbench_busy"}
+      {#if screenRetryable}
         <button type="button" onclick={retryTransport}>
           <RefreshCw size={16} aria-hidden="true" />
           Retry
@@ -498,6 +521,7 @@
 
   .state-panel.session_expired .state-mark,
   .state-panel.workbench_busy .state-mark,
+  .state-panel.request_rejected .state-mark,
   .state-panel.workspace_unavailable .state-mark {
     background: #f7edd8;
     color: #946314;

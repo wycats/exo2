@@ -289,6 +289,33 @@ describe("cockpit page", () => {
     expect(history.state.exoWorkbenchSessionKey).toBe("session-selector");
   });
 
+  it("does not offer an inert retry for a rejected ticket exchange", async () => {
+    history.replaceState({}, "", "/#ticket=v1.rejected-ticket");
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.origin_mismatch",
+          ok: false,
+          message: "The workbench origin did not match",
+        }),
+        { status: 403 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Workbench request rejected",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("The workbench origin did not match"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("exchanges a fresh ticket delivered through same-tab fragment navigation", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session") {
