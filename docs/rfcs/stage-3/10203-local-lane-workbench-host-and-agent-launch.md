@@ -159,12 +159,25 @@ contexts provide an `Arc<WorkbenchHostManager>` and the daemon-wide workbench
 revision counter. `WorkbenchLaunch` and `WorkbenchSnapshot` require this
 service and produce `workbench.daemon_required` when it is absent.
 
-The host manager begins unbound. The first launch serializes startup, binds
-`127.0.0.1:0`, creates daemon-lifetime secret material, starts the HTTP task on
-the existing Tokio runtime, and records the resulting origin. Concurrent first
-launches converge on one host. Later launches reuse that host. A bind or server
-startup failure does not stop the machine-channel daemon; launch returns
-`workbench.host_unavailable` with a stable diagnostic.
+The host manager normally begins unbound. The first launch serializes startup,
+binds `127.0.0.1:0`, creates daemon-lifetime secret material, starts the HTTP
+task on the existing Tokio runtime, and records the resulting origin.
+Concurrent first launches converge on one host. Later launches reuse that host.
+
+When a compatible replacement daemon loads live resumable grants, it also reads
+the prior compatible host record. After installing its command dispatcher, it
+attempts to bind the same loopback port before accepting browser traffic. This
+keeps installed tabs and stable development proxies on one origin across an
+ordinary daemon replacement. The retained origin is only a routing hint: the
+new host creates fresh daemon-lifetime secret material and authenticates every
+request through the restored session grant. Compatibility follows the persisted
+session and host-record schema rather than the embedded asset hash, so a normal
+cockpit upgrade can retain its origin. A malformed origin is ignored. If the
+preferred port is unavailable, the daemon falls back to a fresh ephemeral
+loopback port so a new launch can still succeed.
+
+A bind or server startup failure does not stop the machine-channel daemon;
+launch returns `workbench.host_unavailable` with a stable diagnostic.
 
 The host shuts down with the daemon. It never publishes a replacement daemon
 identity, changes `identity_matches_project`, or participates in daemon
@@ -192,10 +205,12 @@ The host atomically maintains the machine-local record
 }
 ```
 
-The record contains no secret and no workspace root. Readers accept it only
-when instance ID, PID, and process-start identity match the exact current
-daemon. Cleanup removes only a record owned by that exact runtime generation.
-Stale or malformed records are ignored.
+The record contains no secret and no workspace root. Readers accept it as live
+status only when instance ID, PID, and process-start identity match the exact
+current daemon. Clean shutdown marks the owned record inactive rather than
+removing it. A compatible replacement may use its numeric loopback port as a
+recovery hint only when the exact project also has live durable session grants
+with compatible schemas. Other stale or malformed records are ignored.
 
 `daemon status` exposes the matching record as an optional `workbench_host`
 object with `origin`, `assets_hash`, `server_task_alive`, `updated_at`, and
@@ -297,7 +312,7 @@ Forward cannot leave the screen attached to the session from another entry.
 
 On success the application retains the returned public random session key in
 same-entry history state. The server sets an independent random 256-bit session
-identifier in a cookie named
+secret in a cookie named
 `exo_workbench_session_<session-key>`. The cookie has `HttpOnly`,
 `SameSite=Strict`, `Path=/`, no `Domain`, and `Max-Age=43200`. The session key
 selects the matching cookie; it is not authorization without the independent
@@ -306,12 +321,38 @@ same loopback host from replacing each other's credentials. The initial
 transport is HTTP loopback, so the first version does not claim a `Secure`
 cookie that the server cannot portably enforce.
 
-A session has a twelve-hour absolute lifetime and a thirty-minute idle
-lifetime. An authenticated command, snapshot poll, or SSE keepalive refreshes
-the idle deadline but never the absolute deadline. Sessions exist only in
-memory and contain the daemon instance, project ID, workspace key, validated
-workspace root, fixed capabilities, creation time, last activity, and absolute
-expiration. Daemon replacement invalidates every session.
+A session has a renewable twelve-hour grant and a thirty-minute idle lifetime.
+Authenticated commands, snapshot polls, and SSE keepalives refresh activity.
+The browser renews an active grant at a bounded interval, which extends both the
+server grant and the cookie lifetime. An inactive session still expires after
+thirty minutes.
+
+The host stores resumable grants in the project runtime directory as
+`workbench.sessions.json`. This machine-local file is atomically replaced with
+owner-only permissions. It contains a digest of the cookie secret, the public
+selector, exact project and workspace identity, validated canonical workspace
+root, fixed capabilities, creation time, last activity, and grant expiration.
+The raw cookie secret is never written to disk.
+
+A compatible replacement host loads only the store for its exact project. When
+the browser presents both credentials, the host re-resolves the retained root
+and requires the same project ID, state root, workspace key, and canonical
+worktree before hydrating the session into memory. It never substitutes the
+host-launching worktree or another linked worktree. Expired, malformed,
+foreign-project, and no-longer-resolvable grants fail closed. Completion-review
+records remain process-local, so a review interrupted by replacement must be
+prepared again from the current snapshot.
+
+While reconnection is underway, the application keeps its last successful
+snapshot visible and disables focus and planning mutations. A compatible
+replacement reclaims the prior loopback origin when possible, restores the
+session, and requires a fresh authoritative snapshot before mutations resume.
+The replacement is therefore invisible once renewal and refresh succeed. If
+the origin cannot be reclaimed, a fresh launch still exposes the replacement
+host; a development proxy or old direct-origin tab may require explicit route
+recovery. If the exact grant or workspace can no longer be recovered, the
+cockpit remains visible in read-only form with a compact fresh-launch boundary
+instead of replacing the workspace with a terminal error screen.
 
 The server accepts at most 64 live sessions and evicts expired sessions before
 rejecting a new exchange. It accepts at most 32 authenticated event streams.
@@ -332,6 +373,8 @@ The version-one HTTP surface is:
 
 ```text
 POST /api/session   exchange a launch ticket for a session cookie
+POST /api/session/renew
+                    renew the current workspace-bound session grant
 POST /api/command   invoke one capability-allowed Exo operation
 GET  /api/events    receive invalidation events for the session workspace
 ```
@@ -357,6 +400,11 @@ interface WorkbenchSessionResult {
   expires_at: string;
 }
 ```
+
+`POST /api/session/renew` accepts the existing public `session_key`. The
+independent cookie secret remains browser-managed and is not present in the
+body. A successful renewal returns the same result shape, refreshes
+`expires_at`, and repeats the cookie with a fresh `Max-Age`.
 
 `POST /api/command` accepts only this discriminated union:
 
@@ -631,7 +679,7 @@ The adapter uses stable diagnostic kinds:
 | `workbench.host_unavailable` | The loopback host could not start or its task stopped |
 | `workbench.ui_unavailable` | The binary was built without embedded UI assets |
 | `workbench.ticket_invalid` | Ticket validation or one-time redemption failed |
-| `workbench.session_invalid` | The session is missing, expired, or from another runtime |
+| `workbench.session_invalid` | The session is missing, expired, or cannot be revalidated for the exact project and workspace |
 | `workbench.origin_mismatch` | Host or Origin validation failed |
 | `workbench.capability_denied` | The session attempted an operation outside its fixed set |
 | `workbench.workspace_unavailable` | The retained workspace no longer resolves to this project |
@@ -655,8 +703,9 @@ The loopback bind prevents remote network access but does not protect against
 other local processes, browser cross-origin requests, leaked URLs, or DNS
 rebinding. The exact numeric loopback origin, Host and Origin checks,
 short-lived signed ticket, one-time redemption, fixed capabilities, HttpOnly
-SameSite cookie, in-memory session state, body and concurrency bounds, and raw
-path redaction act together. No single one is treated as sufficient.
+SameSite cookie, owner-only digest-based grant persistence, exact workspace
+revalidation, body and concurrency bounds, and raw path redaction act together.
+No single one is treated as sufficient.
 
 The first version intentionally avoids a general HTTP command endpoint. A
 session cannot smuggle arbitrary Exo syntax, workspace roots, confirmation

@@ -1,6 +1,9 @@
 import {
+  decodeWorkbenchPlanningResult,
   decodeWorkbenchSnapshot,
   type WorkbenchCommandRequest,
+  type WorkbenchPlanningRequest,
+  type WorkbenchPlanningResult,
   type WorkbenchSessionResult,
   type WorkbenchSnapshot,
 } from "./workbench";
@@ -22,13 +25,15 @@ export class WorkbenchClientError extends Error {
     readonly kind: WorkbenchFailureKind,
     message: string,
     readonly retryable = false,
+    private readonly sameRequestId = kind === "transport_error",
+    readonly detailKind: string | null = null,
   ) {
     super(message);
     this.name = "WorkbenchClientError";
   }
 
   get retryWithSameRequestId(): boolean {
-    return this.kind === "transport_error";
+    return this.sameRequestId;
   }
 }
 
@@ -42,6 +47,10 @@ interface BrowserCommandEnvelope {
   error?: {
     code?: string;
     message?: string;
+    details?: {
+      kind?: string;
+      retry_with_same_request_id?: boolean;
+    };
   };
 }
 
@@ -148,6 +157,25 @@ export class WorkbenchClient {
     private readonly fetcher: Fetcher = fetch,
   ) {}
 
+  async renewSession(): Promise<WorkbenchSessionResult> {
+    const session = decodeSession(
+      await request(
+        this.fetcher,
+        "/api/session/renew",
+        { session_key: this.sessionKey },
+        "The workbench session could not be renewed",
+      ),
+    );
+    if (session.session_key !== this.sessionKey) {
+      throw new WorkbenchClientError(
+        "transport_error",
+        "Exo renewed a different workbench session",
+        true,
+      );
+    }
+    return session;
+  }
+
   async snapshot(): Promise<WorkbenchSnapshot> {
     const result = await this.dispatch({
       protocol_version: 1,
@@ -184,13 +212,30 @@ export class WorkbenchClient {
     }
   }
 
+  async planning(
+    command: WorkbenchPlanningRequest,
+  ): Promise<WorkbenchPlanningResult> {
+    const result = await this.dispatch(command);
+    try {
+      return decodeWorkbenchPlanningResult(result);
+    } catch {
+      throw new WorkbenchClientError(
+        "transport_error",
+        "Exo returned an invalid workbench planning result",
+        true,
+      );
+    }
+  }
+
   eventSourceUrl(): string {
     return `/api/events?${new URLSearchParams({
       session_key: this.sessionKey,
     })}`;
   }
 
-  private async dispatch(requestBody: WorkbenchCommandRequest): Promise<unknown> {
+  private async dispatch(
+    requestBody: WorkbenchCommandRequest | WorkbenchPlanningRequest,
+  ): Promise<unknown> {
     const value = await request(
       this.fetcher,
       "/api/command",
@@ -206,11 +251,20 @@ export class WorkbenchClient {
       );
     }
     if (envelope.status !== "ok") {
+      const sameRequestId =
+        envelope.error?.details?.retry_with_same_request_id ?? false;
+      const detailKind = envelope.error?.details?.kind ?? null;
+      const receivedRetryPolicy =
+        envelope.error?.details?.retry_with_same_request_id !== undefined;
       throw new WorkbenchClientError(
-        "command_failed",
+        detailKind === "workbench.busy" ? "server_busy" : "command_failed",
         envelope.error?.message ?? "The workbench command failed",
-        envelope.error?.code === "precondition_failed" ||
-          envelope.error?.code === "internal",
+        sameRequestId ||
+          (!receivedRetryPolicy &&
+            (envelope.error?.code === "precondition_failed" ||
+              envelope.error?.code === "internal")),
+        sameRequestId,
+        detailKind,
       );
     }
     return envelope.result;
@@ -247,9 +301,12 @@ async function request(
     try {
       value = await response.json();
     } catch {
+      const contentType =
+        response.headers.get("content-type")?.split(";")[0]?.trim() ||
+        "unknown content type";
       throw new WorkbenchClientError(
         "transport_error",
-        "Exo returned an unreadable workbench response",
+        `Exo returned an unreadable workbench response (HTTP ${response.status}, ${contentType})`,
         true,
       );
     }

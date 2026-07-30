@@ -2,12 +2,16 @@
   import {
     Activity,
     AlertTriangle,
+    ArrowDown,
+    ArrowUp,
     Check,
+    CheckCheck,
     CheckCircle2,
     Circle,
     CircleDashed,
     CircleDot,
     CirclePlay,
+    ClipboardCheck,
     Compass,
     GitBranch,
     GitCommitHorizontal,
@@ -15,46 +19,173 @@
     Layers3,
     ListTodo,
     LoaderCircle,
+    MessageSquareText,
+    PanelLeft,
+    Pencil,
+    Plus,
     RefreshCw,
     Route,
+    Send,
     Target,
     Wifi,
     WifiOff,
+    X,
     XCircle,
   } from "@lucide/svelte";
+  import { onMount } from "svelte";
 
   import type {
     WorkbenchDiagnostic,
+    WorkbenchGoal,
     WorkbenchLaneSummary,
+    WorkbenchPlanningOperation,
     WorkbenchSnapshot,
+    WorkbenchTask,
+    WorkbenchTaskCompletionReview,
   } from "./workbench";
 
   interface Props {
     snapshot: WorkbenchSnapshot;
     refreshing?: boolean;
     streamConnected?: boolean;
+    sessionRecovery?: "connected" | "reconnecting" | "needs_launch";
+    sessionRecoveryMessage?: string | null;
     pendingLaneId?: string | null;
     focusFailure?: string | null;
+    refreshFailure?: string | null;
+    planningFailure?: string | null;
+    planningNotice?: string | null;
+    planningSuccessCount?: number;
+    pendingPlanningKind?: WorkbenchPlanningOperation["kind"] | null;
+    completionReview?: WorkbenchTaskCompletionReview | null;
     onFocus: (laneId: string) => void;
     onRetryFocus?: (() => void) | null;
+    onRetryPlanning?: (() => void) | null;
+    onRetrySession?: (() => void) | null;
     onRefresh: () => void;
+    onPlan?: (operation: WorkbenchPlanningOperation) => Promise<boolean>;
+    onApproveCompletion?: () => Promise<boolean>;
+    onDismissCompletionReview?: () => void;
   }
 
   let {
     snapshot,
     refreshing = false,
     streamConnected = false,
+    sessionRecovery = "connected",
+    sessionRecoveryMessage = null,
     pendingLaneId = null,
     focusFailure = null,
+    refreshFailure = null,
+    planningFailure = null,
+    planningNotice = null,
+    planningSuccessCount = 0,
+    pendingPlanningKind = null,
+    completionReview = null,
     onFocus,
     onRetryFocus = null,
+    onRetryPlanning = null,
+    onRetrySession = null,
     onRefresh,
+    onPlan = async () => false,
+    onApproveCompletion = async () => false,
+    onDismissCompletionReview = () => {},
   }: Props = $props();
+
+  type PlanningEditor =
+    | { kind: "add"; goalId: string }
+    | { kind: "edit"; taskId: string }
+    | { kind: "log"; taskId: string }
+    | { kind: "review"; taskId: string };
+
+  let laneRail: HTMLElement | undefined = $state();
+  let completionReviewCard: HTMLElement | undefined = $state();
+  let compactNavigation = $state(false);
+  let planningEditor = $state<PlanningEditor | null>(null);
+  let planningValue = $state("");
+  let handledPlanningSuccess = 0;
 
   let agentNextStep = $derived(snapshot.steering.next_actions[0] ?? null);
   let hasCoordination = $derived(
     agentNextStep !== null || snapshot.diagnostics.length > 0,
   );
+  let planningBusy = $derived(pendingPlanningKind !== null);
+  let interactionDisabled = $derived(sessionRecovery !== "connected");
+  let connectionPresentation = $derived.by(() => {
+    if (sessionRecovery === "reconnecting") {
+      return {
+        label: "Reconnecting",
+        title: "Reconnecting to the Exo workbench host",
+        kind: "reconnecting" as const,
+      };
+    }
+    if (sessionRecovery === "needs_launch") {
+      return {
+        label: "Paused",
+        title: "This workbench session needs a current launch",
+        kind: "paused" as const,
+      };
+    }
+    if (streamConnected) {
+      return {
+        label: "Live",
+        title: "Live updates connected",
+        kind: "connected" as const,
+      };
+    }
+    return {
+      label: "Polling",
+      title: "Live updates reconnecting; polling remains active",
+      kind: "polling" as const,
+    };
+  });
+  let reviewedTaskTitle = $derived.by(() => {
+    if (!completionReview || !snapshot.phase) {
+      return null;
+    }
+    for (const goal of snapshot.phase.goals) {
+      const task = goal.tasks.find(
+        (candidate) => candidate.id === completionReview.task_id,
+      );
+      if (task) {
+        return task.title;
+      }
+    }
+    return completionReview.task_id;
+  });
+
+  onMount(() => {
+    if (!window.matchMedia) {
+      return;
+    }
+    const query = window.matchMedia("(max-width: 760px)");
+    const updateNavigation = () => {
+      compactNavigation = query.matches;
+      if (!query.matches && laneRail?.matches(":popover-open")) {
+        laneRail.hidePopover();
+      }
+    };
+    updateNavigation();
+    query.addEventListener("change", updateNavigation);
+    return () => query.removeEventListener("change", updateNavigation);
+  });
+
+  $effect(() => {
+    const current = planningSuccessCount;
+    if (current !== handledPlanningSuccess) {
+      handledPlanningSuccess = current;
+      closeEditor();
+    }
+  });
+
+  $effect(() => {
+    if (
+      completionReview?.review_id &&
+      typeof completionReviewCard?.scrollIntoView === "function"
+    ) {
+      completionReviewCard.scrollIntoView({ block: "start" });
+    }
+  });
 
   const shortHead = (head: string | null): string =>
     head ? head.slice(0, 8) : "unborn";
@@ -110,6 +241,120 @@
     }
     return `Focus ${lane.title}`;
   };
+
+  const goalProgressLabel = (goal: WorkbenchGoal): string => {
+    const tone = statusTone(goal.status);
+    if (tone === "complete") {
+      return "Complete";
+    }
+    if (tone === "active") {
+      return "In progress";
+    }
+    return goal.tasks.some((task) => statusTone(task.status) !== "pending")
+      ? "Underway"
+      : "Not started";
+  };
+
+  const taskIndex = (goal: WorkbenchGoal, task: WorkbenchTask): number =>
+    goal.tasks.findIndex((candidate) => candidate.id === task.id);
+
+  const planningLabel = (
+    kind: WorkbenchPlanningOperation["kind"],
+  ): string => {
+    switch (kind) {
+      case "task_add":
+        return "Adding task";
+      case "task_update":
+        return "Updating task";
+      case "task_reorder":
+        return "Reordering task";
+      case "task_start":
+        return "Marking task active";
+      case "task_log":
+        return "Recording progress";
+      case "task_complete_review":
+        return "Preparing review";
+      case "task_complete_approve":
+        return "Recording approval";
+    }
+  };
+
+  function selectLane(laneId: string): void {
+    if (laneRail?.matches(":popover-open")) {
+      laneRail.hidePopover();
+    }
+    onFocus(laneId);
+  }
+
+  function toggleNavigationFallback(event: MouseEvent): void {
+    const button = event.currentTarget as HTMLButtonElement;
+    if (!("commandForElement" in button)) {
+      laneRail?.togglePopover();
+    }
+  }
+
+  function openEditor(editor: PlanningEditor, initialValue = ""): void {
+    planningEditor = editor;
+    planningValue = initialValue;
+  }
+
+  function closeEditor(): void {
+    planningEditor = null;
+    planningValue = "";
+  }
+
+  async function submitEditor(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!planningEditor || planningBusy) {
+      return;
+    }
+    const value = planningValue.trim();
+    if (!value) {
+      return;
+    }
+    let operation: WorkbenchPlanningOperation;
+    switch (planningEditor.kind) {
+      case "add":
+        operation = {
+          kind: "task_add",
+          goal_id: planningEditor.goalId,
+          title: value,
+        };
+        break;
+      case "edit":
+        operation = {
+          kind: "task_update",
+          task_id: planningEditor.taskId,
+          title: value,
+        };
+        break;
+      case "log":
+        operation = {
+          kind: "task_log",
+          task_id: planningEditor.taskId,
+          message: value,
+        };
+        break;
+      case "review":
+        operation = {
+          kind: "task_complete_review",
+          task_id: planningEditor.taskId,
+          outcome: value,
+        };
+        break;
+    }
+    if (await onPlan(operation)) {
+      closeEditor();
+    }
+  }
+
+  async function applyPlanning(
+    operation: WorkbenchPlanningOperation,
+  ): Promise<void> {
+    if (!planningBusy) {
+      await onPlan(operation);
+    }
+  }
 </script>
 
 <div class="workbench">
@@ -142,26 +387,38 @@
 
     <div class="topbar-actions">
       <span
-        class:connected={streamConnected}
+        class:connected={connectionPresentation.kind === "connected"}
+        class:reconnecting={connectionPresentation.kind === "reconnecting"}
+        class:paused={connectionPresentation.kind === "paused"}
         class="connection"
-        title={streamConnected
-          ? "Live updates connected"
-          : "Live updates reconnecting; polling remains active"}
+        title={connectionPresentation.title}
       >
-        {#if streamConnected}
+        {#if connectionPresentation.kind === "connected"}
           <Wifi size={14} aria-hidden="true" />
-          Live
+        {:else if connectionPresentation.kind === "reconnecting"}
+          <LoaderCircle class="spin" size={14} aria-hidden="true" />
         {:else}
           <WifiOff size={14} aria-hidden="true" />
-          Polling
         {/if}
+        {connectionPresentation.label}
       </span>
+      <button
+        class="icon-button lane-invoker"
+        type="button"
+        title="Open project lanes"
+        aria-label="Open project lanes"
+        commandfor="lane-navigation"
+        command="toggle-popover"
+        onclick={toggleNavigationFallback}
+      >
+        <PanelLeft size={17} aria-hidden="true" />
+      </button>
       <button
         class="icon-button"
         type="button"
         title="Refresh workbench"
         aria-label="Refresh workbench"
-        disabled={refreshing}
+        disabled={refreshing || sessionRecovery === "reconnecting"}
         onclick={onRefresh}
       >
         <RefreshCw class={refreshing ? "spin" : undefined} size={17} aria-hidden="true" />
@@ -169,26 +426,87 @@
     </div>
   </header>
 
+  {#if sessionRecovery === "reconnecting"}
+    <div class="recovery-banner" role="status">
+      <LoaderCircle class="spin" size={17} aria-hidden="true" />
+      <span><strong>Reconnecting to Exo.</strong> The current cockpit remains visible while changes are paused.</span>
+    </div>
+  {:else if sessionRecovery === "needs_launch"}
+    <div class="recovery-banner needs-launch" role="alert">
+      <Route size={17} aria-hidden="true" />
+      <span>
+        <strong>This session could not be restored.</strong>
+        {sessionRecoveryMessage ?? "Open a current Exo workbench link for this workspace."}
+      </span>
+      {#if onRetrySession}
+        <button type="button" onclick={onRetrySession}>Try again</button>
+      {/if}
+    </div>
+  {/if}
+
   {#if focusFailure}
     <div class="failure-banner" role="alert">
       <AlertTriangle size={18} aria-hidden="true" />
-      <span>{focusFailure}</span>
+      <span><strong>Lane focus failed.</strong> {focusFailure}</span>
       {#if onRetryFocus}
         <button type="button" onclick={onRetryFocus}>Retry</button>
       {/if}
     </div>
   {/if}
 
+  {#if planningFailure}
+    <div class="failure-banner" role="alert">
+      <AlertTriangle size={18} aria-hidden="true" />
+      <span><strong>Planning change not applied.</strong> {planningFailure}</span>
+      {#if onRetryPlanning}
+        <button type="button" onclick={onRetryPlanning}>Retry same request</button>
+      {/if}
+    </div>
+  {/if}
+
+  {#if planningNotice}
+    <div class="planning-notice" role="status">
+      <CircleDot size={18} aria-hidden="true" />
+      <span><strong>Ready for agent handoff.</strong> {planningNotice}</span>
+    </div>
+  {/if}
+
+  {#if refreshFailure}
+    <div class="failure-banner refresh-failure" role="alert">
+      <WifiOff size={18} aria-hidden="true" />
+      <span><strong>Live refresh paused.</strong> {refreshFailure}</span>
+      <button type="button" onclick={onRefresh}>Refresh</button>
+    </div>
+  {/if}
+
   <div class:has-coordination={hasCoordination} class="workspace-grid">
-    <aside class="lane-rail" aria-label="Project lanes">
+    <aside
+      bind:this={laneRail}
+      class="lane-rail"
+      id="lane-navigation"
+      aria-label="Project lanes"
+      popover={compactNavigation ? "auto" : undefined}
+    >
       <div class="rail-heading">
         <div>
           <span class="section-kicker">Project</span>
           <h2>Lanes</h2>
         </div>
-        <span class="count" aria-label={`${snapshot.lanes.length} lanes`}>
-          {snapshot.lanes.length}
-        </span>
+        <div class="rail-heading-actions">
+          <span class="count" aria-label={`${snapshot.lanes.length} lanes`}>
+            {snapshot.lanes.length}
+          </span>
+          <button
+            class="icon-button rail-close"
+            type="button"
+            title="Close project lanes"
+            aria-label="Close project lanes"
+            commandfor="lane-navigation"
+            command="hide-popover"
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       {#if snapshot.lanes.length === 0}
@@ -208,10 +526,11 @@
               title={!lanePhaseActive(lane)
                 ? "This lane’s phase is not active"
                 : undefined}
-              disabled={pendingLaneId !== null ||
+              disabled={interactionDisabled ||
+                pendingLaneId !== null ||
                 lane.focused_here ||
                 !lanePhaseActive(lane)}
-              onclick={() => onFocus(lane.id)}
+              onclick={() => selectLane(lane.id)}
             >
               <span class="lane-state" aria-hidden="true">
                 {#if pendingLaneId === lane.id}
@@ -279,6 +598,64 @@
             </span>
           </div>
 
+          {#if completionReview}
+            <section
+              class="completion-review"
+              aria-labelledby="completion-review-title"
+              bind:this={completionReviewCard}
+            >
+              <div class="review-heading">
+                <span class="review-mark" aria-hidden="true">
+                  <ClipboardCheck size={19} />
+                </span>
+                <div>
+                  <span class="section-kicker">Task completion review</span>
+                  <h3 id="completion-review-title">{reviewedTaskTitle}</h3>
+                </div>
+              </div>
+              <p class="review-rationale">
+                {completionReview.readiness_rationale}
+              </p>
+              <div class="review-outcome">
+                <span>Outcome to record</span>
+                <p>{completionReview.proposed_outcome}</p>
+              </div>
+              <div class="review-evidence">
+                {#if completionReview.approval_evidence_present}
+                  <CheckCircle2 size={15} aria-hidden="true" />
+                  Existing approval evidence is present.
+                {:else}
+                  <Info size={15} aria-hidden="true" />
+                  Approving records this exact outcome.
+                {/if}
+              </div>
+              <div class="review-actions">
+                <button
+                  class="secondary-button"
+                  type="button"
+                  disabled={planningBusy || interactionDisabled}
+                  onclick={onDismissCompletionReview}
+                >
+                  Keep working
+                </button>
+                <button
+                  class="primary-button"
+                  type="button"
+                  disabled={planningBusy || interactionDisabled}
+                  onclick={() => void onApproveCompletion()}
+                >
+                  {#if pendingPlanningKind === "task_complete_approve"}
+                    <LoaderCircle class="spin" size={16} aria-hidden="true" />
+                    Recording approval
+                  {:else}
+                    <CheckCheck size={16} aria-hidden="true" />
+                    Approve exact outcome
+                  {/if}
+                </button>
+              </div>
+            </section>
+          {/if}
+
           <div class="goal-list">
             {#each snapshot.phase.goals as goal (goal.id)}
               <article class="goal">
@@ -290,29 +667,288 @@
                       <CircleDot size={18} />
                     {:else}
                       <Circle size={18} />
-                    {/if}
+                  {/if}
                   </span>
-                  <div>
+                  <div class="goal-copy">
                     <h3>{goal.title}</h3>
-                    <span>{displayStatus(goal.status)}</span>
+                    <span>{goalProgressLabel(goal)}</span>
                   </div>
+                  {#if statusTone(goal.status) !== "complete"}
+                    <button
+                      class="planning-icon-button"
+                      type="button"
+                      title="Add task"
+                      aria-label={`Add task to ${goal.title}`}
+                      disabled={planningBusy || interactionDisabled}
+                      onclick={() => openEditor({ kind: "add", goalId: goal.id })}
+                    >
+                      <Plus size={16} aria-hidden="true" />
+                    </button>
+                  {/if}
                 </div>
+
+                {#if planningEditor?.kind === "add" && planningEditor.goalId === goal.id}
+                  <form class="planning-editor" onsubmit={submitEditor}>
+                    <label for={`add-task-${goal.id}`}>New task</label>
+                    <div class="editor-control">
+                      <input
+                        id={`add-task-${goal.id}`}
+                        bind:value={planningValue}
+                        maxlength="512"
+                        placeholder="Describe the next bounded task"
+                        required
+                      />
+                      <button
+                        class="primary-icon-button"
+                        type="submit"
+                        title="Add task"
+                        aria-label="Add task"
+                        disabled={planningBusy ||
+                          interactionDisabled ||
+                          planningValue.trim().length === 0}
+                      >
+                        {#if pendingPlanningKind === "task_add"}
+                          <LoaderCircle class="spin" size={16} aria-hidden="true" />
+                        {:else}
+                          <Send size={16} aria-hidden="true" />
+                        {/if}
+                      </button>
+                      <button
+                        class="planning-icon-button"
+                        type="button"
+                        title="Cancel"
+                        aria-label="Cancel adding task"
+                        disabled={planningBusy || interactionDisabled}
+                        onclick={closeEditor}
+                      >
+                        <X size={16} aria-hidden="true" />
+                      </button>
+                    </div>
+                  </form>
+                {/if}
 
                 {#if goal.tasks.length > 0}
                   <ul class="task-list">
-                    {#each goal.tasks as task (task.id)}
+                    {#each goal.tasks as task, index (task.id)}
                       <li>
-                        <span class={`task-check ${statusTone(task.status)}`} aria-hidden="true">
-                          {#if statusTone(task.status) === "complete"}
-                            <Check size={13} />
-                          {:else if statusTone(task.status) === "active"}
-                            <CircleDot size={13} />
-                          {:else}
-                            <Circle size={13} />
+                        <div class="task-row">
+                          <span class={`task-check ${statusTone(task.status)}`} aria-hidden="true">
+                            {#if statusTone(task.status) === "complete"}
+                              <Check size={13} />
+                            {:else if statusTone(task.status) === "active"}
+                              <CircleDot size={13} />
+                            {:else}
+                              <Circle size={13} />
+                            {/if}
+                          </span>
+                          <span class="task-title">{task.title}</span>
+                          {#if statusTone(task.status) === "active"}
+                            <span class="task-active-label">Active</span>
                           {/if}
-                        </span>
-                        <span>{task.title}</span>
-                        <small>{displayStatus(task.status)}</small>
+                          {#if statusTone(task.status) !== "complete"}
+                            <div class="task-actions" aria-label={`Actions for ${task.title}`}>
+                              {#if task.status === "pending"}
+                                <button
+                                  class="planning-icon-button"
+                                  type="button"
+                                  title="Mark active in Exo"
+                                  aria-label={`Mark ${task.title} active in Exo`}
+                                  disabled={planningBusy || interactionDisabled}
+                                  onclick={() =>
+                                    void applyPlanning({
+                                      kind: "task_start",
+                                      task_id: task.id,
+                                    })}
+                                >
+                                  <CircleDot size={15} aria-hidden="true" />
+                                </button>
+                              {/if}
+                              <button
+                                class="planning-icon-button"
+                                type="button"
+                                title="Edit title"
+                                aria-label={`Edit ${task.title}`}
+                                disabled={planningBusy || interactionDisabled}
+                                onclick={() =>
+                                  openEditor(
+                                    { kind: "edit", taskId: task.id },
+                                    task.title,
+                                  )}
+                              >
+                                <Pencil size={14} aria-hidden="true" />
+                              </button>
+                              <button
+                                class="planning-icon-button"
+                                type="button"
+                                title="Move up"
+                                aria-label={`Move ${task.title} up`}
+                                disabled={planningBusy || interactionDisabled || index === 0}
+                                onclick={() =>
+                                  void applyPlanning({
+                                    kind: "task_reorder",
+                                    task_id: task.id,
+                                    position: taskIndex(goal, task) - 1,
+                                  })}
+                              >
+                                <ArrowUp size={14} aria-hidden="true" />
+                              </button>
+                              <button
+                                class="planning-icon-button"
+                                type="button"
+                                title="Move down"
+                                aria-label={`Move ${task.title} down`}
+                                disabled={planningBusy ||
+                                  interactionDisabled ||
+                                  index === goal.tasks.length - 1}
+                                onclick={() =>
+                                  void applyPlanning({
+                                    kind: "task_reorder",
+                                    task_id: task.id,
+                                    position: taskIndex(goal, task) + 1,
+                                  })}
+                              >
+                                <ArrowDown size={14} aria-hidden="true" />
+                              </button>
+                              {#if task.status === "in-progress"}
+                                <button
+                                  class="planning-icon-button"
+                                  type="button"
+                                  title="Record progress"
+                                  aria-label={`Record progress for ${task.title}`}
+                                  disabled={planningBusy || interactionDisabled}
+                                  onclick={() =>
+                                    openEditor({ kind: "log", taskId: task.id })}
+                                >
+                                  <MessageSquareText size={15} aria-hidden="true" />
+                                </button>
+                                <button
+                                  class="planning-icon-button"
+                                  type="button"
+                                  title="Review completion"
+                                  aria-label={`Review completion of ${task.title}`}
+                                  disabled={planningBusy || interactionDisabled}
+                                  onclick={() =>
+                                    openEditor({ kind: "review", taskId: task.id })}
+                                >
+                                  <ClipboardCheck size={15} aria-hidden="true" />
+                                </button>
+                              {/if}
+                            </div>
+                          {/if}
+                        </div>
+
+                        {#if planningEditor?.kind === "edit" && planningEditor.taskId === task.id}
+                          <form class="planning-editor task-editor" onsubmit={submitEditor}>
+                            <label for={`edit-task-${task.id}`}>Task title</label>
+                            <div class="editor-control">
+                              <input
+                                id={`edit-task-${task.id}`}
+                                bind:value={planningValue}
+                                maxlength="512"
+                                required
+                              />
+                              <button
+                                class="primary-icon-button"
+                                type="submit"
+                                title="Save title"
+                                aria-label="Save task title"
+                                disabled={planningBusy ||
+                                  interactionDisabled ||
+                                  planningValue.trim().length === 0}
+                              >
+                                {#if pendingPlanningKind === "task_update"}
+                                  <LoaderCircle class="spin" size={16} aria-hidden="true" />
+                                {:else}
+                                  <Check size={16} aria-hidden="true" />
+                                {/if}
+                              </button>
+                              <button
+                                class="planning-icon-button"
+                                type="button"
+                                title="Cancel"
+                                aria-label="Cancel editing task"
+                                disabled={planningBusy || interactionDisabled}
+                                onclick={closeEditor}
+                              >
+                                <X size={16} aria-hidden="true" />
+                              </button>
+                            </div>
+                          </form>
+                        {:else if planningEditor?.kind === "log" && planningEditor.taskId === task.id}
+                          <form class="planning-editor task-editor" onsubmit={submitEditor}>
+                            <label for={`log-task-${task.id}`}>Progress update</label>
+                            <textarea
+                              id={`log-task-${task.id}`}
+                              bind:value={planningValue}
+                              maxlength="16384"
+                              rows="3"
+                              placeholder="Record evidence, a decision, or the next concrete boundary"
+                              required
+                            ></textarea>
+                            <div class="editor-actions">
+                              <button
+                                class="secondary-button"
+                                type="button"
+                                disabled={planningBusy || interactionDisabled}
+                                onclick={closeEditor}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                class="primary-button"
+                                type="submit"
+                                disabled={planningBusy ||
+                                  interactionDisabled ||
+                                  planningValue.trim().length === 0}
+                              >
+                                {#if pendingPlanningKind === "task_log"}
+                                  <LoaderCircle class="spin" size={16} aria-hidden="true" />
+                                  Recording
+                                {:else}
+                                  <MessageSquareText size={16} aria-hidden="true" />
+                                  Record progress
+                                {/if}
+                              </button>
+                            </div>
+                          </form>
+                        {:else if planningEditor?.kind === "review" && planningEditor.taskId === task.id}
+                          <form class="planning-editor task-editor" onsubmit={submitEditor}>
+                            <label for={`review-task-${task.id}`}>Proposed completion outcome</label>
+                            <textarea
+                              id={`review-task-${task.id}`}
+                              bind:value={planningValue}
+                              maxlength="16384"
+                              rows="5"
+                              placeholder="State the exact verified outcome to review"
+                              required
+                            ></textarea>
+                            <div class="editor-actions">
+                              <button
+                                class="secondary-button"
+                                type="button"
+                                disabled={planningBusy || interactionDisabled}
+                                onclick={closeEditor}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                class="primary-button"
+                                type="submit"
+                                disabled={planningBusy ||
+                                  interactionDisabled ||
+                                  planningValue.trim().length === 0}
+                              >
+                                {#if pendingPlanningKind === "task_complete_review"}
+                                  <LoaderCircle class="spin" size={16} aria-hidden="true" />
+                                  Preparing
+                                {:else}
+                                  <ClipboardCheck size={16} aria-hidden="true" />
+                                  Review completion
+                                {/if}
+                              </button>
+                            </div>
+                          </form>
+                        {/if}
                       </li>
                     {/each}
                   </ul>
@@ -320,6 +956,13 @@
               </article>
             {/each}
           </div>
+
+          {#if pendingPlanningKind}
+            <div class="planning-progress" role="status">
+              <LoaderCircle class="spin" size={15} aria-hidden="true" />
+              {planningLabel(pendingPlanningKind)}
+            </div>
+          {/if}
         </section>
       {/if}
     </main>
@@ -524,6 +1167,16 @@
     color: var(--teal);
   }
 
+  .connection.reconnecting {
+    background: var(--amber-soft);
+    color: var(--amber);
+  }
+
+  .connection.paused {
+    background: var(--red-soft);
+    color: #812c33;
+  }
+
   .icon-button {
     width: 32px;
     height: 32px;
@@ -546,6 +1199,43 @@
     opacity: 0.58;
   }
 
+  .lane-invoker {
+    display: none;
+    anchor-name: --lane-navigation-trigger;
+  }
+
+  .recovery-banner {
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 18px;
+    border-bottom: 1px solid #d8c28e;
+    background: var(--amber-soft);
+    color: #765014;
+    font-size: 0.78rem;
+  }
+
+  .recovery-banner span {
+    flex: 1;
+  }
+
+  .recovery-banner.needs-launch {
+    border-bottom-color: #e9bdc0;
+    background: var(--red-soft);
+    color: #812c33;
+  }
+
+  .recovery-banner button {
+    padding: 5px 9px;
+    border: 1px solid currentColor;
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
   .failure-banner {
     min-height: 42px;
     display: flex;
@@ -562,6 +1252,16 @@
     flex: 1;
   }
 
+  .failure-banner strong {
+    font-weight: 800;
+  }
+
+  .failure-banner.refresh-failure {
+    border-bottom-color: #e5c995;
+    background: var(--amber-soft);
+    color: #7a5213;
+  }
+
   .failure-banner button {
     border: 1px solid #ce858a;
     border-radius: 5px;
@@ -571,6 +1271,22 @@
     font: inherit;
     font-weight: 700;
     cursor: pointer;
+  }
+
+  .planning-notice {
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 18px;
+    border-bottom: 1px solid #a8d1c8;
+    background: var(--teal-soft);
+    color: var(--teal);
+    font-size: 0.78rem;
+  }
+
+  .planning-notice strong {
+    font-weight: 800;
   }
 
   .workspace-grid {
@@ -596,6 +1312,7 @@
   .lane-rail {
     border-right: 1px solid var(--line);
     padding: 18px 12px;
+    box-shadow: 10px 0 24px -24px rgba(23, 32, 31, 0.7);
   }
 
   .rail-heading,
@@ -611,6 +1328,16 @@
   .rail-heading {
     padding: 0 7px 13px;
     align-items: center;
+  }
+
+  .rail-heading-actions {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .rail-close {
+    display: none;
   }
 
   .section-kicker {
@@ -791,6 +1518,7 @@
     max-width: 820px;
     font-size: clamp(1.55rem, 2.3vw, 2.15rem);
     line-height: 1.12;
+    text-wrap: balance;
   }
 
   .lane-intent {
@@ -799,6 +1527,7 @@
     color: #34413f;
     font-size: 1rem;
     line-height: 1.55;
+    text-wrap: pretty;
   }
 
   .lane-context {
@@ -836,6 +1565,7 @@
 
   .goal-heading {
     justify-content: flex-start;
+    align-items: center;
   }
 
   .status-icon {
@@ -853,17 +1583,22 @@
     color: var(--teal);
   }
 
+  .goal-copy {
+    min-width: 0;
+    flex: 1;
+  }
+
   .goal-heading h3 {
     font-size: 0.86rem;
     line-height: 1.3;
+    text-wrap: balance;
   }
 
-  .goal-heading span:last-child {
+  .goal-copy > span {
     display: block;
     margin-top: 3px;
     color: var(--muted);
     font-size: 0.68rem;
-    text-transform: capitalize;
   }
 
   .task-list {
@@ -873,19 +1608,239 @@
   }
 
   .task-list li {
-    min-height: 34px;
+    border-top: 1px solid #e3e8e6;
+  }
+
+  .task-row {
+    min-height: 40px;
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) auto;
+    grid-template-columns: 18px minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 7px;
-    border-top: 1px solid #e3e8e6;
     font-size: 0.77rem;
   }
 
-  .task-list small {
-    color: var(--muted);
+  .task-title {
+    line-height: 1.35;
+    text-wrap: pretty;
+  }
+
+  .task-active-label {
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: var(--teal-soft);
+    color: var(--teal);
     font-size: 0.63rem;
-    text-transform: capitalize;
+    font-weight: 750;
+  }
+
+  .task-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .planning-icon-button,
+  .primary-icon-button {
+    width: 28px;
+    height: 28px;
+    display: inline-grid;
+    flex: 0 0 auto;
+    place-items: center;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .planning-icon-button:hover:not(:disabled) {
+    border-color: var(--line);
+    background: var(--surface);
+    color: var(--ink);
+  }
+
+  .planning-icon-button:disabled,
+  .primary-icon-button:disabled {
+    cursor: default;
+    opacity: 0.38;
+  }
+
+  .primary-icon-button {
+    border-color: var(--teal);
+    background: var(--teal);
+    color: white;
+  }
+
+  .planning-editor {
+    margin: 13px 0 2px 30px;
+    padding: 12px;
+    border-left: 3px solid #9fc5bd;
+    background: #eef5f3;
+  }
+
+  .planning-editor.task-editor {
+    margin: 0 0 10px 25px;
+  }
+
+  .planning-editor label {
+    display: block;
+    margin-bottom: 7px;
+    color: #40504d;
+    font-size: 0.7rem;
+    font-weight: 750;
+  }
+
+  .planning-editor input,
+  .planning-editor textarea {
+    width: 100%;
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    background: var(--surface);
+    color: var(--ink);
+    padding: 8px 9px;
+    font-size: 0.77rem;
+    line-height: 1.45;
+  }
+
+  .planning-editor textarea {
+    display: block;
+    resize: vertical;
+  }
+
+  .editor-control {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 28px 28px;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .editor-actions,
+  .review-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 9px;
+  }
+
+  .primary-button,
+  .secondary-button {
+    min-height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    padding: 6px 10px;
+    font-size: 0.72rem;
+    font-weight: 750;
+    cursor: pointer;
+  }
+
+  .primary-button {
+    border-color: var(--teal);
+    background: var(--teal);
+    color: white;
+  }
+
+  .secondary-button {
+    background: var(--surface);
+    color: var(--ink);
+  }
+
+  .primary-button:disabled,
+  .secondary-button:disabled {
+    cursor: wait;
+    opacity: 0.55;
+  }
+
+  .completion-review {
+    margin-top: 18px;
+    padding: 16px;
+    border: 1px solid #a9c9c2;
+    border-radius: 7px;
+    background: var(--surface);
+    box-shadow: 0 10px 28px -24px rgba(23, 32, 31, 0.8);
+  }
+
+  .review-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .review-heading h3 {
+    margin-top: 2px;
+    font-size: 0.9rem;
+    text-wrap: balance;
+  }
+
+  .review-mark {
+    width: 34px;
+    height: 34px;
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    border-radius: 6px;
+    background: var(--teal-soft);
+    color: var(--teal);
+  }
+
+  .review-rationale {
+    margin-top: 13px;
+    color: #40504d;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .review-outcome {
+    margin-top: 13px;
+    padding: 11px 12px;
+    border-left: 3px solid #9fc5bd;
+    background: var(--surface-soft);
+  }
+
+  .review-outcome > span {
+    color: var(--muted);
+    font-size: 0.64rem;
+    font-weight: 750;
+    text-transform: uppercase;
+  }
+
+  .review-outcome p {
+    margin-top: 5px;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .review-evidence {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 0.68rem;
+  }
+
+  .planning-progress {
+    position: sticky;
+    bottom: 12px;
+    width: fit-content;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 18px 0 0 auto;
+    padding: 7px 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.95);
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-weight: 700;
+    box-shadow: 0 8px 20px -18px rgba(23, 32, 31, 0.8);
   }
 
   .no-focus {
@@ -1104,8 +2059,16 @@
     .workspace-identity {
       grid-column: 1 / -1;
       grid-row: 2;
-      overflow-x: auto;
+      overflow: hidden;
       padding-bottom: 2px;
+    }
+
+    .workspace-identity strong {
+      flex: 1;
+    }
+
+    .workspace-identity .identity-item {
+      display: none;
     }
 
     .topbar-actions {
@@ -1113,32 +2076,67 @@
       grid-row: 1;
     }
 
+    .lane-invoker {
+      display: grid;
+    }
+
     .workspace-grid {
-      display: flex;
-      flex-direction: column;
+      display: block;
     }
 
     .lane-rail {
-      border-right: 0;
-      border-bottom: 1px solid var(--line);
-      padding: 12px;
+      display: none;
     }
 
-    .rail-heading {
-      padding-bottom: 9px;
+    .lane-rail[popover]:popover-open {
+      position: fixed;
+      inset: 66px 12px auto auto;
+      width: min(320px, calc(100vw - 24px));
+      max-height: calc(100dvh - 78px);
+      display: block;
+      overflow: auto;
+      margin: 0;
+      padding: 14px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow:
+        0 24px 56px -30px rgba(23, 32, 31, 0.72),
+        0 8px 22px -18px rgba(23, 32, 31, 0.5);
     }
 
-    .lane-list {
-      display: flex;
-      gap: 7px;
-      overflow-x: auto;
-      padding-bottom: 2px;
-      scroll-snap-type: x proximity;
+    .lane-rail[popover]::backdrop {
+      background: rgba(23, 32, 31, 0.08);
     }
 
-    .lane-row {
-      min-width: min(260px, 78vw);
-      scroll-snap-align: start;
+    @supports (top: anchor(bottom)) {
+      .lane-rail[popover]:popover-open {
+        position-anchor: --lane-navigation-trigger;
+        top: calc(anchor(bottom) + 8px);
+        right: 12px;
+        bottom: auto;
+        left: auto;
+        position-try-fallbacks: flip-block;
+      }
+    }
+
+    .rail-close {
+      display: grid;
+    }
+
+    .task-row {
+      grid-template-columns: 18px minmax(0, 1fr) auto;
+      padding: 7px 0;
+    }
+
+    .task-actions {
+      grid-column: 2 / -1;
+      justify-content: flex-end;
+    }
+
+    .planning-editor,
+    .planning-editor.task-editor {
+      margin-left: 0;
     }
 
     .intent-band,

@@ -118,6 +118,53 @@ export interface WorkbenchCommandRequest {
     | { kind: "lane_focus"; lane_id: string };
 }
 
+export type WorkbenchPlanningOperation =
+  | { kind: "task_add"; goal_id: string; title: string }
+  | { kind: "task_update"; task_id: string; title: string }
+  | { kind: "task_reorder"; task_id: string; position: number }
+  | { kind: "task_start"; task_id: string }
+  | { kind: "task_log"; task_id: string; message: string }
+  | { kind: "task_complete_review"; task_id: string; outcome: string }
+  | { kind: "task_complete_approve"; review_id: string };
+
+export interface WorkbenchPlanningRequest {
+  protocol_version: 2;
+  id: string;
+  session_key: string;
+  expected_revision: number;
+  expected_phase_id: string;
+  operation: WorkbenchPlanningOperation;
+}
+
+export interface WorkbenchTaskMutationResult {
+  kind: "workbench.task_mutation";
+  ok: true;
+  schema_version: 1;
+  operation:
+    | "task_add"
+    | "task_update"
+    | "task_reorder"
+    | "task_start"
+    | "task_log"
+    | "task_complete_approve";
+  task_id: string;
+}
+
+export interface WorkbenchTaskCompletionReview {
+  kind: "workbench.task_completion_review";
+  ok: true;
+  schema_version: 1;
+  review_id: string;
+  task_id: string;
+  readiness_rationale: string;
+  proposed_outcome: string;
+  approval_evidence_present: boolean;
+}
+
+export type WorkbenchPlanningResult =
+  | WorkbenchTaskMutationResult
+  | WorkbenchTaskCompletionReview;
+
 export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");
   literal(snapshot.kind, "workbench.snapshot", "kind");
@@ -139,6 +186,40 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
     workbenchDiagnostic(diagnostic),
   );
   return value as WorkbenchSnapshot;
+}
+
+export function decodeWorkbenchPlanningResult(
+  value: unknown,
+): WorkbenchPlanningResult {
+  const result = record(value, "workbench planning result");
+  literal(result.ok, true, "planning.ok");
+  literal(result.schema_version, 1, "planning.schema_version");
+
+  if (result.kind === "workbench.task_completion_review") {
+    string(result.review_id, "planning.review_id");
+    string(result.task_id, "planning.task_id");
+    string(result.readiness_rationale, "planning.readiness_rationale");
+    string(result.proposed_outcome, "planning.proposed_outcome");
+    boolean(
+      result.approval_evidence_present,
+      "planning.approval_evidence_present",
+    );
+    return value as WorkbenchTaskCompletionReview;
+  }
+
+  literal(result.kind, "workbench.task_mutation", "planning.kind");
+  if (
+    result.operation !== "task_add" &&
+    result.operation !== "task_update" &&
+    result.operation !== "task_reorder" &&
+    result.operation !== "task_start" &&
+    result.operation !== "task_log" &&
+    result.operation !== "task_complete_approve"
+  ) {
+    invalid("planning.operation");
+  }
+  string(result.task_id, "planning.task_id");
+  return value as WorkbenchTaskMutationResult;
 }
 
 function project(value: unknown): void {

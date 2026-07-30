@@ -52,7 +52,7 @@ use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
 use crate::project::{Project, ProjectResolver, git_common_dir_from_filesystem};
 use crate::workbench::{
     DaemonRequestDispatcher, DaemonRuntimeServices, WorkbenchHostManager, WorkbenchHostRecord,
-    WorkbenchHostStatus,
+    WorkbenchHostStatus, planning,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -2791,24 +2791,24 @@ pub async fn run_daemon(
         let write_tx = request_write_tx.clone();
         async move {
             let handler_runtime_services = runtime_services.clone();
+            let gate_runtime_services = runtime_services.clone();
             let request_id = req.id.clone();
             let handler_request_id = request_id.clone();
-            let response = dispatch_bounded_daemon_request(
+            dispatch_bounded_daemon_request(
                 request_id,
                 request_admission,
                 diagnostics.clone(),
                 move || {
-                    let recovery_request =
-                        compatible_protocol_v1_approval_request_id(
-                            &workspace,
-                            project.as_ref(),
-                            &req,
-                        )
-                        .map(|request_id| {
-                            let mut request = req.clone();
-                            request.id = request_id;
-                            request
-                        });
+                    let recovery_request = compatible_protocol_v1_approval_request_id(
+                        &workspace,
+                        project.as_ref(),
+                        &req,
+                    )
+                    .map(|request_id| {
+                        let mut request = req.clone();
+                        request.id = request_id;
+                        request
+                    });
                     let recovery_request = recovery_request.as_ref().unwrap_or(&req);
                     if let Ok(Some(mut outcome)) =
                         outcome_ledger.terminal_outcome_before_preparation(recovery_request)
@@ -2816,6 +2816,11 @@ pub async fn run_daemon(
                         outcome.response.id = handler_request_id;
                         return outcome.response;
                     }
+                    let planning_context = match planning::context_from_request(&req) {
+                        Ok(context) => context,
+                        Err(error) => return error.response(handler_request_id),
+                    };
+                    let execution_request = planning::request_without_context(&req);
                     let declared_recovery = request_declared_recovery(&req);
                     let reserved_recovery = outcome_ledger
                         .reserved_request_recovery_before_preparation(recovery_request)
@@ -2836,22 +2841,57 @@ pub async fn run_daemon(
                     } else if reserved_recovery.is_some() {
                         reserved_recovery
                     } else {
-                        let request_workspace = match validated_request_workspace(
-                            &workspace,
-                            project.as_ref(),
-                            &req,
-                        ) {
-                            Ok(workspace) => workspace,
-                            Err(error) => {
-                                return daemon_workspace_error_response(
-                                    handler_request_id,
-                                    &error,
-                                );
-                            }
-                        };
-                        resolved_request_recovery(&request_workspace, &req)
+                        let request_workspace =
+                            match validated_request_workspace(&workspace, project.as_ref(), &req) {
+                                Ok(workspace) => workspace,
+                                Err(error) => {
+                                    return daemon_workspace_error_response(
+                                        handler_request_id,
+                                        &error,
+                                    );
+                                }
+                            };
+                        resolved_request_recovery(&request_workspace, &execution_request)
                     };
-                    match recovery {
+                    let project_state_guard = if recovery.as_ref().is_some_and(|recovery| {
+                        recovery.recovery_class == RecoveryClass::AtomicProjectState
+                    }) {
+                        match gate_runtime_services.project_state_guard() {
+                            Ok(guard) => Some(guard),
+                            Err(error) => return error.response(handler_request_id),
+                        }
+                    } else {
+                        None
+                    };
+                    if project_state_guard.is_some()
+                        && let Ok(Some(mut outcome)) =
+                            outcome_ledger.terminal_outcome_before_preparation(recovery_request)
+                    {
+                        outcome.response.id = handler_request_id;
+                        return outcome.response;
+                    }
+                    if let Some(context) = planning_context.as_ref() {
+                        if project_state_guard.is_none() {
+                            return planning::WorkbenchPlanningError::invalid_request()
+                                .response(handler_request_id);
+                        }
+                        let request_workspace =
+                            match validated_request_workspace(&workspace, project.as_ref(), &req) {
+                                Ok(workspace) => workspace,
+                                Err(error) => {
+                                    return daemon_workspace_error_response(
+                                        handler_request_id,
+                                        &error,
+                                    );
+                                }
+                            };
+                        if let Err(error) = gate_runtime_services
+                            .validate_planning_context(&request_workspace, context)
+                        {
+                            return error.response(handler_request_id);
+                        }
+                    }
+                    let (response, advances_revision) = match recovery {
                         Some(recovery)
                             if recovery.recovery_class == RecoveryClass::AtomicProjectState =>
                         {
@@ -2879,37 +2919,41 @@ pub async fn run_daemon(
                             };
                             let request_workspace = request_context.workspace_root;
                             let request_project = request_context.project;
-                            outcome_ledger
-                                .execute_atomic_project_state(
-                                    req,
-                                    recovery.effect,
-                                    &instance_id,
-                                    Duration::from_secs(30),
-                                    &request_project.db_path(),
-                                    |req| {
-                                        handle_request_with_project_and_diagnostics_as_atomic_writer(
-                                            &request_workspace,
-                                            Some(&request_project),
-                                            req,
-                                            &diagnostics,
-                                        )
-                                    },
-                                    |response| {
-                                        finalize_atomic_response_after_commit(
-                                            &request_workspace,
-                                            Some(&request_project),
-                                            &namespace,
-                                            &operation,
-                                            recovery.effect,
-                                            response,
-                                            &diagnostics,
-                                        )
-                                    },
-                                )
-                                .response
+                            let outcome = outcome_ledger.execute_atomic_project_state(
+                                req,
+                                recovery.effect,
+                                &instance_id,
+                                Duration::from_secs(30),
+                                &request_project.db_path(),
+                                |req| {
+                                    let request = planning::request_without_context(&req);
+                                    handle_request_with_project_and_diagnostics_as_atomic_writer(
+                                        &request_workspace,
+                                        Some(&request_project),
+                                        request,
+                                        &diagnostics,
+                                    )
+                                },
+                                |response| {
+                                    finalize_atomic_response_after_commit(
+                                        &request_workspace,
+                                        Some(&request_project),
+                                        &namespace,
+                                        &operation,
+                                        recovery.effect,
+                                        response,
+                                        &diagnostics,
+                                    )
+                                },
+                            );
+                            let advances_revision =
+                                !outcome.replayed && response_committed_write(&outcome.response);
+                            (outcome.response, advances_revision)
                         }
-                        Some(recovery) if matches!(recovery.effect, Effect::Write | Effect::Exec) => {
-                            execute_ledgered_daemon_request(
+                        Some(recovery)
+                            if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
+                        {
+                            let outcome = execute_ledgered_daemon_request(
                                 &workspace,
                                 project.as_ref(),
                                 &outcome_ledger,
@@ -2917,8 +2961,10 @@ pub async fn run_daemon(
                                 recovery.effect,
                                 &instance_id,
                                 &diagnostics,
-                            )
-                            .response
+                            );
+                            let advances_revision =
+                                !outcome.replayed && response_committed_write(&outcome.response);
+                            (outcome.response, advances_revision)
                         }
                         _ => {
                             let request_context =
@@ -2931,25 +2977,28 @@ pub async fn run_daemon(
                                         );
                                     }
                                 };
-                            normalize_retryable_daemon_busy_response_if_needed(
+                            let response = normalize_retryable_daemon_busy_response_if_needed(
                                 handle_request_with_project_and_diagnostics_as_daemon_writer(
                                     &request_context.workspace_root,
                                     Some(&request_context.project),
-                                    req,
+                                    execution_request,
                                     &diagnostics,
                                     &handler_runtime_services,
                                 ),
-                            )
+                            );
+                            let advances_revision = response_committed_write(&response);
+                            (response, advances_revision)
                         }
+                    };
+                    if advances_revision {
+                        gate_runtime_services.revision_after_write();
+                        let _ = write_tx.send(());
                     }
+                    drop(project_state_guard);
+                    response
                 },
             )
-            .await;
-            if response_committed_write(&response) {
-                runtime_services.revision_after_write();
-                let _ = write_tx.send(());
-            }
-            response
+            .await
         }
     });
     if let Err(error) = runtime_services.set_dispatcher(dispatcher.clone()) {

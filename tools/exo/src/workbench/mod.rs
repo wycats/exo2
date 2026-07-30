@@ -1,5 +1,6 @@
 mod assets;
 mod http;
+pub(crate) mod planning;
 mod snapshot;
 
 use crate::api::protocol::{RequestEnvelope, ResponseEnvelope};
@@ -12,12 +13,13 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,8 +28,10 @@ use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinHandle;
 
 const TICKET_LIFETIME: Duration = Duration::from_mins(5);
-const SESSION_ABSOLUTE_LIFETIME: Duration = Duration::from_hours(12);
+const SESSION_RENEWAL_LIFETIME: Duration = Duration::from_hours(12);
 const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
+const SESSION_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
+const SESSION_STORE_SCHEMA_VERSION: u8 = 1;
 const MAX_SESSIONS: usize = 64;
 const MAX_EVENT_STREAMS: usize = 32;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -92,6 +96,26 @@ impl DaemonRuntimeServices {
         self.host.revision_after_write()
     }
 
+    pub(crate) fn project_state_guard(
+        &self,
+    ) -> std::result::Result<MutexGuard<'_, ()>, planning::WorkbenchPlanningError> {
+        self.host
+            .inner
+            .project_state_gate
+            .lock()
+            .map_err(|_| planning::WorkbenchPlanningError::internal())
+    }
+
+    pub(crate) fn validate_planning_context(
+        &self,
+        workspace_root: &Path,
+        context: &planning::WorkbenchPlanningContext,
+    ) -> std::result::Result<(), planning::WorkbenchPlanningError> {
+        self.host
+            .inner
+            .validate_planning_context(workspace_root, context, false)
+    }
+
     pub fn write_events(&self) -> broadcast::Receiver<u64> {
         self.host.write_events()
     }
@@ -135,8 +159,11 @@ struct WorkbenchHostInner {
     process_start_id: Arc<str>,
     runtime: Handle,
     host_record_path: PathBuf,
+    session_store_path: PathBuf,
+    session_store_gate: Mutex<()>,
     last_activity: Arc<AtomicU64>,
     revision: AtomicU64,
+    project_state_gate: Mutex<()>,
     write_tx: broadcast::Sender<u64>,
     dispatcher: OnceLock<DaemonRequestDispatcher>,
     state: Mutex<WorkbenchState>,
@@ -146,10 +173,15 @@ struct WorkbenchHostInner {
 #[derive(Default)]
 struct WorkbenchState {
     host: Option<BoundHost>,
+    preferred_port: Option<u16>,
     workspaces_by_root: HashMap<PathBuf, String>,
     workspaces_by_key: HashMap<String, WorkspaceRegistration>,
     pending_capabilities: HashMap<String, PendingCapability>,
+    session_grants: HashMap<String, WorkbenchSessionGrantV1>,
     sessions: HashMap<String, WorkbenchSession>,
+    completion_review_requests:
+        HashMap<planning::CompletionReviewRequestKey, planning::CompletionReviewRequestRecord>,
+    completion_reviews: HashMap<String, planning::CompletionReviewRecord>,
 }
 
 struct BoundHost {
@@ -182,9 +214,9 @@ struct PendingCapability {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkbenchSession {
+    /// Stable, non-secret digest used for server-side correlation and replay binding.
     pub(crate) id: String,
     pub(crate) selector: String,
-    pub(crate) instance_id: String,
     pub(crate) project_id: String,
     pub(crate) workspace_key: String,
     pub(crate) workspace_root: PathBuf,
@@ -192,6 +224,27 @@ pub(crate) struct WorkbenchSession {
     pub(crate) created_at: u64,
     pub(crate) last_activity: u64,
     pub(crate) expires_at: u64,
+    last_persisted_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchSessionGrantV1 {
+    credential_digest: String,
+    selector: String,
+    project_id: String,
+    workspace_key: String,
+    workspace_root: PathBuf,
+    capabilities: Vec<String>,
+    created_at: u64,
+    last_activity: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchSessionStoreV1 {
+    schema_version: u8,
+    project_id: String,
+    sessions: Vec<WorkbenchSessionGrantV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +420,7 @@ pub(crate) struct WorkbenchSessionResult {
 pub(crate) enum TicketExchangeError {
     Invalid,
     Busy,
+    Unavailable,
 }
 
 impl WorkbenchHostManager {
@@ -379,18 +433,36 @@ impl WorkbenchHostManager {
         runtime: Handle,
     ) -> Self {
         let (write_tx, _) = broadcast::channel(16);
+        let host_record_path = runtime_dir.join("workbench.host.json");
+        let session_store_path = runtime_dir.join("workbench.sessions.json");
+        let mut state = WorkbenchState::default();
+        match read_session_store(&session_store_path, project.id.as_str(), unix_seconds()) {
+            Ok(grants) => state.session_grants = grants,
+            Err(error) => {
+                eprintln!(
+                    "exo daemon: failed to read workbench session store at {}: {error}",
+                    session_store_path.display()
+                );
+            }
+        }
+        if !state.session_grants.is_empty() {
+            state.preferred_port = resumable_host_port(&host_record_path);
+        }
         Self {
             inner: Arc::new(WorkbenchHostInner {
                 project,
                 instance_id,
                 process_start_id,
                 runtime,
-                host_record_path: runtime_dir.join("workbench.host.json"),
+                host_record_path,
+                session_store_path,
+                session_store_gate: Mutex::new(()),
                 last_activity,
                 revision: AtomicU64::new(0),
+                project_state_gate: Mutex::new(()),
                 write_tx,
                 dispatcher: OnceLock::new(),
-                state: Mutex::new(WorkbenchState::default()),
+                state: Mutex::new(state),
                 event_admission: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
             }),
         }
@@ -400,7 +472,16 @@ impl WorkbenchHostManager {
         self.inner
             .dispatcher
             .set(dispatcher)
-            .map_err(|_| anyhow::anyhow!("daemon request dispatcher was already installed"))
+            .map_err(|_| anyhow::anyhow!("daemon request dispatcher was already installed"))?;
+        let resume_host = self
+            .inner
+            .state
+            .lock()
+            .is_ok_and(|state| assets::available() && state.preferred_port.is_some());
+        if resume_host && let Err(error) = self.ensure_host() {
+            eprintln!("exo daemon: failed to resume the prior workbench origin: {error}");
+        }
+        Ok(())
     }
 
     pub fn launch(&self, workspace_root: &Path) -> Result<WorkbenchLaunchResult> {
@@ -422,7 +503,11 @@ impl WorkbenchHostManager {
             instance_id: self.inner.instance_id.to_string(),
             project_id: self.inner.project.id.to_string(),
             workspace_key: workspace.key.clone(),
-            capabilities: vec!["workbench.snapshot".to_string(), "lane.focus".to_string()],
+            capabilities: std::iter::once("workbench.snapshot")
+                .chain(std::iter::once("lane.focus"))
+                .chain(planning::PLANNING_CAPABILITIES)
+                .map(str::to_string)
+                .collect(),
             issued_at,
             expires_at,
         };
@@ -517,11 +602,10 @@ impl WorkbenchHostManager {
             let Ok(mut state) = self.inner.state.lock() else {
                 return;
             };
-            let Some(host) = state.host.as_mut() else {
-                return;
-            };
-            let _ = host.shutdown.send(true);
-            host.task.take()
+            state.host.as_mut().and_then(|host| {
+                let _ = host.shutdown.send(true);
+                host.task.take()
+            })
         };
         if let Some(mut task) = task
             && tokio::time::timeout(Duration::from_secs(2), &mut task)
@@ -531,7 +615,10 @@ impl WorkbenchHostManager {
             task.abort();
             let _ = task.await;
         }
-        self.inner.remove_owned_host_record();
+        if let Err(error) = self.inner.persist_session_store() {
+            eprintln!("exo daemon: failed to persist workbench sessions during shutdown: {error}");
+        }
+        self.inner.mark_host_inactive();
     }
 
     fn register_workspace(&self, workspace_root: &Path) -> Result<WorkspaceRegistration> {
@@ -542,11 +629,20 @@ impl WorkbenchHostManager {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
-        let key = state
-            .workspaces_by_root
-            .get(&root)
-            .cloned()
-            .unwrap_or(random_token()?);
+        let now = unix_seconds();
+        let key = state.workspaces_by_root.get(&root).cloned().or_else(|| {
+            state
+                .session_grants
+                .values()
+                .filter(|grant| {
+                    grant.project_id == self.inner.project.id.as_str()
+                        && grant.workspace_root == root
+                        && grant.is_live(now)
+                })
+                .max_by_key(|grant| grant.last_activity)
+                .map(|grant| grant.workspace_key.clone())
+        });
+        let key = key.unwrap_or(random_token()?);
         let label = git
             .branch
             .clone()
@@ -587,23 +683,42 @@ impl WorkbenchHostManager {
             )));
         }
 
-        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .map_err(|error| {
-                anyhow::Error::new(
-                    workbench_failure(
-                        "workbench.host_unavailable",
-                        "The local workbench host could not bind a loopback port",
-                    )
-                    .with_details(serde_json::json!({
-                        "kind": "workbench.host_unavailable",
-                        "error": error.to_string(),
-                    })),
+        let listener = if let Some(port) = state.preferred_port {
+            match TcpListener::bind(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+            )) {
+                Ok(listener) => Ok(listener),
+                Err(preferred_error) => {
+                    eprintln!(
+                        "exo daemon: prior workbench port {port} is unavailable; binding a new loopback port: {preferred_error}"
+                    );
+                    TcpListener::bind(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+                }
+            }
+        } else {
+            TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        }
+        .map_err(|error| {
+            anyhow::Error::new(
+                workbench_failure(
+                    "workbench.host_unavailable",
+                    "The local workbench host could not bind a loopback port",
                 )
-            })?;
+                .with_details(serde_json::json!({
+                    "kind": "workbench.host_unavailable",
+                    "error": error.to_string(),
+                })),
+            )
+        })?;
         listener
             .set_nonblocking(true)
             .context("configure workbench listener")?;
         let address = listener.local_addr().context("read workbench address")?;
+        state.preferred_port = Some(address.port());
         let expected_host = address.to_string();
         let origin = format!("http://{expected_host}");
         let secret = random_bytes()?;
@@ -725,8 +840,8 @@ impl WorkbenchHostInner {
         state
             .pending_capabilities
             .retain(|_, pending| pending.expires_at > now);
-        state.sessions.retain(|_, session| session.is_live(now));
-        if state.sessions.len() >= MAX_SESSIONS {
+        retain_live_sessions(&mut state, now);
+        if state.session_grants.len() >= MAX_SESSIONS {
             return Err(TicketExchangeError::Busy);
         }
         let pending = state
@@ -743,26 +858,29 @@ impl WorkbenchHostInner {
             .get(&payload.workspace_key)
             .cloned()
             .ok_or(TicketExchangeError::Invalid)?;
-        let session_id = random_token().map_err(|_| TicketExchangeError::Invalid)?;
+        let session_secret = random_token().map_err(|_| TicketExchangeError::Invalid)?;
+        let credential_digest = session_credential_digest(&session_secret);
         let session_key = random_token().map_err(|_| TicketExchangeError::Invalid)?;
-        let session_expires_at = now.saturating_add(SESSION_ABSOLUTE_LIFETIME.as_secs());
-        state.sessions.insert(
-            session_id.clone(),
-            WorkbenchSession {
-                id: session_id.clone(),
-                selector: session_key.clone(),
-                instance_id: payload.instance_id,
-                project_id: payload.project_id.clone(),
-                workspace_key: payload.workspace_key.clone(),
-                workspace_root: workspace.root,
-                capabilities: payload.capabilities,
-                created_at: now,
-                last_activity: now,
-                expires_at: session_expires_at,
-            },
+        let session_expires_at = now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs());
+        let session = WorkbenchSession {
+            id: credential_digest.clone(),
+            selector: session_key.clone(),
+            project_id: payload.project_id.clone(),
+            workspace_key: payload.workspace_key.clone(),
+            workspace_root: workspace.root,
+            capabilities: payload.capabilities,
+            created_at: now,
+            last_activity: now,
+            expires_at: session_expires_at,
+            last_persisted_at: now,
+        };
+        state.session_grants.insert(
+            credential_digest.clone(),
+            WorkbenchSessionGrantV1::from(&session),
         );
+        state.sessions.insert(credential_digest.clone(), session);
         let result = (
-            session_id,
+            session_secret,
             WorkbenchSessionResult {
                 kind: "workbench.session",
                 ok: true,
@@ -774,31 +892,208 @@ impl WorkbenchHostInner {
             },
         );
         drop(state);
+        if self.persist_session_store().is_err() {
+            if let Ok(mut state) = self.state.lock() {
+                state.sessions.remove(&credential_digest);
+                state.session_grants.remove(&credential_digest);
+                state
+                    .pending_capabilities
+                    .insert(payload.capability_id, pending);
+            }
+            return Err(TicketExchangeError::Unavailable);
+        }
         Ok(result)
     }
 
-    pub(crate) fn session(&self, session_key: &str, session_id: &str) -> Option<WorkbenchSession> {
-        let now = unix_seconds();
-        let mut state = self.state.lock().ok()?;
-        state.sessions.retain(|_, session| session.is_live(now));
-        let session_is_bound = state.sessions.get(session_id).is_some_and(|session| {
-            session.selector == session_key
-                && session.instance_id == self.instance_id.as_ref()
-                && session.project_id == self.project.id.as_str()
-                && state
-                    .workspaces_by_key
-                    .get(&session.workspace_key)
-                    .is_some_and(|workspace| workspace.root == session.workspace_root)
-        });
-        if !session_is_bound {
-            state.sessions.remove(session_id);
+    pub(crate) fn session(
+        &self,
+        session_key: &str,
+        session_secret: &str,
+    ) -> Option<WorkbenchSession> {
+        self.session_by_digest(session_key, &session_credential_digest(session_secret))
+    }
+
+    pub(crate) fn session_by_digest(
+        &self,
+        session_key: &str,
+        credential_digest: &str,
+    ) -> Option<WorkbenchSession> {
+        if !self.restore_session(session_key, credential_digest) {
             return None;
         }
-        let session = state.sessions.get_mut(session_id)?;
-        session.last_activity = now;
-        let session = session.clone();
+        let now = unix_seconds();
+        let mut state = self.state.lock().ok()?;
+        retain_live_sessions(&mut state, now);
+        let session_is_bound = state
+            .sessions
+            .get(credential_digest)
+            .is_some_and(|session| {
+                session.selector == session_key
+                    && session.project_id == self.project.id.as_str()
+                    && state
+                        .workspaces_by_key
+                        .get(&session.workspace_key)
+                        .is_some_and(|workspace| workspace.root == session.workspace_root)
+            });
+        if !session_is_bound {
+            return None;
+        }
+        let (session, persist_activity) = {
+            let session = state.sessions.get_mut(credential_digest)?;
+            session.last_activity = now;
+            let persist_activity =
+                now.saturating_sub(session.last_persisted_at) >= SESSION_PERSIST_INTERVAL.as_secs();
+            if persist_activity {
+                session.last_persisted_at = now;
+            }
+            (session.clone(), persist_activity)
+        };
+        if persist_activity && let Some(grant) = state.session_grants.get_mut(credential_digest) {
+            grant.last_activity = now;
+        }
         drop(state);
+        if persist_activity && let Err(error) = self.persist_session_store() {
+            eprintln!("exo daemon: failed to persist workbench session activity: {error}");
+        }
         Some(session)
+    }
+
+    pub(crate) fn renew_session(
+        &self,
+        session_key: &str,
+        session_secret: &str,
+    ) -> Result<Option<WorkbenchSessionResult>> {
+        let session = match self.session(session_key, session_secret) {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+        if self
+            .validate_session_workspace(&session.workspace_root)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let now = unix_seconds();
+        let expires_at = now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs());
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let renewed = {
+            let current = state
+                .sessions
+                .get_mut(&session.id)
+                .filter(|current| current.selector == session_key);
+            let Some(current) = current else {
+                return Ok(None);
+            };
+            current.last_activity = now;
+            current.last_persisted_at = now;
+            current.expires_at = expires_at;
+            current.clone()
+        };
+        state
+            .session_grants
+            .insert(session.id.clone(), WorkbenchSessionGrantV1::from(&renewed));
+        drop(state);
+        self.persist_session_store()
+            .context("persist renewed workbench session")?;
+        Ok(Some(WorkbenchSessionResult {
+            kind: "workbench.session",
+            ok: true,
+            schema_version: 1,
+            session_key: renewed.selector,
+            project_id: renewed.project_id,
+            workspace_key: renewed.workspace_key,
+            expires_at: timestamp_for_unix_seconds(expires_at),
+        }))
+    }
+
+    fn restore_session(&self, session_key: &str, credential_digest: &str) -> bool {
+        let now = unix_seconds();
+        let grant = {
+            let Ok(mut state) = self.state.lock() else {
+                return false;
+            };
+            retain_live_sessions(&mut state, now);
+            if state.sessions.contains_key(credential_digest) {
+                return true;
+            }
+            state.session_grants.get(credential_digest).cloned()
+        };
+        let Some(grant) = grant else {
+            return false;
+        };
+        if grant.selector != session_key
+            || grant.project_id != self.project.id.as_str()
+            || !grant.is_live(now)
+        {
+            return false;
+        }
+        let Ok(root) = self.validate_workspace(&grant.workspace_root) else {
+            return false;
+        };
+        if root != grant.workspace_root {
+            return false;
+        }
+        let git = snapshot::sample_git(&root);
+        let label = git
+            .branch
+            .clone()
+            .or_else(|| {
+                git.head
+                    .as_deref()
+                    .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
+            })
+            .unwrap_or_else(|| "detached".to_string());
+        let workspace = WorkspaceRegistration {
+            key: grant.workspace_key.clone(),
+            root: root.clone(),
+            label,
+            branch: git.branch,
+            head: git.head,
+        };
+
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state
+            .session_grants
+            .get(credential_digest)
+            .is_none_or(|current| current != &grant)
+            || state
+                .workspaces_by_root
+                .get(&root)
+                .is_some_and(|key| key != &grant.workspace_key)
+            || state
+                .workspaces_by_key
+                .get(&grant.workspace_key)
+                .is_some_and(|registered| registered.root != root)
+        {
+            return false;
+        }
+        state
+            .workspaces_by_root
+            .insert(root, grant.workspace_key.clone());
+        state
+            .workspaces_by_key
+            .insert(grant.workspace_key.clone(), workspace);
+        state.sessions.insert(
+            credential_digest.to_string(),
+            WorkbenchSession {
+                id: credential_digest.to_string(),
+                selector: grant.selector,
+                project_id: grant.project_id,
+                workspace_key: grant.workspace_key,
+                workspace_root: grant.workspace_root,
+                capabilities: grant.capabilities,
+                created_at: grant.created_at,
+                last_activity: grant.last_activity,
+                expires_at: grant.expires_at,
+                last_persisted_at: grant.last_activity,
+            },
+        );
+        true
     }
 
     pub(crate) fn validate_workspace(&self, workspace_root: &Path) -> Result<PathBuf> {
@@ -846,6 +1141,32 @@ impl WorkbenchHostInner {
         Ok(resolved_root)
     }
 
+    fn persist_session_store(&self) -> Result<()> {
+        let _gate = self
+            .session_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench session store is unavailable"))?;
+        let store = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            let mut sessions = state.session_grants.values().cloned().collect::<Vec<_>>();
+            sessions.sort_by(|left, right| {
+                left.selector
+                    .cmp(&right.selector)
+                    .then_with(|| left.credential_digest.cmp(&right.credential_digest))
+            });
+            WorkbenchSessionStoreV1 {
+                schema_version: SESSION_STORE_SCHEMA_VERSION,
+                project_id: self.project.id.to_string(),
+                sessions,
+            }
+        };
+        write_session_store(&self.session_store_path, &store)
+            .with_context(|| format!("write {}", self.session_store_path.display()))
+    }
+
     fn server_stopped(&self, error: Option<String>) {
         if let Ok(mut state) = self.state.lock()
             && let Some(host) = state.host.as_mut()
@@ -853,6 +1174,16 @@ impl WorkbenchHostInner {
             host.server_task_alive = false;
             host.updated_at = timestamp_now();
             host.last_error = error;
+        }
+        self.persist_host_record();
+    }
+
+    fn mark_host_inactive(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(host) = state.host.as_mut()
+        {
+            host.server_task_alive = false;
+            host.updated_at = timestamp_now();
         }
         self.persist_host_record();
     }
@@ -885,28 +1216,25 @@ impl WorkbenchHostInner {
             );
         }
     }
+}
 
-    fn remove_owned_host_record(&self) {
-        let owned = std::fs::read(&self.host_record_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<WorkbenchHostRecord>(&bytes).ok())
-            .is_some_and(|record| {
-                record.instance_id == self.instance_id.as_ref()
-                    && record.pid == std::process::id()
-                    && record.process_start_id == self.process_start_id.as_ref()
-            });
-        if owned {
-            let _ = std::fs::remove_file(&self.host_record_path);
-        }
+fn resumable_host_port(path: &Path) -> Option<u16> {
+    let record = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WorkbenchHostRecord>(&bytes).ok())?;
+    if record.schema_version != 1 {
+        return None;
     }
+    record
+        .origin
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
 }
 
 impl WorkbenchSession {
     const fn is_live(&self, now: u64) -> bool {
-        self.created_at
-            .saturating_add(SESSION_ABSOLUTE_LIFETIME.as_secs())
-            > now
-            && self.expires_at > now
+        self.expires_at > now
             && self
                 .last_activity
                 .saturating_add(SESSION_IDLE_LIFETIME.as_secs())
@@ -918,6 +1246,46 @@ impl WorkbenchSession {
             .iter()
             .any(|candidate| candidate == capability)
     }
+}
+
+impl WorkbenchSessionGrantV1 {
+    const fn is_live(&self, now: u64) -> bool {
+        self.expires_at > now
+            && self
+                .last_activity
+                .saturating_add(SESSION_IDLE_LIFETIME.as_secs())
+                > now
+    }
+}
+
+impl From<&WorkbenchSession> for WorkbenchSessionGrantV1 {
+    fn from(session: &WorkbenchSession) -> Self {
+        Self {
+            credential_digest: session.id.clone(),
+            selector: session.selector.clone(),
+            project_id: session.project_id.clone(),
+            workspace_key: session.workspace_key.clone(),
+            workspace_root: session.workspace_root.clone(),
+            capabilities: session.capabilities.clone(),
+            created_at: session.created_at,
+            last_activity: session.last_activity,
+            expires_at: session.expires_at,
+        }
+    }
+}
+
+fn retain_live_sessions(state: &mut WorkbenchState, now: u64) {
+    state
+        .session_grants
+        .retain(|_, session| session.is_live(now));
+    state.sessions.retain(|_, session| session.is_live(now));
+    let live_sessions = state.sessions.keys().cloned().collect::<HashSet<_>>();
+    state
+        .completion_reviews
+        .retain(|_, review| live_sessions.contains(&review.session_id));
+    state
+        .completion_review_requests
+        .retain(|key, _| live_sessions.contains(&key.session_id));
 }
 
 pub fn daemon_required_failure() -> ExoFailure {
@@ -958,6 +1326,10 @@ fn random_token() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(random_bytes()?))
 }
 
+fn session_credential_digest(session_secret: &str) -> String {
+    blake3::hash(session_secret.as_bytes()).to_hex().to_string()
+}
+
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -990,6 +1362,77 @@ fn write_host_record(path: &Path, record: &WorkbenchHostRecord) -> std::io::Resu
         .persist(path)
         .map(drop)
         .map_err(|error| error.error)
+}
+
+fn read_session_store(
+    path: &Path,
+    project_id: &str,
+    now: u64,
+) -> Result<HashMap<String, WorkbenchSessionGrantV1>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let store: WorkbenchSessionStoreV1 =
+        serde_json::from_slice(&bytes).context("decode workbench session store")?;
+    if store.schema_version != SESSION_STORE_SCHEMA_VERSION || store.project_id != project_id {
+        return Ok(HashMap::new());
+    }
+    Ok(store
+        .sessions
+        .into_iter()
+        .filter(|grant| {
+            grant.project_id == project_id
+                && grant.workspace_root.is_absolute()
+                && grant.is_live(now)
+                && valid_public_token(&grant.selector)
+                && grant.credential_digest.len() == 64
+                && grant
+                    .credential_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(|grant| (grant.credential_digest.clone(), grant))
+        .collect())
+}
+
+fn write_session_store(path: &Path, store: &WorkbenchSessionStoreV1) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workbench session store path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let content = serde_json::to_vec(store)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".workbench.sessions.json.exo-tmp.")
+        .tempfile_in(parent)?;
+    use std::io::Write as _;
+    temporary.write_all(&content)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .persist(path)
+        .map(drop)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn valid_public_token(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[cfg(test)]

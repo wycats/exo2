@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import snapshotFixture from "./workbench-snapshot.v1.json";
@@ -60,6 +67,177 @@ describe("focus-only lane workbench", () => {
         "task log host-goal::implement-host --message <message>",
       ),
     ).toBeTruthy();
+  });
+
+  it("uses one command-invoked lane navigator for persistent and popover layouts", () => {
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const invoker = screen.getByRole("button", {
+      name: "Open project lanes",
+    });
+    const navigator = screen.getByRole("complementary", {
+      name: "Project lanes",
+    });
+    expect(invoker.getAttribute("commandfor")).toBe("lane-navigation");
+    expect(invoker.getAttribute("command")).toBe("toggle-popover");
+    expect(navigator.id).toBe("lane-navigation");
+  });
+
+  it("distinguishes underway goals from goals that have not started", () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals = [
+      {
+        id: "underway",
+        title: "Underway goal",
+        status: "pending",
+        tasks: [
+          { id: "done", title: "Completed evidence", status: "completed" },
+          { id: "next", title: "Pending follow-up", status: "pending" },
+        ],
+      },
+      {
+        id: "not-started",
+        title: "Not started goal",
+        status: "pending",
+        tasks: [
+          { id: "future", title: "Future work", status: "pending" },
+        ],
+      },
+    ];
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const underway = screen
+      .getByRole("heading", { name: "Underway goal" })
+      .closest("article");
+    const notStarted = screen
+      .getByRole("heading", { name: "Not started goal" })
+      .closest("article");
+    expect(within(underway!).getByText("Underway")).toBeTruthy();
+    expect(within(notStarted!).getByText("Not started")).toBeTruthy();
+    expect(within(underway!).queryByText("Pending")).toBeNull();
+  });
+
+  it("submits bounded task planning from inline controls", async () => {
+    const onPlan = vi.fn().mockResolvedValue(true);
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Add task to Establish local host and launch",
+      }),
+    );
+    await fireEvent.input(screen.getByLabelText("New task"), {
+      target: { value: "Validate the browser review card" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Add task" }));
+
+    await waitFor(() => {
+      expect(onPlan).toHaveBeenCalledWith({
+        kind: "task_add",
+        goal_id: "host-goal",
+        title: "Validate the browser review card",
+      });
+    });
+  });
+
+  it("marks a task active in Exo without implying that an agent started", async () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals[0]!.tasks.push({
+      id: "agent-handoff",
+      title: "Prepare the agent handoff",
+      status: "pending",
+    });
+    const onPlan = vi.fn().mockResolvedValue(true);
+    render(WorkbenchView, {
+      snapshot,
+      planningNotice:
+        "Exo marked the task active; the workbench did not start an agent.",
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    });
+
+    expect(screen.getByText("Ready for agent handoff.")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Exo marked the task active; the workbench did not start an agent.",
+      ),
+    ).toBeTruthy();
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark Prepare the agent handoff active in Exo",
+      }),
+    );
+    expect(onPlan).toHaveBeenCalledWith({
+      kind: "task_start",
+      task_id: "agent-handoff",
+    });
+    expect(screen.queryByTitle("Start task")).toBeNull();
+  });
+
+  it("renders a human completion review with deliberate approval and dismissal", async () => {
+    const onApproveCompletion = vi.fn().mockResolvedValue(true);
+    const onDismissCompletionReview = vi.fn();
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      completionReview: {
+        kind: "workbench.task_completion_review",
+        ok: true,
+        schema_version: 1,
+        review_id: "review-selector",
+        task_id: "implement-host",
+        readiness_rationale: "The exact focused checks pass.",
+        proposed_outcome: "Implemented the local host.",
+        approval_evidence_present: false,
+      },
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onApproveCompletion,
+      onDismissCompletionReview,
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Implement host" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Implemented the local host.")).toBeTruthy();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Approve exact outcome" }),
+    );
+    expect(onApproveCompletion).toHaveBeenCalledOnce();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Keep working" }),
+    );
+    expect(onDismissCompletionReview).toHaveBeenCalledOnce();
+  });
+
+  it("keeps refresh failure distinct from focus and planning failures", async () => {
+    const onRefresh = vi.fn();
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      refreshFailure:
+        "Exo returned an unreadable workbench response (HTTP 502, text/html)",
+      onFocus: vi.fn(),
+      onRefresh,
+    });
+
+    expect(screen.getByText("Live refresh paused.")).toBeTruthy();
+    expect(screen.queryByText("Lane focus failed.")).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(onRefresh).toHaveBeenCalledOnce();
   });
 
   it("shows only the first agent action as quiet coordination context", () => {

@@ -11,7 +11,12 @@
   import { onMount } from "svelte";
 
   import WorkbenchView from "$lib/WorkbenchView.svelte";
-  import type { WorkbenchSnapshot } from "$lib/workbench";
+  import type {
+    WorkbenchPlanningOperation,
+    WorkbenchPlanningRequest,
+    WorkbenchSnapshot,
+    WorkbenchTaskCompletionReview,
+  } from "$lib/workbench";
   import {
     createWorkbenchRequestId,
     exchangeWorkbenchTicket,
@@ -34,9 +39,23 @@
     | "workspace_unavailable"
     | "transport_error";
 
+  type SessionRecoveryState = "connected" | "reconnecting" | "needs_launch";
+
+  const SESSION_RENEW_INTERVAL_MS = 5 * 60_000;
+
   interface FocusRequest {
     laneId: string;
     requestId: string;
+  }
+
+  interface PreparedPlanningRequest {
+    request: WorkbenchPlanningRequest;
+  }
+
+  interface BoundCompletionReview {
+    review: WorkbenchTaskCompletionReview;
+    expectedRevision: number;
+    expectedPhaseId: string;
   }
 
   let screen = $state<ScreenState>("loading");
@@ -47,19 +66,32 @@
   let retryFocus = $state<FocusRequest | null>(null);
   let focusFailure = $state<string | null>(null);
   let refreshFailure = $state<string | null>(null);
+  let pendingPlanning = $state<PreparedPlanningRequest | null>(null);
+  let retryPlanning = $state<PreparedPlanningRequest | null>(null);
+  let planningFailure = $state<string | null>(null);
+  let planningNotice = $state<string | null>(null);
+  let planningSuccessCount = $state(0);
+  let completionReview = $state<BoundCompletionReview | null>(null);
   let screenMessage = $state<string | null>(null);
   let screenRetryable = $state(false);
   let retryBootstrap = $state<(() => void) | null>(null);
+  let sessionRecovery = $state<SessionRecoveryState>("connected");
+  let sessionRecoveryMessage = $state<string | null>(null);
 
   let client: WorkbenchClient | null = null;
   let ambiguousFocus: FocusRequest | null = null;
   let refreshQueued = false;
   let startLiveUpdates: (() => void) | null = null;
   let stopLiveUpdates: (() => void) | null = null;
+  let beginSessionRecovery: (() => void) | null = null;
 
   onMount(() => {
     let events: EventSource | null = null;
     let pollTimer: number | null = null;
+    let renewalTimer: number | null = null;
+    let recoveryTimer: number | null = null;
+    let recoveryAttempt = 0;
+    let recoveryInFlight = false;
     let liveUpdatesStarted = false;
     let bootstrapGeneration = 0;
 
@@ -102,6 +134,11 @@
           void refreshSnapshot(true);
         }
       }, 5_000);
+      renewalTimer = window.setInterval(() => {
+        if (document.visibilityState === "visible") {
+          void renewCurrentSession();
+        }
+      }, SESSION_RENEW_INTERVAL_MS);
       document.addEventListener("visibilitychange", refreshForVisibility);
       window.addEventListener("focus", refreshForFocus);
     };
@@ -112,15 +149,86 @@
         window.clearInterval(pollTimer);
         pollTimer = null;
       }
+      if (renewalTimer !== null) {
+        window.clearInterval(renewalTimer);
+        renewalTimer = null;
+      }
       document.removeEventListener("visibilitychange", refreshForVisibility);
       window.removeEventListener("focus", refreshForFocus);
       liveUpdatesStarted = false;
       streamConnected = false;
     };
+    const clearRecoveryTimer = () => {
+      if (recoveryTimer !== null) {
+        window.clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    };
+    const recoverSession = async () => {
+      const activeClient = client;
+      if (!activeClient || snapshot === null || recoveryInFlight) {
+        return;
+      }
+      recoveryInFlight = true;
+      clearRecoveryTimer();
+      stopUpdates();
+      sessionRecovery = "reconnecting";
+      sessionRecoveryMessage = null;
+      try {
+        await activeClient.renewSession();
+        if (client !== activeClient) {
+          return;
+        }
+        const nextSnapshot = await activeClient.snapshot();
+        if (client !== activeClient) {
+          return;
+        }
+        recoveryAttempt = 0;
+        sessionRecovery = "connected";
+        sessionRecoveryMessage = null;
+        applySnapshot(nextSnapshot);
+      } catch (error) {
+        if (client !== activeClient) {
+          return;
+        }
+        if (
+          error instanceof WorkbenchClientError &&
+          (error.kind === "session_expired" ||
+            error.kind === "workspace_unavailable")
+        ) {
+          sessionRecovery = "needs_launch";
+          sessionRecoveryMessage = messageFrom(error);
+          return;
+        }
+        recoveryAttempt += 1;
+        const delay = Math.min(15_000, 1_000 * 2 ** Math.min(recoveryAttempt, 4));
+        recoveryTimer = window.setTimeout(() => {
+          recoveryTimer = null;
+          void recoverSession();
+        }, delay);
+      } finally {
+        recoveryInFlight = false;
+      }
+    };
+    const renewCurrentSession = async () => {
+      const activeClient = client;
+      if (!activeClient || sessionRecovery !== "connected") {
+        return;
+      }
+      try {
+        await activeClient.renewSession();
+      } catch {
+        if (client === activeClient) {
+          void recoverSession();
+        }
+      }
+    };
+    beginSessionRecovery = () => void recoverSession();
     startLiveUpdates = startUpdates;
     stopLiveUpdates = stopUpdates;
 
     const resetClientState = () => {
+      clearRecoveryTimer();
       stopUpdates();
       client = null;
       snapshot = null;
@@ -129,6 +237,13 @@
       ambiguousFocus = null;
       focusFailure = null;
       refreshFailure = null;
+      pendingPlanning = null;
+      retryPlanning = null;
+      planningFailure = null;
+      completionReview = null;
+      recoveryAttempt = 0;
+      sessionRecovery = "connected";
+      sessionRecoveryMessage = null;
     };
 
     const bootstrap = async (
@@ -168,6 +283,9 @@
         }
 
         client = new WorkbenchClient(sessionKey);
+        if (!ticket) {
+          await client.renewSession();
+        }
         await refreshSnapshot(false);
       } catch (error) {
         if (isCurrent()) {
@@ -202,8 +320,10 @@
       bootstrapGeneration += 1;
       retryBootstrap = null;
       startLiveUpdates = null;
+      beginSessionRecovery = null;
       window.removeEventListener("hashchange", bootstrapFreshTicket);
       window.removeEventListener("popstate", bootstrapRestoredSession);
+      clearRecoveryTimer();
       stopUpdates();
       stopLiveUpdates = null;
     };
@@ -228,21 +348,7 @@
       if (client !== activeClient) {
         return;
       }
-      snapshot = nextSnapshot;
-      screen = "ready";
-      screenMessage = null;
-      screenRetryable = false;
-      refreshFailure = null;
-      if (
-        ambiguousFocus &&
-        nextSnapshot.focused_lane?.id === ambiguousFocus.laneId
-      ) {
-        ambiguousFocus = null;
-        focusFailure = null;
-        retryFocus = null;
-      }
-      retryBootstrap = null;
-      startLiveUpdates?.();
+      applySnapshot(nextSnapshot);
     } catch (error) {
       if (client !== activeClient) {
         return;
@@ -270,11 +376,39 @@
     }
   }
 
+  function applySnapshot(nextSnapshot: WorkbenchSnapshot): void {
+    snapshot = nextSnapshot;
+    screen = "ready";
+    screenMessage = null;
+    screenRetryable = false;
+    refreshFailure = null;
+    if (
+      completionReview &&
+      (nextSnapshot.revision !== completionReview.expectedRevision ||
+        nextSnapshot.phase?.id !== completionReview.expectedPhaseId)
+    ) {
+      completionReview = null;
+      retryPlanning = null;
+      planningFailure =
+        "The plan changed. Review task completion again from the current plan.";
+    }
+    if (
+      ambiguousFocus &&
+      nextSnapshot.focused_lane?.id === ambiguousFocus.laneId
+    ) {
+      ambiguousFocus = null;
+      focusFailure = null;
+      retryFocus = null;
+    }
+    retryBootstrap = null;
+    startLiveUpdates?.();
+  }
+
   async function focusLane(
     laneId: string,
     requestId = createWorkbenchRequestId(),
   ): Promise<void> {
-    if (!client || pendingFocus) {
+    if (!client || pendingFocus || sessionRecovery !== "connected") {
       return;
     }
 
@@ -314,9 +448,130 @@
     }
   }
 
+  function preparePlanningRequest(
+    operation: WorkbenchPlanningOperation,
+    binding?: { revision: number; phaseId: string },
+  ): PreparedPlanningRequest | null {
+    if (
+      !client ||
+      !snapshot?.phase ||
+      sessionRecovery !== "connected"
+    ) {
+      return null;
+    }
+    return {
+      request: {
+        protocol_version: 2,
+        id: createWorkbenchRequestId(),
+        session_key: client.sessionKey,
+        expected_revision: binding?.revision ?? snapshot.revision,
+        expected_phase_id: binding?.phaseId ?? snapshot.phase.id,
+        operation,
+      },
+    };
+  }
+
+  async function submitPlanning(
+    operation: WorkbenchPlanningOperation,
+  ): Promise<boolean> {
+    const prepared = preparePlanningRequest(operation);
+    return prepared ? executePlanning(prepared) : false;
+  }
+
+  async function executePlanning(
+    prepared: PreparedPlanningRequest,
+  ): Promise<boolean> {
+    if (!client || pendingPlanning) {
+      return false;
+    }
+
+    const activeClient = client;
+    pendingPlanning = prepared;
+    retryPlanning = null;
+    planningFailure = null;
+    planningNotice = null;
+    try {
+      const result = await activeClient.planning(prepared.request);
+      if (client !== activeClient) {
+        return false;
+      }
+      if (result.kind === "workbench.task_completion_review") {
+        completionReview = {
+          review: result,
+          expectedRevision: prepared.request.expected_revision,
+          expectedPhaseId: prepared.request.expected_phase_id,
+        };
+      } else {
+        completionReview = null;
+      }
+      if (prepared.request.operation.kind === "task_start") {
+        planningNotice =
+          "Exo marked the task active; the workbench did not start an agent.";
+      }
+      planningSuccessCount += 1;
+      await refreshSnapshot(true);
+      return true;
+    } catch (error) {
+      if (client !== activeClient) {
+        return false;
+      }
+      if (terminalFailure(error)) {
+        applyTerminalFailure(error);
+      } else {
+        planningFailure = messageFrom(error);
+        if (
+          error instanceof WorkbenchClientError &&
+          error.retryable &&
+          error.retryWithSameRequestId
+        ) {
+          retryPlanning = prepared;
+        }
+        if (
+          error instanceof WorkbenchClientError &&
+          (error.detailKind === "workbench.stale_snapshot" ||
+            error.detailKind === "workbench.phase_mismatch" ||
+            error.detailKind === "workbench.review_invalid")
+        ) {
+          completionReview = null;
+          await refreshSnapshot(true);
+        }
+      }
+      return false;
+    } finally {
+      if (client === activeClient) {
+        pendingPlanning = null;
+      }
+    }
+  }
+
+  async function approveCompletionReview(): Promise<boolean> {
+    if (!completionReview) {
+      return false;
+    }
+    const prepared = preparePlanningRequest(
+      {
+        kind: "task_complete_approve",
+        review_id: completionReview.review.review_id,
+      },
+      {
+        revision: completionReview.expectedRevision,
+        phaseId: completionReview.expectedPhaseId,
+      },
+    );
+    return prepared ? executePlanning(prepared) : false;
+  }
+
   function applyTerminalFailure(error: unknown): void {
     const kind =
       error instanceof WorkbenchClientError ? error.kind : "transport_error";
+    if (
+      snapshot !== null &&
+      (kind === "session_expired" || kind === "workspace_unavailable")
+    ) {
+      screen = "ready";
+      beginSessionRecovery?.();
+      return;
+    }
     screen = screenForFailure(kind);
     screenMessage = messageFrom(error);
     screenRetryable =
@@ -330,7 +585,17 @@
     }
   }
 
+  function retryPendingPlanning(): void {
+    if (retryPlanning) {
+      void executePlanning(retryPlanning);
+    }
+  }
+
   function retryTransport(): void {
+    if (snapshot !== null && sessionRecovery !== "connected") {
+      beginSessionRecovery?.();
+      return;
+    }
     if (client) {
       void refreshSnapshot(false);
     } else {
@@ -431,11 +696,27 @@
     {snapshot}
     {refreshing}
     {streamConnected}
+    {sessionRecovery}
+    {sessionRecoveryMessage}
     pendingLaneId={pendingFocus?.laneId ?? null}
-    focusFailure={focusFailure ?? refreshFailure}
+    {focusFailure}
+    {refreshFailure}
+    planningFailure={planningFailure}
+    {planningNotice}
+    {planningSuccessCount}
+    pendingPlanningKind={pendingPlanning?.request.operation.kind ?? null}
+    completionReview={completionReview?.review ?? null}
     onFocus={(laneId) => void focusLane(laneId)}
     onRetryFocus={retryFocus ? retryPendingFocus : null}
+    onRetryPlanning={retryPlanning ? retryPendingPlanning : null}
+    onRetrySession={() => beginSessionRecovery?.()}
     onRefresh={() => void refreshSnapshot(false)}
+    onPlan={submitPlanning}
+    onApproveCompletion={approveCompletionReview}
+    onDismissCompletionReview={() => {
+      completionReview = null;
+      planningFailure = null;
+    }}
   />
 {:else}
   {@const content = stateContent(screen)}
