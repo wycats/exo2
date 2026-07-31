@@ -27,6 +27,20 @@ describe("workbench snapshot contract", () => {
     );
   });
 
+  it("accepts a bounded progress-history marker", () => {
+    const bounded = structuredClone(snapshotFixture);
+    (
+      bounded.phase.goals[0]!.tasks[0] as {
+        progress_truncated?: boolean;
+      }
+    ).progress_truncated = true;
+
+    expect(
+      decodeWorkbenchSnapshot(bounded).phase?.goals[0]?.tasks[0]
+        ?.progress_truncated,
+    ).toBe(true);
+  });
+
   it("rejects non-finite steering confidence", () => {
     const malformed = structuredClone(snapshotFixture);
     malformed.steering.next_actions[0]!.confidence = Number.NaN;

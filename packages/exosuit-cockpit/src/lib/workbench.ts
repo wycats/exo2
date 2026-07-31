@@ -82,6 +82,7 @@ export interface WorkbenchTask {
   title: string;
   status: string;
   progress?: WorkbenchTaskProgress[];
+  progress_truncated?: boolean;
 }
 
 export interface WorkbenchTaskProgress {
@@ -325,6 +326,12 @@ function phase(value: unknown): void {
           string(progressItem.message, "task.progress.message");
           string(progressItem.created_at, "task.progress.created_at");
         });
+      }
+      if (taskItem.progress_truncated !== undefined) {
+        boolean(
+          taskItem.progress_truncated,
+          "task.progress_truncated",
+        );
       }
     });
   });

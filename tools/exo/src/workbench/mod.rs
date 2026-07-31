@@ -423,12 +423,18 @@ pub struct WorkbenchTask {
     pub title: String,
     pub status: String,
     pub progress: Vec<WorkbenchTaskProgress>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub progress_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkbenchTaskProgress {
     pub message: String,
     pub created_at: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

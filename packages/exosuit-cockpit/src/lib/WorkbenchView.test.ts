@@ -174,6 +174,21 @@ describe("focus-only lane workbench", () => {
     ).toBeTruthy();
   });
 
+  it("identifies a bounded recent progress window", async () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals[0]!.tasks[0]!.progress_truncated = true;
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    await fireEvent.click(screen.getByText("1 recent progress update"));
+    expect(
+      screen.getByText("Earlier or longer updates remain available in Exo."),
+    ).toBeTruthy();
+  });
+
   it("shows terminal planning entities without mutation controls", () => {
     const snapshot = fixture();
     snapshot.phase!.goals = [

@@ -359,6 +359,10 @@
 
   const taskIndex = (goal: WorkbenchGoal, task: WorkbenchTask): number =>
     goal.tasks.findIndex((candidate) => candidate.id === task.id);
+  const progressSummary = (count: number, truncated = false): string =>
+    `${count} ${truncated ? "recent " : ""}progress ${
+      count === 1 ? "update" : "updates"
+    }`;
 
   const planningLabel = (
     kind: WorkbenchPlanningOperation["kind"],
@@ -1019,8 +1023,7 @@
                         {#if progress.length > 0}
                           <details class="task-progress">
                             <summary>
-                              {progress.length}
-                              {progress.length === 1 ? "progress update" : "progress updates"}
+                              {progressSummary(progress.length, task.progress_truncated)}
                             </summary>
                             <ol>
                               {#each progress as entry}
@@ -1032,6 +1035,11 @@
                                 </li>
                               {/each}
                             </ol>
+                            {#if task.progress_truncated}
+                              <p class="task-progress-note">
+                                Earlier or longer updates remain available in Exo.
+                              </p>
+                            {/if}
                           </details>
                         {/if}
 
@@ -1933,6 +1941,12 @@
 
   .task-progress time {
     white-space: nowrap;
+  }
+
+  .task-progress .task-progress-note {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 0.63rem;
   }
 
   .task-actions {

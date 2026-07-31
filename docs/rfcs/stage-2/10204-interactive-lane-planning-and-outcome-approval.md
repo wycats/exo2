@@ -73,8 +73,10 @@ commit.
 
 Committed progress notes return in later snapshots as timestamped task progress.
 The host projects only canonical `progress` entries; internal task-log kinds do
-not become browser data. The cockpit keeps those entries compact until a person
-opens them for review.
+not become browser data. Each task carries at most its eight most recent updates
+and 16 KiB of progress text. A `progress_truncated` marker tells the cockpit
+that earlier or longer canonical history remains available through Exo. The
+cockpit keeps the recent entries compact until a person opens them for review.
 
 While a request is in flight, the relevant control is pending and cannot submit
 a second intention. The browser does not optimistically rewrite the plan. On
@@ -497,7 +499,8 @@ contains the changed entity, it does not acquire the issuing workspace's focus.
 `WorkbenchSnapshot` remains schema version 1. Goal-progress presentation is
 derived in the client from existing task statuses. Each task may also carry an
 additive `progress` collection containing the message and timestamp of canonical
-progress logs; older clients ignore that field.
+progress logs plus an additive `progress_truncated` marker when the bounded
+recent window omits canonical history; older clients ignore those fields.
 
 The host accepts version-one snapshot and lane-focus requests while adding
 version-two planning requests. Older embedded clients continue to orient and

@@ -208,6 +208,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
                         message: "Captured browser evidence.".to_string(),
                         created_at: "2026-07-28T19:45:00Z".to_string(),
                     }],
+                    progress_truncated: false,
                 }],
             }],
         }),
@@ -994,6 +995,15 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             &format!("Internal note from {}", fixture.root.display()),
         )
         .expect("add non-progress task note");
+    for index in 0..10 {
+        writer
+            .add_task_log(
+                "implement",
+                "progress",
+                &format!("Recent browser evidence {index}."),
+            )
+            .expect("add bounded browser-safe progress");
+    }
     let lane = writer
         .add_workbench_lane(
             "Host and launch",
@@ -1033,11 +1043,22 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
     let progress = &snapshot.phase.as_ref().expect("phase").goals[0].tasks[0].progress;
     assert_eq!(
         progress.len(),
-        1,
+        8,
+        "the snapshot exposes only a bounded recent progress window"
+    );
+    assert_eq!(progress[0].message, "Recent browser evidence 2.");
+    assert_eq!(progress[7].message, "Recent browser evidence 9.");
+    assert!(!progress[0].created_at.is_empty());
+    assert!(
+        snapshot.phase.as_ref().expect("phase").goals[0].tasks[0].progress_truncated,
+        "the snapshot identifies omitted progress history"
+    );
+    assert!(
+        progress
+            .iter()
+            .all(|entry| !entry.message.contains("Internal note")),
         "the snapshot withholds non-progress task log kinds"
     );
-    assert_eq!(progress[0].message, "Captured browser evidence.");
-    assert!(!progress[0].created_at.is_empty());
     assert!(snapshot.diagnostics.is_empty());
     assert!(snapshot.steering.next_actions.iter().all(|action| matches!(
         action.intent.as_str(),
