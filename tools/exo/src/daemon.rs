@@ -2780,13 +2780,16 @@ pub async fn run_daemon(
     let request_admission = Arc::new(tokio::sync::Semaphore::new(
         DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
     ));
+    let dispatch_request_admission = Arc::clone(&request_admission);
+    let replay_request_admission = Arc::clone(&request_admission);
+    let replay_outcome_ledger = Arc::clone(&outcome_ledger);
     let dispatcher = DaemonRequestDispatcher::new(move |req: RequestEnvelope| {
         let workspace = Arc::clone(&request_workspace);
         let project = Arc::clone(&request_project);
         let diagnostics = handler_diagnostics.clone();
         let outcome_ledger = Arc::clone(&request_outcome_ledger);
         let instance_id = Arc::clone(&request_instance_id);
-        let request_admission = Arc::clone(&request_admission);
+        let request_admission = Arc::clone(&dispatch_request_admission);
         let runtime_services = request_runtime_services.clone();
         let write_tx = request_write_tx.clone();
         async move {
@@ -2999,6 +3002,30 @@ pub async fn run_daemon(
                 },
             )
             .await
+        }
+    })
+    .with_terminal_replay(move |request: RequestEnvelope| {
+        let outcome_ledger = Arc::clone(&replay_outcome_ledger);
+        let request_admission = Arc::clone(&replay_request_admission);
+        async move {
+            let permit = request_admission
+                .try_acquire_owned()
+                .map_err(|_| planning::WorkbenchPlanningError::busy())?;
+            let request_id = request.id.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                outcome_ledger
+                    .terminal_outcome_before_preparation(&request)
+                    .map(|outcome| {
+                        outcome.map(|mut outcome| {
+                            outcome.response.id = request_id;
+                            outcome.response
+                        })
+                    })
+                    .map_err(|_| planning::WorkbenchPlanningError::internal())
+            })
+            .await
+            .map_err(|_| planning::WorkbenchPlanningError::internal())?
         }
     });
     if let Err(error) = runtime_services.set_dispatcher(dispatcher.clone()) {

@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub(crate) const PLANNING_PROTOCOL_VERSION: u32 = 2;
 pub(crate) const PLANNING_CONTEXT_FIELD: &str = "_exo_workbench_planning";
+pub(super) const MAX_COMPLETION_REVIEWS_IN_FLIGHT: usize = 32;
 pub(crate) const PLANNING_CAPABILITIES: [&str; 7] = [
     "workbench.task.add",
     "workbench.task.update",
@@ -42,13 +43,34 @@ pub(super) struct BrowserPlanningRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::enum_variant_names)]
 pub(super) enum BrowserPlanningOperation {
-    TaskAdd { goal_id: String, title: String },
-    TaskUpdate { task_id: String, title: String },
-    TaskReorder { task_id: String, position: usize },
-    TaskStart { task_id: String },
-    TaskLog { task_id: String, message: String },
-    TaskCompleteReview { task_id: String, outcome: String },
-    TaskCompleteApprove { review_id: String },
+    TaskAdd {
+        goal_id: String,
+        title: String,
+    },
+    TaskUpdate {
+        task_id: String,
+        title: String,
+    },
+    TaskReorder {
+        task_id: String,
+        position: usize,
+    },
+    TaskStart {
+        task_id: String,
+    },
+    TaskLog {
+        task_id: String,
+        message: String,
+    },
+    TaskCompleteReview {
+        task_id: String,
+        outcome: String,
+    },
+    TaskCompleteApprove {
+        review_id: String,
+        task_id: String,
+        outcome: String,
+    },
 }
 
 impl BrowserPlanningOperation {
@@ -259,6 +281,15 @@ impl WorkbenchPlanningError {
         )
     }
 
+    pub(crate) const fn busy() -> Self {
+        Self::new(
+            "workbench.busy",
+            "The workbench planning service is busy",
+            ErrorCode::PreconditionFailed,
+            true,
+        )
+    }
+
     const fn new(
         kind: &'static str,
         message: &'static str,
@@ -446,6 +477,59 @@ pub(super) fn mutation_request(
     Ok(request)
 }
 
+pub(super) fn completion_approval_request(
+    id: String,
+    workspace_root: std::path::PathBuf,
+    session: &WorkbenchSession,
+    expected_daemon_instance_id: String,
+    expected_revision: u64,
+    expected_phase_id: String,
+    review_id: String,
+    task_id: String,
+    proposed_outcome: String,
+) -> Result<RequestEnvelope, WorkbenchPlanningError> {
+    if task_id.trim().is_empty() || review_id.trim().is_empty() {
+        return Err(WorkbenchPlanningError::invalid_input());
+    }
+    validate_message(&proposed_outcome)?;
+    let context = WorkbenchPlanningContext {
+        schema_version: 1,
+        session_id: session.id.clone(),
+        expected_daemon_instance_id,
+        expected_revision,
+        expected_phase_id,
+        operation: WorkbenchPlanningContextOperation::TaskCompleteApprove {
+            task_id: task_id.clone(),
+            review_id,
+        },
+    };
+    let mut request = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id,
+        op: Op::Call(CallParams {
+            address: crate::api::protocol::Address::Operation {
+                path: vec!["task".to_string(), "complete".to_string()],
+            },
+            input: json!({
+                "id": task_id,
+                "log": proposed_outcome,
+            }),
+        }),
+        workspace_root: Some(workspace_root),
+        auth: None,
+        workflow_confirmation: Some(crate::api::protocol::WorkflowConfirmationInput {
+            kind: "workflow_completion_confirmation".to_string(),
+            entity_type: "task".to_string(),
+            entity_id: task_id,
+            decision: crate::api::protocol::WorkflowConfirmationDecision::YesComplete,
+            outcome: proposed_outcome,
+        }),
+        agent_id: None,
+    };
+    attach_context(&mut request, &context)?;
+    Ok(request)
+}
+
 impl WorkbenchHostInner {
     pub(super) fn completion_review(
         &self,
@@ -578,6 +662,8 @@ impl WorkbenchHostInner {
         expected_revision: u64,
         expected_phase_id: &str,
         review_id: &str,
+        task_id: &str,
+        proposed_outcome: &str,
     ) -> Result<PreparedCompletionApproval, WorkbenchPlanningError> {
         let mut state = self
             .state
@@ -591,6 +677,8 @@ impl WorkbenchHostInner {
         if review.expected_daemon_instance_id != expected_daemon_instance_id
             || review.expected_revision != expected_revision
             || review.expected_phase_id != expected_phase_id
+            || review.task_id != task_id
+            || review.proposed_outcome != proposed_outcome
         {
             return Err(WorkbenchPlanningError::review_invalid());
         }
@@ -784,12 +872,8 @@ pub(crate) fn safe_planning_error(response: &ResponseEnvelope) -> WorkbenchPlann
         Some("workbench.invalid_transition") => WorkbenchPlanningError::invalid_transition(),
         Some("workbench.invalid_input") => WorkbenchPlanningError::invalid_input(),
         Some("workbench.review_invalid") => WorkbenchPlanningError::review_invalid(),
-        Some("daemon.busy" | "workbench.busy") => WorkbenchPlanningError::new(
-            "workbench.busy",
-            "The workbench planning service is busy",
-            ErrorCode::PreconditionFailed,
-            true,
-        ),
+        Some("daemon.busy" | "workbench.busy") => WorkbenchPlanningError::busy(),
+        Some("daemon.request_id_conflict") => WorkbenchPlanningError::invalid_input(),
         _ if response.error.as_ref().is_some_and(|error| {
             matches!(
                 error.code,

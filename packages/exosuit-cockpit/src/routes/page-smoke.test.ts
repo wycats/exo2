@@ -242,6 +242,66 @@ describe("cockpit page", () => {
     });
   });
 
+  it("enters recovery immediately when a live refresh returns an unreadable response", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const renewal = deferred<Response>();
+    let snapshotReads = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      snapshotReads += 1;
+      const request = JSON.parse(String(init?.body));
+      if (snapshotReads === 2) {
+        return new Response("temporary upstream failure", {
+          status: 500,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: {
+            ...snapshotFixture,
+            revision: snapshotReads === 1 ? 7 : 8,
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    expect(await screen.findByText("Reconnecting to Exo.")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Refresh workbench",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    renewal.resolve(sessionResponse("session-selector"));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+    });
+  });
+
   it("shows a compact recovery boundary when the replacement cannot resume the snapshot", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     let snapshotReads = 0;
@@ -839,6 +899,8 @@ describe("cockpit page", () => {
       operation: {
         kind: "task_complete_approve",
         review_id: "review-selector",
+        task_id: "implement-host",
+        outcome: "Implemented the exact local host contract.",
       },
     });
     expect(planningRequests[1]!.id).not.toBe(planningRequests[0]!.id);
@@ -970,11 +1032,13 @@ describe("cockpit page", () => {
     activeSnapshot.phase.goals[0]!.tasks.at(-1)!.status = "in-progress";
     const planningRequests: WorkbenchPlanningRequest[] = [];
     let taskStarted = false;
+    let sessionExchanges = 0;
     const fetcher = vi
       .fn<typeof fetch>()
       .mockImplementation(async (path, init) => {
         if (path === "/api/session") {
-          return sessionResponse("session-selector");
+          sessionExchanges += 1;
+          return sessionResponse(`session-selector-${sessionExchanges}`);
         }
         const request = JSON.parse(String(init?.body));
         if (request.protocol_version === 2) {
@@ -1029,6 +1093,19 @@ describe("cockpit page", () => {
         "Exo marked the task active; the workbench did not start an agent.",
       ),
     ).toBeTruthy();
+
+    history.replaceState(history.state, "", "/#ticket=v1.fresh-ticket");
+    window.dispatchEvent(new Event("hashchange"));
+
+    await waitFor(() => {
+      expect(sessionExchanges).toBe(2);
+      expect(screen.queryByText("Ready for agent handoff.")).toBeNull();
+      expect(
+        screen.queryByText(
+          "Exo marked the task active; the workbench did not start an agent.",
+        ),
+      ).toBeNull();
+    });
   });
 
   it("retries an ambiguous planning write with the exact prepared request", async () => {

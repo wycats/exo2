@@ -5,7 +5,7 @@ use super::{
 };
 use crate::api::protocol::{
     Address, CallParams, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RequestEnvelope,
-    ResponseEnvelope, Status, WorkflowConfirmationDecision, WorkflowConfirmationInput,
+    ResponseEnvelope, Status,
 };
 use async_stream::stream;
 use axum::Json;
@@ -379,6 +379,14 @@ async fn run_planning_command(
     inner.touch_daemon_activity();
 
     if let BrowserPlanningOperation::TaskCompleteReview { task_id, outcome } = &request.operation {
+        let permit = match inner.completion_review_admission().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return no_store_json(
+                    planning::WorkbenchPlanningError::busy().response(request.id),
+                );
+            }
+        };
         let review_inner = Arc::clone(&inner);
         let review_session = session.clone();
         let request_id = request.id.clone();
@@ -388,6 +396,7 @@ async fn run_planning_command(
         let task_id = task_id.clone();
         let outcome = outcome.clone();
         let review = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             review_inner.completion_review(
                 &review_session,
                 &request_id,
@@ -416,7 +425,32 @@ async fn run_planning_command(
     };
     let operation_name = request.operation.operation_name();
     let review_binding = match &request.operation {
-        BrowserPlanningOperation::TaskCompleteApprove { review_id } => {
+        BrowserPlanningOperation::TaskCompleteApprove {
+            review_id,
+            task_id,
+            outcome,
+        } => {
+            let replay_envelope = match planning::completion_approval_request(
+                request.id.clone(),
+                workspace_root.clone(),
+                &session,
+                request.expected_daemon_instance_id.clone(),
+                request.expected_revision,
+                request.expected_phase_id.clone(),
+                review_id.clone(),
+                task_id.clone(),
+                outcome.clone(),
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => return no_store_json(error.response(request.id)),
+            };
+            match dispatcher.replay_terminal(replay_envelope).await {
+                Ok(Some(response)) => {
+                    return no_store_json(browser_safe_planning_response(response, operation_name));
+                }
+                Ok(None) => {}
+                Err(error) => return no_store_json(error.response(request.id)),
+            }
             let approval = match inner.prepare_completion_approval(
                 &session,
                 &request.id,
@@ -424,38 +458,26 @@ async fn run_planning_command(
                 request.expected_revision,
                 &request.expected_phase_id,
                 review_id,
+                task_id,
+                outcome,
             ) {
                 Ok(approval) => approval,
                 Err(error) => return no_store_json(error.response(request.id)),
             };
-            let task_id = approval.task_id;
-            let proposed_outcome = approval.proposed_outcome;
-            let mut envelope = RequestEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                id: request.id.clone(),
-                op: Op::Call(CallParams {
-                    address: Address::Operation {
-                        path: vec!["task".to_string(), "complete".to_string()],
-                    },
-                    input: json!({
-                        "id": task_id,
-                        "log": proposed_outcome,
-                    }),
-                }),
-                workspace_root: Some(workspace_root),
-                auth: None,
-                workflow_confirmation: Some(WorkflowConfirmationInput {
-                    kind: "workflow_completion_confirmation".to_string(),
-                    entity_type: "task".to_string(),
-                    entity_id: task_id,
-                    decision: WorkflowConfirmationDecision::YesComplete,
-                    outcome: proposed_outcome,
-                }),
-                agent_id: None,
+            let envelope = match planning::completion_approval_request(
+                request.id.clone(),
+                workspace_root,
+                &session,
+                approval.context.expected_daemon_instance_id.clone(),
+                approval.context.expected_revision,
+                approval.context.expected_phase_id.clone(),
+                review_id.clone(),
+                approval.task_id,
+                approval.proposed_outcome,
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => return no_store_json(error.response(request.id)),
             };
-            if let Err(error) = planning::attach_context(&mut envelope, &approval.context) {
-                return no_store_json(error.response(request.id));
-            }
             Some((envelope, review_id.clone()))
         }
         _ => {

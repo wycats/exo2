@@ -11,11 +11,13 @@
   import { onMount } from "svelte";
 
   import WorkbenchView from "$lib/WorkbenchView.svelte";
-  import type {
-    WorkbenchPlanningOperation,
-    WorkbenchPlanningRequest,
-    WorkbenchSnapshot,
-    WorkbenchTaskCompletionReview,
+  import {
+    workbenchPlanningBinding,
+    type WorkbenchPlanningBinding,
+    type WorkbenchPlanningOperation,
+    type WorkbenchPlanningRequest,
+    type WorkbenchSnapshot,
+    type WorkbenchTaskCompletionReview,
   } from "$lib/workbench";
   import {
     createWorkbenchRequestId,
@@ -246,6 +248,7 @@
       pendingPlanning = null;
       retryPlanning = null;
       planningFailure = null;
+      planningNotice = null;
       planningSuccess = null;
       completionReview = null;
       recoveryAttempt = 0;
@@ -373,6 +376,12 @@
           error instanceof WorkbenchClientError && error.retryable;
       } else {
         refreshFailure = messageFrom(error);
+        if (
+          error instanceof WorkbenchClientError &&
+          error.kind === "transport_error"
+        ) {
+          beginSessionRecovery?.();
+        }
       }
     } finally {
       refreshing = false;
@@ -465,17 +474,11 @@
 
   function preparePlanningRequest(
     operation: WorkbenchPlanningOperation,
-    binding?: {
-      daemonInstanceId: string;
-      revision: number;
-      phaseId: string;
-    },
+    binding?: WorkbenchPlanningBinding,
   ): PreparedPlanningRequest | null {
-    if (
-      !client ||
-      !snapshot?.phase ||
-      sessionRecovery !== "connected"
-    ) {
+    const resolvedBinding =
+      binding ?? (snapshot ? workbenchPlanningBinding(snapshot) : null);
+    if (!client || !resolvedBinding || sessionRecovery !== "connected") {
       return null;
     }
     return {
@@ -484,9 +487,9 @@
         id: createWorkbenchRequestId(),
         session_key: client.sessionKey,
         expected_daemon_instance_id:
-          binding?.daemonInstanceId ?? snapshot.daemon.instance_id,
-        expected_revision: binding?.revision ?? snapshot.revision,
-        expected_phase_id: binding?.phaseId ?? snapshot.phase.id,
+          resolvedBinding.expected_daemon_instance_id,
+        expected_revision: resolvedBinding.expected_revision,
+        expected_phase_id: resolvedBinding.expected_phase_id,
         operation,
       },
     };
@@ -494,8 +497,9 @@
 
   async function submitPlanning(
     operation: WorkbenchPlanningOperation,
+    binding?: WorkbenchPlanningBinding,
   ): Promise<boolean> {
-    const prepared = preparePlanningRequest(operation);
+    const prepared = preparePlanningRequest(operation, binding);
     return prepared ? executePlanning(prepared) : false;
   }
 
@@ -579,11 +583,14 @@
       {
         kind: "task_complete_approve",
         review_id: completionReview.review.review_id,
+        task_id: completionReview.review.task_id,
+        outcome: completionReview.review.proposed_outcome,
       },
       {
-        daemonInstanceId: completionReview.expectedDaemonInstanceId,
-        revision: completionReview.expectedRevision,
-        phaseId: completionReview.expectedPhaseId,
+        expected_daemon_instance_id:
+          completionReview.expectedDaemonInstanceId,
+        expected_revision: completionReview.expectedRevision,
+        expected_phase_id: completionReview.expectedPhaseId,
       },
     );
     return prepared ? executePlanning(prepared) : false;

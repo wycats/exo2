@@ -115,9 +115,12 @@ readiness rationale, and exact proposed outcome in a decision card. The person
 may approve it, revise the text and request a new review, or keep working.
 
 Approval is a new deliberate request. The browser sends the opaque review
-identity returned by Exo; it does not construct a workflow confirmation.
-Exo retrieves the reviewed task and outcome from the browser session, creates
-the canonical task completion confirmation internally, and commits approval
+identity returned by Exo and echoes the exact reviewed task and outcome. Those
+echoed values are replay material, not approval authority: Exo uses them to
+reconstruct the canonical request identity for a terminal ledger lookup. A new
+execution still requires the server-held review to match every echoed value.
+The browser does not construct a workflow confirmation. Exo creates the
+canonical task completion confirmation internally and commits approval
 evidence and task completion through its normal atomic path.
 
 Revising the outcome creates a new review request and a new review identity.
@@ -127,6 +130,9 @@ session expiry, and they do not form a durable queue of things that supposedly
 need the person's attention. Each session retains at most 32 transient reviews.
 When that bound is reached, Exo evicts the oldest consumed review first and
 then the oldest remaining review, together with its request-replay record.
+The host also admits at most 32 concurrent completion-review evaluations.
+Additional reviews receive a retryable busy result before entering the blocking
+readiness path.
 
 ## Reference-Level Design
 
@@ -208,6 +214,8 @@ type WorkbenchPlanningOperation =
   | {
       kind: "task_complete_approve";
       review_id: string;
+      task_id: string;
+      outcome: string;
     };
 ```
 
@@ -304,11 +312,12 @@ inside the canonical transaction. The gate remains held through commit or
 rollback and revision publication. This prevents another client from
 committing between a successful precondition check and the browser write.
 
-A completion review acquires the same gate while it compares revision,
-validates focus, and reads readiness evidence. It releases the gate without
-incrementing the revision because review cannot mutate state. This gives the
-returned review one coherent project-state boundary without treating it as a
-write.
+A completion review first enters a bounded host admission lane, then acquires
+the same revision gate while it compares revision, validates focus, and reads
+readiness evidence. It releases the gate without incrementing the revision
+because review cannot mutate state. This gives the returned review one coherent
+project-state boundary without treating it as a write or allowing review work
+to grow without bound.
 
 A revision mismatch, focus mismatch, entity outside the phase, invalid task
 transition, or invalid destination commits nothing. A stale response tells the
@@ -332,6 +341,10 @@ Changing an input also creates a new request ID.
 
 Completion review and completion approval are separate intentions. They always
 have different request IDs. Retrying either one preserves its own ID.
+For approval, Exo checks the terminal request ledger before consulting the
+transient review cache. This lets a committed approval replay after daemon
+replacement or review eviction without allowing an evicted review to authorize
+a new completion.
 
 ### Non-mutating completion review
 
@@ -366,9 +379,11 @@ canonical task ID, exact outcome, expected phase, reviewed revision, and
 canonical review result under that identity. Replaying the same review request
 ID in the same session returns the same review identity and content.
 
-An approval operation succeeds only when the review belongs to that session,
-the expected phase and revision still match the reviewed values, and the task
-is still eligible for completion. The server constructs the internal value:
+An approval operation that has no terminal ledger outcome succeeds only when
+the review belongs to that session, the echoed task and outcome exactly match
+the server-held review, the expected phase and revision still match the
+reviewed values, and the task is still eligible for completion. The server
+constructs the internal value:
 
 ```rust
 WorkflowConfirmationInput {
@@ -380,11 +395,13 @@ WorkflowConfirmationInput {
 }
 ```
 
-The browser cannot alter those fields. Approval evidence and task completion
+The browser cannot alter those fields for a new execution: any mismatch with
+the server-held review is rejected. Approval evidence and task completion
 commit together through the existing atomic request boundary. The review
 record is consumed after a terminal successful approval; an ambiguous
-transport outcome is retried with the same approval request ID so the outcome
-ledger can replay the commit.
+transport outcome is retried with the same approval request ID and exact echoed
+task and outcome so the outcome ledger can replay the commit before transient
+review lookup.
 
 ### Browser-safe results and failures
 
@@ -419,15 +436,30 @@ goal; reorder controls for that goal wait until it resolves. Unrelated goals
 may remain interactive, although Exo may conservatively reject their request
 after another write advances the revision.
 
-The client keeps an input draft separate from the snapshot. A successful write
-clears its submitted draft after the authoritative refresh. A stale or invalid
-response preserves useful text. A transport failure keeps both the payload and
-request ID for retry.
+The client keeps an input draft separate from the snapshot and captures the
+daemon instance, revision, and focused phase when the editor opens. A later
+refresh may update the visible plan, but submitting that draft retains its
+opening binding so Exo can reject it as stale instead of applying old text over
+a collaborator's change. A successful write clears its submitted draft after
+the authoritative refresh. A stale or invalid response preserves useful text.
+A transport failure keeps both the payload and request ID for retry.
 
 The completion card stores only the browser-safe review result. `Approve`
-dispatches its review identity. `Revise` restores the exact proposed outcome
-to the editor and invalidates the visible card before issuing a new review.
-`Keep working` dismisses the card without a request.
+dispatches its review identity with the exact task and outcome Exo returned.
+`Revise` restores the exact proposed outcome to the editor and invalidates the
+visible card before issuing a new review. `Keep working` dismisses the card
+without a request.
+
+Planning controls are enabled only when the snapshot has one focused lane, that
+lane belongs to the displayed phase, both lane phase and phase are in progress,
+and no focus-mismatch diagnostic is present. A missing or incoherent focus
+keeps the plan readable but non-mutating.
+
+Any transport or unreadable-response failure during live refresh enters session
+recovery immediately. The last authoritative snapshot stays visible, but all
+mutations pause while the client renews the session and obtains a fresh
+snapshot. Replacing the browser session clears notices and pending transient
+planning state from the prior session.
 
 ### Linked worktrees
 
@@ -463,7 +495,9 @@ Browser input is data, never command text. IDs are resolved against the
 expected phase rather than interpolated into a shell command. The server
 constructs every Exo address and every workflow confirmation. Review identities
 are random, session-local, and useless without the independent authenticated
-session.
+session. The task and outcome echoed for approval can identify only an already
+committed terminal ledger entry; they cannot bypass the matching live review
+required for a new execution.
 
 ## Scope
 
@@ -571,12 +605,14 @@ following evidence is green:
   linked-worktree writers;
 - request-ledger tests prove ambiguous retries preserve request ID, payload,
   completion review identity, and exactly-once approval;
-- completion tests prove review is non-mutating, approval is bound to the exact
-  reviewed outcome, revised outcomes require a new review, and stale reviews
-  cannot complete a task;
+- completion tests prove review is non-mutating and bounded, approval is bound
+  to the exact reviewed task and outcome, terminal approval replays before
+  transient review lookup, revised outcomes require a new review, and stale
+  reviews cannot complete a task;
 - browser tests cover task editing, add, reorder, start, progress, review,
-  approval, stale refresh, draft preservation, retry, keyboard operation, and
-  accessible status names;
+  approval, stale refresh, opening-snapshot draft binding, immediate transport
+  recovery, session reset, retry, keyboard operation, and accessible status
+  names;
 - view tests distinguish untouched goals from partial progress, remove
   redundant visible task-status labels, and verify balanced wrapping at narrow
   and wide layouts;

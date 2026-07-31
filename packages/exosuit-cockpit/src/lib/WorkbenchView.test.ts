@@ -146,11 +146,18 @@ describe("focus-only lane workbench", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Add task" }));
 
     await waitFor(() => {
-      expect(onPlan).toHaveBeenCalledWith({
-        kind: "task_add",
-        goal_id: "host-goal",
-        title: "Validate the browser review card",
-      });
+      expect(onPlan).toHaveBeenCalledWith(
+        {
+          kind: "task_add",
+          goal_id: "host-goal",
+          title: "Validate the browser review card",
+        },
+        {
+          expected_daemon_instance_id: "daemon-fixture",
+          expected_revision: 7,
+          expected_phase_id: "phase-fixture",
+        },
+      );
     });
   });
 
@@ -271,6 +278,49 @@ describe("focus-only lane workbench", () => {
     expect(screen.queryByLabelText("Task title")).toBeNull();
   });
 
+  it("submits an open draft against the snapshot that opened it", async () => {
+    const snapshot = fixture();
+    const onPlan = vi.fn().mockResolvedValue(false);
+    const props = {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    };
+    const view = render(WorkbenchView, props);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "A title from the observed plan" },
+    });
+
+    const refreshed = structuredClone(snapshot);
+    refreshed.revision = 8;
+    refreshed.phase!.goals[0]!.tasks[0]!.title = "A collaborator's title";
+    await view.rerender({ ...props, snapshot: refreshed });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+
+    expect(onPlan).toHaveBeenCalledWith(
+      {
+        kind: "task_update",
+        task_id: "implement-host",
+        title: "A title from the observed plan",
+      },
+      {
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+      },
+    );
+    expect((screen.getByLabelText("Task title") as HTMLInputElement).value).toBe(
+      "A title from the observed plan",
+    );
+  });
+
   it("preserves exact progress and completion text while validating non-whitespace", async () => {
     const onPlan = vi.fn().mockResolvedValue(true);
     render(WorkbenchView, {
@@ -292,11 +342,18 @@ describe("focus-only lane workbench", () => {
       screen.getByRole("button", { name: "Record progress" }),
     );
 
-    expect(onPlan).toHaveBeenLastCalledWith({
-      kind: "task_log",
-      task_id: "implement-host",
-      message: "  indented evidence\n",
-    });
+    expect(onPlan).toHaveBeenLastCalledWith(
+      {
+        kind: "task_log",
+        task_id: "implement-host",
+        message: "  indented evidence\n",
+      },
+      {
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+      },
+    );
 
     await fireEvent.click(
       screen.getByRole("button", {
@@ -309,11 +366,18 @@ describe("focus-only lane workbench", () => {
     await fireEvent.click(
       screen.getByRole("button", { name: "Review completion" }),
     );
-    expect(onPlan).toHaveBeenLastCalledWith({
-      kind: "task_complete_review",
-      task_id: "implement-host",
-      outcome: "  exact outcome\n",
-    });
+    expect(onPlan).toHaveBeenLastCalledWith(
+      {
+        kind: "task_complete_review",
+        task_id: "implement-host",
+        outcome: "  exact outcome\n",
+      },
+      {
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+      },
+    );
   });
 
   it("keeps refresh failure distinct from focus and planning failures", async () => {
@@ -457,6 +521,30 @@ describe("focus-only lane workbench", () => {
     expect(
       screen.getByRole("button", { name: "Focus Local workbench host" }),
     ).toBeTruthy();
+  });
+
+  it("disables planning when phase state has no coherent focused lane", () => {
+    const snapshot = fixture();
+    snapshot.focused_lane = null;
+    snapshot.lanes = snapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: false,
+    }));
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      screen.getByRole("button", {
+        name: "Add task to Establish local host and launch",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    ).toHaveProperty("disabled", true);
   });
 
   it("keeps completed-phase lanes visible without making them focusable", async () => {

@@ -3033,6 +3033,8 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "operation": {
             "kind": "task_complete_approve",
             "review_id": review_id,
+            "task_id": "plan-from-the-browser",
+            "outcome": "Implemented and verified shared browser planning.",
         },
     }))
     .await;
@@ -3052,6 +3054,8 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "operation": {
             "kind": "task_complete_approve",
             "review_id": review_id,
+            "task_id": "plan-from-the-browser",
+            "outcome": "Implemented and verified shared browser planning.",
         },
     });
     let approval = planning_command(approval_request.clone()).await;

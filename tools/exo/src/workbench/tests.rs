@@ -1058,6 +1058,8 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
             0,
             &phase,
             &first.review_id,
+            "review-task",
+            "Implemented the bounded planning contract.",
         )
         .expect("prepare exact approval");
     assert_eq!(approval.task_id, "review-task");
@@ -1065,6 +1067,33 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
         approval.proposed_outcome,
         "Implemented the bounded planning contract."
     );
+    for (task_id, outcome) in [
+        ("other-task", "Implemented the bounded planning contract."),
+        ("review-task", "A browser-edited outcome."),
+    ] {
+        let mismatch = manager
+            .inner
+            .prepare_completion_approval(
+                &session,
+                "mismatched-approval",
+                "test-workbench-instance",
+                0,
+                &phase,
+                &first.review_id,
+                task_id,
+                outcome,
+            )
+            .expect_err("browser approval must exactly match the server-held review");
+        assert_eq!(
+            mismatch
+                .response("mismatch".to_string())
+                .error
+                .unwrap()
+                .details
+                .unwrap()["kind"],
+            "workbench.review_invalid"
+        );
+    }
 
     manager.revision_after_write();
     let stale = manager
@@ -1153,6 +1182,30 @@ fn planning_requests_reject_unknown_fields_and_invalid_text_bounds() {
     unknown_operation_field["operation"]["command"] = json!("task add");
     serde_json::from_value::<planning::BrowserPlanningRequest>(unknown_operation_field)
         .expect_err("generic command text must be rejected");
+
+    let approval = json!({
+        "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+        "id": "planning-approval",
+        "session_key": "planning-session",
+        "expected_daemon_instance_id": "test-workbench-instance",
+        "expected_revision": 3,
+        "expected_phase_id": "planning-phase",
+        "operation": {
+            "kind": "task_complete_approve",
+            "review_id": "review-id",
+            "task_id": "planning-task",
+            "outcome": "Recorded the exact reviewed outcome.",
+        },
+    });
+    serde_json::from_value::<planning::BrowserPlanningRequest>(approval.clone())
+        .expect("approval carries exact replay material");
+    let mut incomplete_approval = approval;
+    incomplete_approval["operation"]
+        .as_object_mut()
+        .expect("approval operation")
+        .remove("outcome");
+    serde_json::from_value::<planning::BrowserPlanningRequest>(incomplete_approval)
+        .expect_err("approval without exact outcome replay material must be rejected");
 
     assert_eq!(
         planning::normalize_title("  Plan together  ").expect("trim valid title"),
@@ -1274,6 +1327,7 @@ async fn snapshot_storage_failures_are_stable_and_path_free() {
 async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     let fixture = fixture();
     let seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
+    let replay_seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
     let manager = WorkbenchHostManager::new(
         Arc::clone(&fixture.project),
         Arc::from("test-http-instance"),
@@ -1283,49 +1337,81 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         tokio::runtime::Handle::current(),
     );
     let dispatch_seen = Arc::clone(&seen);
+    let replay_capture = Arc::clone(&replay_seen);
     manager
-        .set_dispatcher(DaemonRequestDispatcher::new(move |request| {
-            let dispatch_seen = Arc::clone(&dispatch_seen);
-            async move {
-                dispatch_seen
-                    .lock()
-                    .expect("record dispatched request")
-                    .push(request.clone());
-                let (effect, result) = match &request.op {
-                    Op::Call(call)
-                        if matches!(
-                            &call.address,
-                            crate::api::protocol::Address::Operation { path }
-                                if path.as_slice() == ["task", "add"]
-                        ) =>
-                    {
-                        (
-                            Effect::Write,
-                            json!({
-                                "kind": "task.add",
-                                "ok": true,
-                                "task_id": "browser-task",
-                            }),
-                        )
+        .set_dispatcher(
+            DaemonRequestDispatcher::new(move |request| {
+                let dispatch_seen = Arc::clone(&dispatch_seen);
+                async move {
+                    dispatch_seen
+                        .lock()
+                        .expect("record dispatched request")
+                        .push(request.clone());
+                    let (effect, result) = match &request.op {
+                        Op::Call(call)
+                            if matches!(
+                                &call.address,
+                                crate::api::protocol::Address::Operation { path }
+                                    if path.as_slice() == ["task", "add"]
+                            ) =>
+                        {
+                            (
+                                Effect::Write,
+                                json!({
+                                    "kind": "task.add",
+                                    "ok": true,
+                                    "task_id": "browser-task",
+                                }),
+                            )
+                        }
+                        _ => (Effect::Pure, json!({ "kind": "test.dispatch", "ok": true })),
+                    };
+                    ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        id: request.id,
+                        status: Status::Ok,
+                        result: Some(result),
+                        error: None,
+                        ticket: None,
+                        steering: None,
+                        reminders: None,
+                        display: None,
+                        preview: None,
+                        effect: Some(effect),
+                        trace: None,
                     }
-                    _ => (Effect::Pure, json!({ "kind": "test.dispatch", "ok": true })),
-                };
-                ResponseEnvelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    id: request.id,
-                    status: Status::Ok,
-                    result: Some(result),
-                    error: None,
-                    ticket: None,
-                    steering: None,
-                    reminders: None,
-                    display: None,
-                    preview: None,
-                    effect: Some(effect),
-                    trace: None,
                 }
-            }
-        }))
+            })
+            .with_terminal_replay(move |request| {
+                let replay_capture = Arc::clone(&replay_capture);
+                async move {
+                    replay_capture
+                        .lock()
+                        .expect("record terminal replay request")
+                        .push(request.clone());
+                    Ok(
+                        (request.id == "browser-terminal-approval").then(|| ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            id: request.id,
+                            status: Status::Ok,
+                            result: Some(json!({
+                                "kind": "task.complete",
+                                "ok": true,
+                                "task_id": "terminal-task",
+                            })),
+                            error: None,
+                            ticket: None,
+                            steering: None,
+                            reminders: None,
+                            display: None,
+                            preview: None,
+                            effect: Some(Effect::Write),
+                            trace: None,
+                        }),
+                    )
+                }
+            }),
+        )
         .expect("install test dispatcher");
 
     let launch = manager.launch(&fixture.root).expect("launch workbench");
@@ -1459,6 +1545,50 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         Some("no-store")
     );
 
+    let review_permits = manager
+        .inner
+        .completion_review_admission()
+        .try_acquire_many_owned(planning::MAX_COMPLETION_REVIEWS_IN_FLIGHT as u32)
+        .expect("acquire all completion review permits");
+    let review_busy = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-busy-review",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "test-workbench-instance",
+                "expected_revision": 4,
+                "expected_phase_id": "phase-browser",
+                "operation": {
+                    "kind": "task_complete_review",
+                    "task_id": "browser-task",
+                    "outcome": "Reviewed browser completion.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("bound completion review admission");
+    assert_eq!(review_busy.status, 200, "{review_busy:?}");
+    assert_eq!(review_busy.json()["status"], "error", "{review_busy:?}");
+    assert_eq!(
+        review_busy.json()["error"]["details"]["kind"],
+        "workbench.busy",
+        "{review_busy:?}"
+    );
+    assert_eq!(
+        review_busy.json()["error"]["details"]["retry_with_same_request_id"],
+        true,
+        "{review_busy:?}"
+    );
+    drop(review_permits);
+
     let planning = raw_http(
         origin,
         "POST",
@@ -1526,6 +1656,72 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
             "browser acknowledgement must not echo planning context"
         );
     }
+
+    let terminal_approval = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-terminal-approval",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "retired-daemon-instance",
+                "expected_revision": 3,
+                "expected_phase_id": "retired-phase",
+                "operation": {
+                    "kind": "task_complete_approve",
+                    "review_id": "evicted-review",
+                    "task_id": "terminal-task",
+                    "outcome": "Recorded the exact terminal browser outcome.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("replay terminal browser approval");
+    assert_eq!(terminal_approval.status, 200, "{terminal_approval:?}");
+    assert_eq!(
+        terminal_approval.json()["result"],
+        json!({
+            "kind": "workbench.task_mutation",
+            "ok": true,
+            "schema_version": 1,
+            "operation": "task_complete_approve",
+            "task_id": "terminal-task",
+        })
+    );
+    assert_eq!(
+        seen.lock().expect("dispatched requests").len(),
+        2,
+        "terminal approval replay must not dispatch a new task completion"
+    );
+    let replayed = replay_seen.lock().expect("terminal replay requests");
+    assert_eq!(replayed.len(), 1);
+    let Op::Call(call) = &replayed[0].op else {
+        panic!("terminal approval replay must be a task completion call");
+    };
+    assert_eq!(call.input["id"], "terminal-task");
+    assert_eq!(
+        call.input["log"],
+        "Recorded the exact terminal browser outcome."
+    );
+    assert_eq!(
+        call.input[planning::PLANNING_CONTEXT_FIELD]["expected_daemon_instance_id"],
+        "retired-daemon-instance"
+    );
+    assert_eq!(
+        replayed[0]
+            .workflow_confirmation
+            .as_ref()
+            .expect("terminal approval confirmation")
+            .outcome,
+        "Recorded the exact terminal browser outcome."
+    );
+    drop(replayed);
 
     let session_id = cookie_pair
         .strip_prefix(&format!("{SESSION_COOKIE_PREFIX}{session_key}="))

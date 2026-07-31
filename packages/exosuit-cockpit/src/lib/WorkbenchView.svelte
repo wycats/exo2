@@ -34,14 +34,16 @@
   } from "@lucide/svelte";
   import { onMount } from "svelte";
 
-  import type {
-    WorkbenchDiagnostic,
-    WorkbenchGoal,
-    WorkbenchLaneSummary,
-    WorkbenchPlanningOperation,
-    WorkbenchSnapshot,
-    WorkbenchTask,
-    WorkbenchTaskCompletionReview,
+  import {
+    workbenchPlanningBinding,
+    type WorkbenchDiagnostic,
+    type WorkbenchGoal,
+    type WorkbenchLaneSummary,
+    type WorkbenchPlanningBinding,
+    type WorkbenchPlanningOperation,
+    type WorkbenchSnapshot,
+    type WorkbenchTask,
+    type WorkbenchTaskCompletionReview,
   } from "./workbench";
 
   interface Props {
@@ -66,7 +68,10 @@
     onRetryPlanning?: (() => void) | null;
     onRetrySession?: (() => void) | null;
     onRefresh: () => void;
-    onPlan?: (operation: WorkbenchPlanningOperation) => Promise<boolean>;
+    onPlan?: (
+      operation: WorkbenchPlanningOperation,
+      binding?: WorkbenchPlanningBinding,
+    ) => Promise<boolean>;
     onApproveCompletion?: () => Promise<boolean>;
     onDismissCompletionReview?: () => void;
   }
@@ -105,6 +110,7 @@
   let completionReviewCard: HTMLElement | undefined = $state();
   let compactNavigation = $state(false);
   let planningEditor = $state<PlanningEditor | null>(null);
+  let planningEditorBinding = $state<WorkbenchPlanningBinding | null>(null);
   let planningValue = $state("");
   let handledPlanningSuccessId: string | null = null;
 
@@ -114,6 +120,12 @@
   );
   let planningBusy = $derived(pendingPlanningKind !== null);
   let interactionDisabled = $derived(sessionRecovery !== "connected");
+  let planningContextAvailable = $derived(
+    workbenchPlanningBinding(snapshot) !== null,
+  );
+  let planningDisabled = $derived(
+    planningBusy || interactionDisabled || !planningContextAvailable,
+  );
   let connectionPresentation = $derived.by(() => {
     if (sessionRecovery === "reconnecting") {
       return {
@@ -304,12 +316,18 @@
   }
 
   function openEditor(editor: PlanningEditor, initialValue = ""): void {
+    const binding = workbenchPlanningBinding(snapshot);
+    if (!binding) {
+      return;
+    }
     planningEditor = editor;
+    planningEditorBinding = binding;
     planningValue = initialValue;
   }
 
   function closeEditor(): void {
     planningEditor = null;
+    planningEditorBinding = null;
     planningValue = "";
   }
 
@@ -354,7 +372,7 @@
 
   async function submitEditor(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (!planningEditor || planningBusy) {
+    if (!planningEditor || !planningEditorBinding || planningDisabled) {
       return;
     }
     const trimmedValue = planningValue.trim();
@@ -396,7 +414,7 @@
         };
         break;
     }
-    if (await onPlan(operation)) {
+    if (await onPlan(operation, planningEditorBinding)) {
       closeEditor();
     }
   }
@@ -404,7 +422,7 @@
   async function applyPlanning(
     operation: WorkbenchPlanningOperation,
   ): Promise<void> {
-    if (!planningBusy) {
+    if (!planningDisabled) {
       await onPlan(operation);
     }
   }
@@ -696,7 +714,7 @@
                 <button
                   class="secondary-button"
                   type="button"
-                  disabled={planningBusy || interactionDisabled}
+                  disabled={planningDisabled}
                   onclick={reviseCompletionReview}
                 >
                   <Pencil size={16} aria-hidden="true" />
@@ -705,7 +723,7 @@
                 <button
                   class="primary-button"
                   type="button"
-                  disabled={planningBusy || interactionDisabled}
+                  disabled={planningDisabled}
                   onclick={() => void onApproveCompletion()}
                 >
                   {#if pendingPlanningKind === "task_complete_approve"}
@@ -743,7 +761,7 @@
                       type="button"
                       title="Add task"
                       aria-label={`Add task to ${goal.title}`}
-                      disabled={planningBusy || interactionDisabled}
+                      disabled={planningDisabled}
                       onclick={() => openEditor({ kind: "add", goalId: goal.id })}
                     >
                       <Plus size={16} aria-hidden="true" />
@@ -767,8 +785,7 @@
                         type="submit"
                         title="Add task"
                         aria-label="Add task"
-                        disabled={planningBusy ||
-                          interactionDisabled ||
+                        disabled={planningDisabled ||
                           planningValue.trim().length === 0}
                       >
                         {#if pendingPlanningKind === "task_add"}
@@ -817,7 +834,7 @@
                                   type="button"
                                   title="Mark active in Exo"
                                   aria-label={`Mark ${task.title} active in Exo`}
-                                  disabled={planningBusy || interactionDisabled}
+                                  disabled={planningDisabled}
                                   onclick={() =>
                                     void applyPlanning({
                                       kind: "task_start",
@@ -832,7 +849,7 @@
                                 type="button"
                                 title="Edit title"
                                 aria-label={`Edit ${task.title}`}
-                                disabled={planningBusy || interactionDisabled}
+                                disabled={planningDisabled}
                                 onclick={() =>
                                   openEditor(
                                     { kind: "edit", taskId: task.id },
@@ -846,7 +863,7 @@
                                 type="button"
                                 title="Move up"
                                 aria-label={`Move ${task.title} up`}
-                                disabled={planningBusy || interactionDisabled || index === 0}
+                                disabled={planningDisabled || index === 0}
                                 onclick={() =>
                                   void applyPlanning({
                                     kind: "task_reorder",
@@ -861,8 +878,7 @@
                                 type="button"
                                 title="Move down"
                                 aria-label={`Move ${task.title} down`}
-                                disabled={planningBusy ||
-                                  interactionDisabled ||
+                                disabled={planningDisabled ||
                                   index === goal.tasks.length - 1}
                                 onclick={() =>
                                   void applyPlanning({
@@ -879,7 +895,7 @@
                                   type="button"
                                   title="Record progress"
                                   aria-label={`Record progress for ${task.title}`}
-                                  disabled={planningBusy || interactionDisabled}
+                                  disabled={planningDisabled}
                                   onclick={() =>
                                     openEditor({ kind: "log", taskId: task.id })}
                                 >
@@ -890,7 +906,7 @@
                                   type="button"
                                   title="Review completion"
                                   aria-label={`Review completion of ${task.title}`}
-                                  disabled={planningBusy || interactionDisabled}
+                                  disabled={planningDisabled}
                                   onclick={() =>
                                     openEditor({ kind: "review", taskId: task.id })}
                                 >
@@ -916,8 +932,7 @@
                                 type="submit"
                                 title="Save title"
                                 aria-label="Save task title"
-                                disabled={planningBusy ||
-                                  interactionDisabled ||
+                                disabled={planningDisabled ||
                                   planningValue.trim().length === 0}
                               >
                                 {#if pendingPlanningKind === "task_update"}
@@ -961,8 +976,7 @@
                               <button
                                 class="primary-button"
                                 type="submit"
-                                disabled={planningBusy ||
-                                  interactionDisabled ||
+                                disabled={planningDisabled ||
                                   planningValue.trim().length === 0}
                               >
                                 {#if pendingPlanningKind === "task_log"}
@@ -998,8 +1012,7 @@
                               <button
                                 class="primary-button"
                                 type="submit"
-                                disabled={planningBusy ||
-                                  interactionDisabled ||
+                                disabled={planningDisabled ||
                                   planningValue.trim().length === 0}
                               >
                                 {#if pendingPlanningKind === "task_complete_review"}

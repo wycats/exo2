@@ -128,7 +128,18 @@ export type WorkbenchPlanningOperation =
   | { kind: "task_start"; task_id: string }
   | { kind: "task_log"; task_id: string; message: string }
   | { kind: "task_complete_review"; task_id: string; outcome: string }
-  | { kind: "task_complete_approve"; review_id: string };
+  | {
+      kind: "task_complete_approve";
+      review_id: string;
+      task_id: string;
+      outcome: string;
+    };
+
+export interface WorkbenchPlanningBinding {
+  expected_daemon_instance_id: string;
+  expected_revision: number;
+  expected_phase_id: string;
+}
 
 export interface WorkbenchPlanningRequest {
   protocol_version: 2;
@@ -168,6 +179,31 @@ export interface WorkbenchTaskCompletionReview {
 export type WorkbenchPlanningResult =
   | WorkbenchTaskMutationResult
   | WorkbenchTaskCompletionReview;
+
+export function workbenchPlanningBinding(
+  snapshot: WorkbenchSnapshot,
+): WorkbenchPlanningBinding | null {
+  const lane = snapshot.focused_lane;
+  const phase = snapshot.phase;
+  if (
+    lane === null ||
+    phase === null ||
+    !lane.focused_here ||
+    lane.phase_id !== phase.id ||
+    lane.phase_status !== "in-progress" ||
+    phase.status !== "in-progress" ||
+    snapshot.diagnostics.some(
+      (diagnostic) => diagnostic.code === "lane.phase_focus_mismatch",
+    )
+  ) {
+    return null;
+  }
+  return {
+    expected_daemon_instance_id: snapshot.daemon.instance_id,
+    expected_revision: snapshot.revision,
+    expected_phase_id: phase.id,
+  };
+}
 
 export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");

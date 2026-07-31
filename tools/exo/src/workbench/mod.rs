@@ -39,11 +39,23 @@ pub(crate) const SESSION_COOKIE_PREFIX: &str = "exo_workbench_session_";
 
 type DispatchFuture = Pin<Box<dyn Future<Output = ResponseEnvelope> + Send>>;
 type DispatchFn = dyn Fn(RequestEnvelope) -> DispatchFuture + Send + Sync;
+type TerminalReplayFuture = Pin<
+    Box<
+        dyn Future<
+                Output = std::result::Result<
+                    Option<ResponseEnvelope>,
+                    planning::WorkbenchPlanningError,
+                >,
+            > + Send,
+    >,
+>;
+type TerminalReplayFn = dyn Fn(RequestEnvelope) -> TerminalReplayFuture + Send + Sync;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct DaemonRequestDispatcher {
     dispatch: Arc<DispatchFn>,
+    replay_terminal: Option<Arc<TerminalReplayFn>>,
 }
 
 impl DaemonRequestDispatcher {
@@ -54,11 +66,37 @@ impl DaemonRequestDispatcher {
     {
         Self {
             dispatch: Arc::new(move |request| Box::pin(dispatch(request))),
+            replay_terminal: None,
         }
+    }
+
+    pub(crate) fn with_terminal_replay<F, Fut>(mut self, replay_terminal: F) -> Self
+    where
+        F: Fn(RequestEnvelope) -> Fut + Send + Sync + 'static,
+        Fut: Future<
+                Output = std::result::Result<
+                    Option<ResponseEnvelope>,
+                    planning::WorkbenchPlanningError,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.replay_terminal = Some(Arc::new(move |request| Box::pin(replay_terminal(request))));
+        self
     }
 
     pub async fn dispatch(&self, request: RequestEnvelope) -> ResponseEnvelope {
         (self.dispatch)(request).await
+    }
+
+    pub(crate) async fn replay_terminal(
+        &self,
+        request: RequestEnvelope,
+    ) -> std::result::Result<Option<ResponseEnvelope>, planning::WorkbenchPlanningError> {
+        let Some(replay_terminal) = self.replay_terminal.as_ref() else {
+            return Ok(None);
+        };
+        replay_terminal(request).await
     }
 }
 
@@ -168,6 +206,7 @@ struct WorkbenchHostInner {
     dispatcher: OnceLock<DaemonRequestDispatcher>,
     state: Mutex<WorkbenchState>,
     event_admission: Arc<Semaphore>,
+    completion_review_admission: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -466,6 +505,9 @@ impl WorkbenchHostManager {
                 dispatcher: OnceLock::new(),
                 state: Mutex::new(state),
                 event_admission: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
+                completion_review_admission: Arc::new(Semaphore::new(
+                    planning::MAX_COMPLETION_REVIEWS_IN_FLIGHT,
+                )),
             }),
         }
     }
@@ -785,6 +827,10 @@ impl WorkbenchHostInner {
 
     pub(crate) fn event_admission(&self) -> Arc<Semaphore> {
         Arc::clone(&self.event_admission)
+    }
+
+    pub(crate) fn completion_review_admission(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.completion_review_admission)
     }
 
     pub(crate) fn touch_daemon_activity(&self) {
