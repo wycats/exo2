@@ -467,6 +467,96 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
+async fn session_activity_survives_shutdown_inside_the_persistence_interval() {
+    let fixture = fixture();
+    let manager =
+        test_manager_with_identity(Arc::clone(&fixture.project), "activity-workbench-instance");
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch activity workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let (session_secret, session) = manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem activity session");
+    let digest = session_credential_digest(&session_secret);
+    let persisted_at = unix_seconds();
+    let stale_activity = persisted_at.saturating_sub(1);
+    {
+        let mut state = manager
+            .inner
+            .state
+            .lock()
+            .expect("activity workbench state");
+        let live = state
+            .sessions
+            .get_mut(&digest)
+            .expect("live activity session");
+        live.last_activity = stale_activity;
+        live.last_persisted_at = persisted_at;
+        state
+            .session_grants
+            .get_mut(&digest)
+            .expect("durable activity session")
+            .last_activity = stale_activity;
+    }
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist stale activity fixture");
+
+    let touched = manager
+        .inner
+        .session(&session.session_key, &session_secret)
+        .expect("authenticate activity session");
+    assert!(touched.last_activity > stale_activity);
+    assert_eq!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("touched workbench state")
+            .session_grants
+            .get(&digest)
+            .expect("touched durable grant")
+            .last_activity,
+        touched.last_activity,
+        "the durable grant must track every authenticated activity touch"
+    );
+    let before_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
+        &fs::read(&manager.inner.session_store_path).expect("read throttled session store"),
+    )
+    .expect("decode throttled session store");
+    assert_eq!(
+        before_shutdown
+            .sessions
+            .iter()
+            .find(|grant| grant.credential_digest == digest)
+            .expect("persisted throttled grant")
+            .last_activity,
+        stale_activity,
+        "the normal persistence interval still throttles filesystem writes"
+    );
+
+    manager.shutdown().await;
+    let after_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
+        &fs::read(&manager.inner.session_store_path).expect("read shutdown session store"),
+    )
+    .expect("decode shutdown session store");
+    assert_eq!(
+        after_shutdown
+            .sessions
+            .iter()
+            .find(|grant| grant.credential_digest == digest)
+            .expect("persisted shutdown grant")
+            .last_activity,
+        touched.last_activity,
+        "shutdown must persist the latest authenticated activity"
+    );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
 async fn expired_durable_sessions_are_not_restored_by_a_replacement_host() {
     let fixture = fixture();
     let first_manager =

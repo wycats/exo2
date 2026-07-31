@@ -2812,6 +2812,43 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "{replay}"
     );
 
+    let runtime_ledger_path = exo::daemon::paths_for_workspace(&primary)
+        .expect("daemon paths")
+        .outcome_ledger_path();
+    let runtime_ledger = exosuit_storage::Connection::open(&runtime_ledger_path)
+        .expect("open planning runtime outcome ledger");
+    assert_eq!(
+        runtime_ledger
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+                 WHERE request_id = 'browser-primary-task-add'",
+                [],
+            )
+            .expect("simulate planning finalization loss"),
+        1,
+        "the planning request must have one runtime reservation"
+    );
+    let canonical_replay = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(planning_request.to_string()),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("replay committed planning request after finalization loss")
+    .json();
+    assert_eq!(canonical_replay["status"], "ok", "{canonical_replay}");
+    assert_eq!(
+        canonical_replay["result"]["task_id"], "plan-from-the-browser",
+        "{canonical_replay}"
+    );
+    assert!(
+        runtime_outcome_completed(&runtime_ledger_path, "browser-primary-task-add"),
+        "canonical planning replay must repair the runtime outcome"
+    );
+
     let linked_after_planning = snapshot(
         "browser-linked-after-planning",
         browser_cookies.clone(),

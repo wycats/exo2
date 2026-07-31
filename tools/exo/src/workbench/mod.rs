@@ -997,7 +997,7 @@ impl WorkbenchHostInner {
             }
             (session.clone(), persist_activity)
         };
-        if persist_activity && let Some(grant) = state.session_grants.get_mut(credential_digest) {
+        if let Some(grant) = state.session_grants.get_mut(credential_digest) {
             grant.last_activity = now;
         }
         drop(state);

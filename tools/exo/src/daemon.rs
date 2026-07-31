@@ -2878,8 +2878,12 @@ pub async fn run_daemon(
                             return planning::WorkbenchPlanningError::invalid_request()
                                 .response(handler_request_id);
                         }
-                        let request_workspace =
-                            match validated_request_workspace(&workspace, project.as_ref(), &req) {
+                        if !canonical_atomic_replay {
+                            let request_workspace = match validated_request_workspace(
+                                &workspace,
+                                project.as_ref(),
+                                &req,
+                            ) {
                                 Ok(workspace) => workspace,
                                 Err(error) => {
                                     return daemon_workspace_error_response(
@@ -2888,10 +2892,11 @@ pub async fn run_daemon(
                                     );
                                 }
                             };
-                        if let Err(error) = gate_runtime_services
-                            .validate_planning_context(&request_workspace, context)
-                        {
-                            return error.response(handler_request_id);
+                            if let Err(error) = gate_runtime_services
+                                .validate_planning_context(&request_workspace, context)
+                            {
+                                return error.response(handler_request_id);
+                            }
                         }
                     }
                     let (response, advances_revision) = match recovery {
