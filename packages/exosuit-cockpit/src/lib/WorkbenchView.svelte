@@ -132,6 +132,11 @@
   let planningContextAvailable = $derived(
     workbenchPlanningBinding(snapshot) !== null,
   );
+  let planningEditorAvailable = $derived.by(
+    () =>
+      planningContextAvailable &&
+      editorAllowsPlanning(planningEditor, snapshot),
+  );
   let planningDisabled = $derived(
     planningBusy || interactionDisabled || !planningContextAvailable,
   );
@@ -153,6 +158,7 @@
   );
   let planningSubmitDisabled = $derived(
     planningDisabled ||
+      !planningEditorAvailable ||
       planningValueForOperation.trim().length === 0 ||
       planningValueTooLarge,
   );
@@ -236,10 +242,10 @@
       !planningBusy &&
       planningEditorRebindToken > handledPlanningEditorRebindToken
     ) {
+      handledPlanningEditorRebindToken = planningEditorRebindToken;
       const binding = workbenchPlanningBinding(snapshot);
-      if (binding) {
+      if (binding && planningEditorAvailable) {
         planningEditorBinding = binding;
-        handledPlanningEditorRebindToken = planningEditorRebindToken;
       }
     }
   });
@@ -443,6 +449,30 @@
     }
   }
 
+  function editorAllowsPlanning(
+    editor: PlanningEditor | null,
+    currentSnapshot: WorkbenchSnapshot,
+  ): boolean {
+    if (!editor || !currentSnapshot.phase) {
+      return editor === null;
+    }
+    if (editor.kind === "add") {
+      const goal = currentSnapshot.phase.goals.find(
+        (candidate) => candidate.id === editor.goalId,
+      );
+      return goal !== undefined && goalAllowsPlanning(goal);
+    }
+    const task = currentSnapshot.phase.goals
+      .flatMap((goal) => goal.tasks)
+      .find((candidate) => candidate.id === editor.taskId);
+    if (!task) {
+      return false;
+    }
+    return editor.kind === "edit"
+      ? taskAllowsPlanning(task)
+      : task.status === "in-progress";
+  }
+
   function reviseCompletionReview(): void {
     if (!completionReview) {
       return;
@@ -456,7 +486,12 @@
 
   async function submitEditor(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (!planningEditor || !planningEditorBinding || planningDisabled) {
+    if (
+      !planningEditor ||
+      !planningEditorBinding ||
+      planningDisabled ||
+      !planningEditorAvailable
+    ) {
       return;
     }
     const value = planningValueForOperation;
@@ -748,6 +783,13 @@
               {displayStatus(snapshot.phase.status)}
             </span>
           </div>
+
+          {#if !snapshot.phase.planning_available}
+            <div class="planning-read-only" role="status">
+              <Info size={16} aria-hidden="true" />
+              Planning is read-only here because this phase is owned by another workspace.
+            </div>
+          {/if}
 
           {#if completionReview}
             <section
@@ -1051,6 +1093,7 @@
                                 id={`edit-task-${task.id}`}
                                 bind:value={planningValue}
                                 maxlength="512"
+                                readonly={!planningEditorAvailable}
                                 aria-invalid={planningValueTooLarge}
                                 aria-describedby={planningValueTooLarge
                                   ? `edit-task-limit-${task.id}`
@@ -1091,6 +1134,11 @@
                                 {planningValueByteLimit} bytes).
                               </p>
                             {/if}
+                            {#if !planningEditorAvailable}
+                              <p class="editor-availability" role="status">
+                                This task changed and can no longer accept this action. Your draft is preserved.
+                              </p>
+                            {/if}
                           </form>
                         {:else if planningEditor?.kind === "log" && planningEditor.taskId === task.id}
                           <form class="planning-editor task-editor" onsubmit={submitEditor}>
@@ -1099,6 +1147,7 @@
                               id={`log-task-${task.id}`}
                               bind:value={planningValue}
                               maxlength="16384"
+                              readonly={!planningEditorAvailable}
                               aria-invalid={planningValueTooLarge}
                               aria-describedby={planningValueTooLarge
                                 ? `log-task-limit-${task.id}`
@@ -1115,6 +1164,11 @@
                               >
                                 Text is too long ({planningValueByteLength} of
                                 {planningValueByteLimit} bytes).
+                              </p>
+                            {/if}
+                            {#if !planningEditorAvailable}
+                              <p class="editor-availability" role="status">
+                                This task changed and can no longer accept this action. Your draft is preserved.
                               </p>
                             {/if}
                             <div class="editor-actions">
@@ -1148,6 +1202,7 @@
                               id={`review-task-${task.id}`}
                               bind:value={planningValue}
                               maxlength="16384"
+                              readonly={!planningEditorAvailable}
                               aria-invalid={planningValueTooLarge}
                               aria-describedby={planningValueTooLarge
                                 ? `review-task-limit-${task.id}`
@@ -1164,6 +1219,11 @@
                               >
                                 Text is too long ({planningValueByteLength} of
                                 {planningValueByteLimit} bytes).
+                              </p>
+                            {/if}
+                            {#if !planningEditorAvailable}
+                              <p class="editor-availability" role="status">
+                                This task changed and can no longer accept this action. Your draft is preserved.
                               </p>
                             {/if}
                             <div class="editor-actions">
@@ -2023,11 +2083,36 @@
     resize: vertical;
   }
 
+  .planning-editor input:read-only,
+  .planning-editor textarea:read-only {
+    background: #f5f7f6;
+    color: var(--muted);
+  }
+
   .editor-validation {
     margin-top: 6px;
     color: var(--danger);
     font-size: 0.68rem;
     font-weight: 650;
+  }
+
+  .editor-availability {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 0.68rem;
+    line-height: 1.45;
+  }
+
+  .planning-read-only {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 0 18px;
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 0.72rem;
   }
 
   .editor-control {

@@ -178,6 +178,72 @@ describe("cockpit page", () => {
     });
   });
 
+  it("backs off a capacity-limited event stream while polling stays available", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    let renewalReads = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        renewalReads += 1;
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshotFixture,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    const scheduled: Array<{ callback: () => void; delay: number }> = [];
+    const timeout = vi
+      .spyOn(window, "setTimeout")
+      .mockImplementation((handler, delay) => {
+        scheduled.push({
+          callback: handler as () => void,
+          delay: Number(delay),
+        });
+        return scheduled.length as unknown as ReturnType<
+          typeof window.setTimeout
+        >;
+      });
+
+    TestEventSource.instances[0]!.fail();
+    expect(renewalReads).toBe(0);
+    expect(TestEventSource.instances).toHaveLength(1);
+    expect(scheduled.map((entry) => entry.delay)).toEqual([1_000]);
+
+    scheduled[0]!.callback();
+    expect(TestEventSource.instances).toHaveLength(2);
+    TestEventSource.instances[1]!.fail();
+    expect(renewalReads).toBe(0);
+    expect(scheduled.map((entry) => entry.delay)).toEqual([1_000, 2_000]);
+
+    scheduled[1]!.callback();
+    expect(TestEventSource.instances).toHaveLength(3);
+    TestEventSource.instances[2]!.emit("ready");
+    TestEventSource.instances[2]!.fail();
+    expect(scheduled.map((entry) => entry.delay)).toEqual([
+      1_000,
+      2_000,
+      1_000,
+    ]);
+    expect(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    ).toHaveProperty("disabled", false);
+    timeout.mockRestore();
+  });
+
   it("keeps the last cockpit visible while a replaced session reconnects", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const renewal = deferred<Response>();
@@ -306,26 +372,25 @@ describe("cockpit page", () => {
     });
   });
 
-  it("enters recovery immediately and discards an older in-flight refresh", async () => {
+  it("keeps an in-flight refresh alive while the event stream reconnects", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
-    const renewal = deferred<Response>();
-    const staleRefresh = deferred<Response>();
+    const pendingRefresh = deferred<Response>();
     let snapshotReads = 0;
     let renewalReads = 0;
-    let staleRefreshRequestId = "";
+    let pendingRefreshRequestId = "";
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session") {
         return sessionResponse("session-selector");
       }
       if (path === "/api/session/renew") {
         renewalReads += 1;
-        return renewal.promise;
+        return sessionResponse("session-selector");
       }
       snapshotReads += 1;
       const request = JSON.parse(String(init?.body));
       if (snapshotReads === 2) {
-        staleRefreshRequestId = request.id;
-        return staleRefresh.promise;
+        pendingRefreshRequestId = request.id;
+        return pendingRefresh.promise;
       }
       return new Response(
         JSON.stringify({
@@ -351,28 +416,24 @@ describe("cockpit page", () => {
 
     TestEventSource.instances[0]!.fail();
 
-    expect(await screen.findByText("Reconnecting to Exo.")).toBeTruthy();
-    expect(renewalReads).toBe(1);
+    expect(
+      await screen.findByText("Polling", { selector: ".connection" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
+    expect(renewalReads).toBe(0);
     expect(
       screen.getByRole("button", { name: "Refresh workbench" }),
     ).toHaveProperty("disabled", true);
 
-    renewal.resolve(sessionResponse("session-selector"));
-    await waitFor(() => {
-      expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
-      expect(screen.getByText("Revision 8")).toBeTruthy();
-      expect(TestEventSource.instances).toHaveLength(2);
-    });
-
-    staleRefresh.resolve(
+    pendingRefresh.resolve(
       new Response(
         JSON.stringify({
           protocol_version: 1,
-          id: staleRefreshRequestId,
+          id: pendingRefreshRequestId,
           status: "ok",
           result: {
             ...snapshotFixture,
-            revision: 6,
+            revision: 8,
           },
         }),
         { status: 200 },
@@ -384,7 +445,7 @@ describe("cockpit page", () => {
       ).toHaveProperty("disabled", false),
     );
     expect(screen.getByText("Revision 8")).toBeTruthy();
-    expect(screen.queryByText("Revision 6")).toBeNull();
+    expect(renewalReads).toBe(0);
   });
 
   it("shows a compact recovery boundary when the replacement cannot resume the snapshot", async () => {
@@ -1128,6 +1189,116 @@ describe("cockpit page", () => {
     await waitFor(() => {
       expect(screen.queryByLabelText("Task title")).toBeNull();
       expect(screen.getByText("Revision 9")).toBeTruthy();
+    });
+  });
+
+  it("waits for recovered state before rebinding a stale draft", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const planningRequests: WorkbenchPlanningRequest[] = [];
+    let snapshotReads = 0;
+    let renewalReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("session-selector");
+        }
+        if (path === "/api/session/renew") {
+          renewalReads += 1;
+          return sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.protocol_version === 2) {
+          planningRequests.push(request as WorkbenchPlanningRequest);
+          if (planningRequests.length === 1) {
+            return new Response(
+              JSON.stringify({
+                protocol_version: 1,
+                id: request.id,
+                status: "error",
+                error: {
+                  code: "precondition_failed",
+                  message: "The displayed plan is stale",
+                  details: {
+                    kind: "workbench.stale_snapshot",
+                    retry_with_same_request_id: false,
+                  },
+                },
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: {
+                kind: "workbench.task_mutation",
+                ok: true,
+                schema_version: 1,
+                operation: "task_update",
+                task_id: "implement-host",
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        snapshotReads += 1;
+        if (snapshotReads === 2) {
+          return new Response("temporary upstream failure", {
+            status: 500,
+            headers: { "Content-Type": "text/plain" },
+          });
+        }
+        const nextSnapshot = structuredClone(snapshotFixture);
+        nextSnapshot.revision = snapshotReads === 1 ? 7 : 8;
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: nextSnapshot,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "A draft awaiting recovered state" },
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+
+    await waitFor(() => {
+      expect(renewalReads).toBe(1);
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+      expect(
+        (screen.getByLabelText("Task title") as HTMLInputElement).value,
+      ).toBe("A draft awaiting recovered state");
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+    await waitFor(() => expect(planningRequests).toHaveLength(2));
+
+    expect(planningRequests[0]).toMatchObject({
+      expected_revision: 7,
+    });
+    expect(planningRequests[1]).toMatchObject({
+      expected_revision: 8,
+      operation: {
+        kind: "task_update",
+        task_id: "implement-host",
+        title: "A draft awaiting recovered state",
+      },
     });
   });
 

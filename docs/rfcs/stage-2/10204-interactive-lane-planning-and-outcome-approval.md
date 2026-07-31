@@ -270,6 +270,9 @@ Starting is valid only for a pending task, progress logging and completion
 review are valid only for an in-progress task, and reorder or title editing is
 valid for a pending or in-progress task. The server validates these
 transitions; hiding a control in the frontend is not an authorization check.
+The focused phase must also be unowned or owned by the current workspace's
+phase owner. A phase owned elsewhere remains visible as shared project context,
+but its planning controls are read-only in this workspace.
 
 `task_start` changes authoritative Exo planning state. It does not dispatch,
 notify, or resume an agent host. The cockpit labels this action as marking the
@@ -355,8 +358,11 @@ Changing an input also creates a new request ID.
 
 Completion review and completion approval are separate intentions. They always
 have different request IDs. Retrying either one preserves its own ID.
-For approval, Exo checks the terminal request ledger before consulting the
-transient review cache. This lets a committed approval replay after daemon
+For approval, Exo checks both the runtime request ledger and canonical atomic
+outcome before consulting the transient review cache. A runtime terminal
+response replays directly. A canonical outcome whose runtime response was lost
+re-enters the dispatcher only to replay the committed core and finish
+post-commit persistence. This lets a committed approval recover after daemon
 replacement or review eviction without allowing an evicted review to authorize
 a new completion.
 
@@ -456,9 +462,14 @@ refresh may update the visible plan, but submitting that draft retains its
 opening binding so Exo can reject it as stale instead of applying old text over
 a collaborator's change. A successful write clears its submitted draft after
 the authoritative refresh. A stale response preserves the text and explicitly
-rebinds that editor after the refreshed plan arrives, allowing the person to
-apply it again as a new intention. Other invalid responses preserve useful
-text. A transport failure keeps both the payload and request ID for retry.
+rebinds that editor only after the refreshed plan arrives, allowing the person
+to apply it again as a new intention. If refresh itself enters session
+recovery, rebinding remains pending until recovery applies an authoritative
+snapshot. When that snapshot shows that the task can no longer accept the
+action, the workbench preserves the draft for inspection but makes the editor
+read-only instead of offering a request that Exo must reject. Other invalid
+responses preserve useful text. A transport failure keeps both the payload and
+request ID for retry.
 An approval retry remains attached to its completion review when the approved
 write's own invalidation refreshes the snapshot before the original response is
 read.
@@ -471,17 +482,23 @@ without a request.
 
 Planning controls are enabled only when the snapshot has one focused lane, that
 lane belongs to the displayed phase, both lane phase and phase are in progress,
-and no focus-mismatch diagnostic is present. A missing or incoherent focus
-keeps the plan readable but non-mutating.
+the phase is unowned or owned here, and no focus-mismatch diagnostic is present.
+The snapshot exposes only the resulting `planning_available` boolean, not phase
+owner identity or a workspace path. A missing, incoherent, or foreign-owned
+focus keeps the plan readable but non-mutating, and the daemon repeats the
+ownership check before admitting review or mutation.
 
-Any transport or unreadable-response failure during live refresh enters session
-recovery immediately. The last authoritative snapshot stays visible, but all
-mutations pause while the client renews the session and obtains a fresh
-snapshot. Recovery invalidates snapshot requests that began under the prior
-connection so a delayed response cannot replace the recovered view. Replacing
-the browser session clears notices and pending transient planning state from
-the prior session. A session that cannot be restored asks for a current launch
-instead of retrying expired credentials.
+An event-stream failure closes that stream and retries it with bounded
+exponential backoff while ordinary snapshot polling remains active. Reaching
+the stream's `ready` event resets that backoff. A transport or
+unreadable-response failure from snapshot polling enters session recovery. The
+last authoritative snapshot stays visible, but all mutations pause while the
+client renews the session and obtains a fresh snapshot. Recovery invalidates
+snapshot requests that began under the prior connection so a delayed response
+cannot replace the recovered view. Replacing the browser session clears notices
+and pending transient planning state from the prior session. A session that
+cannot be restored asks for a current launch instead of retrying expired
+credentials.
 
 ### Linked worktrees
 
@@ -500,7 +517,10 @@ contains the changed entity, it does not acquire the issuing workspace's focus.
 derived in the client from existing task statuses. Each task may also carry an
 additive `progress` collection containing the message and timestamp of canonical
 progress logs plus an additive `progress_truncated` marker when the bounded
-recent window omits canonical history; older clients ignore those fields.
+recent window omits canonical history. The focused phase also carries the
+additive `planning_available` boolean derived from phase ownership; clients
+that do not understand it remain orientation-only rather than assuming write
+authority.
 
 The host accepts version-one snapshot and lane-focus requests while adding
 version-two planning requests. Older embedded clients continue to orient and

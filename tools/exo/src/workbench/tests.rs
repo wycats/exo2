@@ -196,6 +196,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
             id: "phase-fixture".to_string(),
             title: "Workbench foundation".to_string(),
             status: "in-progress".to_string(),
+            planning_available: true,
             goals: vec![WorkbenchGoal {
                 id: "host-goal".to_string(),
                 title: "Establish local host and launch".to_string(),
@@ -1060,6 +1061,10 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
         "the snapshot withholds non-progress task log kinds"
     );
     assert!(snapshot.diagnostics.is_empty());
+    assert!(
+        snapshot.phase.as_ref().expect("phase").planning_available,
+        "an unowned focused phase is available for planning"
+    );
     assert!(snapshot.steering.next_actions.iter().all(|action| matches!(
         action.intent.as_str(),
         "orient" | "plan" | "execute" | "record" | "verify" | "ship"
@@ -1078,6 +1083,113 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             forbidden.display()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planning_is_read_only_when_the_focused_phase_is_owned_elsewhere() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Owned Planning Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Owned Planning Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    writer
+        .add_goal(
+            &phase,
+            "owned-goal",
+            "Plan under the current owner",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add goal");
+    writer
+        .add_task("owned-goal", "owned-task", "Respect the owner", None)
+        .expect("add task");
+    let lane = writer
+        .add_workbench_lane("Owned lane", "Respect phase ownership", &phase)
+        .expect("add lane");
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    writer
+        .focus_workbench_lane(&workspace.to_string_lossy(), &lane, &phase)
+        .expect("focus lane and phase");
+    writer
+        .set_phase_owner(
+            &phase,
+            "workspace",
+            "workspace:foreign-project:owner",
+            Some("workspace:foreign-project:owner"),
+            Some("/foreign/workspace"),
+        )
+        .expect("assign another phase owner");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let registered = manager
+        .register_workspace(&fixture.root)
+        .expect("register workspace");
+    let now = unix_seconds();
+    let session = WorkbenchSession {
+        id: "owned-phase-session".to_string(),
+        selector: "owned-phase-selector".to_string(),
+        project_id: fixture.project.id.to_string(),
+        workspace_key: registered.key,
+        workspace_root: registered.root.clone(),
+        capabilities: planning::PLANNING_CAPABILITIES
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        created_at: now,
+        last_activity: now,
+        expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
+        last_persisted_at: now,
+    };
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .sessions
+        .insert(session.id.clone(), session.clone());
+
+    let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
+    assert!(
+        !snapshot.phase.as_ref().expect("phase").planning_available,
+        "a foreign-owned phase must remain visible but read-only"
+    );
+
+    let context = planning::WorkbenchPlanningContext {
+        schema_version: 1,
+        session_id: session.id,
+        expected_daemon_instance_id: "test-workbench-instance".to_string(),
+        expected_revision: snapshot.revision,
+        expected_phase_id: phase,
+        operation: planning::WorkbenchPlanningContextOperation::TaskUpdate {
+            task_id: "owned-task".to_string(),
+        },
+    };
+    let error = manager
+        .inner
+        .validate_planning_context(&registered.root, &context, false)
+        .expect_err("foreign-owned planning must be rejected");
+    assert_eq!(
+        error
+            .response("owned-phase-request".to_string())
+            .error
+            .expect("planning error")
+            .details
+            .expect("planning details")["kind"],
+        "workbench.invalid_transition"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1596,6 +1708,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     let fixture = fixture();
     let seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
     let replay_seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
+    let preparation_probe_seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
     let manager = WorkbenchHostManager::new(
         Arc::clone(&fixture.project),
         Arc::from("test-http-instance"),
@@ -1606,6 +1719,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     );
     let dispatch_seen = Arc::clone(&seen);
     let replay_capture = Arc::clone(&replay_seen);
+    let preparation_probe_capture = Arc::clone(&preparation_probe_seen);
     manager
         .set_dispatcher(
             DaemonRequestDispatcher::new(move |request| {
@@ -1629,6 +1743,22 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
                                     "kind": "task.add",
                                     "ok": true,
                                     "task_id": "browser-task",
+                                }),
+                            )
+                        }
+                        Op::Call(call)
+                            if matches!(
+                                &call.address,
+                                crate::api::protocol::Address::Operation { path }
+                                    if path.as_slice() == ["task", "complete"]
+                            ) =>
+                        {
+                            (
+                                Effect::Write,
+                                json!({
+                                    "kind": "task.complete",
+                                    "ok": true,
+                                    "task_id": call.input["id"],
                                 }),
                             )
                         }
@@ -1677,6 +1807,16 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
                             trace: None,
                         }),
                     )
+                }
+            })
+            .with_atomic_preparation_probe(move |request| {
+                let preparation_probe_capture = Arc::clone(&preparation_probe_capture);
+                async move {
+                    preparation_probe_capture
+                        .lock()
+                        .expect("record atomic preparation probe")
+                        .push(request.clone());
+                    Ok(request.id != "browser-canonical-approval")
                 }
             }),
         )
@@ -1990,6 +2130,54 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         "Recorded the exact terminal browser outcome."
     );
     drop(replayed);
+
+    let canonical_approval = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-canonical-approval",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "retired-daemon-instance",
+                "expected_revision": 3,
+                "expected_phase_id": "retired-phase",
+                "operation": {
+                    "kind": "task_complete_approve",
+                    "review_id": "evicted-canonical-review",
+                    "task_id": "canonical-task",
+                    "outcome": "Recorded the canonical browser outcome.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("replay canonical browser approval");
+    assert_eq!(canonical_approval.status, 200, "{canonical_approval:?}");
+    assert_eq!(
+        canonical_approval.json()["result"],
+        json!({
+            "kind": "workbench.task_mutation",
+            "ok": true,
+            "schema_version": 1,
+            "operation": "task_complete_approve",
+            "task_id": "canonical-task",
+        })
+    );
+    let dispatched = seen.lock().expect("dispatched requests");
+    assert_eq!(dispatched.len(), 3);
+    assert_eq!(dispatched[2].id, "browser-canonical-approval");
+    drop(dispatched);
+    let probed = preparation_probe_seen
+        .lock()
+        .expect("atomic preparation probes");
+    assert_eq!(probed.len(), 1);
+    assert_eq!(probed[0].id, "browser-canonical-approval");
+    drop(probed);
 
     let session_id = cookie_pair
         .strip_prefix(&format!("{SESSION_COOKIE_PREFIX}{session_key}="))

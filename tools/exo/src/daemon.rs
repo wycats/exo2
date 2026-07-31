@@ -2782,7 +2782,11 @@ pub async fn run_daemon(
     ));
     let dispatch_request_admission = Arc::clone(&request_admission);
     let replay_request_admission = Arc::clone(&request_admission);
+    let preparation_probe_request_admission = Arc::clone(&request_admission);
     let replay_outcome_ledger = Arc::clone(&outcome_ledger);
+    let preparation_probe_outcome_ledger = Arc::clone(&outcome_ledger);
+    let preparation_probe_project = Arc::clone(&project);
+    let preparation_probe_instance_id = Arc::clone(&instance_id);
     let dispatcher = DaemonRequestDispatcher::new(move |req: RequestEnvelope| {
         let workspace = Arc::clone(&request_workspace);
         let project = Arc::clone(&request_project);
@@ -3027,6 +3031,25 @@ pub async fn run_daemon(
                             outcome.response
                         })
                     })
+                    .map_err(|_| planning::WorkbenchPlanningError::internal())
+            })
+            .await
+            .map_err(|_| planning::WorkbenchPlanningError::internal())?
+        }
+    })
+    .with_atomic_preparation_probe(move |request: RequestEnvelope| {
+        let outcome_ledger = Arc::clone(&preparation_probe_outcome_ledger);
+        let project = Arc::clone(&preparation_probe_project);
+        let instance_id = Arc::clone(&preparation_probe_instance_id);
+        let request_admission = Arc::clone(&preparation_probe_request_admission);
+        async move {
+            let permit = request_admission
+                .try_acquire_owned()
+                .map_err(|_| planning::WorkbenchPlanningError::busy())?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                outcome_ledger
+                    .atomic_request_needs_preparation(&request, &project.db_path(), &instance_id)
                     .map_err(|_| planning::WorkbenchPlanningError::internal())
             })
             .await

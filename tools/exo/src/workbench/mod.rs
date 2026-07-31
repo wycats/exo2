@@ -50,12 +50,18 @@ type TerminalReplayFuture = Pin<
     >,
 >;
 type TerminalReplayFn = dyn Fn(RequestEnvelope) -> TerminalReplayFuture + Send + Sync;
+type AtomicPreparationProbeFuture = Pin<
+    Box<dyn Future<Output = std::result::Result<bool, planning::WorkbenchPlanningError>> + Send>,
+>;
+type AtomicPreparationProbeFn =
+    dyn Fn(RequestEnvelope) -> AtomicPreparationProbeFuture + Send + Sync;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct DaemonRequestDispatcher {
     dispatch: Arc<DispatchFn>,
     replay_terminal: Option<Arc<TerminalReplayFn>>,
+    atomic_preparation_probe: Option<Arc<AtomicPreparationProbeFn>>,
 }
 
 impl DaemonRequestDispatcher {
@@ -67,6 +73,7 @@ impl DaemonRequestDispatcher {
         Self {
             dispatch: Arc::new(move |request| Box::pin(dispatch(request))),
             replay_terminal: None,
+            atomic_preparation_probe: None,
         }
     }
 
@@ -85,18 +92,42 @@ impl DaemonRequestDispatcher {
         self
     }
 
+    pub(crate) fn with_atomic_preparation_probe<F, Fut>(
+        mut self,
+        atomic_preparation_probe: F,
+    ) -> Self
+    where
+        F: Fn(RequestEnvelope) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<bool, planning::WorkbenchPlanningError>>
+            + Send
+            + 'static,
+    {
+        self.atomic_preparation_probe = Some(Arc::new(move |request| {
+            Box::pin(atomic_preparation_probe(request))
+        }));
+        self
+    }
+
     pub async fn dispatch(&self, request: RequestEnvelope) -> ResponseEnvelope {
         (self.dispatch)(request).await
     }
 
-    pub(crate) async fn replay_terminal(
+    pub(crate) async fn replay_before_preparation(
         &self,
         request: RequestEnvelope,
     ) -> std::result::Result<Option<ResponseEnvelope>, planning::WorkbenchPlanningError> {
-        let Some(replay_terminal) = self.replay_terminal.as_ref() else {
+        if let Some(replay_terminal) = self.replay_terminal.as_ref()
+            && let Some(response) = replay_terminal(request.clone()).await?
+        {
+            return Ok(Some(response));
+        }
+        let Some(atomic_preparation_probe) = self.atomic_preparation_probe.as_ref() else {
             return Ok(None);
         };
-        replay_terminal(request).await
+        if atomic_preparation_probe(request.clone()).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.dispatch(request).await))
     }
 }
 
@@ -406,6 +437,7 @@ pub struct WorkbenchPhase {
     pub id: String,
     pub title: String,
     pub status: String,
+    pub planning_available: bool,
     pub goals: Vec<WorkbenchGoal>,
 }
 

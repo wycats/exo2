@@ -80,6 +80,7 @@
   let planningNotice = $state<string | null>(null);
   let planningSuccess = $state<PlanningSuccess | null>(null);
   let planningEditorRebindToken = $state(0);
+  let planningEditorRebindPending = false;
   let completionReview = $state<BoundCompletionReview | null>(null);
   let screenMessage = $state<string | null>(null);
   let screenRetryable = $state(false);
@@ -90,7 +91,7 @@
   let client: WorkbenchClient | null = null;
   let ambiguousFocus: FocusRequest | null = null;
   let refreshQueued = false;
-  let refreshIdleWaiters: Array<() => void> = [];
+  let refreshIdleWaiters: Array<(applied: boolean) => void> = [];
   let startLiveUpdates: (() => void) | null = null;
   let stopLiveUpdates: (() => void) | null = null;
   let beginSessionRecovery: (() => void) | null = null;
@@ -101,7 +102,9 @@
     let pollTimer: number | null = null;
     let renewalTimer: number | null = null;
     let recoveryTimer: number | null = null;
+    let eventRetryTimer: number | null = null;
     let recoveryAttempt = 0;
+    let eventRetryAttempt = 0;
     let recoveryInFlight = false;
     let liveUpdatesStarted = false;
     let bootstrapGeneration = 0;
@@ -118,29 +121,75 @@
       }
     };
 
+    const clearEventRetryTimer = () => {
+      if (eventRetryTimer !== null) {
+        window.clearTimeout(eventRetryTimer);
+        eventRetryTimer = null;
+      }
+    };
+    function scheduleEventStreamRetry(): void {
+      if (!client || !liveUpdatesStarted || eventRetryTimer !== null) {
+        return;
+      }
+      eventRetryAttempt += 1;
+      const delay = Math.min(
+        15_000,
+        1_000 * 2 ** Math.min(eventRetryAttempt - 1, 4),
+      );
+      eventRetryTimer = window.setTimeout(() => {
+        eventRetryTimer = null;
+        openEventStream();
+      }, delay);
+    }
+    function openEventStream(): void {
+      const activeClient = client;
+      if (!activeClient || !liveUpdatesStarted || events !== null) {
+        return;
+      }
+      try {
+        const nextEvents = new EventSource(activeClient.eventSourceUrl());
+        events = nextEvents;
+        nextEvents.onopen = () => {
+          if (events !== nextEvents || client !== activeClient) {
+            return;
+          }
+          streamConnected = true;
+        };
+        nextEvents.onerror = () => {
+          if (events !== nextEvents || client !== activeClient) {
+            return;
+          }
+          nextEvents.close();
+          events = null;
+          streamConnected = false;
+          scheduleEventStreamRetry();
+        };
+        nextEvents.addEventListener("ready", () => {
+          if (events !== nextEvents || client !== activeClient) {
+            return;
+          }
+          clearEventRetryTimer();
+          eventRetryAttempt = 0;
+          streamConnected = true;
+        });
+        nextEvents.addEventListener("invalidate", () => {
+          if (events !== nextEvents || client !== activeClient) {
+            return;
+          }
+          void refreshSnapshot(true);
+        });
+      } catch {
+        events = null;
+        streamConnected = false;
+        scheduleEventStreamRetry();
+      }
+    }
     const startUpdates = () => {
       if (!client || liveUpdatesStarted) {
         return;
       }
       liveUpdatesStarted = true;
-      try {
-        events = new EventSource(client.eventSourceUrl());
-        events.onopen = () => {
-          streamConnected = true;
-        };
-        events.onerror = () => {
-          streamConnected = false;
-          void recoverSession();
-        };
-        events.addEventListener("ready", () => {
-          streamConnected = true;
-        });
-        events.addEventListener("invalidate", () => {
-          void refreshSnapshot(true);
-        });
-      } catch {
-        streamConnected = false;
-      }
+      openEventStream();
       pollTimer = window.setInterval(() => {
         if (document.visibilityState === "visible") {
           void refreshSnapshot(true);
@@ -157,6 +206,8 @@
     const stopUpdates = () => {
       events?.close();
       events = null;
+      clearEventRetryTimer();
+      eventRetryAttempt = 0;
       if (pollTimer !== null) {
         window.clearInterval(pollTimer);
         pollTimer = null;
@@ -256,6 +307,7 @@
       planningNotice = null;
       planningSuccess = null;
       planningEditorRebindToken = 0;
+      planningEditorRebindPending = false;
       completionReview = null;
       recoveryAttempt = 0;
       sessionRecovery = "connected";
@@ -345,19 +397,19 @@
     };
   });
 
-  async function refreshSnapshot(quiet: boolean): Promise<void> {
+  async function refreshSnapshot(quiet: boolean): Promise<boolean> {
     if (!client) {
-      return;
+      return false;
     }
     if (refreshing) {
       refreshQueued = true;
-      await new Promise<void>((resolve) => {
+      return new Promise<boolean>((resolve) => {
         refreshIdleWaiters.push(resolve);
       });
-      return;
     }
 
     refreshing = true;
+    let applied = false;
     const refreshGeneration = snapshotRefreshGeneration;
     if (!quiet && snapshot === null) {
       screen = "loading";
@@ -369,15 +421,16 @@
         client !== activeClient ||
         refreshGeneration !== snapshotRefreshGeneration
       ) {
-        return;
+        return false;
       }
       applySnapshot(nextSnapshot);
+      applied = true;
     } catch (error) {
       if (
         client !== activeClient ||
         refreshGeneration !== snapshotRefreshGeneration
       ) {
-        return;
+        return false;
       }
       if (terminalFailure(error)) {
         applyTerminalFailure(error);
@@ -403,16 +456,17 @@
       refreshing = false;
       if (refreshQueued) {
         refreshQueued = false;
-        await refreshSnapshot(true);
+        applied = await refreshSnapshot(true);
       }
       if (!refreshing && !refreshQueued) {
         const waiters = refreshIdleWaiters;
         refreshIdleWaiters = [];
         for (const resolve of waiters) {
-          resolve();
+          resolve(applied);
         }
       }
     }
+    return applied;
   }
 
   function applySnapshot(nextSnapshot: WorkbenchSnapshot): void {
@@ -450,6 +504,10 @@
       retryFocus = null;
     }
     retryBootstrap = null;
+    if (planningEditorRebindPending) {
+      planningEditorRebindPending = false;
+      planningEditorRebindToken += 1;
+    }
     startLiveUpdates?.();
   }
 
@@ -607,12 +665,22 @@
             error.detailKind === "workbench.review_invalid");
         if (shouldRefreshPlanningContext) {
           completionReview = null;
-          await refreshSnapshot(true);
+          const applied = await refreshSnapshot(true);
           if (
             error instanceof WorkbenchClientError &&
             error.detailKind === "workbench.stale_snapshot"
           ) {
-            planningEditorRebindToken += 1;
+            const recoveredBinding =
+              snapshot !== null &&
+              (snapshot.daemon.instance_id !==
+                prepared.request.expected_daemon_instance_id ||
+                snapshot.revision !== prepared.request.expected_revision ||
+                snapshot.phase?.id !== prepared.request.expected_phase_id);
+            if (applied || recoveredBinding) {
+              planningEditorRebindToken += 1;
+            } else {
+              planningEditorRebindPending = true;
+            }
           }
         }
       }

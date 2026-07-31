@@ -45,6 +45,7 @@
     "id": "phase-fixture",
     "title": "Workbench foundation",
     "status": "in-progress",
+    "planning_available": true,
     "goals": [
       {
         "id": "host-goal",

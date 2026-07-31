@@ -5,6 +5,7 @@ use super::{
     WorkbenchTaskProgress, WorkspaceRegistration,
 };
 use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
+use crate::phase_owner::PhaseOwnerViewContext;
 use crate::project::Project;
 use crate::steering::derive_phase_steering;
 use anyhow::{Context, Result};
@@ -100,6 +101,10 @@ fn build_with_git_and_after_state_hook(
     git: GitSnapshot,
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
+    let mut workspace_project = project.clone();
+    workspace_project.workspace_root = Some(registered.root.clone());
+    let phase_owner_context =
+        PhaseOwnerViewContext::new(&registered.root, Some(&workspace_project));
     let loader = SqliteLoader::open(project.db_path())?;
     let transaction = loader
         .database()
@@ -141,9 +146,20 @@ fn build_with_git_and_after_state_hook(
                 .ok_or_else(|| anyhow::anyhow!("focused lane phase details are missing"))
         })
         .transpose()?;
+    let planning_available = focused_phase
+        .map(|phase| {
+            loader.load_phase_owner(&phase.id).map(|owner| {
+                owner
+                    .as_ref()
+                    .is_none_or(|owner| phase_owner_context.owner_view(owner).owned_here)
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
     let phase = focused_phase
         .zip(focused_phase_details.as_ref())
         .map(|(phase, details)| WorkbenchPhase {
+            planning_available,
             id: phase.id.clone(),
             title: phase.title.clone(),
             status: phase.status.clone(),

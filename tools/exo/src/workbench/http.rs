@@ -424,7 +424,7 @@ async fn run_planning_command(
                 Ok(envelope) => envelope,
                 Err(error) => return no_store_json(error.response(request.id)),
             };
-            match dispatcher.replay_terminal(replay_envelope).await {
+            match dispatcher.replay_before_preparation(replay_envelope).await {
                 Ok(Some(response)) => {
                     return no_store_json(browser_safe_planning_response(response, operation_name));
                 }

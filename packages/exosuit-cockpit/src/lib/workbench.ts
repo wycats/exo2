@@ -67,6 +67,7 @@ export interface WorkbenchPhase {
   id: string;
   title: string;
   status: string;
+  planning_available: boolean;
   goals: WorkbenchGoal[];
 }
 
@@ -199,6 +200,7 @@ export function workbenchPlanningBinding(
     lane.phase_id !== phase.id ||
     lane.phase_status !== "in-progress" ||
     phase.status !== "in-progress" ||
+    !phase.planning_available ||
     snapshot.diagnostics.some(
       (diagnostic) => diagnostic.code === "lane.phase_focus_mismatch",
     )
@@ -310,6 +312,7 @@ function phase(value: unknown): void {
   string(item.id, "phase.id");
   string(item.title, "phase.title");
   string(item.status, "phase.status");
+  boolean(item.planning_available, "phase.planning_available");
   array(item.goals, "phase.goals").forEach((goal) => {
     const goalItem = record(goal, "goal");
     string(goalItem.id, "goal.id");

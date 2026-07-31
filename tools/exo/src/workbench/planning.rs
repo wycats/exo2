@@ -779,6 +779,9 @@ impl WorkbenchHostInner {
         if !focus_is_coherent || phase.status != "in-progress" {
             return Err(WorkbenchPlanningError::phase_mismatch());
         }
+        if !phase.planning_available {
+            return Err(WorkbenchPlanningError::invalid_transition());
+        }
 
         match &context.operation {
             WorkbenchPlanningContextOperation::TaskAdd { goal_id } => {

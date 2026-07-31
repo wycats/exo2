@@ -521,6 +521,50 @@ describe("focus-only lane workbench", () => {
     );
   });
 
+  it("preserves but disables a draft when the refreshed task is immutable", async () => {
+    const snapshot = fixture();
+    const onPlan = vi.fn().mockResolvedValue(false);
+    const props = {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    };
+    const view = render(WorkbenchView, props);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "A preserved title draft" },
+    });
+
+    const completed = structuredClone(snapshot);
+    completed.revision = 8;
+    completed.phase!.goals[0]!.tasks[0]!.status = "completed";
+    await view.rerender({
+      ...props,
+      snapshot: completed,
+      planningEditorRebindToken: 1,
+    });
+
+    const editor = screen.getByLabelText("Task title") as HTMLInputElement;
+    expect(editor.value).toBe("A preserved title draft");
+    expect(editor.readOnly).toBe(true);
+    expect(
+      screen.getByText(
+        "This task changed and can no longer accept this action. Your draft is preserved.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Save task title" }),
+    ).toHaveProperty("disabled", true);
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+    expect(onPlan).not.toHaveBeenCalled();
+  });
+
   it("preserves exact progress and completion text while validating non-whitespace", async () => {
     const onPlan = vi.fn().mockResolvedValue(true);
     render(WorkbenchView, {
@@ -737,6 +781,46 @@ describe("focus-only lane workbench", () => {
       onRefresh: vi.fn(),
     });
 
+    expect(
+      screen.getByRole("button", {
+        name: "Add task to Establish local host and launch",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    ).toHaveProperty("disabled", true);
+  });
+
+  it("keeps a foreign-owned focused phase and its open draft read-only", async () => {
+    const snapshot = fixture();
+    const props = {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    };
+    const view = render(WorkbenchView, props);
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "Preserved while ownership changes" },
+    });
+
+    const foreignOwned = structuredClone(snapshot);
+    foreignOwned.phase!.planning_available = false;
+    await view.rerender({
+      ...props,
+      snapshot: foreignOwned,
+    });
+
+    expect(
+      screen.getByText(
+        "Planning is read-only here because this phase is owned by another workspace.",
+      ),
+    ).toBeTruthy();
+    const editor = screen.getByLabelText("Task title") as HTMLInputElement;
+    expect(editor.value).toBe("Preserved while ownership changes");
+    expect(editor.readOnly).toBe(true);
     expect(
       screen.getByRole("button", {
         name: "Add task to Establish local host and launch",
