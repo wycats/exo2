@@ -215,24 +215,34 @@
   const displayStatus = (status: string): string =>
     status.replaceAll("-", " ");
 
-  const statusTone = (status: string): "complete" | "active" | "pending" => {
+  type StatusTone = "complete" | "active" | "pending" | "terminal";
+
+  const statusTone = (status: string): StatusTone => {
     const normalized = status.toLowerCase();
     if (
-      normalized.includes("complete") ||
-      normalized.includes("done") ||
-      normalized.includes("closed")
+      ["completed", "complete", "done", "closed", "green"].includes(normalized)
     ) {
       return "complete";
     }
-    if (
-      normalized.includes("progress") ||
-      normalized.includes("execut") ||
-      normalized.includes("active")
-    ) {
+    if (["in-progress", "executing", "active"].includes(normalized)) {
       return "active";
     }
-    return "pending";
+    if (normalized === "pending" || normalized === "prepared") {
+      return "pending";
+    }
+    return "terminal";
   };
+
+  const statusLabel = (status: string): string => {
+    const label = displayStatus(status);
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  };
+
+  const goalAllowsPlanning = (goal: WorkbenchGoal): boolean =>
+    ["pending", "in-progress", "active"].includes(goal.status);
+
+  const taskAllowsPlanning = (task: WorkbenchTask): boolean =>
+    ["pending", "in-progress"].includes(task.status);
 
   const observedTime = (value: string): string => {
     const date = new Date(value);
@@ -271,6 +281,9 @@
     }
     if (tone === "active") {
       return "In progress";
+    }
+    if (tone === "terminal") {
+      return statusLabel(goal.status);
     }
     return goal.tasks.some((task) => statusTone(task.status) !== "pending")
       ? "Underway"
@@ -747,15 +760,17 @@
                       <CheckCircle2 size={18} />
                     {:else if statusTone(goal.status) === "active"}
                       <CircleDot size={18} />
+                    {:else if statusTone(goal.status) === "terminal"}
+                      <XCircle size={18} />
                     {:else}
                       <Circle size={18} />
-                  {/if}
+                    {/if}
                   </span>
                   <div class="goal-copy">
                     <h3>{goal.title}</h3>
                     <span>{goalProgressLabel(goal)}</span>
                   </div>
-                  {#if statusTone(goal.status) !== "complete"}
+                  {#if goalAllowsPlanning(goal)}
                     <button
                       class="planning-icon-button"
                       type="button"
@@ -818,6 +833,8 @@
                               <Check size={13} />
                             {:else if statusTone(task.status) === "active"}
                               <CircleDot size={13} />
+                            {:else if statusTone(task.status) === "terminal"}
+                              <X size={13} />
                             {:else}
                               <Circle size={13} />
                             {/if}
@@ -825,8 +842,10 @@
                           <span class="task-title">{task.title}</span>
                           {#if statusTone(task.status) === "active"}
                             <span class="task-active-label">Active</span>
+                          {:else if statusTone(task.status) === "terminal"}
+                            <span class="task-terminal-label">{statusLabel(task.status)}</span>
                           {/if}
-                          {#if statusTone(task.status) !== "complete"}
+                          {#if taskAllowsPlanning(task)}
                             <div class="task-actions" aria-label={`Actions for ${task.title}`}>
                               {#if task.status === "pending"}
                                 <button
@@ -1660,6 +1679,11 @@
     color: var(--teal);
   }
 
+  .status-icon.terminal,
+  .task-check.terminal {
+    color: var(--muted);
+  }
+
   .goal-copy {
     min-width: 0;
     flex: 1;
@@ -1707,6 +1731,15 @@
     border-radius: 4px;
     background: var(--teal-soft);
     color: var(--teal);
+    font-size: 0.63rem;
+    font-weight: 750;
+  }
+
+  .task-terminal-label {
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: var(--surface-quiet);
+    color: var(--muted);
     font-size: 0.63rem;
     font-weight: 750;
   }

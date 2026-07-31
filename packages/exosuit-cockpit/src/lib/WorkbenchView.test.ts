@@ -126,6 +126,64 @@ describe("focus-only lane workbench", () => {
     expect(within(underway!).queryByText("Pending")).toBeNull();
   });
 
+  it("shows terminal planning entities without mutation controls", () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals = [
+      {
+        id: "abandoned-goal",
+        title: "Abandoned direction",
+        status: "abandoned",
+        tasks: [
+          {
+            id: "abandoned-task",
+            title: "Abandoned task",
+            status: "abandoned",
+          },
+        ],
+      },
+      {
+        id: "active-goal",
+        title: "Active direction",
+        status: "in-progress",
+        tasks: [
+          {
+            id: "skipped-task",
+            title: "Skipped task",
+            status: "skipped",
+          },
+        ],
+      },
+    ];
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan: vi.fn(),
+    });
+
+    const abandonedGoal = screen
+      .getByRole("heading", { name: "Abandoned direction" })
+      .closest("article");
+    const activeGoal = screen
+      .getByRole("heading", { name: "Active direction" })
+      .closest("article");
+
+    expect(within(abandonedGoal!).getAllByText("Abandoned")).toHaveLength(2);
+    expect(
+      within(abandonedGoal!).queryByRole("button", {
+        name: "Add task to Abandoned direction",
+      }),
+    ).toBeNull();
+    expect(
+      within(abandonedGoal!).queryByLabelText("Actions for Abandoned task"),
+    ).toBeNull();
+    expect(within(activeGoal!).getByText("Skipped")).toBeTruthy();
+    expect(
+      within(activeGoal!).queryByLabelText("Actions for Skipped task"),
+    ).toBeNull();
+  });
+
   it("submits bounded task planning from inline controls", async () => {
     const onPlan = vi.fn().mockResolvedValue(true);
     render(WorkbenchView, {

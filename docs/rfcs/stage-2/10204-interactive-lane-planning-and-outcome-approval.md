@@ -93,6 +93,9 @@ presentation summary from the tasks:
 - when every task is complete but the goal itself is not, the summary reads
   `Tasks complete · Goal pending`;
 - only a canonically completed goal receives the completed treatment.
+- abandoned, skipped, deferred, or otherwise non-actionable goal and task
+  statuses retain their explicit lifecycle label and expose no planning
+  controls.
 
 Task rows use the status icon as their visible state marker. They do not repeat
 `Pending` or `Completed` in a trailing text column. The same status remains in
@@ -254,12 +257,12 @@ The adapter maps the closed browser operations to existing task behavior:
 | `task_complete_approve` | `task complete` with a server-constructed canonical workflow confirmation |
 
 Task addition lets Exo derive the task ID from the title and returns the
-canonical ID. Editing a title never renames that ID. A completed task is
-read-only through this protocol. Starting is valid only for a pending task,
-progress logging and completion review are valid only for an in-progress task,
-and reorder or title editing is valid for a pending or in-progress task. The
-server validates these transitions; hiding a control in the frontend is not an
-authorization check.
+canonical ID. Editing a title never renames that ID. Completed, abandoned,
+skipped, and other non-actionable tasks are read-only through this protocol.
+Starting is valid only for a pending task, progress logging and completion
+review are valid only for an in-progress task, and reorder or title editing is
+valid for a pending or in-progress task. The server validates these
+transitions; hiding a control in the frontend is not an authorization check.
 
 `task_start` changes authoritative Exo planning state. It does not dispatch,
 notify, or resume an agent host. The cockpit labels this action as marking the
