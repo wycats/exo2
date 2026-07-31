@@ -189,7 +189,7 @@ describe("focus-only lane workbench", () => {
     expect(screen.queryByTitle("Start task")).toBeNull();
   });
 
-  it("renders a human completion review with deliberate approval and dismissal", async () => {
+  it("renders a human completion review with deliberate approval and revision", async () => {
     const onApproveCompletion = vi.fn().mockResolvedValue(true);
     const onDismissCompletionReview = vi.fn();
     render(WorkbenchView, {
@@ -219,9 +219,101 @@ describe("focus-only lane workbench", () => {
     );
     expect(onApproveCompletion).toHaveBeenCalledOnce();
     await fireEvent.click(
-      screen.getByRole("button", { name: "Keep working" }),
+      screen.getByRole("button", { name: "Revise outcome" }),
     );
     expect(onDismissCompletionReview).toHaveBeenCalledOnce();
+    expect(
+      (screen.getByLabelText("Proposed completion outcome") as HTMLTextAreaElement)
+        .value,
+    ).toBe("Implemented the local host.");
+    await fireEvent.click(screen.getByRole("button", { name: "Keep working" }));
+    expect(onDismissCompletionReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves an open draft after an unrelated planning success", async () => {
+    const props = {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan: vi.fn().mockResolvedValue(true),
+    };
+    const view = render(WorkbenchView, props);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "A title still being drafted" },
+    });
+    await view.rerender({
+      ...props,
+      planningSuccess: {
+        requestId: "unrelated-start",
+        operation: { kind: "task_start", task_id: "another-task" },
+      },
+    });
+
+    expect((screen.getByLabelText("Task title") as HTMLInputElement).value).toBe(
+      "A title still being drafted",
+    );
+
+    await view.rerender({
+      ...props,
+      planningSuccess: {
+        requestId: "matching-update",
+        operation: {
+          kind: "task_update",
+          task_id: "implement-host",
+          title: "A title still being drafted",
+        },
+      },
+    });
+    expect(screen.queryByLabelText("Task title")).toBeNull();
+  });
+
+  it("preserves exact progress and completion text while validating non-whitespace", async () => {
+    const onPlan = vi.fn().mockResolvedValue(true);
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Record progress for Implement host",
+      }),
+    );
+    await fireEvent.input(screen.getByLabelText("Progress update"), {
+      target: { value: "  indented evidence\n" },
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Record progress" }),
+    );
+
+    expect(onPlan).toHaveBeenLastCalledWith({
+      kind: "task_log",
+      task_id: "implement-host",
+      message: "  indented evidence\n",
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review completion of Implement host",
+      }),
+    );
+    await fireEvent.input(screen.getByLabelText("Proposed completion outcome"), {
+      target: { value: "  exact outcome\n" },
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Review completion" }),
+    );
+    expect(onPlan).toHaveBeenLastCalledWith({
+      kind: "task_complete_review",
+      task_id: "implement-host",
+      outcome: "  exact outcome\n",
+    });
   });
 
   it("keeps refresh failure distinct from focus and planning failures", async () => {

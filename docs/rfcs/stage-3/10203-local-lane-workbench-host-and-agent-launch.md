@@ -233,6 +233,9 @@ interface WorkbenchLaunchResult {
   project: {
     id: string;
   };
+  daemon: {
+    instance_id: string;
+  };
   workspace: {
     key: string;
     label: string;

@@ -174,6 +174,9 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         project: WorkbenchProjectIdentity {
             id: "project-fixture".to_string(),
         },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: "daemon-fixture".to_string(),
+        },
         workspace: WorkbenchSnapshotWorkspace {
             key: "workspace-fixture".to_string(),
             label: "main".to_string(),
@@ -396,6 +399,29 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
     );
     assert_eq!(restored.workspace_key, session.workspace_key);
     assert_eq!(restored.id, digest);
+    let stale_generation = planning::WorkbenchPlanningContext {
+        schema_version: 1,
+        session_id: restored.id.clone(),
+        expected_daemon_instance_id: "first-workbench-instance".to_string(),
+        expected_revision: replacement.inner.current_revision(),
+        expected_phase_id: "phase-from-prior-generation".to_string(),
+        operation: planning::WorkbenchPlanningContextOperation::TaskStart {
+            task_id: "task-from-prior-generation".to_string(),
+        },
+    };
+    let stale_generation = replacement
+        .inner
+        .validate_planning_context(&restored.workspace_root, &stale_generation, false)
+        .expect_err("a prior daemon generation must not reuse a reset revision");
+    assert_eq!(
+        stale_generation
+            .response("stale-generation".to_string())
+            .error
+            .expect("stale generation error")
+            .details
+            .expect("stale generation details")["kind"],
+        "workbench.stale_snapshot"
+    );
     assert!(
         replacement
             .inner
@@ -961,6 +987,7 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
         .completion_review(
             &session,
             "review-request",
+            "test-workbench-instance",
             0,
             &phase,
             "review-task",
@@ -972,6 +999,7 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
         .completion_review(
             &session,
             "review-request",
+            "test-workbench-instance",
             0,
             &phase,
             "review-task",
@@ -1004,6 +1032,7 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
         .completion_review(
             &session,
             "review-request",
+            "test-workbench-instance",
             0,
             &phase,
             "review-task",
@@ -1022,7 +1051,14 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
 
     let approval = manager
         .inner
-        .prepare_completion_approval(&session, "approval-request", 0, &phase, &first.review_id)
+        .prepare_completion_approval(
+            &session,
+            "approval-request",
+            "test-workbench-instance",
+            0,
+            &phase,
+            &first.review_id,
+        )
         .expect("prepare exact approval");
     assert_eq!(approval.task_id, "review-task");
     assert_eq!(
@@ -1036,6 +1072,7 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
         .completion_review(
             &session,
             "stale-review",
+            "test-workbench-instance",
             0,
             &phase,
             "review-task",
@@ -1051,6 +1088,42 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
             .unwrap()["kind"],
         "workbench.stale_snapshot"
     );
+
+    for index in 0..planning::MAX_COMPLETION_REVIEWS_PER_SESSION {
+        manager
+            .inner
+            .completion_review(
+                &session,
+                &format!("bounded-review-{index}"),
+                "test-workbench-instance",
+                1,
+                &phase,
+                "review-task",
+                "Implemented the bounded planning contract.",
+            )
+            .expect("build bounded completion review");
+    }
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(
+        state
+            .completion_reviews
+            .values()
+            .filter(|review| review.session_id == session.id)
+            .count(),
+        planning::MAX_COMPLETION_REVIEWS_PER_SESSION
+    );
+    assert_eq!(
+        state
+            .completion_review_requests
+            .keys()
+            .filter(|key| key.session_id == session.id)
+            .count(),
+        planning::MAX_COMPLETION_REVIEWS_PER_SESSION
+    );
+    assert!(
+        !state.completion_reviews.contains_key(&first.review_id),
+        "the oldest transient review should be evicted at the session bound"
+    );
 }
 
 #[test]
@@ -1059,6 +1132,7 @@ fn planning_requests_reject_unknown_fields_and_invalid_text_bounds() {
         "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
         "id": "planning-request",
         "session_key": "planning-session",
+        "expected_daemon_instance_id": "test-workbench-instance",
         "expected_revision": 3,
         "expected_phase_id": "planning-phase",
         "operation": {
@@ -1122,6 +1196,7 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
         &fixture.project,
         &registered,
         manager.inner.current_revision(),
+        &manager.inner.instance_id,
         || {
             let writer =
                 SqliteWriter::open(fixture.project.db_path()).expect("open concurrent writer");
@@ -1145,6 +1220,7 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
         &fixture.project,
         &registered,
         manager.inner.current_revision(),
+        &manager.inner.instance_id,
     )
     .expect("read refreshed snapshot");
     assert_eq!(
@@ -1392,6 +1468,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
                 "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
                 "id": "browser-task-add",
                 "session_key": session_key,
+                "expected_daemon_instance_id": "test-workbench-instance",
                 "expected_revision": 4,
                 "expected_phase_id": "phase-browser",
                 "operation": {
@@ -1432,6 +1509,10 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         );
         assert_eq!(call.input["label"], "Add a browser task");
         assert_eq!(call.input["goal"], "goal-browser");
+        assert_eq!(
+            call.input[planning::PLANNING_CONTEXT_FIELD]["expected_daemon_instance_id"],
+            "test-workbench-instance"
+        );
         assert_eq!(
             call.input[planning::PLANNING_CONTEXT_FIELD]["expected_revision"],
             4

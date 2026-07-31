@@ -124,7 +124,9 @@ Revising the outcome creates a new review request and a new review identity.
 Keeping the task open dismisses the card locally and sends no command. Review
 records are session-local. They do not survive a daemon replacement or browser
 session expiry, and they do not form a durable queue of things that supposedly
-need the person's attention.
+need the person's attention. Each session retains at most 32 transient reviews.
+When that bound is reached, Exo evicts the oldest consumed review first and
+then the oldest remaining review, together with its request-replay record.
 
 ## Reference-Level Design
 
@@ -167,6 +169,7 @@ interface WorkbenchPlanningRequestV2 {
   protocol_version: 2;
   id: string;
   session_key: string;
+  expected_daemon_instance_id: string;
   expected_revision: number;
   expected_phase_id: string;
   operation: WorkbenchPlanningOperation;
@@ -208,10 +211,10 @@ type WorkbenchPlanningOperation =
     };
 ```
 
-`expected_revision` is the `revision` from the snapshot that rendered the
-control. `expected_phase_id` is that snapshot's focused phase. All identifiers
-are opaque values copied from the snapshot; the browser does not parse
-goal-qualified task IDs.
+`expected_daemon_instance_id` and `expected_revision` are copied together from
+the snapshot that rendered the control. `expected_phase_id` is that snapshot's
+focused phase. All identifiers are opaque values copied from the snapshot; the
+browser does not parse goal-qualified task IDs.
 
 This version number belongs to the browser command protocol. The adapter still
 constructs an internal `RequestEnvelope` at Exo's current machine-protocol
@@ -266,16 +269,20 @@ excluded.
 
 The workbench revision is a daemon-generation counter. A compatible daemon
 replacement may restore a browser session, but it does not carry the prior
-generation's revision forward. During reconnection the browser disables
-mutations, renews the durable grant, and loads a fresh authoritative snapshot
-before sending another planning request. A revision from the last visible
-snapshot is therefore never compared across runtime generations.
+generation's revision forward. Every snapshot therefore carries the current
+daemon instance ID, and every planning request binds its revision to that
+instance. A terminal same-request-ID outcome is replayed before precondition
+validation; otherwise a request from a prior instance is stale even when the
+replacement's counter has reached the same numeric revision. During
+reconnection the browser also disables new mutations, renews the durable
+grant, and loads a fresh authoritative snapshot.
 
 Within one daemon generation, every `AtomicProjectState` write enters a
 revision gate. The gate serializes the following sequence:
 
-1. compare `expected_revision` with the current workbench revision when the
-   request carries a workbench precondition;
+1. compare `expected_daemon_instance_id` and `expected_revision` with the
+   current workbench instance and revision when the request carries a
+   workbench precondition;
 2. verify that this workspace still focuses `expected_phase_id`;
 3. resolve the goal or task and verify that it belongs to that phase;
 4. execute or roll back the existing `AtomicProjectState` transaction;
@@ -391,7 +398,7 @@ Known planning failures are projected into stable, path-free browser kinds:
 
 | Kind | Meaning | Client behavior |
 | --- | --- | --- |
-| `workbench.stale_snapshot` | Revision no longer matches | Refresh and ask for a new intention |
+| `workbench.stale_snapshot` | Daemon generation or revision no longer matches | Refresh and ask for a new intention |
 | `workbench.phase_mismatch` | Workspace no longer focuses the expected phase | Refresh; do not retry unchanged |
 | `workbench.entity_outside_phase` | Goal or task is not in the expected phase | Refresh and discard the stale target |
 | `workbench.invalid_transition` | Task state does not allow the operation | Refresh and explain the current state |
@@ -559,9 +566,9 @@ following evidence is green:
   capabilities;
 - command tests prove each browser operation maps to the intended Exo behavior
   without accepting command text or caller-supplied paths;
-- concurrent daemon tests prove the revision/focus/entity guard and atomic
-  mutation are one ordered boundary for browser, CLI, MCP, and linked-worktree
-  writers;
+- concurrent daemon tests prove the generation/revision/focus/entity guard and
+  atomic mutation are one ordered boundary for browser, CLI, MCP, and
+  linked-worktree writers;
 - request-ledger tests prove ambiguous retries preserve request ID, payload,
   completion review identity, and exactly-once approval;
 - completion tests prove review is non-mutating, approval is bound to the exact

@@ -215,6 +215,7 @@ describe("workbench browser client", () => {
       protocol_version: 2,
       id: "01PLANNINGREQUEST0000000000",
       session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
       expected_revision: 7,
       expected_phase_id: "phase-fixture",
       operation: {
@@ -268,6 +269,7 @@ describe("workbench browser client", () => {
       protocol_version: 2,
       id: "01REVIEWREQUEST00000000000",
       session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
       expected_revision: 7,
       expected_phase_id: "phase-fixture",
       operation: {
@@ -309,6 +311,7 @@ describe("workbench browser client", () => {
         protocol_version: 2,
         id: "01BUSYREQUEST0000000000000",
         session_key: "session-selector",
+        expected_daemon_instance_id: "daemon-fixture",
         expected_revision: 7,
         expected_phase_id: "phase-fixture",
         operation: { kind: "task_start", task_id: "implement-host" },
@@ -346,6 +349,7 @@ describe("workbench browser client", () => {
         protocol_version: 2,
         id: "01STALEREQUEST000000000000",
         session_key: "session-selector",
+        expected_daemon_instance_id: "daemon-fixture",
         expected_revision: 7,
         expected_phase_id: "phase-fixture",
         operation: { kind: "task_start", task_id: "implement-host" },

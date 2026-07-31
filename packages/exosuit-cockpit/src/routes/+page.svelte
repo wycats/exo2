@@ -52,8 +52,14 @@
     request: WorkbenchPlanningRequest;
   }
 
+  interface PlanningSuccess {
+    requestId: string;
+    operation: WorkbenchPlanningOperation;
+  }
+
   interface BoundCompletionReview {
     review: WorkbenchTaskCompletionReview;
+    expectedDaemonInstanceId: string;
     expectedRevision: number;
     expectedPhaseId: string;
   }
@@ -70,7 +76,7 @@
   let retryPlanning = $state<PreparedPlanningRequest | null>(null);
   let planningFailure = $state<string | null>(null);
   let planningNotice = $state<string | null>(null);
-  let planningSuccessCount = $state(0);
+  let planningSuccess = $state<PlanningSuccess | null>(null);
   let completionReview = $state<BoundCompletionReview | null>(null);
   let screenMessage = $state<string | null>(null);
   let screenRetryable = $state(false);
@@ -240,6 +246,7 @@
       pendingPlanning = null;
       retryPlanning = null;
       planningFailure = null;
+      planningSuccess = null;
       completionReview = null;
       recoveryAttempt = 0;
       sessionRecovery = "connected";
@@ -384,8 +391,16 @@
     refreshFailure = null;
     if (
       completionReview &&
-      (nextSnapshot.revision !== completionReview.expectedRevision ||
-        nextSnapshot.phase?.id !== completionReview.expectedPhaseId)
+      (nextSnapshot.daemon.instance_id !==
+        completionReview.expectedDaemonInstanceId ||
+        nextSnapshot.revision !== completionReview.expectedRevision ||
+        nextSnapshot.phase?.id !== completionReview.expectedPhaseId) &&
+      !(
+        pendingPlanning?.request.operation.kind ===
+          "task_complete_approve" &&
+        pendingPlanning.request.operation.review_id ===
+          completionReview.review.review_id
+      )
     ) {
       completionReview = null;
       retryPlanning = null;
@@ -450,7 +465,11 @@
 
   function preparePlanningRequest(
     operation: WorkbenchPlanningOperation,
-    binding?: { revision: number; phaseId: string },
+    binding?: {
+      daemonInstanceId: string;
+      revision: number;
+      phaseId: string;
+    },
   ): PreparedPlanningRequest | null {
     if (
       !client ||
@@ -464,6 +483,8 @@
         protocol_version: 2,
         id: createWorkbenchRequestId(),
         session_key: client.sessionKey,
+        expected_daemon_instance_id:
+          binding?.daemonInstanceId ?? snapshot.daemon.instance_id,
         expected_revision: binding?.revision ?? snapshot.revision,
         expected_phase_id: binding?.phaseId ?? snapshot.phase.id,
         operation,
@@ -498,6 +519,8 @@
       if (result.kind === "workbench.task_completion_review") {
         completionReview = {
           review: result,
+          expectedDaemonInstanceId:
+            prepared.request.expected_daemon_instance_id,
           expectedRevision: prepared.request.expected_revision,
           expectedPhaseId: prepared.request.expected_phase_id,
         };
@@ -508,7 +531,11 @@
         planningNotice =
           "Exo marked the task active; the workbench did not start an agent.";
       }
-      planningSuccessCount += 1;
+      planningFailure = null;
+      planningSuccess = {
+        requestId: prepared.request.id,
+        operation: prepared.request.operation,
+      };
       await refreshSnapshot(true);
       return true;
     } catch (error) {
@@ -554,6 +581,7 @@
         review_id: completionReview.review.review_id,
       },
       {
+        daemonInstanceId: completionReview.expectedDaemonInstanceId,
         revision: completionReview.expectedRevision,
         phaseId: completionReview.expectedPhaseId,
       },
@@ -703,7 +731,7 @@
     {refreshFailure}
     planningFailure={planningFailure}
     {planningNotice}
-    {planningSuccessCount}
+    {planningSuccess}
     pendingPlanningKind={pendingPlanning?.request.operation.kind ?? null}
     completionReview={completionReview?.review ?? null}
     onFocus={(laneId) => void focusLane(laneId)}

@@ -2741,10 +2741,12 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
     let planning_revision = primary_snapshot["result"]["revision"]
         .as_u64()
         .expect("planning snapshot revision");
+    let planning_daemon_instance_id = primary_snapshot["result"]["daemon"]["instance_id"].clone();
     let planning_request = serde_json::json!({
         "protocol_version": 2,
         "id": "browser-primary-task-add",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": planning_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2850,6 +2852,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
                 "protocol_version": 2,
                 "id": "browser-primary-stale-update",
                 "session_key": primary_session_key,
+                "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
                 "expected_revision": planning_revision,
                 "expected_phase_id": phase_id,
                 "operation": {
@@ -2891,6 +2894,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-task-update-a",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": planning_invalidation_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2903,6 +2907,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-task-update-b",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": planning_invalidation_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2934,6 +2939,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-task-reorder",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": update_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2953,6 +2959,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-task-start",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": reorder_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2971,6 +2978,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-task-log",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": start_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -2990,6 +2998,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-completion-review",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": log_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -3018,6 +3027,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-linked-foreign-approval",
         "session_key": linked_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
         "expected_revision": log_revision,
         "expected_phase_id": phase_id,
         "operation": {
@@ -3036,6 +3046,7 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         "protocol_version": 2,
         "id": "browser-primary-completion-approval",
         "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id,
         "expected_revision": log_revision,
         "expected_phase_id": phase_id,
         "operation": {

@@ -1,7 +1,8 @@
 use super::{
-    WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails, WorkbenchLaneSummary, WorkbenchPhase,
-    WorkbenchProjectIdentity, WorkbenchSnapshot, WorkbenchSnapshotWorkspace, WorkbenchSteering,
-    WorkbenchSuggestedAction, WorkbenchTask, WorkspaceRegistration,
+    WorkbenchDaemonIdentity, WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails,
+    WorkbenchLaneSummary, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
+    WorkbenchSnapshotWorkspace, WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask,
+    WorkspaceRegistration,
 };
 use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
 use crate::project::Project;
@@ -36,14 +37,16 @@ pub(super) fn build(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
+    daemon_instance_id: &str,
 ) -> Result<WorkbenchSnapshot> {
-    build_with_after_state_hook(project, registered, revision, || {})
+    build_with_after_state_hook(project, registered, revision, daemon_instance_id, || {})
 }
 
 pub(super) fn build_with_after_state_hook(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
+    daemon_instance_id: &str,
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
     let loader = SqliteLoader::open(project.db_path())?;
@@ -169,6 +172,9 @@ pub(super) fn build_with_after_state_hook(
         revision,
         project: WorkbenchProjectIdentity {
             id: project.id.to_string(),
+        },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: daemon_instance_id.to_string(),
         },
         workspace: WorkbenchSnapshotWorkspace {
             key: registered.key.clone(),

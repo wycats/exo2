@@ -31,6 +31,9 @@ export interface WorkbenchSnapshot {
   project: {
     id: string;
   };
+  daemon: {
+    instance_id: string;
+  };
   workspace: WorkbenchSnapshotWorkspace;
   lanes: WorkbenchLaneSummary[];
   focused_lane: WorkbenchLaneDetails | null;
@@ -131,6 +134,7 @@ export interface WorkbenchPlanningRequest {
   protocol_version: 2;
   id: string;
   session_key: string;
+  expected_daemon_instance_id: string;
   expected_revision: number;
   expected_phase_id: string;
   operation: WorkbenchPlanningOperation;
@@ -173,6 +177,7 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   string(snapshot.observed_at, "observed_at");
   finiteNumber(snapshot.revision, "revision");
   project(snapshot.project);
+  string(record(snapshot.daemon, "daemon").instance_id, "daemon.instance_id");
   workspace(snapshot.workspace);
   array(snapshot.lanes, "lanes").forEach((lane) => laneSummary(lane));
   if (snapshot.focused_lane !== null) {

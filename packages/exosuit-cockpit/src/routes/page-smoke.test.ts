@@ -821,6 +821,7 @@ describe("cockpit page", () => {
     expect(planningRequests[0]).toMatchObject({
       protocol_version: 2,
       session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
       expected_revision: 7,
       expected_phase_id: "phase-fixture",
       operation: {
@@ -832,6 +833,7 @@ describe("cockpit page", () => {
     expect(planningRequests[1]).toMatchObject({
       protocol_version: 2,
       session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
       expected_revision: 7,
       expected_phase_id: "phase-fixture",
       operation: {
@@ -842,6 +844,116 @@ describe("cockpit page", () => {
     expect(planningRequests[1]!.id).not.toBe(planningRequests[0]!.id);
     await waitFor(() => {
       expect(screen.getByText("Revision 8")).toBeTruthy();
+    });
+  });
+
+  it("accepts an approval's own invalidation while its response is pending", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const approvalResponse = deferred<Response>();
+    let approvalCommitted = false;
+    let approvalRequestId: string | null = null;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.protocol_version === 2) {
+          if (request.operation.kind === "task_complete_review") {
+            return new Response(
+              JSON.stringify({
+                protocol_version: 1,
+                id: request.id,
+                status: "ok",
+                result: {
+                  kind: "workbench.task_completion_review",
+                  ok: true,
+                  schema_version: 1,
+                  review_id: "review-selector",
+                  task_id: "implement-host",
+                  readiness_rationale: "All focused checks pass.",
+                  proposed_outcome: request.operation.outcome,
+                  approval_evidence_present: false,
+                },
+              }),
+              { status: 200 },
+            );
+          }
+          approvalRequestId = request.id;
+          return approvalResponse.promise;
+        }
+        const nextSnapshot = structuredClone(snapshotFixture);
+        if (approvalCommitted) {
+          nextSnapshot.revision = 8;
+          nextSnapshot.phase.goals[0]!.tasks[0]!.status = "completed";
+        }
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: nextSnapshot,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review completion of Implement host",
+      }),
+    );
+    await fireEvent.input(
+      screen.getByLabelText("Proposed completion outcome"),
+      { target: { value: "Implemented the exact local host contract." } },
+    );
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Review completion" }),
+    );
+    await screen.findByText("Implemented the exact local host contract.");
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Approve exact outcome" }),
+    );
+
+    approvalCommitted = true;
+    TestEventSource.instances[0]!.emit("invalidate");
+    await waitFor(() => {
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+    });
+    expect(screen.queryByText("Planning change not applied.")).toBeNull();
+    expect(
+      screen.queryByText(
+        "The plan changed. Review task completion again from the current plan.",
+      ),
+    ).toBeNull();
+
+    approvalResponse.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: approvalRequestId,
+          status: "ok",
+          result: {
+            kind: "workbench.task_mutation",
+            ok: true,
+            schema_version: 1,
+            operation: "task_complete_approve",
+            task_id: "implement-host",
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    await waitFor(() => {
+      expect(
+        screen.queryByText("Implemented the exact local host contract."),
+      ).toBeNull();
+      expect(screen.queryByText("Planning change not applied.")).toBeNull();
     });
   });
 

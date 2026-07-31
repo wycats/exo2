@@ -341,6 +341,7 @@ async fn run_planning_command(
 ) -> AxumResponse {
     if request.protocol_version != planning::PLANNING_PROTOCOL_VERSION
         || request.id.trim().is_empty()
+        || request.expected_daemon_instance_id.trim().is_empty()
         || request.expected_phase_id.trim().is_empty()
         || !valid_session_key(&request.session_key)
     {
@@ -381,6 +382,7 @@ async fn run_planning_command(
         let review_inner = Arc::clone(&inner);
         let review_session = session.clone();
         let request_id = request.id.clone();
+        let expected_daemon_instance_id = request.expected_daemon_instance_id.clone();
         let expected_revision = request.expected_revision;
         let expected_phase_id = request.expected_phase_id.clone();
         let task_id = task_id.clone();
@@ -389,6 +391,7 @@ async fn run_planning_command(
             review_inner.completion_review(
                 &review_session,
                 &request_id,
+                &expected_daemon_instance_id,
                 expected_revision,
                 &expected_phase_id,
                 &task_id,
@@ -417,6 +420,7 @@ async fn run_planning_command(
             let approval = match inner.prepare_completion_approval(
                 &session,
                 &request.id,
+                &request.expected_daemon_instance_id,
                 request.expected_revision,
                 &request.expected_phase_id,
                 review_id,
@@ -459,6 +463,7 @@ async fn run_planning_command(
                 request.id.clone(),
                 workspace_root,
                 &session,
+                request.expected_daemon_instance_id.clone(),
                 request.expected_revision,
                 request.expected_phase_id.clone(),
                 &request.operation,

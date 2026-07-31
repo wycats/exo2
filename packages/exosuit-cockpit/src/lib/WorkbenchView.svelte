@@ -55,7 +55,10 @@
     refreshFailure?: string | null;
     planningFailure?: string | null;
     planningNotice?: string | null;
-    planningSuccessCount?: number;
+    planningSuccess?: {
+      requestId: string;
+      operation: WorkbenchPlanningOperation;
+    } | null;
     pendingPlanningKind?: WorkbenchPlanningOperation["kind"] | null;
     completionReview?: WorkbenchTaskCompletionReview | null;
     onFocus: (laneId: string) => void;
@@ -79,7 +82,7 @@
     refreshFailure = null,
     planningFailure = null,
     planningNotice = null,
-    planningSuccessCount = 0,
+    planningSuccess = null,
     pendingPlanningKind = null,
     completionReview = null,
     onFocus,
@@ -103,7 +106,7 @@
   let compactNavigation = $state(false);
   let planningEditor = $state<PlanningEditor | null>(null);
   let planningValue = $state("");
-  let handledPlanningSuccess = 0;
+  let handledPlanningSuccessId: string | null = null;
 
   let agentNextStep = $derived(snapshot.steering.next_actions[0] ?? null);
   let hasCoordination = $derived(
@@ -171,10 +174,17 @@
   });
 
   $effect(() => {
-    const current = planningSuccessCount;
-    if (current !== handledPlanningSuccess) {
-      handledPlanningSuccess = current;
-      closeEditor();
+    if (
+      planningSuccess &&
+      planningSuccess.requestId !== handledPlanningSuccessId
+    ) {
+      handledPlanningSuccessId = planningSuccess.requestId;
+      if (
+        planningEditor &&
+        editorMatchesOperation(planningEditor, planningSuccess.operation)
+      ) {
+        closeEditor();
+      }
     }
   });
 
@@ -303,15 +313,58 @@
     planningValue = "";
   }
 
+  function editorMatchesOperation(
+    editor: PlanningEditor,
+    operation: WorkbenchPlanningOperation,
+  ): boolean {
+    switch (editor.kind) {
+      case "add":
+        return (
+          operation.kind === "task_add" &&
+          operation.goal_id === editor.goalId
+        );
+      case "edit":
+        return (
+          operation.kind === "task_update" &&
+          operation.task_id === editor.taskId
+        );
+      case "log":
+        return (
+          operation.kind === "task_log" &&
+          operation.task_id === editor.taskId
+        );
+      case "review":
+        return (
+          operation.kind === "task_complete_review" &&
+          operation.task_id === editor.taskId
+        );
+    }
+  }
+
+  function reviseCompletionReview(): void {
+    if (!completionReview) {
+      return;
+    }
+    openEditor(
+      { kind: "review", taskId: completionReview.task_id },
+      completionReview.proposed_outcome,
+    );
+    onDismissCompletionReview();
+  }
+
   async function submitEditor(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     if (!planningEditor || planningBusy) {
       return;
     }
-    const value = planningValue.trim();
-    if (!value) {
+    const trimmedValue = planningValue.trim();
+    if (!trimmedValue) {
       return;
     }
+    const value =
+      planningEditor.kind === "add" || planningEditor.kind === "edit"
+        ? trimmedValue
+        : planningValue;
     let operation: WorkbenchPlanningOperation;
     switch (planningEditor.kind) {
       case "add":
@@ -612,6 +665,16 @@
                   <span class="section-kicker">Task completion review</span>
                   <h3 id="completion-review-title">{reviewedTaskTitle}</h3>
                 </div>
+                <button
+                  class="review-dismiss"
+                  type="button"
+                  title="Keep working"
+                  aria-label="Keep working"
+                  disabled={planningBusy || interactionDisabled}
+                  onclick={onDismissCompletionReview}
+                >
+                  <X size={17} aria-hidden="true" />
+                </button>
               </div>
               <p class="review-rationale">
                 {completionReview.readiness_rationale}
@@ -634,9 +697,10 @@
                   class="secondary-button"
                   type="button"
                   disabled={planningBusy || interactionDisabled}
-                  onclick={onDismissCompletionReview}
+                  onclick={reviseCompletionReview}
                 >
-                  Keep working
+                  <Pencil size={16} aria-hidden="true" />
+                  Revise outcome
                 </button>
                 <button
                   class="primary-button"
@@ -1768,6 +1832,31 @@
     display: flex;
     align-items: center;
     gap: 10px;
+  }
+
+  .review-dismiss {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    margin-left: auto;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .review-dismiss:hover:not(:disabled) {
+    border-color: var(--line);
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+
+  .review-dismiss:disabled {
+    cursor: wait;
+    opacity: 0.55;
   }
 
   .review-heading h3 {

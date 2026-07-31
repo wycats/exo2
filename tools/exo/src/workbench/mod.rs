@@ -182,6 +182,7 @@ struct WorkbenchState {
     completion_review_requests:
         HashMap<planning::CompletionReviewRequestKey, planning::CompletionReviewRequestRecord>,
     completion_reviews: HashMap<String, planning::CompletionReviewRecord>,
+    completion_review_sequence: u64,
 }
 
 struct BoundHost {
@@ -322,6 +323,7 @@ pub struct WorkbenchSnapshot {
     pub observed_at: String,
     pub revision: u64,
     pub project: WorkbenchProjectIdentity,
+    pub daemon: WorkbenchDaemonIdentity,
     pub workspace: WorkbenchSnapshotWorkspace,
     pub lanes: Vec<WorkbenchLaneSummary>,
     pub focused_lane: Option<WorkbenchLaneDetails>,
@@ -559,6 +561,7 @@ impl WorkbenchHostManager {
             &self.inner.project,
             &workspace,
             self.inner.revision.load(Ordering::Acquire),
+            &self.inner.instance_id,
         )
         .map_err(|_| {
             anyhow::Error::new(workbench_failure(

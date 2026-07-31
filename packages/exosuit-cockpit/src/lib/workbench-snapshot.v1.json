@@ -7,6 +7,9 @@
   "project": {
     "id": "project-fixture"
   },
+  "daemon": {
+    "instance_id": "daemon-fixture"
+  },
   "workspace": {
     "key": "workspace-fixture",
     "label": "main",

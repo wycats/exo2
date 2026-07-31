@@ -1,6 +1,6 @@
 #![allow(clippy::redundant_pub_crate)]
 
-use super::{WorkbenchHostInner, WorkbenchSession, snapshot};
+use super::{WorkbenchHostInner, WorkbenchSession, WorkbenchState, snapshot};
 use crate::api::protocol::{
     CallParams, Effect, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RequestEnvelope,
     ResponseEnvelope, Status,
@@ -24,6 +24,7 @@ pub(crate) const PLANNING_CAPABILITIES: [&str; 7] = [
 
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+pub(super) const MAX_COMPLETION_REVIEWS_PER_SESSION: usize = 32;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +32,7 @@ pub(super) struct BrowserPlanningRequest {
     pub protocol_version: u32,
     pub id: String,
     pub session_key: String,
+    pub expected_daemon_instance_id: String,
     pub expected_revision: u64,
     pub expected_phase_id: String,
     pub operation: BrowserPlanningOperation,
@@ -79,6 +81,7 @@ impl BrowserPlanningOperation {
 pub(crate) struct WorkbenchPlanningContext {
     pub schema_version: u8,
     pub session_id: String,
+    pub expected_daemon_instance_id: String,
     pub expected_revision: u64,
     pub expected_phase_id: String,
     pub operation: WorkbenchPlanningContextOperation,
@@ -111,6 +114,7 @@ pub(crate) struct WorkbenchTaskCompletionReview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CompletionReviewFingerprint {
+    pub expected_daemon_instance_id: String,
     pub expected_revision: u64,
     pub expected_phase_id: String,
     pub task_id: String,
@@ -126,6 +130,7 @@ pub(super) struct CompletionReviewRequestRecord {
 #[derive(Debug, Clone)]
 pub(super) struct CompletionReviewRecord {
     pub session_id: String,
+    pub expected_daemon_instance_id: String,
     pub expected_revision: u64,
     pub expected_phase_id: String,
     pub task_id: String,
@@ -133,6 +138,7 @@ pub(super) struct CompletionReviewRecord {
     pub result: WorkbenchTaskCompletionReview,
     pub approval_request_id: Option<String>,
     pub consumed: bool,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -146,6 +152,30 @@ pub(super) struct PreparedCompletionApproval {
     pub task_id: String,
     pub proposed_outcome: String,
     pub context: WorkbenchPlanningContext,
+}
+
+fn evict_completion_review_if_needed(state: &mut WorkbenchState, session_id: &str) {
+    while state
+        .completion_reviews
+        .values()
+        .filter(|review| review.session_id == session_id)
+        .count()
+        >= MAX_COMPLETION_REVIEWS_PER_SESSION
+    {
+        let Some(review_id) = state
+            .completion_reviews
+            .iter()
+            .filter(|(_, review)| review.session_id == session_id)
+            .min_by_key(|(_, review)| (if review.consumed { 0 } else { 1 }, review.sequence))
+            .map(|(review_id, _)| review_id.clone())
+        else {
+            break;
+        };
+        state.completion_reviews.remove(&review_id);
+        state
+            .completion_review_requests
+            .retain(|_, request| request.review_id != review_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +366,7 @@ pub(super) fn mutation_request(
     id: String,
     workspace_root: std::path::PathBuf,
     session: &WorkbenchSession,
+    expected_daemon_instance_id: String,
     expected_revision: u64,
     expected_phase_id: String,
     operation: &BrowserPlanningOperation,
@@ -394,6 +425,7 @@ pub(super) fn mutation_request(
     let context = WorkbenchPlanningContext {
         schema_version: 1,
         session_id: session.id.clone(),
+        expected_daemon_instance_id,
         expected_revision,
         expected_phase_id,
         operation: context_operation,
@@ -419,6 +451,7 @@ impl WorkbenchHostInner {
         &self,
         session: &WorkbenchSession,
         request_id: &str,
+        expected_daemon_instance_id: &str,
         expected_revision: u64,
         expected_phase_id: &str,
         task_id: &str,
@@ -426,6 +459,7 @@ impl WorkbenchHostInner {
     ) -> Result<WorkbenchTaskCompletionReview, WorkbenchPlanningError> {
         validate_message(proposed_outcome)?;
         let fingerprint = CompletionReviewFingerprint {
+            expected_daemon_instance_id: expected_daemon_instance_id.to_string(),
             expected_revision,
             expected_phase_id: expected_phase_id.to_string(),
             task_id: task_id.to_string(),
@@ -451,6 +485,7 @@ impl WorkbenchHostInner {
         let context = WorkbenchPlanningContext {
             schema_version: 1,
             session_id: session.id.clone(),
+            expected_daemon_instance_id: expected_daemon_instance_id.to_string(),
             expected_revision,
             expected_phase_id: expected_phase_id.to_string(),
             operation: WorkbenchPlanningContextOperation::TaskCompleteReview {
@@ -481,6 +516,9 @@ impl WorkbenchHostInner {
             .state
             .lock()
             .map_err(|_| WorkbenchPlanningError::internal())?;
+        evict_completion_review_if_needed(&mut state, &session.id);
+        state.completion_review_sequence = state.completion_review_sequence.saturating_add(1);
+        let sequence = state.completion_review_sequence;
         state.completion_review_requests.insert(
             request_key,
             CompletionReviewRequestRecord {
@@ -492,6 +530,7 @@ impl WorkbenchHostInner {
             review_id,
             CompletionReviewRecord {
                 session_id: session.id.clone(),
+                expected_daemon_instance_id: expected_daemon_instance_id.to_string(),
                 expected_revision,
                 expected_phase_id: expected_phase_id.to_string(),
                 task_id: review.task_id,
@@ -499,6 +538,7 @@ impl WorkbenchHostInner {
                 result: result.clone(),
                 approval_request_id: None,
                 consumed: false,
+                sequence,
             },
         );
         drop(state);
@@ -534,6 +574,7 @@ impl WorkbenchHostInner {
         &self,
         session: &WorkbenchSession,
         request_id: &str,
+        expected_daemon_instance_id: &str,
         expected_revision: u64,
         expected_phase_id: &str,
         review_id: &str,
@@ -547,7 +588,8 @@ impl WorkbenchHostInner {
             .get_mut(review_id)
             .filter(|review| review.session_id == session.id)
             .ok_or_else(WorkbenchPlanningError::review_invalid)?;
-        if review.expected_revision != expected_revision
+        if review.expected_daemon_instance_id != expected_daemon_instance_id
+            || review.expected_revision != expected_revision
             || review.expected_phase_id != expected_phase_id
         {
             return Err(WorkbenchPlanningError::review_invalid());
@@ -567,6 +609,7 @@ impl WorkbenchHostInner {
             context: WorkbenchPlanningContext {
                 schema_version: 1,
                 session_id: session.id.clone(),
+                expected_daemon_instance_id: expected_daemon_instance_id.to_string(),
                 expected_revision,
                 expected_phase_id: expected_phase_id.to_string(),
                 operation: WorkbenchPlanningContextOperation::TaskCompleteApprove {
@@ -600,7 +643,10 @@ impl WorkbenchHostInner {
         context: &WorkbenchPlanningContext,
         review: bool,
     ) -> Result<(), WorkbenchPlanningError> {
-        if context.schema_version != 1 || self.current_revision() != context.expected_revision {
+        if context.schema_version != 1
+            || context.expected_daemon_instance_id != self.instance_id.as_ref()
+            || self.current_revision() != context.expected_revision
+        {
             return Err(WorkbenchPlanningError::stale_snapshot());
         }
 
@@ -620,8 +666,13 @@ impl WorkbenchHostInner {
                 .cloned()
                 .ok_or_else(WorkbenchPlanningError::review_invalid)?
         };
-        let snapshot = snapshot::build(&self.project, &registered, context.expected_revision)
-            .map_err(|_| WorkbenchPlanningError::internal())?;
+        let snapshot = snapshot::build(
+            &self.project,
+            &registered,
+            context.expected_revision,
+            &self.instance_id,
+        )
+        .map_err(|_| WorkbenchPlanningError::internal())?;
         let phase = snapshot
             .phase
             .as_ref()
