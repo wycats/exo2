@@ -122,7 +122,9 @@
   let hasCoordination = $derived(
     agentNextStep !== null || snapshot.diagnostics.length > 0,
   );
-  let planningBusy = $derived(pendingPlanningKind !== null);
+  let planningBusy = $derived(
+    pendingPlanningKind !== null || onRetryPlanning !== null,
+  );
   let interactionDisabled = $derived(sessionRecovery !== "connected");
   let planningContextAvailable = $derived(
     workbenchPlanningBinding(snapshot) !== null,

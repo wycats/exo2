@@ -509,10 +509,15 @@
     if (!client || pendingPlanning) {
       return false;
     }
+    if (
+      retryPlanning !== null &&
+      retryPlanning.request.id !== prepared.request.id
+    ) {
+      return false;
+    }
 
     const activeClient = client;
     pendingPlanning = prepared;
-    retryPlanning = null;
     planningFailure = null;
     planningNotice = null;
     try {
@@ -536,6 +541,7 @@
           "Exo marked the task active; the workbench did not start an agent.";
       }
       planningFailure = null;
+      retryPlanning = null;
       planningSuccess = {
         requestId: prepared.request.id,
         operation: prepared.request.operation,
@@ -556,6 +562,8 @@
           error.retryWithSameRequestId
         ) {
           retryPlanning = prepared;
+        } else {
+          retryPlanning = null;
         }
         if (
           error instanceof WorkbenchClientError &&

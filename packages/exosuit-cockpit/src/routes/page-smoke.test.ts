@@ -433,9 +433,9 @@ describe("cockpit page", () => {
                 JSON.stringify({
                   kind: "workbench.busy",
                   ok: false,
-                  message: "The workbench session limit is busy",
+                  message: "The workbench session store is temporarily unavailable",
                 }),
-                { status: 429 },
+                { status: 503 },
               )
             : sessionResponse("session-selector");
         }
@@ -457,7 +457,7 @@ describe("cockpit page", () => {
       await screen.findByRole("heading", { name: "Workbench is busy" }),
     ).toBeTruthy();
     expect(
-      screen.getByText("The workbench session limit is busy"),
+      screen.getByText("The workbench session store is temporarily unavailable"),
     ).toBeTruthy();
     expect(location.hash).toBe("");
 
@@ -1179,6 +1179,12 @@ describe("cockpit page", () => {
     expect(
       await screen.findByText("The workbench planning service is busy"),
     ).toBeTruthy();
+    const editButton = screen.getByRole("button", {
+      name: "Edit Implement host",
+    }) as HTMLButtonElement;
+    expect(editButton.disabled).toBe(true);
+    await fireEvent.click(editButton);
+    expect(planningRequests).toHaveLength(1);
     await fireEvent.click(
       screen.getByRole("button", { name: "Retry same request" }),
     );

@@ -121,27 +121,7 @@ async fn create_session(
     }
     let (session_id, result) = match inner.redeem_ticket(&request.ticket) {
         Ok(result) => result,
-        Err(TicketExchangeError::Invalid) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "workbench.ticket_invalid",
-                "The workbench launch ticket is invalid",
-            );
-        }
-        Err(TicketExchangeError::Busy) => {
-            return error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "workbench.busy",
-                "The workbench session limit is reached",
-            );
-        }
-        Err(TicketExchangeError::Unavailable) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "workbench.host_unavailable",
-                "The workbench session could not be persisted",
-            );
-        }
+        Err(error) => return ticket_exchange_error_response(error),
     };
     inner.touch_daemon_activity();
     let cookie_name = session_cookie_name(&result.session_key);
@@ -787,6 +767,27 @@ fn error_response(status: StatusCode, kind: &'static str, message: &'static str)
     response
 }
 
+fn ticket_exchange_error_response(error: TicketExchangeError) -> AxumResponse {
+    let (status, kind, message) = match error {
+        TicketExchangeError::Invalid => (
+            StatusCode::UNAUTHORIZED,
+            "workbench.ticket_invalid",
+            "The workbench launch ticket is invalid",
+        ),
+        TicketExchangeError::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "workbench.busy",
+            "The workbench session limit is reached",
+        ),
+        TicketExchangeError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.busy",
+            "The workbench session store is temporarily unavailable",
+        ),
+    };
+    error_response(status, kind, message)
+}
+
 fn json_rejection_response(error: JsonRejection) -> AxumResponse {
     if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
         error_response(
@@ -933,5 +934,18 @@ mod tests {
                 "retry_with_same_request_id": true,
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn restored_ticket_persistence_failure_is_retryable() {
+        let response = ticket_exchange_error_response(TicketExchangeError::Unavailable);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read ticket exchange response");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode ticket exchange response");
+        assert_eq!(body["kind"], "workbench.busy");
+        assert_eq!(body["ok"], false);
     }
 }

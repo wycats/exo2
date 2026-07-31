@@ -323,6 +323,41 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
+async fn ticket_persistence_failure_restores_the_one_time_capability() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = ticket_payload(ticket);
+    fs::create_dir(&manager.inner.session_store_path)
+        .expect("block the session store with a directory");
+
+    assert_eq!(
+        manager.inner.redeem_ticket(ticket),
+        Err(TicketExchangeError::Unavailable)
+    );
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pending_capabilities
+            .contains_key(&payload.capability_id),
+        "a failed durable exchange must restore the one-time capability"
+    );
+
+    fs::remove_dir(&manager.inner.session_store_path)
+        .expect("restore the session store destination");
+    manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("retry the restored ticket");
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sessions_restore_and_renew_across_compatible_host_replacement() {
     let fixture = fixture();
     let first_manager =
@@ -1376,6 +1411,80 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
     assert_eq!(
         refreshed.phase.as_ref().map(|phase| phase.id.as_str()),
         Some(phase.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_revision_and_database_state_share_the_project_state_gate() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Snapshot Gate Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Snapshot Gate Phase", "regular", None, &[])
+        .expect("add phase");
+    let lane = writer
+        .add_workbench_lane("Snapshot gate lane", "Serialize the snapshot", &phase)
+        .expect("add lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let project_state_guard = manager
+        .inner
+        .project_state_gate
+        .lock()
+        .expect("project state gate");
+    let (before_gate_tx, before_gate_rx) = std::sync::mpsc::channel();
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+    let snapshot_manager = manager.clone();
+    let snapshot_root = fixture.root.clone();
+    let snapshot_thread = std::thread::spawn(move || {
+        let snapshot = snapshot_manager.snapshot_with_before_state_gate(&snapshot_root, || {
+            before_gate_tx
+                .send(())
+                .expect("announce snapshot gate wait");
+        });
+        snapshot_tx.send(snapshot).expect("send snapshot result");
+    });
+    before_gate_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot reached the project state gate");
+    assert!(
+        snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "snapshot creation must wait while an atomic project-state write owns the gate"
+    );
+
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    writer
+        .focus_workbench_lane(&workspace.to_string_lossy(), &lane, &phase)
+        .expect("focus lane and phase");
+    drop(writer);
+    let revision = manager.revision_after_write();
+    drop(project_state_guard);
+
+    let snapshot = snapshot_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("snapshot completed after the write")
+        .expect("read coherent snapshot");
+    snapshot_thread.join().expect("join snapshot thread");
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(
+        snapshot.phase.as_ref().map(|phase| phase.id.as_str()),
+        Some(phase.as_str())
+    );
+    assert_eq!(
+        snapshot
+            .focused_lane
+            .as_ref()
+            .map(|lane| lane.summary.id.as_str()),
+        Some(lane.as_str())
     );
 }
 

@@ -598,7 +598,22 @@ impl WorkbenchHostManager {
     }
 
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
+        self.snapshot_with_before_state_gate(workspace_root, || {})
+    }
+
+    fn snapshot_with_before_state_gate(
+        &self,
+        workspace_root: &Path,
+        before_state_gate: impl FnOnce(),
+    ) -> Result<WorkbenchSnapshot> {
         let workspace = self.register_workspace(workspace_root)?;
+        before_state_gate();
+        let _project_state_guard = self.inner.project_state_gate.lock().map_err(|_| {
+            anyhow::Error::new(workbench_failure(
+                "workbench.snapshot_unavailable",
+                "The workbench snapshot is temporarily unavailable",
+            ))
+        })?;
         snapshot::build(
             &self.inner.project,
             &workspace,
