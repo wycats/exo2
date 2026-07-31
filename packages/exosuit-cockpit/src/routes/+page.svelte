@@ -127,6 +127,7 @@
         };
         events.onerror = () => {
           streamConnected = false;
+          void recoverSession();
         };
         events.addEventListener("ready", () => {
           streamConnected = true;
@@ -404,11 +405,13 @@
         completionReview.expectedDaemonInstanceId ||
         nextSnapshot.revision !== completionReview.expectedRevision ||
         nextSnapshot.phase?.id !== completionReview.expectedPhaseId) &&
-      !(
-        pendingPlanning?.request.operation.kind ===
-          "task_complete_approve" &&
-        pendingPlanning.request.operation.review_id ===
-          completionReview.review.review_id
+      !preparedPlanningApprovesReview(
+        pendingPlanning,
+        completionReview.review.review_id,
+      ) &&
+      !preparedPlanningApprovesReview(
+        retryPlanning,
+        completionReview.review.review_id,
       )
     ) {
       completionReview = null;
@@ -426,6 +429,16 @@
     }
     retryBootstrap = null;
     startLiveUpdates?.();
+  }
+
+  function preparedPlanningApprovesReview(
+    prepared: PreparedPlanningRequest | null,
+    reviewId: string,
+  ): boolean {
+    return (
+      prepared?.request.operation.kind === "task_complete_approve" &&
+      prepared.request.operation.review_id === reviewId
+    );
   }
 
   async function focusLane(
@@ -752,7 +765,9 @@
     onFocus={(laneId) => void focusLane(laneId)}
     onRetryFocus={retryFocus ? retryPendingFocus : null}
     onRetryPlanning={retryPlanning ? retryPendingPlanning : null}
-    onRetrySession={() => beginSessionRecovery?.()}
+    onRetrySession={sessionRecovery === "reconnecting"
+      ? () => beginSessionRecovery?.()
+      : null}
     onRefresh={() => void refreshSnapshot(false)}
     onPlan={submitPlanning}
     onApproveCompletion={approveCompletionReview}

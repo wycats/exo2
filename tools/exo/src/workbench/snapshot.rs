@@ -2,7 +2,7 @@ use super::{
     WorkbenchDaemonIdentity, WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails,
     WorkbenchLaneSummary, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
     WorkbenchSnapshotWorkspace, WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask,
-    WorkspaceRegistration,
+    WorkbenchTaskProgress, WorkspaceRegistration,
 };
 use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
 use crate::project::Project;
@@ -110,6 +110,15 @@ pub(super) fn build_with_after_state_hook(
                             id: task.id.clone(),
                             title: task.title.clone(),
                             status: task.status.clone(),
+                            progress: task
+                                .logs
+                                .iter()
+                                .filter(|log| log.kind == "progress")
+                                .map(|log| WorkbenchTaskProgress {
+                                    message: log.message.clone(),
+                                    created_at: log.created_at.clone(),
+                                })
+                                .collect(),
                         })
                         .collect(),
                 })

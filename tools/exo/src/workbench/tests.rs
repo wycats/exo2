@@ -204,6 +204,10 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
                     id: "implement-host".to_string(),
                     title: "Implement host".to_string(),
                     status: "in-progress".to_string(),
+                    progress: vec![WorkbenchTaskProgress {
+                        message: "Captured browser evidence.".to_string(),
+                        created_at: "2026-07-28T19:45:00Z".to_string(),
+                    }],
                 }],
             }],
         }),
@@ -980,6 +984,16 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             None,
         )
         .expect("add task");
+    writer
+        .add_task_log("implement", "progress", "Captured browser evidence.")
+        .expect("add browser-safe progress");
+    writer
+        .add_task_log(
+            "implement",
+            "note",
+            &format!("Internal note from {}", fixture.root.display()),
+        )
+        .expect("add non-progress task note");
     let lane = writer
         .add_workbench_lane(
             "Host and launch",
@@ -1016,6 +1030,14 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
         snapshot.phase.as_ref().expect("phase").goals[0].tasks.len(),
         1
     );
+    let progress = &snapshot.phase.as_ref().expect("phase").goals[0].tasks[0].progress;
+    assert_eq!(
+        progress.len(),
+        1,
+        "the snapshot withholds non-progress task log kinds"
+    );
+    assert_eq!(progress[0].message, "Captured browser evidence.");
+    assert!(!progress[0].created_at.is_empty());
     assert!(snapshot.diagnostics.is_empty());
     assert!(snapshot.steering.next_actions.iter().all(|action| matches!(
         action.intent.as_str(),

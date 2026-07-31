@@ -81,6 +81,12 @@ export interface WorkbenchTask {
   id: string;
   title: string;
   status: string;
+  progress?: WorkbenchTaskProgress[];
+}
+
+export interface WorkbenchTaskProgress {
+  message: string;
+  created_at: string;
 }
 
 export interface WorkbenchSteering {
@@ -313,6 +319,13 @@ function phase(value: unknown): void {
       string(taskItem.id, "task.id");
       string(taskItem.title, "task.title");
       string(taskItem.status, "task.status");
+      if (taskItem.progress !== undefined) {
+        array(taskItem.progress, "task.progress").forEach((progress) => {
+          const progressItem = record(progress, "task progress");
+          string(progressItem.message, "task.progress.message");
+          string(progressItem.created_at, "task.progress.created_at");
+        });
+      }
     });
   });
 }

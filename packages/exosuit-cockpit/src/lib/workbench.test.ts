@@ -10,6 +10,12 @@ describe("workbench snapshot contract", () => {
     expect(snapshot.kind).toBe("workbench.snapshot");
     expect(snapshot.focused_lane?.id).toBe("lane-fixture");
     expect(snapshot.phase?.goals[0]?.tasks[0]?.id).toBe("implement-host");
+    expect(snapshot.phase?.goals[0]?.tasks[0]?.progress).toEqual([
+      {
+        message: "Captured browser evidence.",
+        created_at: "2026-07-28T19:45:00Z",
+      },
+    ]);
   });
 
   it("rejects malformed nested lane state", () => {

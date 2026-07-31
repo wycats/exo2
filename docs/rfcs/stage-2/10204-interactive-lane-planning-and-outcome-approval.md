@@ -71,6 +71,11 @@ task rather than making every row permanently tall. An unsent title, task, or
 note remains local input; it is not reflected in the plan until Exo confirms a
 commit.
 
+Committed progress notes return in later snapshots as timestamped task progress.
+The host projects only canonical `progress` entries; internal task-log kinds do
+not become browser data. The cockpit keeps those entries compact until a person
+opens them for review.
+
 While a request is in flight, the relevant control is pending and cannot submit
 a second intention. The browser does not optimistically rewrite the plan. On
 success it refreshes from the authoritative snapshot, normally through the
@@ -446,6 +451,9 @@ opening binding so Exo can reject it as stale instead of applying old text over
 a collaborator's change. A successful write clears its submitted draft after
 the authoritative refresh. A stale or invalid response preserves useful text.
 A transport failure keeps both the payload and request ID for retry.
+An approval retry remains attached to its completion review when the approved
+write's own invalidation refreshes the snapshot before the original response is
+read.
 
 The completion card stores only the browser-safe review result. `Approve`
 dispatches its review identity with the exact task and outcome Exo returned.
@@ -462,7 +470,8 @@ Any transport or unreadable-response failure during live refresh enters session
 recovery immediately. The last authoritative snapshot stays visible, but all
 mutations pause while the client renews the session and obtains a fresh
 snapshot. Replacing the browser session clears notices and pending transient
-planning state from the prior session.
+planning state from the prior session. A session that cannot be restored asks
+for a current launch instead of retrying expired credentials.
 
 ### Linked worktrees
 
@@ -478,7 +487,9 @@ contains the changed entity, it does not acquire the issuing workspace's focus.
 ### Compatibility and rollout
 
 `WorkbenchSnapshot` remains schema version 1. Goal-progress presentation is
-derived in the client from existing task statuses.
+derived in the client from existing task statuses. Each task may also carry an
+additive `progress` collection containing the message and timestamp of canonical
+progress logs; older clients ignore that field.
 
 The host accepts version-one snapshot and lane-focus requests while adding
 version-two planning requests. Older embedded clients continue to orient and

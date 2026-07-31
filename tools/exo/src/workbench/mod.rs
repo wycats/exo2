@@ -422,6 +422,13 @@ pub struct WorkbenchTask {
     pub id: String,
     pub title: String,
     pub status: String,
+    pub progress: Vec<WorkbenchTaskProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchTaskProgress {
+    pub message: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

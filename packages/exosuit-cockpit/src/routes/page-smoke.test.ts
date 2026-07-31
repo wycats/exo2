@@ -35,6 +35,10 @@ class TestEventSource {
     }
   }
 
+  fail(): void {
+    this.onerror?.(new Event("error"));
+  }
+
   close(): void {}
 }
 
@@ -302,6 +306,55 @@ describe("cockpit page", () => {
     });
   });
 
+  it("enters recovery immediately when the event stream disconnects", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const renewal = deferred<Response>();
+    let snapshotReads = 0;
+    let renewalReads = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        renewalReads += 1;
+        return renewal.promise;
+      }
+      snapshotReads += 1;
+      const request = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: {
+            ...snapshotFixture,
+            revision: snapshotReads === 1 ? 7 : 8,
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    TestEventSource.instances[0]!.fail();
+
+    expect(await screen.findByText("Reconnecting to Exo.")).toBeTruthy();
+    expect(renewalReads).toBe(1);
+    expect(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    ).toHaveProperty("disabled", true);
+
+    renewal.resolve(sessionResponse("session-selector"));
+    await waitFor(() => {
+      expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+      expect(TestEventSource.instances).toHaveLength(2);
+    });
+  });
+
   it("shows a compact recovery boundary when the replacement cannot resume the snapshot", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     let snapshotReads = 0;
@@ -351,7 +404,7 @@ describe("cockpit page", () => {
     expect(
       screen.queryByRole("heading", { name: "Session expired" }),
     ).toBeNull();
-    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("renders workspace loss as a terminal workspace state", async () => {
@@ -1019,6 +1072,137 @@ describe("cockpit page", () => {
     });
   });
 
+  it("keeps an ambiguous approval retry through its own invalidation", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const planningRequests: WorkbenchPlanningRequest[] = [];
+    let approvalCommitted = false;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.protocol_version === 2) {
+          planningRequests.push(request as WorkbenchPlanningRequest);
+          if (request.operation.kind === "task_complete_review") {
+            return new Response(
+              JSON.stringify({
+                protocol_version: 1,
+                id: request.id,
+                status: "ok",
+                result: {
+                  kind: "workbench.task_completion_review",
+                  ok: true,
+                  schema_version: 1,
+                  review_id: "review-selector",
+                  task_id: "implement-host",
+                  readiness_rationale: "All focused checks pass.",
+                  proposed_outcome: request.operation.outcome,
+                  approval_evidence_present: false,
+                },
+              }),
+              { status: 200 },
+            );
+          }
+          approvalCommitted = true;
+          return planningRequests.filter(
+            (candidate) =>
+              candidate.operation.kind === "task_complete_approve",
+          ).length === 1
+            ? new Response(
+                JSON.stringify({
+                  protocol_version: 1,
+                  id: request.id,
+                  status: "error",
+                  error: {
+                    code: "precondition_failed",
+                    message: "The approval outcome is not known yet",
+                    details: {
+                      kind: "workbench.busy",
+                      retry_with_same_request_id: true,
+                    },
+                  },
+                }),
+                { status: 200 },
+              )
+            : new Response(
+                JSON.stringify({
+                  protocol_version: 1,
+                  id: request.id,
+                  status: "ok",
+                  result: {
+                    kind: "workbench.task_mutation",
+                    ok: true,
+                    schema_version: 1,
+                    operation: "task_complete_approve",
+                    task_id: "implement-host",
+                  },
+                }),
+                { status: 200 },
+              );
+        }
+        const nextSnapshot = structuredClone(snapshotFixture);
+        if (approvalCommitted) {
+          nextSnapshot.revision = 8;
+          nextSnapshot.phase.goals[0]!.tasks[0]!.status = "completed";
+        }
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: nextSnapshot,
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review completion of Implement host",
+      }),
+    );
+    await fireEvent.input(
+      screen.getByLabelText("Proposed completion outcome"),
+      { target: { value: "Implemented the exact local host contract." } },
+    );
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Review completion" }),
+    );
+    await screen.findByText("Implemented the exact local host contract.");
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Approve exact outcome" }),
+    );
+
+    expect(
+      await screen.findByText("The approval outcome is not known yet"),
+    ).toBeTruthy();
+    const firstApproval = planningRequests.at(-1)!;
+    TestEventSource.instances[0]!.emit("invalidate");
+    await waitFor(() => {
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: "Retry same request" }),
+      ).toBeTruthy();
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Retry same request" }),
+    );
+    await waitFor(() => expect(planningRequests).toHaveLength(3));
+    expect(planningRequests[2]).toEqual(firstApproval);
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Retry same request" }),
+      ).toBeNull();
+    });
+  });
+
   it("reports task activation as Exo state rather than agent dispatch", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const pendingSnapshot = structuredClone(snapshotFixture);
@@ -1026,6 +1210,7 @@ describe("cockpit page", () => {
       id: "agent-handoff",
       title: "Prepare the agent handoff",
       status: "pending",
+      progress: [],
     });
     const activeSnapshot = structuredClone(pendingSnapshot);
     activeSnapshot.revision = pendingSnapshot.revision + 1;

@@ -306,15 +306,38 @@
     if (tone === "complete") {
       return "Complete";
     }
-    if (tone === "active") {
-      return "In progress";
-    }
     if (tone === "terminal") {
       return statusLabel(goal.status);
     }
-    return goal.tasks.some((task) => statusTone(task.status) !== "pending")
-      ? "Underway"
-      : "Not started";
+    const completed = goal.tasks.filter(
+      (task) => statusTone(task.status) === "complete",
+    ).length;
+    const started = goal.tasks.some((task) =>
+      ["active", "complete"].includes(statusTone(task.status)),
+    );
+    if (
+      tone === "pending" &&
+      goal.tasks.length > 0 &&
+      completed === goal.tasks.length
+    ) {
+      return "Tasks complete · Goal pending";
+    }
+    if (tone === "active" || started) {
+      return goal.tasks.length > 0
+        ? `${completed} of ${goal.tasks.length} tasks complete`
+        : "In progress";
+    }
+    return "Not started";
+  };
+
+  const goalProgressTone = (goal: WorkbenchGoal): StatusTone => {
+    const tone = statusTone(goal.status);
+    return tone === "pending" &&
+      goal.tasks.some((task) =>
+        ["active", "complete"].includes(statusTone(task.status)),
+      )
+      ? "active"
+      : tone;
   };
 
   const taskIndex = (goal: WorkbenchGoal, task: WorkbenchTask): number =>
@@ -778,12 +801,12 @@
             {#each snapshot.phase.goals as goal (goal.id)}
               <article class="goal">
                 <div class="goal-heading">
-                  <span class={`status-icon ${statusTone(goal.status)}`} aria-hidden="true">
-                    {#if statusTone(goal.status) === "complete"}
+                  <span class={`status-icon ${goalProgressTone(goal)}`} aria-hidden="true">
+                    {#if goalProgressTone(goal) === "complete"}
                       <CheckCircle2 size={18} />
-                    {:else if statusTone(goal.status) === "active"}
+                    {:else if goalProgressTone(goal) === "active"}
                       <CircleDot size={18} />
-                    {:else if statusTone(goal.status) === "terminal"}
+                    {:else if goalProgressTone(goal) === "terminal"}
                       <XCircle size={18} />
                     {:else}
                       <Circle size={18} />
@@ -862,6 +885,7 @@
                 {#if goal.tasks.length > 0}
                   <ul class="task-list">
                     {#each goal.tasks as task, index (task.id)}
+                      {@const progress = task.progress ?? []}
                       <li>
                         <div class="task-row">
                           <span class={`task-check ${statusTone(task.status)}`} aria-hidden="true">
@@ -876,6 +900,9 @@
                             {/if}
                           </span>
                           <span class="task-title">{task.title}</span>
+                          {#if ["pending", "complete"].includes(statusTone(task.status))}
+                            <span class="sr-only">{statusLabel(task.status)}</span>
+                          {/if}
                           {#if statusTone(task.status) === "active"}
                             <span class="task-active-label">Active</span>
                           {:else if statusTone(task.status) === "terminal"}
@@ -971,6 +998,25 @@
                             </div>
                           {/if}
                         </div>
+
+                        {#if progress.length > 0}
+                          <details class="task-progress">
+                            <summary>
+                              {progress.length}
+                              {progress.length === 1 ? "progress update" : "progress updates"}
+                            </summary>
+                            <ol>
+                              {#each progress as entry}
+                                <li>
+                                  <p>{entry.message}</p>
+                                  <time datetime={entry.created_at}>
+                                    {observedTime(entry.created_at)}
+                                  </time>
+                                </li>
+                              {/each}
+                            </ol>
+                          </details>
+                        {/if}
 
                         {#if planningEditor?.kind === "edit" && planningEditor.taskId === task.id}
                           <form class="planning-editor task-editor" onsubmit={submitEditor}>
@@ -1787,6 +1833,18 @@
     border-top: 1px solid #e3e8e6;
   }
 
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .task-row {
     min-height: 40px;
     display: grid;
@@ -1817,6 +1875,47 @@
     color: var(--muted);
     font-size: 0.63rem;
     font-weight: 750;
+  }
+
+  .task-progress {
+    margin: -2px 0 10px 25px;
+    color: var(--muted);
+    font-size: 0.68rem;
+  }
+
+  .task-progress summary {
+    width: fit-content;
+    cursor: pointer;
+    font-weight: 700;
+  }
+
+  .task-progress ol {
+    display: grid;
+    gap: 7px;
+    margin: 7px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .task-progress li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    padding: 7px 9px;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: var(--surface-soft);
+  }
+
+  .task-progress p {
+    color: var(--ink-soft);
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .task-progress time {
+    white-space: nowrap;
   }
 
   .task-actions {

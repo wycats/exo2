@@ -107,6 +107,15 @@ describe("focus-only lane workbench", () => {
           { id: "future", title: "Future work", status: "pending" },
         ],
       },
+      {
+        id: "tasks-complete",
+        title: "Tasks complete goal",
+        status: "pending",
+        tasks: [
+          { id: "done-one", title: "First result", status: "completed" },
+          { id: "done-two", title: "Second result", status: "completed" },
+        ],
+      },
     ];
 
     render(WorkbenchView, {
@@ -121,9 +130,48 @@ describe("focus-only lane workbench", () => {
     const notStarted = screen
       .getByRole("heading", { name: "Not started goal" })
       .closest("article");
-    expect(within(underway!).getByText("Underway")).toBeTruthy();
+    const tasksComplete = screen
+      .getByRole("heading", { name: "Tasks complete goal" })
+      .closest("article");
+    expect(within(underway!).getByText("1 of 2 tasks complete")).toBeTruthy();
     expect(within(notStarted!).getByText("Not started")).toBeTruthy();
-    expect(within(underway!).queryByText("Pending")).toBeNull();
+    expect(
+      within(tasksComplete!).getByText("Tasks complete · Goal pending"),
+    ).toBeTruthy();
+    expect(
+      within(underway!).queryByText("Pending", {
+        selector: ".goal-copy > span",
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps icon-only task status accessible and exposes recorded progress", async () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals[0]!.tasks.push(
+      {
+        id: "future-proof",
+        title: "Future proof",
+        status: "pending",
+      },
+      {
+        id: "captured-proof",
+        title: "Captured proof",
+        status: "completed",
+      },
+    );
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(screen.getByText("Pending", { selector: ".sr-only" })).toBeTruthy();
+    expect(screen.getByText("Completed", { selector: ".sr-only" })).toBeTruthy();
+    await fireEvent.click(screen.getByText("1 progress update"));
+    expect(screen.getByText("Captured browser evidence.")).toBeTruthy();
+    expect(
+      document.querySelector('time[datetime="2026-07-28T19:45:00Z"]'),
+    ).toBeTruthy();
   });
 
   it("shows terminal planning entities without mutation controls", () => {
@@ -169,7 +217,11 @@ describe("focus-only lane workbench", () => {
       .getByRole("heading", { name: "Active direction" })
       .closest("article");
 
-    expect(within(abandonedGoal!).getAllByText("Abandoned")).toHaveLength(2);
+    expect(
+      within(abandonedGoal!)
+        .getAllByText("Abandoned")
+        .filter((element) => !element.classList.contains("sr-only")),
+    ).toHaveLength(2);
     expect(
       within(abandonedGoal!).queryByRole("button", {
         name: "Add task to Abandoned direction",
@@ -178,7 +230,11 @@ describe("focus-only lane workbench", () => {
     expect(
       within(abandonedGoal!).queryByLabelText("Actions for Abandoned task"),
     ).toBeNull();
-    expect(within(activeGoal!).getByText("Skipped")).toBeTruthy();
+    expect(
+      within(activeGoal!).getByText("Skipped", {
+        selector: ".task-terminal-label",
+      }),
+    ).toBeTruthy();
     expect(
       within(activeGoal!).queryByLabelText("Actions for Skipped task"),
     ).toBeNull();
