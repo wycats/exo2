@@ -106,6 +106,10 @@
     | { kind: "log"; taskId: string }
     | { kind: "review"; taskId: string };
 
+  const TITLE_MAX_BYTES = 512;
+  const MESSAGE_MAX_BYTES = 16 * 1024;
+  const utf8Encoder = new TextEncoder();
+
   let laneRail: HTMLElement | undefined = $state();
   let completionReviewCard: HTMLElement | undefined = $state();
   let compactNavigation = $state(false);
@@ -125,6 +129,27 @@
   );
   let planningDisabled = $derived(
     planningBusy || interactionDisabled || !planningContextAvailable,
+  );
+  let planningValueForOperation = $derived.by(() =>
+    planningEditor?.kind === "add" || planningEditor?.kind === "edit"
+      ? planningValue.trim()
+      : planningValue,
+  );
+  let planningValueByteLimit = $derived(
+    planningEditor?.kind === "add" || planningEditor?.kind === "edit"
+      ? TITLE_MAX_BYTES
+      : MESSAGE_MAX_BYTES,
+  );
+  let planningValueByteLength = $derived(
+    utf8Encoder.encode(planningValueForOperation).byteLength,
+  );
+  let planningValueTooLarge = $derived(
+    planningValueByteLength > planningValueByteLimit,
+  );
+  let planningSubmitDisabled = $derived(
+    planningDisabled ||
+      planningValueForOperation.trim().length === 0 ||
+      planningValueTooLarge,
   );
   let connectionPresentation = $derived.by(() => {
     if (sessionRecovery === "reconnecting") {
@@ -388,14 +413,10 @@
     if (!planningEditor || !planningEditorBinding || planningDisabled) {
       return;
     }
-    const trimmedValue = planningValue.trim();
-    if (!trimmedValue) {
+    const value = planningValueForOperation;
+    if (!value.trim() || planningValueTooLarge) {
       return;
     }
-    const value =
-      planningEditor.kind === "add" || planningEditor.kind === "edit"
-        ? trimmedValue
-        : planningValue;
     let operation: WorkbenchPlanningOperation;
     switch (planningEditor.kind) {
       case "add":
@@ -712,7 +733,7 @@
               </p>
               <div class="review-outcome">
                 <span>Outcome to record</span>
-                <p>{completionReview.proposed_outcome}</p>
+                <p class="review-outcome-text">{completionReview.proposed_outcome}</p>
               </div>
               <div class="review-evidence">
                 {#if completionReview.approval_evidence_present}
@@ -792,6 +813,10 @@
                         id={`add-task-${goal.id}`}
                         bind:value={planningValue}
                         maxlength="512"
+                        aria-invalid={planningValueTooLarge}
+                        aria-describedby={planningValueTooLarge
+                          ? `add-task-limit-${goal.id}`
+                          : undefined}
                         placeholder="Describe the next bounded task"
                         required
                       />
@@ -800,8 +825,7 @@
                         type="submit"
                         title="Add task"
                         aria-label="Add task"
-                        disabled={planningDisabled ||
-                          planningValue.trim().length === 0}
+                        disabled={planningSubmitDisabled}
                       >
                         {#if pendingPlanningKind === "task_add"}
                           <LoaderCircle class="spin" size={16} aria-hidden="true" />
@@ -820,6 +844,16 @@
                         <X size={16} aria-hidden="true" />
                       </button>
                     </div>
+                    {#if planningValueTooLarge}
+                      <p
+                        class="editor-validation"
+                        id={`add-task-limit-${goal.id}`}
+                        role="alert"
+                      >
+                        Text is too long ({planningValueByteLength} of
+                        {planningValueByteLimit} bytes).
+                      </p>
+                    {/if}
                   </form>
                 {/if}
 
@@ -944,6 +978,10 @@
                                 id={`edit-task-${task.id}`}
                                 bind:value={planningValue}
                                 maxlength="512"
+                                aria-invalid={planningValueTooLarge}
+                                aria-describedby={planningValueTooLarge
+                                  ? `edit-task-limit-${task.id}`
+                                  : undefined}
                                 required
                               />
                               <button
@@ -951,8 +989,7 @@
                                 type="submit"
                                 title="Save title"
                                 aria-label="Save task title"
-                                disabled={planningDisabled ||
-                                  planningValue.trim().length === 0}
+                                disabled={planningSubmitDisabled}
                               >
                                 {#if pendingPlanningKind === "task_update"}
                                   <LoaderCircle class="spin" size={16} aria-hidden="true" />
@@ -971,6 +1008,16 @@
                                 <X size={16} aria-hidden="true" />
                               </button>
                             </div>
+                            {#if planningValueTooLarge}
+                              <p
+                                class="editor-validation"
+                                id={`edit-task-limit-${task.id}`}
+                                role="alert"
+                              >
+                                Text is too long ({planningValueByteLength} of
+                                {planningValueByteLimit} bytes).
+                              </p>
+                            {/if}
                           </form>
                         {:else if planningEditor?.kind === "log" && planningEditor.taskId === task.id}
                           <form class="planning-editor task-editor" onsubmit={submitEditor}>
@@ -979,10 +1026,24 @@
                               id={`log-task-${task.id}`}
                               bind:value={planningValue}
                               maxlength="16384"
+                              aria-invalid={planningValueTooLarge}
+                              aria-describedby={planningValueTooLarge
+                                ? `log-task-limit-${task.id}`
+                                : undefined}
                               rows="3"
                               placeholder="Record evidence, a decision, or the next concrete boundary"
                               required
                             ></textarea>
+                            {#if planningValueTooLarge}
+                              <p
+                                class="editor-validation"
+                                id={`log-task-limit-${task.id}`}
+                                role="alert"
+                              >
+                                Text is too long ({planningValueByteLength} of
+                                {planningValueByteLimit} bytes).
+                              </p>
+                            {/if}
                             <div class="editor-actions">
                               <button
                                 class="secondary-button"
@@ -995,8 +1056,7 @@
                               <button
                                 class="primary-button"
                                 type="submit"
-                                disabled={planningDisabled ||
-                                  planningValue.trim().length === 0}
+                                disabled={planningSubmitDisabled}
                               >
                                 {#if pendingPlanningKind === "task_log"}
                                   <LoaderCircle class="spin" size={16} aria-hidden="true" />
@@ -1015,10 +1075,24 @@
                               id={`review-task-${task.id}`}
                               bind:value={planningValue}
                               maxlength="16384"
+                              aria-invalid={planningValueTooLarge}
+                              aria-describedby={planningValueTooLarge
+                                ? `review-task-limit-${task.id}`
+                                : undefined}
                               rows="5"
                               placeholder="State the exact verified outcome to review"
                               required
                             ></textarea>
+                            {#if planningValueTooLarge}
+                              <p
+                                class="editor-validation"
+                                id={`review-task-limit-${task.id}`}
+                                role="alert"
+                              >
+                                Text is too long ({planningValueByteLength} of
+                                {planningValueByteLimit} bytes).
+                              </p>
+                            {/if}
                             <div class="editor-actions">
                               <button
                                 class="secondary-button"
@@ -1031,8 +1105,7 @@
                               <button
                                 class="primary-button"
                                 type="submit"
-                                disabled={planningDisabled ||
-                                  planningValue.trim().length === 0}
+                                disabled={planningSubmitDisabled}
                               >
                                 {#if pendingPlanningKind === "task_complete_review"}
                                   <LoaderCircle class="spin" size={16} aria-hidden="true" />
@@ -1818,6 +1891,13 @@
     resize: vertical;
   }
 
+  .editor-validation {
+    margin-top: 6px;
+    color: var(--danger);
+    font-size: 0.68rem;
+    font-weight: 650;
+  }
+
   .editor-control {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 28px 28px;
@@ -1944,11 +2024,13 @@
     text-transform: uppercase;
   }
 
-  .review-outcome p {
+  .review-outcome-text {
     margin-top: 5px;
     font-size: 0.78rem;
     line-height: 1.5;
+    overflow-wrap: anywhere;
     text-wrap: pretty;
+    white-space: pre-wrap;
   }
 
   .review-evidence {

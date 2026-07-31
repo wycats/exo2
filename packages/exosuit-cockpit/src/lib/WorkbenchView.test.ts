@@ -257,6 +257,8 @@ describe("focus-only lane workbench", () => {
   it("renders a human completion review with deliberate approval and revision", async () => {
     const onApproveCompletion = vi.fn().mockResolvedValue(true);
     const onDismissCompletionReview = vi.fn();
+    const exactOutcome =
+      "Implemented the local host.\n  Preserved indented verification.";
     render(WorkbenchView, {
       snapshot: fixture(),
       completionReview: {
@@ -266,7 +268,7 @@ describe("focus-only lane workbench", () => {
         review_id: "review-selector",
         task_id: "implement-host",
         readiness_rationale: "The exact focused checks pass.",
-        proposed_outcome: "Implemented the local host.",
+        proposed_outcome: exactOutcome,
         approval_evidence_present: false,
       },
       onFocus: vi.fn(),
@@ -278,7 +280,9 @@ describe("focus-only lane workbench", () => {
     expect(
       screen.getByRole("heading", { name: "Implement host" }),
     ).toBeTruthy();
-    expect(screen.getByText("Implemented the local host.")).toBeTruthy();
+    const reviewedOutcome = document.querySelector(".review-outcome-text");
+    expect(reviewedOutcome?.textContent).toBe(exactOutcome);
+    expect(reviewedOutcome?.classList.contains("review-outcome-text")).toBe(true);
     await fireEvent.click(
       screen.getByRole("button", { name: "Approve exact outcome" }),
     );
@@ -290,9 +294,49 @@ describe("focus-only lane workbench", () => {
     expect(
       (screen.getByLabelText("Proposed completion outcome") as HTMLTextAreaElement)
         .value,
-    ).toBe("Implemented the local host.");
+    ).toBe(exactOutcome);
     await fireEvent.click(screen.getByRole("button", { name: "Keep working" }));
     expect(onDismissCompletionReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("enforces server UTF-8 byte limits before planning submission", async () => {
+    const onPlan = vi.fn().mockResolvedValue(true);
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+      onPlan,
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "🙂".repeat(129) },
+    });
+    expect(screen.getByText("Text is too long (516 of 512 bytes).")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Save task title" }),
+    ).toHaveProperty("disabled", true);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Cancel editing task" }),
+    );
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review completion of Implement host",
+      }),
+    );
+    await fireEvent.input(screen.getByLabelText("Proposed completion outcome"), {
+      target: { value: "🙂".repeat(4097) },
+    });
+    expect(
+      screen.getByText("Text is too long (16388 of 16384 bytes)."),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Review completion" }),
+    ).toHaveProperty("disabled", true);
+    expect(onPlan).not.toHaveBeenCalled();
   });
 
   it("preserves an open draft after an unrelated planning success", async () => {
