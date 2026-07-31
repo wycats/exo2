@@ -61,6 +61,7 @@
       requestId: string;
       operation: WorkbenchPlanningOperation;
     } | null;
+    planningEditorRebindToken?: number;
     pendingPlanningKind?: WorkbenchPlanningOperation["kind"] | null;
     completionReview?: WorkbenchTaskCompletionReview | null;
     onFocus: (laneId: string) => void;
@@ -88,6 +89,7 @@
     planningFailure = null,
     planningNotice = null,
     planningSuccess = null,
+    planningEditorRebindToken = 0,
     pendingPlanningKind = null,
     completionReview = null,
     onFocus,
@@ -117,6 +119,7 @@
   let planningEditorBinding = $state<WorkbenchPlanningBinding | null>(null);
   let planningValue = $state("");
   let handledPlanningSuccessId: string | null = null;
+  let handledPlanningEditorRebindToken = 0;
 
   let agentNextStep = $derived(snapshot.steering.next_actions[0] ?? null);
   let hasCoordination = $derived(
@@ -223,6 +226,20 @@
         editorMatchesOperation(planningEditor, planningSuccess.operation)
       ) {
         closeEditor();
+      }
+    }
+  });
+
+  $effect(() => {
+    if (
+      planningEditor &&
+      !planningBusy &&
+      planningEditorRebindToken > handledPlanningEditorRebindToken
+    ) {
+      const binding = workbenchPlanningBinding(snapshot);
+      if (binding) {
+        planningEditorBinding = binding;
+        handledPlanningEditorRebindToken = planningEditorRebindToken;
       }
     }
   });

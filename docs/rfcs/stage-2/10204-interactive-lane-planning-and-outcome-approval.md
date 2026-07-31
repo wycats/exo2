@@ -319,6 +319,10 @@ the gate is held. The SQLite membership and lifecycle checks are repeated
 inside the canonical transaction. The gate remains held through commit or
 rollback and revision publication. This prevents another client from
 committing between a successful precondition check and the browser write.
+Snapshot reads use the same gate only while capturing the revision and one
+transactionally consistent SQLite view. Workspace Git metadata is sampled
+before entering the gate, so branch and dirty-state inspection cannot delay
+unrelated canonical writes.
 
 A completion review first enters a bounded host admission lane, then acquires
 the same revision gate while it compares revision, validates focus, and reads
@@ -449,8 +453,10 @@ daemon instance, revision, and focused phase when the editor opens. A later
 refresh may update the visible plan, but submitting that draft retains its
 opening binding so Exo can reject it as stale instead of applying old text over
 a collaborator's change. A successful write clears its submitted draft after
-the authoritative refresh. A stale or invalid response preserves useful text.
-A transport failure keeps both the payload and request ID for retry.
+the authoritative refresh. A stale response preserves the text and explicitly
+rebinds that editor after the refreshed plan arrives, allowing the person to
+apply it again as a new intention. Other invalid responses preserve useful
+text. A transport failure keeps both the payload and request ID for retry.
 An approval retry remains attached to its completion review when the approved
 write's own invalidation refreshes the snapshot before the original response is
 read.
@@ -469,9 +475,11 @@ keeps the plan readable but non-mutating.
 Any transport or unreadable-response failure during live refresh enters session
 recovery immediately. The last authoritative snapshot stays visible, but all
 mutations pause while the client renews the session and obtains a fresh
-snapshot. Replacing the browser session clears notices and pending transient
-planning state from the prior session. A session that cannot be restored asks
-for a current launch instead of retrying expired credentials.
+snapshot. Recovery invalidates snapshot requests that began under the prior
+connection so a delayed response cannot replace the recovered view. Replacing
+the browser session clears notices and pending transient planning state from
+the prior session. A session that cannot be restored asks for a current launch
+instead of retrying expired credentials.
 
 ### Linked worktrees
 
@@ -624,9 +632,9 @@ following evidence is green:
   transient review lookup, revised outcomes require a new review, and stale
   reviews cannot complete a task;
 - browser tests cover task editing, add, reorder, start, progress, review,
-  approval, stale refresh, opening-snapshot draft binding, immediate transport
-  recovery, session reset, retry, keyboard operation, and accessible status
-  names;
+  approval, stale refresh, opening-snapshot draft binding, post-rejection
+  rebinding, superseded-refresh rejection, immediate transport recovery,
+  session reset, retry, keyboard operation, and accessible status names;
 - view tests distinguish untouched goals from partial progress, remove
   redundant visible task-status labels, and verify balanced wrapping at narrow
   and wide layouts;

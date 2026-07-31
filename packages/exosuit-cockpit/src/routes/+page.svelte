@@ -79,6 +79,7 @@
   let planningFailure = $state<string | null>(null);
   let planningNotice = $state<string | null>(null);
   let planningSuccess = $state<PlanningSuccess | null>(null);
+  let planningEditorRebindToken = $state(0);
   let completionReview = $state<BoundCompletionReview | null>(null);
   let screenMessage = $state<string | null>(null);
   let screenRetryable = $state(false);
@@ -89,9 +90,11 @@
   let client: WorkbenchClient | null = null;
   let ambiguousFocus: FocusRequest | null = null;
   let refreshQueued = false;
+  let refreshIdleWaiters: Array<() => void> = [];
   let startLiveUpdates: (() => void) | null = null;
   let stopLiveUpdates: (() => void) | null = null;
   let beginSessionRecovery: (() => void) | null = null;
+  let snapshotRefreshGeneration = 0;
 
   onMount(() => {
     let events: EventSource | null = null;
@@ -179,6 +182,7 @@
         return;
       }
       recoveryInFlight = true;
+      snapshotRefreshGeneration += 1;
       clearRecoveryTimer();
       stopUpdates();
       sessionRecovery = "reconnecting";
@@ -251,6 +255,7 @@
       planningFailure = null;
       planningNotice = null;
       planningSuccess = null;
+      planningEditorRebindToken = 0;
       completionReview = null;
       recoveryAttempt = 0;
       sessionRecovery = "connected";
@@ -346,22 +351,32 @@
     }
     if (refreshing) {
       refreshQueued = true;
+      await new Promise<void>((resolve) => {
+        refreshIdleWaiters.push(resolve);
+      });
       return;
     }
 
     refreshing = true;
+    const refreshGeneration = snapshotRefreshGeneration;
     if (!quiet && snapshot === null) {
       screen = "loading";
     }
     const activeClient = client;
     try {
       const nextSnapshot = await activeClient.snapshot();
-      if (client !== activeClient) {
+      if (
+        client !== activeClient ||
+        refreshGeneration !== snapshotRefreshGeneration
+      ) {
         return;
       }
       applySnapshot(nextSnapshot);
     } catch (error) {
-      if (client !== activeClient) {
+      if (
+        client !== activeClient ||
+        refreshGeneration !== snapshotRefreshGeneration
+      ) {
         return;
       }
       if (terminalFailure(error)) {
@@ -388,7 +403,14 @@
       refreshing = false;
       if (refreshQueued) {
         refreshQueued = false;
-        void refreshSnapshot(true);
+        await refreshSnapshot(true);
+      }
+      if (!refreshing && !refreshQueued) {
+        const waiters = refreshIdleWaiters;
+        refreshIdleWaiters = [];
+        for (const resolve of waiters) {
+          resolve();
+        }
       }
     }
   }
@@ -578,14 +600,20 @@
         } else {
           retryPlanning = null;
         }
-        if (
+        const shouldRefreshPlanningContext =
           error instanceof WorkbenchClientError &&
           (error.detailKind === "workbench.stale_snapshot" ||
             error.detailKind === "workbench.phase_mismatch" ||
-            error.detailKind === "workbench.review_invalid")
-        ) {
+            error.detailKind === "workbench.review_invalid");
+        if (shouldRefreshPlanningContext) {
           completionReview = null;
           await refreshSnapshot(true);
+          if (
+            error instanceof WorkbenchClientError &&
+            error.detailKind === "workbench.stale_snapshot"
+          ) {
+            planningEditorRebindToken += 1;
+          }
         }
       }
       return false;
@@ -760,6 +788,7 @@
     planningFailure={planningFailure}
     {planningNotice}
     {planningSuccess}
+    {planningEditorRebindToken}
     pendingPlanningKind={pendingPlanning?.request.operation.kind ?? null}
     completionReview={completionReview?.review ?? null}
     onFocus={(laneId) => void focusLane(laneId)}

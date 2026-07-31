@@ -436,7 +436,7 @@ describe("focus-only lane workbench", () => {
     expect(screen.queryByLabelText("Task title")).toBeNull();
   });
 
-  it("submits an open draft against the snapshot that opened it", async () => {
+  it("rebinds a preserved draft only after an explicit stale rejection", async () => {
     const snapshot = fixture();
     const onPlan = vi.fn().mockResolvedValue(false);
     const props = {
@@ -462,7 +462,8 @@ describe("focus-only lane workbench", () => {
       screen.getByRole("button", { name: "Save task title" }),
     );
 
-    expect(onPlan).toHaveBeenCalledWith(
+    expect(onPlan).toHaveBeenNthCalledWith(
+      1,
       {
         kind: "task_update",
         task_id: "implement-host",
@@ -471,6 +472,32 @@ describe("focus-only lane workbench", () => {
       {
         expected_daemon_instance_id: "daemon-fixture",
         expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+      },
+    );
+    expect((screen.getByLabelText("Task title") as HTMLInputElement).value).toBe(
+      "A title from the observed plan",
+    );
+
+    await view.rerender({
+      ...props,
+      snapshot: refreshed,
+      planningEditorRebindToken: 1,
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+
+    expect(onPlan).toHaveBeenNthCalledWith(
+      2,
+      {
+        kind: "task_update",
+        task_id: "implement-host",
+        title: "A title from the observed plan",
+      },
+      {
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 8,
         expected_phase_id: "phase-fixture",
       },
     );

@@ -33,20 +33,68 @@ pub(super) fn sample_git(root: &Path) -> GitSnapshot {
     }
 }
 
+pub(super) fn registered_git(registered: &WorkspaceRegistration) -> GitSnapshot {
+    GitSnapshot {
+        detached: registered.branch.is_none() && registered.head.is_some(),
+        branch: registered.branch.clone(),
+        head: registered.head.clone(),
+        dirty: false,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn build(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
     daemon_instance_id: &str,
 ) -> Result<WorkbenchSnapshot> {
-    build_with_after_state_hook(project, registered, revision, daemon_instance_id, || {})
+    let git = sample_git(&registered.root);
+    build_with_git(project, registered, revision, daemon_instance_id, git)
 }
 
+pub(super) fn build_with_git(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    git: GitSnapshot,
+) -> Result<WorkbenchSnapshot> {
+    build_with_git_and_after_state_hook(
+        project,
+        registered,
+        revision,
+        daemon_instance_id,
+        git,
+        || {},
+    )
+}
+
+#[cfg(test)]
 pub(super) fn build_with_after_state_hook(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
     daemon_instance_id: &str,
+    after_state: impl FnOnce(),
+) -> Result<WorkbenchSnapshot> {
+    let git = sample_git(&registered.root);
+    build_with_git_and_after_state_hook(
+        project,
+        registered,
+        revision,
+        daemon_instance_id,
+        git,
+        after_state,
+    )
+}
+
+fn build_with_git_and_after_state_hook(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    git: GitSnapshot,
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
     let loader = SqliteLoader::open(project.db_path())?;
@@ -162,7 +210,6 @@ pub(super) fn build_with_after_state_hook(
         .commit()
         .context("Failed to finish workbench snapshot read transaction")?;
 
-    let git = sample_git(&registered.root);
     let label = git
         .branch
         .clone()

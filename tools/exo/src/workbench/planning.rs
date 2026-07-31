@@ -754,11 +754,13 @@ impl WorkbenchHostInner {
                 .cloned()
                 .ok_or_else(WorkbenchPlanningError::review_invalid)?
         };
-        let snapshot = snapshot::build(
+        let git = snapshot::registered_git(&registered);
+        let snapshot = snapshot::build_with_git(
             &self.project,
             &registered,
             context.expected_revision,
             &self.instance_id,
+            git,
         )
         .map_err(|_| WorkbenchPlanningError::internal())?;
         let phase = snapshot

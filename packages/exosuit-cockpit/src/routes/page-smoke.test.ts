@@ -306,11 +306,13 @@ describe("cockpit page", () => {
     });
   });
 
-  it("enters recovery immediately when the event stream disconnects", async () => {
+  it("enters recovery immediately and discards an older in-flight refresh", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const renewal = deferred<Response>();
+    const staleRefresh = deferred<Response>();
     let snapshotReads = 0;
     let renewalReads = 0;
+    let staleRefreshRequestId = "";
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session") {
         return sessionResponse("session-selector");
@@ -321,6 +323,10 @@ describe("cockpit page", () => {
       }
       snapshotReads += 1;
       const request = JSON.parse(String(init?.body));
+      if (snapshotReads === 2) {
+        staleRefreshRequestId = request.id;
+        return staleRefresh.promise;
+      }
       return new Response(
         JSON.stringify({
           protocol_version: 1,
@@ -338,6 +344,10 @@ describe("cockpit page", () => {
     render(Page);
     await screen.findByRole("heading", { name: "Local workbench host" });
     await waitFor(() => expect(TestEventSource.instances).toHaveLength(1));
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await waitFor(() => expect(snapshotReads).toBe(2));
 
     TestEventSource.instances[0]!.fail();
 
@@ -353,6 +363,28 @@ describe("cockpit page", () => {
       expect(screen.getByText("Revision 8")).toBeTruthy();
       expect(TestEventSource.instances).toHaveLength(2);
     });
+
+    staleRefresh.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: staleRefreshRequestId,
+          status: "ok",
+          result: {
+            ...snapshotFixture,
+            revision: 6,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Refresh workbench" }),
+      ).toHaveProperty("disabled", false),
+    );
+    expect(screen.getByText("Revision 8")).toBeTruthy();
+    expect(screen.queryByText("Revision 6")).toBeNull();
   });
 
   it("shows a compact recovery boundary when the replacement cannot resume the snapshot", async () => {
@@ -959,6 +991,143 @@ describe("cockpit page", () => {
     expect(planningRequests[1]!.id).not.toBe(planningRequests[0]!.id);
     await waitFor(() => {
       expect(screen.getByText("Revision 8")).toBeTruthy();
+    });
+  });
+
+  it("preserves and rebinds a draft after Exo rejects its opening snapshot", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const planningRequests: WorkbenchPlanningRequest[] = [];
+    const staleRefresh = deferred<Response>();
+    let snapshotRevision = 7;
+    let snapshotReads = 0;
+    let staleRefreshRequestId = "";
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/session") {
+          return sessionResponse("session-selector");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.protocol_version === 2) {
+          planningRequests.push(request as WorkbenchPlanningRequest);
+          if (planningRequests.length === 1) {
+            snapshotRevision = 8;
+            return new Response(
+              JSON.stringify({
+                protocol_version: 1,
+                id: request.id,
+                status: "error",
+                error: {
+                  code: "precondition_failed",
+                  message: "The displayed plan is stale",
+                  details: {
+                    kind: "workbench.stale_snapshot",
+                    retry_with_same_request_id: false,
+                  },
+                },
+              }),
+              { status: 200 },
+            );
+          }
+          snapshotRevision = 9;
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: {
+                kind: "workbench.task_mutation",
+                ok: true,
+                schema_version: 1,
+                operation: "task_update",
+                task_id: "implement-host",
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        snapshotReads += 1;
+        if (snapshotReads === 2) {
+          staleRefreshRequestId = request.id;
+          return staleRefresh.promise;
+        }
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: {
+              ...snapshotFixture,
+              revision: snapshotRevision,
+            },
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Edit Implement host" }),
+    );
+    await fireEvent.input(screen.getByLabelText("Task title"), {
+      target: { value: "A preserved task title" },
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await waitFor(() => expect(snapshotReads).toBe(2));
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+    await waitFor(() => expect(planningRequests).toHaveLength(1));
+    staleRefresh.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: staleRefreshRequestId,
+          status: "ok",
+          result: {
+            ...snapshotFixture,
+            revision: 7,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Revision 8")).toBeTruthy();
+      expect(
+        (screen.getByLabelText("Task title") as HTMLInputElement).value,
+      ).toBe("A preserved task title");
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save task title" }),
+    );
+    await waitFor(() => expect(planningRequests).toHaveLength(2));
+
+    expect(planningRequests[0]).toMatchObject({
+      expected_revision: 7,
+      operation: {
+        kind: "task_update",
+        task_id: "implement-host",
+        title: "A preserved task title",
+      },
+    });
+    expect(planningRequests[1]).toMatchObject({
+      expected_revision: 8,
+      operation: {
+        kind: "task_update",
+        task_id: "implement-host",
+        title: "A preserved task title",
+      },
+    });
+    expect(planningRequests[1]!.id).not.toBe(planningRequests[0]!.id);
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Task title")).toBeNull();
+      expect(screen.getByText("Revision 9")).toBeTruthy();
     });
   });
 

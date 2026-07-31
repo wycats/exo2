@@ -1511,6 +1511,32 @@ async fn snapshot_revision_and_database_state_share_the_project_state_gate() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn snapshot_samples_git_before_entering_the_project_state_gate() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let snapshot = manager
+        .snapshot_with_before_state_gate(&fixture.root, || {
+            run_git(&fixture.root, &["checkout", "-b", "changed-after-sample"]);
+        })
+        .expect("capture snapshot");
+    assert_eq!(
+        snapshot.workspace.branch.as_deref(),
+        Some("main"),
+        "the snapshot must use Git metadata captured before entering the project-state gate",
+    );
+
+    let refreshed = manager
+        .snapshot(&fixture.root)
+        .expect("capture refreshed snapshot");
+    assert_eq!(
+        refreshed.workspace.branch.as_deref(),
+        Some("changed-after-sample"),
+        "the next snapshot must observe workspace changes",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn snapshot_storage_failures_are_stable_and_path_free() {
     let fixture = fixture();
     let database_path = fixture.project.db_path();

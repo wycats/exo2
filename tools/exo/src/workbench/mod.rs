@@ -613,7 +613,7 @@ impl WorkbenchHostManager {
         workspace_root: &Path,
         before_state_gate: impl FnOnce(),
     ) -> Result<WorkbenchSnapshot> {
-        let workspace = self.register_workspace(workspace_root)?;
+        let (workspace, git) = self.register_workspace_with_git(workspace_root)?;
         before_state_gate();
         let _project_state_guard = self.inner.project_state_gate.lock().map_err(|_| {
             anyhow::Error::new(workbench_failure(
@@ -621,11 +621,12 @@ impl WorkbenchHostManager {
                 "The workbench snapshot is temporarily unavailable",
             ))
         })?;
-        snapshot::build(
+        snapshot::build_with_git(
             &self.inner.project,
             &workspace,
             self.inner.revision.load(Ordering::Acquire),
             &self.inner.instance_id,
+            git,
         )
         .map_err(|_| {
             anyhow::Error::new(workbench_failure(
@@ -689,6 +690,14 @@ impl WorkbenchHostManager {
     }
 
     fn register_workspace(&self, workspace_root: &Path) -> Result<WorkspaceRegistration> {
+        self.register_workspace_with_git(workspace_root)
+            .map(|(workspace, _)| workspace)
+    }
+
+    fn register_workspace_with_git(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<(WorkspaceRegistration, snapshot::GitSnapshot)> {
         let root = self.inner.validate_workspace(workspace_root)?;
         let git = snapshot::sample_git(&root);
         let mut state = self
@@ -723,13 +732,13 @@ impl WorkbenchHostManager {
             key: key.clone(),
             root: root.clone(),
             label,
-            branch: git.branch,
-            head: git.head,
+            branch: git.branch.clone(),
+            head: git.head.clone(),
         };
         state.workspaces_by_root.insert(root, key.clone());
         state.workspaces_by_key.insert(key, workspace.clone());
         drop(state);
-        Ok(workspace)
+        Ok((workspace, git))
     }
 
     fn ensure_host(&self) -> Result<(String, bool, [u8; 32])> {
