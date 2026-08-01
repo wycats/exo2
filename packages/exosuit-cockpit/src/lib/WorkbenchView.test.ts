@@ -45,6 +45,16 @@ describe("focus-only lane workbench", () => {
       screen.getByRole("heading", { name: "Workbench foundation" }),
     ).toBeTruthy();
     expect(screen.getByText("Implement host")).toBeTruthy();
+    const activeTaskCopy = screen
+      .getByText("Implement host")
+      .closest<HTMLElement>(".task-copy");
+    expect(activeTaskCopy).toBeTruthy();
+    expect(within(activeTaskCopy!).getByText("Active")).toBeTruthy();
+    expect(
+      screen.getByText("0 of 1 tasks complete", {
+        selector: ".goal-progress",
+      }),
+    ).toBeTruthy();
     expect(
       screen.getByRole("heading", { name: "Coordination" }),
     ).toBeTruthy();

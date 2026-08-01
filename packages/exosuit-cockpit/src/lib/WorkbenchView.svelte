@@ -877,7 +877,7 @@
                   </span>
                   <div class="goal-copy">
                     <h3>{goal.title}</h3>
-                    <span>{goalProgressLabel(goal)}</span>
+                    <span class="goal-progress">{goalProgressLabel(goal)}</span>
                   </div>
                   {#if goalAllowsPlanning(goal)}
                     <button
@@ -962,15 +962,16 @@
                               <Circle size={13} />
                             {/if}
                           </span>
-                          <span class="task-title">{task.title}</span>
-                          {#if ["pending", "complete"].includes(statusTone(task.status))}
-                            <span class="sr-only">{statusLabel(task.status)}</span>
-                          {/if}
-                          {#if statusTone(task.status) === "active"}
-                            <span class="task-active-label">Active</span>
-                          {:else if statusTone(task.status) === "terminal"}
-                            <span class="task-terminal-label">{statusLabel(task.status)}</span>
-                          {/if}
+                          <span class="task-copy">
+                            <span class="task-title">{task.title}</span>
+                            {#if ["pending", "complete"].includes(statusTone(task.status))}
+                              <span class="sr-only">{statusLabel(task.status)}</span>
+                            {:else if statusTone(task.status) === "active"}
+                              <span class="task-active-label">Active</span>
+                            {:else if statusTone(task.status) === "terminal"}
+                              <span class="task-terminal-label">{statusLabel(task.status)}</span>
+                            {/if}
+                          </span>
                           {#if taskAllowsPlanning(task)}
                             <div class="task-actions" aria-label={`Actions for ${task.title}`}>
                               {#if task.status === "pending"}
@@ -1861,17 +1862,21 @@
   }
 
   .goal {
-    padding: 18px 0;
+    padding: 22px 0;
     border-bottom: 1px solid var(--line);
   }
 
   .goal-heading {
-    justify-content: flex-start;
-    align-items: center;
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 12px;
   }
 
   .status-icon {
-    margin-top: 1px;
+    min-height: 28px;
+    display: grid;
+    place-items: center;
     color: var(--muted);
   }
 
@@ -1896,20 +1901,22 @@
   }
 
   .goal-heading h3 {
-    font-size: 0.86rem;
-    line-height: 1.3;
+    font-size: 0.9rem;
+    line-height: 1.35;
     text-wrap: balance;
   }
 
-  .goal-copy > span {
+  .goal-progress {
     display: block;
-    margin-top: 3px;
+    margin-top: 4px;
     color: var(--muted);
     font-size: 0.68rem;
+    font-weight: 600;
+    line-height: 1.35;
   }
 
   .task-list {
-    margin: 13px 0 0 30px;
+    margin: 16px 0 0 32px;
     padding: 0;
     list-style: none;
   }
@@ -1931,35 +1938,47 @@
   }
 
   .task-row {
-    min-height: 40px;
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) auto auto;
-    align-items: center;
-    gap: 7px;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 10px;
+    min-height: 44px;
+    padding: 8px 0;
     font-size: 0.77rem;
   }
 
+  .task-check {
+    min-height: 28px;
+    display: grid;
+    place-items: center;
+  }
+
+  .task-copy {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+    padding: 4px 0;
+  }
+
   .task-title {
-    line-height: 1.35;
+    line-height: 1.4;
     text-wrap: pretty;
   }
 
-  .task-active-label {
-    padding: 2px 5px;
-    border-radius: 4px;
-    background: var(--teal-soft);
-    color: var(--teal);
+  .task-active-label,
+  .task-terminal-label {
+    width: fit-content;
     font-size: 0.63rem;
     font-weight: 750;
+    line-height: 1.25;
+  }
+
+  .task-active-label {
+    color: var(--teal);
   }
 
   .task-terminal-label {
-    padding: 2px 5px;
-    border-radius: 4px;
-    background: var(--surface-quiet);
     color: var(--muted);
-    font-size: 0.63rem;
-    font-weight: 750;
   }
 
   .task-progress {
@@ -2013,6 +2032,7 @@
     display: flex;
     align-items: center;
     gap: 2px;
+    min-height: 28px;
   }
 
   .planning-icon-button,
@@ -2559,13 +2579,14 @@
     }
 
     .task-row {
-      grid-template-columns: 18px minmax(0, 1fr) auto;
-      padding: 7px 0;
+      grid-template-columns: 18px minmax(0, 1fr);
+      row-gap: 3px;
+      padding: 9px 0;
     }
 
     .task-actions {
-      grid-column: 2 / -1;
-      justify-content: flex-end;
+      grid-column: 2;
+      justify-content: flex-start;
     }
 
     .planning-editor,
