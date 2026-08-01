@@ -89,10 +89,17 @@ fn run_git(root: &Path, args: &[&str]) {
 }
 
 fn test_manager(project: Arc<Project>) -> WorkbenchHostManager {
+    test_manager_with_identity(project, "test-workbench-instance")
+}
+
+fn test_manager_with_identity(
+    project: Arc<Project>,
+    instance_id: &'static str,
+) -> WorkbenchHostManager {
     let manager = WorkbenchHostManager::new(
         Arc::clone(&project),
-        Arc::from("test-workbench-instance"),
-        Arc::from("test-process-start"),
+        Arc::from(instance_id),
+        Arc::from(format!("{instance_id}-process-start")),
         project.runtime_dir(),
         Arc::new(AtomicU64::new(unix_seconds())),
         tokio::runtime::Handle::current(),
@@ -167,6 +174,9 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         project: WorkbenchProjectIdentity {
             id: "project-fixture".to_string(),
         },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: "daemon-fixture".to_string(),
+        },
         workspace: WorkbenchSnapshotWorkspace {
             key: "workspace-fixture".to_string(),
             label: "main".to_string(),
@@ -186,6 +196,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
             id: "phase-fixture".to_string(),
             title: "Workbench foundation".to_string(),
             status: "in-progress".to_string(),
+            planning_available: true,
             goals: vec![WorkbenchGoal {
                 id: "host-goal".to_string(),
                 title: "Establish local host and launch".to_string(),
@@ -194,6 +205,11 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
                     id: "implement-host".to_string(),
                     title: "Implement host".to_string(),
                     status: "in-progress".to_string(),
+                    progress: vec![WorkbenchTaskProgress {
+                        message: "Captured browser evidence.".to_string(),
+                        created_at: "2026-07-28T19:45:00Z".to_string(),
+                    }],
+                    progress_truncated: false,
                 }],
             }],
         }),
@@ -266,7 +282,7 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     assert!(!record_text.contains(&fixture.root.display().to_string()));
     assert!(!record_text.contains(&fixture.project.state_root.display().to_string()));
 
-    let (session_id, session) = manager
+    let (session_secret, session) = manager
         .inner
         .redeem_ticket(ticket)
         .expect("redeem launch ticket");
@@ -277,22 +293,17 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         Err(TicketExchangeError::Invalid)
     );
 
-    manager
-        .inner
-        .state
-        .lock()
-        .expect("workbench state")
-        .sessions
-        .get_mut(&session_id)
-        .expect("redeemed session")
-        .instance_id = "replacement-daemon".to_string();
     assert!(
         manager
             .inner
-            .session(&session.session_key, &session_id)
-            .is_none(),
-        "a session from another daemon generation is invalid"
+            .session(&session.session_key, &session_secret)
+            .is_some(),
+        "the redeemed session is authenticated by its independent cookie secret"
     );
+    let session_store = fs::read_to_string(&manager.inner.session_store_path)
+        .expect("read workbench session store");
+    assert!(!session_store.contains(&session_secret));
+    assert!(session_store.contains(&session_credential_digest(&session_secret)));
 
     let mut tampered = launch_parts(&second).1.as_bytes().to_vec();
     let last = tampered.last_mut().expect("ticket has signature");
@@ -305,10 +316,415 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     );
 
     manager.shutdown().await;
+    let inactive_record: WorkbenchHostRecord = serde_json::from_slice(
+        &fs::read(&manager.inner.host_record_path).expect("read inactive host record"),
+    )
+    .expect("decode inactive host record");
+    assert_eq!(inactive_record.origin, origin);
     assert!(
-        !manager.inner.host_record_path.exists(),
-        "owned host record is removed on shutdown"
+        !inactive_record.server_task_alive,
+        "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn ticket_persistence_failure_restores_the_one_time_capability() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = ticket_payload(ticket);
+    fs::create_dir(&manager.inner.session_store_path)
+        .expect("block the session store with a directory");
+
+    assert_eq!(
+        manager.inner.redeem_ticket(ticket),
+        Err(TicketExchangeError::Unavailable)
+    );
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pending_capabilities
+            .contains_key(&payload.capability_id),
+        "a failed durable exchange must restore the one-time capability"
+    );
+
+    fs::remove_dir(&manager.inner.session_store_path)
+        .expect("restore the session store destination");
+    manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("retry the restored ticket");
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_restore_and_renew_across_compatible_host_replacement() {
+    let fixture = fixture();
+    let first_manager =
+        test_manager_with_identity(Arc::clone(&fixture.project), "first-workbench-instance");
+    let launch = first_manager
+        .launch(&fixture.root)
+        .expect("launch first workbench");
+    let (first_origin, ticket) = launch_parts(&launch);
+    let first_origin = first_origin.to_string();
+    let (session_secret, session) = first_manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem first session");
+    let digest = session_credential_digest(&session_secret);
+    let short_expiry = unix_seconds().saturating_add(60);
+    {
+        let mut state = first_manager
+            .inner
+            .state
+            .lock()
+            .expect("first workbench state");
+        state
+            .sessions
+            .get_mut(&digest)
+            .expect("first live session")
+            .expires_at = short_expiry;
+        state
+            .session_grants
+            .get_mut(&digest)
+            .expect("first durable session")
+            .expires_at = short_expiry;
+    }
+    first_manager
+        .inner
+        .persist_session_store()
+        .expect("persist short session");
+    let store_path = first_manager.inner.session_store_path.clone();
+    let persisted = fs::read_to_string(&store_path).expect("read durable session");
+    assert!(!persisted.contains(&session_secret));
+    assert!(persisted.contains(&digest));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&store_path)
+                .expect("durable session metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    first_manager.shutdown().await;
+
+    let replacement = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "replacement-workbench-instance",
+    );
+    let replacement_origin = replacement
+        .host_status()
+        .expect("replacement resumes the compatible workbench host")
+        .origin;
+    assert_eq!(
+        replacement_origin, first_origin,
+        "a compatible replacement must preserve the browser's local origin"
+    );
+    let restored = replacement
+        .inner
+        .session(&session.session_key, &session_secret)
+        .expect("restore durable session");
+    assert_eq!(
+        restored.workspace_root,
+        fixture.root.canonicalize().expect("canonical workspace")
+    );
+    assert_eq!(restored.workspace_key, session.workspace_key);
+    assert_eq!(restored.id, digest);
+    let stale_generation = planning::WorkbenchPlanningContext {
+        schema_version: 1,
+        session_id: restored.id.clone(),
+        expected_daemon_instance_id: "first-workbench-instance".to_string(),
+        expected_revision: replacement.inner.current_revision(),
+        expected_phase_id: "phase-from-prior-generation".to_string(),
+        operation: planning::WorkbenchPlanningContextOperation::TaskStart {
+            task_id: "task-from-prior-generation".to_string(),
+        },
+    };
+    let stale_generation = replacement
+        .inner
+        .validate_planning_context(&restored.workspace_root, &stale_generation, false)
+        .expect_err("a prior daemon generation must not reuse a reset revision");
+    assert_eq!(
+        stale_generation
+            .response("stale-generation".to_string())
+            .error
+            .expect("stale generation error")
+            .details
+            .expect("stale generation details")["kind"],
+        "workbench.stale_snapshot"
+    );
+    assert!(
+        replacement
+            .inner
+            .session("wrong-workspace-selector", &session_secret)
+            .is_none(),
+        "the cookie secret is not authorization without its public selector"
+    );
+
+    let renewed = replacement
+        .inner
+        .renew_session(&session.session_key, &session_secret)
+        .expect("renew durable session")
+        .expect("renewed session result");
+    let renewed_expiry = DateTime::parse_from_rfc3339(&renewed.expires_at)
+        .expect("parse renewed expiry")
+        .timestamp();
+    assert!(
+        renewed_expiry > i64::try_from(short_expiry).expect("short expiry fits i64"),
+        "renewal extends the durable grant and browser cookie horizon"
+    );
+
+    let cookie = format!(
+        "{SESSION_COOKIE_PREFIX}{}={session_secret}",
+        session.session_key
+    );
+    let renewed_over_same_origin = raw_http(
+        &first_origin,
+        "POST",
+        "/api/session/renew",
+        Some(json!({ "session_key": session.session_key }).to_string()),
+        Some(&cookie),
+        Some(&first_origin),
+    )
+    .await
+    .expect("renew the restored session over the original browser origin");
+    assert_eq!(
+        renewed_over_same_origin.status, 200,
+        "{renewed_over_same_origin:?}"
+    );
+    assert_eq!(renewed_over_same_origin.json()["kind"], "workbench.session");
+    replacement.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn session_activity_survives_shutdown_inside_the_persistence_interval() {
+    let fixture = fixture();
+    let manager =
+        test_manager_with_identity(Arc::clone(&fixture.project), "activity-workbench-instance");
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch activity workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let (session_secret, session) = manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem activity session");
+    let digest = session_credential_digest(&session_secret);
+    let persisted_at = unix_seconds();
+    let stale_activity = persisted_at.saturating_sub(1);
+    {
+        let mut state = manager
+            .inner
+            .state
+            .lock()
+            .expect("activity workbench state");
+        let live = state
+            .sessions
+            .get_mut(&digest)
+            .expect("live activity session");
+        live.last_activity = stale_activity;
+        live.last_persisted_at = persisted_at;
+        state
+            .session_grants
+            .get_mut(&digest)
+            .expect("durable activity session")
+            .last_activity = stale_activity;
+    }
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist stale activity fixture");
+
+    let touched = manager
+        .inner
+        .session(&session.session_key, &session_secret)
+        .expect("authenticate activity session");
+    assert!(touched.last_activity > stale_activity);
+    assert_eq!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("touched workbench state")
+            .session_grants
+            .get(&digest)
+            .expect("touched durable grant")
+            .last_activity,
+        touched.last_activity,
+        "the durable grant must track every authenticated activity touch"
+    );
+    let before_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
+        &fs::read(&manager.inner.session_store_path).expect("read throttled session store"),
+    )
+    .expect("decode throttled session store");
+    assert_eq!(
+        before_shutdown
+            .sessions
+            .iter()
+            .find(|grant| grant.credential_digest == digest)
+            .expect("persisted throttled grant")
+            .last_activity,
+        stale_activity,
+        "the normal persistence interval still throttles filesystem writes"
+    );
+
+    manager.shutdown().await;
+    let after_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
+        &fs::read(&manager.inner.session_store_path).expect("read shutdown session store"),
+    )
+    .expect("decode shutdown session store");
+    assert_eq!(
+        after_shutdown
+            .sessions
+            .iter()
+            .find(|grant| grant.credential_digest == digest)
+            .expect("persisted shutdown grant")
+            .last_activity,
+        touched.last_activity,
+        "shutdown must persist the latest authenticated activity"
+    );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_durable_sessions_are_not_restored_by_a_replacement_host() {
+    let fixture = fixture();
+    let first_manager =
+        test_manager_with_identity(Arc::clone(&fixture.project), "expiring-workbench-instance");
+    let launch = first_manager
+        .launch(&fixture.root)
+        .expect("launch expiring workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let (session_secret, session) = first_manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem expiring session");
+    let digest = session_credential_digest(&session_secret);
+    let expired_at = unix_seconds().saturating_sub(1);
+    {
+        let mut state = first_manager
+            .inner
+            .state
+            .lock()
+            .expect("expiring workbench state");
+        state
+            .sessions
+            .get_mut(&digest)
+            .expect("live expiring session")
+            .expires_at = expired_at;
+        state
+            .session_grants
+            .get_mut(&digest)
+            .expect("durable expiring session")
+            .expires_at = expired_at;
+    }
+    first_manager
+        .inner
+        .persist_session_store()
+        .expect("persist expired session fixture");
+    assert!(
+        fs::read_to_string(&first_manager.inner.session_store_path)
+            .expect("read expired session fixture")
+            .contains(&digest),
+        "the replacement must reject the persisted grant rather than relying on its removal"
+    );
+    first_manager.shutdown().await;
+
+    let replacement =
+        test_manager_with_identity(Arc::clone(&fixture.project), "expired-replacement-instance");
+    assert!(
+        replacement
+            .inner
+            .session(&session.session_key, &session_secret)
+            .is_none(),
+        "an expired durable grant must not restore across host replacement"
+    );
+    assert!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("replacement workbench state")
+            .session_grants
+            .is_empty(),
+        "expired grants are filtered while loading the durable store"
+    );
+    replacement.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn restored_sessions_keep_their_exact_linked_worktree_boundary() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("session-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-session-linked",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    let linked_root = linked.canonicalize().expect("canonical linked worktree");
+    let first_manager =
+        test_manager_with_identity(Arc::clone(&fixture.project), "linked-session-instance");
+    let launch = first_manager
+        .launch(&linked_root)
+        .expect("launch linked worktree");
+    let (_, ticket) = launch_parts(&launch);
+    let (session_secret, session) = first_manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem linked session");
+    first_manager.shutdown().await;
+
+    let replacement =
+        test_manager_with_identity(Arc::clone(&fixture.project), "primary-host-instance");
+    let primary_launch = replacement
+        .launch(&fixture.root)
+        .expect("launch replacement from primary worktree");
+    assert_ne!(primary_launch.workspace.key, session.workspace_key);
+    let restored = replacement
+        .inner
+        .session(&session.session_key, &session_secret)
+        .expect("restore linked session through replacement host");
+    assert_eq!(restored.workspace_root, linked_root);
+    assert_ne!(
+        restored.workspace_root,
+        fixture.root.canonicalize().expect("canonical primary"),
+        "restoration must not fall back to the host-launching worktree"
+    );
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    assert!(
+        replacement
+            .inner
+            .renew_session(&session.session_key, &session_secret)
+            .expect("validate removed linked worktree during renewal")
+            .is_none(),
+        "renewal must fail closed after the exact retained worktree disappears"
+    );
+    replacement.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -319,6 +735,17 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
     let launch = manager.launch(&fixture.root).expect("launch workbench");
     let (_, ticket) = launch_parts(&launch);
     let payload = ticket_payload(ticket);
+    assert_eq!(
+        payload.capabilities,
+        std::iter::once("workbench.snapshot".to_string())
+            .chain(std::iter::once("lane.focus".to_string()))
+            .chain(
+                planning::PLANNING_CAPABILITIES
+                    .iter()
+                    .map(ToString::to_string)
+            )
+            .collect::<Vec<_>>()
+    );
     let now = unix_seconds();
 
     let secret = manager
@@ -352,21 +779,22 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
             .clone();
         for index in 0..MAX_SESSIONS {
             let session_id = format!("bounded-session-{index}");
-            state.sessions.insert(
-                session_id.clone(),
-                WorkbenchSession {
-                    id: session_id,
-                    selector: format!("bounded-selector-{index}"),
-                    instance_id: manager.inner.instance_id.to_string(),
-                    project_id: fixture.project.id.to_string(),
-                    workspace_key: payload.workspace_key.clone(),
-                    workspace_root: workspace_root.clone(),
-                    capabilities: payload.capabilities.clone(),
-                    created_at: now,
-                    last_activity: now,
-                    expires_at: now + SESSION_ABSOLUTE_LIFETIME.as_secs(),
-                },
-            );
+            let session = WorkbenchSession {
+                id: session_id.clone(),
+                selector: format!("bounded-selector-{index}"),
+                project_id: fixture.project.id.to_string(),
+                workspace_key: payload.workspace_key.clone(),
+                workspace_root: workspace_root.clone(),
+                capabilities: payload.capabilities.clone(),
+                created_at: now,
+                last_activity: now,
+                expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
+                last_persisted_at: now,
+            };
+            state
+                .session_grants
+                .insert(session_id.clone(), WorkbenchSessionGrantV1::from(&session));
+            state.sessions.insert(session_id, session);
         }
     }
     assert_eq!(
@@ -383,40 +811,45 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
             .contains_key(&payload.capability_id),
         "session saturation must not consume the one-time ticket"
     );
-    manager
-        .inner
-        .state
-        .lock()
-        .expect("workbench state")
-        .sessions
-        .remove("bounded-session-0");
-    let (session_id, session) = manager
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        state.sessions.remove("bounded-session-0");
+        state.session_grants.remove("bounded-session-0");
+    }
+    let (session_secret, session) = manager
         .inner
         .redeem_ticket(ticket)
         .expect("ticket remains redeemable after capacity returns");
+    let session_id = session_credential_digest(&session_secret);
 
     {
         let mut state = manager.inner.state.lock().expect("workbench state");
         let session = state.sessions.get_mut(&session_id).expect("new session");
-        session.created_at = now.saturating_sub(SESSION_ABSOLUTE_LIFETIME.as_secs() + 1);
-        session.expires_at = now.saturating_add(SESSION_ABSOLUTE_LIFETIME.as_secs());
+        session.expires_at = now.saturating_sub(1);
         session.last_activity = now;
+        let grant = state
+            .session_grants
+            .get_mut(&session_id)
+            .expect("new session grant");
+        grant.expires_at = now.saturating_sub(1);
+        grant.last_activity = now;
         drop(state);
     }
     assert!(
         manager
             .inner
-            .session(&session.session_key, &session_id)
+            .session(&session.session_key, &session_secret)
             .is_none(),
-        "sessions expire at the absolute lifetime even when recently active"
+        "sessions expire when their renewable grant expires"
     );
 
     let idle_launch = manager.launch(&fixture.root).expect("launch idle session");
     let (_, idle_ticket) = launch_parts(&idle_launch);
-    let (idle_session_id, idle_session) = manager
+    let (idle_session_secret, idle_session) = manager
         .inner
         .redeem_ticket(idle_ticket)
         .expect("redeem idle session ticket");
+    let idle_session_id = session_credential_digest(&idle_session_secret);
     {
         let mut state = manager.inner.state.lock().expect("workbench state");
         let session = state
@@ -424,12 +857,17 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
             .get_mut(&idle_session_id)
             .expect("idle session");
         session.last_activity = now.saturating_sub(SESSION_IDLE_LIFETIME.as_secs() + 1);
+        state
+            .session_grants
+            .get_mut(&idle_session_id)
+            .expect("idle session grant")
+            .last_activity = now.saturating_sub(SESSION_IDLE_LIFETIME.as_secs() + 1);
         drop(state);
     }
     assert!(
         manager
             .inner
-            .session(&idle_session.session_key, &idle_session_id)
+            .session(&idle_session.session_key, &idle_session_secret)
             .is_none(),
         "idle sessions expire"
     );
@@ -548,6 +986,25 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             None,
         )
         .expect("add task");
+    writer
+        .add_task_log("implement", "progress", "Captured browser evidence.")
+        .expect("add browser-safe progress");
+    writer
+        .add_task_log(
+            "implement",
+            "note",
+            &format!("Internal note from {}", fixture.root.display()),
+        )
+        .expect("add non-progress task note");
+    for index in 0..10 {
+        writer
+            .add_task_log(
+                "implement",
+                "progress",
+                &format!("Recent browser evidence {index}."),
+            )
+            .expect("add bounded browser-safe progress");
+    }
     let lane = writer
         .add_workbench_lane(
             "Host and launch",
@@ -584,7 +1041,30 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
         snapshot.phase.as_ref().expect("phase").goals[0].tasks.len(),
         1
     );
+    let progress = &snapshot.phase.as_ref().expect("phase").goals[0].tasks[0].progress;
+    assert_eq!(
+        progress.len(),
+        8,
+        "the snapshot exposes only a bounded recent progress window"
+    );
+    assert_eq!(progress[0].message, "Recent browser evidence 2.");
+    assert_eq!(progress[7].message, "Recent browser evidence 9.");
+    assert!(!progress[0].created_at.is_empty());
+    assert!(
+        snapshot.phase.as_ref().expect("phase").goals[0].tasks[0].progress_truncated,
+        "the snapshot identifies omitted progress history"
+    );
+    assert!(
+        progress
+            .iter()
+            .all(|entry| !entry.message.contains("Internal note")),
+        "the snapshot withholds non-progress task log kinds"
+    );
     assert!(snapshot.diagnostics.is_empty());
+    assert!(
+        snapshot.phase.as_ref().expect("phase").planning_available,
+        "an unowned focused phase is available for planning"
+    );
     assert!(snapshot.steering.next_actions.iter().all(|action| matches!(
         action.intent.as_str(),
         "orient" | "plan" | "execute" | "record" | "verify" | "ship"
@@ -603,6 +1083,426 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             forbidden.display()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planning_is_read_only_when_the_focused_phase_is_owned_elsewhere() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Owned Planning Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Owned Planning Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    writer
+        .add_goal(
+            &phase,
+            "owned-goal",
+            "Plan under the current owner",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add goal");
+    writer
+        .add_task("owned-goal", "owned-task", "Respect the owner", None)
+        .expect("add task");
+    let lane = writer
+        .add_workbench_lane("Owned lane", "Respect phase ownership", &phase)
+        .expect("add lane");
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    writer
+        .focus_workbench_lane(&workspace.to_string_lossy(), &lane, &phase)
+        .expect("focus lane and phase");
+    writer
+        .set_phase_owner(
+            &phase,
+            "workspace",
+            "workspace:foreign-project:owner",
+            Some("workspace:foreign-project:owner"),
+            Some("/foreign/workspace"),
+        )
+        .expect("assign another phase owner");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let registered = manager
+        .register_workspace(&fixture.root)
+        .expect("register workspace");
+    let now = unix_seconds();
+    let session = WorkbenchSession {
+        id: "owned-phase-session".to_string(),
+        selector: "owned-phase-selector".to_string(),
+        project_id: fixture.project.id.to_string(),
+        workspace_key: registered.key,
+        workspace_root: registered.root.clone(),
+        capabilities: planning::PLANNING_CAPABILITIES
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        created_at: now,
+        last_activity: now,
+        expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
+        last_persisted_at: now,
+    };
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .sessions
+        .insert(session.id.clone(), session.clone());
+
+    let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
+    assert!(
+        !snapshot.phase.as_ref().expect("phase").planning_available,
+        "a foreign-owned phase must remain visible but read-only"
+    );
+
+    let context = planning::WorkbenchPlanningContext {
+        schema_version: 1,
+        session_id: session.id,
+        expected_daemon_instance_id: "test-workbench-instance".to_string(),
+        expected_revision: snapshot.revision,
+        expected_phase_id: phase,
+        operation: planning::WorkbenchPlanningContextOperation::TaskUpdate {
+            task_id: "owned-task".to_string(),
+        },
+    };
+    let error = manager
+        .inner
+        .validate_planning_context(&registered.root, &context, false)
+        .expect_err("foreign-owned planning must be rejected");
+    assert_eq!(
+        error
+            .response("owned-phase-request".to_string())
+            .error
+            .expect("planning error")
+            .details
+            .expect("planning details")["kind"],
+        "workbench.invalid_transition"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Planning Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Planning Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    writer
+        .add_goal(
+            &phase,
+            "planning-goal",
+            "Plan through the workbench",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add goal");
+    writer
+        .add_task("planning-goal", "review-task", "Review the outcome", None)
+        .expect("add task");
+    writer
+        .update_task_status("review-task", "in-progress")
+        .expect("start task");
+    let lane = writer
+        .add_workbench_lane("Planning lane", "Review task outcomes", &phase)
+        .expect("add lane");
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    writer
+        .focus_workbench_lane(&workspace.to_string_lossy(), &lane, &phase)
+        .expect("focus lane and phase");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let registered = manager
+        .register_workspace(&fixture.root)
+        .expect("register workspace");
+    let now = unix_seconds();
+    let session = WorkbenchSession {
+        id: "review-session".to_string(),
+        selector: "review-selector".to_string(),
+        project_id: fixture.project.id.to_string(),
+        workspace_key: registered.key,
+        workspace_root: registered.root,
+        capabilities: planning::PLANNING_CAPABILITIES
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        created_at: now,
+        last_activity: now,
+        expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
+        last_persisted_at: now,
+    };
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .sessions
+        .insert(session.id.clone(), session.clone());
+
+    let first = manager
+        .inner
+        .completion_review(
+            &session,
+            "review-request",
+            "test-workbench-instance",
+            0,
+            &phase,
+            "review-task",
+            "Implemented the bounded planning contract.",
+        )
+        .expect("build completion review");
+    let replay = manager
+        .inner
+        .completion_review(
+            &session,
+            "review-request",
+            "test-workbench-instance",
+            0,
+            &phase,
+            "review-task",
+            "Implemented the bounded planning contract.",
+        )
+        .expect("replay completion review");
+    assert_eq!(first, replay);
+    assert_eq!(first.task_id, "review-task");
+    assert!(!first.approval_evidence_present);
+
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("reopen project writer");
+    let task = writer
+        .resolve_task_reference("review-task")
+        .expect("resolve task")
+        .expect("task exists");
+    let status: String = writer
+        .database()
+        .connection()
+        .query_row(
+            "SELECT status FROM tasks_data WHERE id = ?1",
+            [task.row_id],
+            |row| row.get(0),
+        )
+        .expect("read task status");
+    assert_eq!(status, "in-progress", "review must not complete the task");
+    drop(writer);
+
+    let changed_payload = manager
+        .inner
+        .completion_review(
+            &session,
+            "review-request",
+            "test-workbench-instance",
+            0,
+            &phase,
+            "review-task",
+            "A different outcome.",
+        )
+        .expect_err("one request ID cannot review a different outcome");
+    assert_eq!(
+        changed_payload
+            .response("changed".to_string())
+            .error
+            .unwrap()
+            .details
+            .unwrap()["kind"],
+        "workbench.invalid_input"
+    );
+
+    let approval = manager
+        .inner
+        .prepare_completion_approval(
+            &session,
+            "approval-request",
+            "test-workbench-instance",
+            0,
+            &phase,
+            &first.review_id,
+            "review-task",
+            "Implemented the bounded planning contract.",
+        )
+        .expect("prepare exact approval");
+    assert_eq!(approval.task_id, "review-task");
+    assert_eq!(
+        approval.proposed_outcome,
+        "Implemented the bounded planning contract."
+    );
+    for (task_id, outcome) in [
+        ("other-task", "Implemented the bounded planning contract."),
+        ("review-task", "A browser-edited outcome."),
+    ] {
+        let mismatch = manager
+            .inner
+            .prepare_completion_approval(
+                &session,
+                "mismatched-approval",
+                "test-workbench-instance",
+                0,
+                &phase,
+                &first.review_id,
+                task_id,
+                outcome,
+            )
+            .expect_err("browser approval must exactly match the server-held review");
+        assert_eq!(
+            mismatch
+                .response("mismatch".to_string())
+                .error
+                .unwrap()
+                .details
+                .unwrap()["kind"],
+            "workbench.review_invalid"
+        );
+    }
+
+    manager.revision_after_write();
+    let stale = manager
+        .inner
+        .completion_review(
+            &session,
+            "stale-review",
+            "test-workbench-instance",
+            0,
+            &phase,
+            "review-task",
+            "Stale outcome.",
+        )
+        .expect_err("stale review must be rejected");
+    assert_eq!(
+        stale
+            .response("stale".to_string())
+            .error
+            .unwrap()
+            .details
+            .unwrap()["kind"],
+        "workbench.stale_snapshot"
+    );
+
+    for index in 0..planning::MAX_COMPLETION_REVIEWS_PER_SESSION {
+        manager
+            .inner
+            .completion_review(
+                &session,
+                &format!("bounded-review-{index}"),
+                "test-workbench-instance",
+                1,
+                &phase,
+                "review-task",
+                "Implemented the bounded planning contract.",
+            )
+            .expect("build bounded completion review");
+    }
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(
+        state
+            .completion_reviews
+            .values()
+            .filter(|review| review.session_id == session.id)
+            .count(),
+        planning::MAX_COMPLETION_REVIEWS_PER_SESSION
+    );
+    assert_eq!(
+        state
+            .completion_review_requests
+            .keys()
+            .filter(|key| key.session_id == session.id)
+            .count(),
+        planning::MAX_COMPLETION_REVIEWS_PER_SESSION
+    );
+    assert!(
+        !state.completion_reviews.contains_key(&first.review_id),
+        "the oldest transient review should be evicted at the session bound"
+    );
+}
+
+#[test]
+fn planning_requests_reject_unknown_fields_and_invalid_text_bounds() {
+    let request = json!({
+        "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+        "id": "planning-request",
+        "session_key": "planning-session",
+        "expected_daemon_instance_id": "test-workbench-instance",
+        "expected_revision": 3,
+        "expected_phase_id": "planning-phase",
+        "operation": {
+            "kind": "task_add",
+            "goal_id": "planning-goal",
+            "title": "Plan in the browser",
+        },
+    });
+    serde_json::from_value::<planning::BrowserPlanningRequest>(request.clone())
+        .expect("closed planning request");
+
+    let mut unknown_request_field = request.clone();
+    unknown_request_field["workspace_root"] = json!("/tmp/not-allowed");
+    serde_json::from_value::<planning::BrowserPlanningRequest>(unknown_request_field)
+        .expect_err("caller-supplied workspace roots must be rejected");
+
+    let mut unknown_operation_field = request;
+    unknown_operation_field["operation"]["command"] = json!("task add");
+    serde_json::from_value::<planning::BrowserPlanningRequest>(unknown_operation_field)
+        .expect_err("generic command text must be rejected");
+
+    let approval = json!({
+        "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+        "id": "planning-approval",
+        "session_key": "planning-session",
+        "expected_daemon_instance_id": "test-workbench-instance",
+        "expected_revision": 3,
+        "expected_phase_id": "planning-phase",
+        "operation": {
+            "kind": "task_complete_approve",
+            "review_id": "review-id",
+            "task_id": "planning-task",
+            "outcome": "Recorded the exact reviewed outcome.",
+        },
+    });
+    serde_json::from_value::<planning::BrowserPlanningRequest>(approval.clone())
+        .expect("approval carries exact replay material");
+    let mut incomplete_approval = approval;
+    incomplete_approval["operation"]
+        .as_object_mut()
+        .expect("approval operation")
+        .remove("outcome");
+    serde_json::from_value::<planning::BrowserPlanningRequest>(incomplete_approval)
+        .expect_err("approval without exact outcome replay material must be rejected");
+
+    assert_eq!(
+        planning::normalize_title("  Plan together  ").expect("trim valid title"),
+        "Plan together"
+    );
+    for invalid in ["", " \t ", "line one\nline two"] {
+        planning::normalize_title(invalid).expect_err("invalid title");
+    }
+    planning::normalize_title(&"x".repeat(512)).expect("512-byte title");
+    planning::normalize_title(&"x".repeat(513)).expect_err("oversized title");
+
+    planning::validate_message("Outcome\nwith detail").expect("valid multiline outcome");
+    for invalid in ["", " \t "] {
+        planning::validate_message(invalid).expect_err("invalid message");
+    }
+    planning::validate_message(&"x".repeat(16 * 1024)).expect("16 KiB message");
+    planning::validate_message(&"x".repeat(16 * 1024 + 1)).expect_err("oversized message");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -629,6 +1529,7 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
         &fixture.project,
         &registered,
         manager.inner.current_revision(),
+        &manager.inner.instance_id,
         || {
             let writer =
                 SqliteWriter::open(fixture.project.db_path()).expect("open concurrent writer");
@@ -652,6 +1553,7 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
         &fixture.project,
         &registered,
         manager.inner.current_revision(),
+        &manager.inner.instance_id,
     )
     .expect("read refreshed snapshot");
     assert_eq!(
@@ -664,6 +1566,106 @@ async fn snapshot_database_reads_share_one_sqlite_snapshot() {
     assert_eq!(
         refreshed.phase.as_ref().map(|phase| phase.id.as_str()),
         Some(phase.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_revision_and_database_state_share_the_project_state_gate() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Snapshot Gate Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Snapshot Gate Phase", "regular", None, &[])
+        .expect("add phase");
+    let lane = writer
+        .add_workbench_lane("Snapshot gate lane", "Serialize the snapshot", &phase)
+        .expect("add lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let project_state_guard = manager
+        .inner
+        .project_state_gate
+        .lock()
+        .expect("project state gate");
+    let (before_gate_tx, before_gate_rx) = std::sync::mpsc::channel();
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+    let snapshot_manager = manager.clone();
+    let snapshot_root = fixture.root.clone();
+    let snapshot_thread = std::thread::spawn(move || {
+        let snapshot = snapshot_manager.snapshot_with_before_state_gate(&snapshot_root, || {
+            before_gate_tx
+                .send(())
+                .expect("announce snapshot gate wait");
+        });
+        snapshot_tx.send(snapshot).expect("send snapshot result");
+    });
+    before_gate_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot reached the project state gate");
+    assert!(
+        snapshot_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "snapshot creation must wait while an atomic project-state write owns the gate"
+    );
+
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    writer
+        .focus_workbench_lane(&workspace.to_string_lossy(), &lane, &phase)
+        .expect("focus lane and phase");
+    drop(writer);
+    let revision = manager.revision_after_write();
+    drop(project_state_guard);
+
+    let snapshot = snapshot_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("snapshot completed after the write")
+        .expect("read coherent snapshot");
+    snapshot_thread.join().expect("join snapshot thread");
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(
+        snapshot.phase.as_ref().map(|phase| phase.id.as_str()),
+        Some(phase.as_str())
+    );
+    assert_eq!(
+        snapshot
+            .focused_lane
+            .as_ref()
+            .map(|lane| lane.summary.id.as_str()),
+        Some(lane.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_samples_git_before_entering_the_project_state_gate() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let snapshot = manager
+        .snapshot_with_before_state_gate(&fixture.root, || {
+            run_git(&fixture.root, &["checkout", "-b", "changed-after-sample"]);
+        })
+        .expect("capture snapshot");
+    assert_eq!(
+        snapshot.workspace.branch.as_deref(),
+        Some("main"),
+        "the snapshot must use Git metadata captured before entering the project-state gate",
+    );
+
+    let refreshed = manager
+        .snapshot(&fixture.root)
+        .expect("capture refreshed snapshot");
+    assert_eq!(
+        refreshed.workspace.branch.as_deref(),
+        Some("changed-after-sample"),
+        "the next snapshot must observe workspace changes",
     );
 }
 
@@ -705,6 +1707,8 @@ async fn snapshot_storage_failures_are_stable_and_path_free() {
 async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     let fixture = fixture();
     let seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
+    let replay_seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
+    let preparation_probe_seen = Arc::new(Mutex::new(Vec::<RequestEnvelope>::new()));
     let manager = WorkbenchHostManager::new(
         Arc::clone(&fixture.project),
         Arc::from("test-http-instance"),
@@ -714,30 +1718,108 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         tokio::runtime::Handle::current(),
     );
     let dispatch_seen = Arc::clone(&seen);
+    let replay_capture = Arc::clone(&replay_seen);
+    let preparation_probe_capture = Arc::clone(&preparation_probe_seen);
     manager
-        .set_dispatcher(DaemonRequestDispatcher::new(move |request| {
-            let dispatch_seen = Arc::clone(&dispatch_seen);
-            async move {
-                dispatch_seen
-                    .lock()
-                    .expect("record dispatched request")
-                    .push(request.clone());
-                ResponseEnvelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    id: request.id,
-                    status: Status::Ok,
-                    result: Some(json!({ "kind": "test.dispatch", "ok": true })),
-                    error: None,
-                    ticket: None,
-                    steering: None,
-                    reminders: None,
-                    display: None,
-                    preview: None,
-                    effect: Some(Effect::Pure),
-                    trace: None,
+        .set_dispatcher(
+            DaemonRequestDispatcher::new(move |request| {
+                let dispatch_seen = Arc::clone(&dispatch_seen);
+                async move {
+                    dispatch_seen
+                        .lock()
+                        .expect("record dispatched request")
+                        .push(request.clone());
+                    let (effect, result) = match &request.op {
+                        Op::Call(call)
+                            if matches!(
+                                &call.address,
+                                crate::api::protocol::Address::Operation { path }
+                                    if path.as_slice() == ["task", "add"]
+                            ) =>
+                        {
+                            (
+                                Effect::Write,
+                                json!({
+                                    "kind": "task.add",
+                                    "ok": true,
+                                    "task_id": "browser-task",
+                                }),
+                            )
+                        }
+                        Op::Call(call)
+                            if matches!(
+                                &call.address,
+                                crate::api::protocol::Address::Operation { path }
+                                    if path.as_slice() == ["task", "complete"]
+                            ) =>
+                        {
+                            (
+                                Effect::Write,
+                                json!({
+                                    "kind": "task.complete",
+                                    "ok": true,
+                                    "task_id": call.input["id"],
+                                }),
+                            )
+                        }
+                        _ => (Effect::Pure, json!({ "kind": "test.dispatch", "ok": true })),
+                    };
+                    ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        id: request.id,
+                        status: Status::Ok,
+                        result: Some(result),
+                        error: None,
+                        ticket: None,
+                        steering: None,
+                        reminders: None,
+                        display: None,
+                        preview: None,
+                        effect: Some(effect),
+                        trace: None,
+                    }
                 }
-            }
-        }))
+            })
+            .with_terminal_replay(move |request| {
+                let replay_capture = Arc::clone(&replay_capture);
+                async move {
+                    replay_capture
+                        .lock()
+                        .expect("record terminal replay request")
+                        .push(request.clone());
+                    Ok(
+                        (request.id == "browser-terminal-approval").then(|| ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            id: request.id,
+                            status: Status::Ok,
+                            result: Some(json!({
+                                "kind": "task.complete",
+                                "ok": true,
+                                "task_id": "terminal-task",
+                            })),
+                            error: None,
+                            ticket: None,
+                            steering: None,
+                            reminders: None,
+                            display: None,
+                            preview: None,
+                            effect: Some(Effect::Write),
+                            trace: None,
+                        }),
+                    )
+                }
+            })
+            .with_atomic_preparation_probe(move |request| {
+                let preparation_probe_capture = Arc::clone(&preparation_probe_capture);
+                async move {
+                    preparation_probe_capture
+                        .lock()
+                        .expect("record atomic preparation probe")
+                        .push(request.clone());
+                    Ok(request.id != "browser-canonical-approval")
+                }
+            }),
+        )
         .expect("install test dispatcher");
 
     let launch = manager.launch(&fixture.root).expect("launch workbench");
@@ -804,6 +1886,25 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         Some("no-store")
     );
     let cookie_pair = cookie.split(';').next().expect("cookie pair");
+    let renewed = raw_http(
+        origin,
+        "POST",
+        "/api/session/renew",
+        Some(json!({ "session_key": session_key }).to_string()),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("renew browser session");
+    assert_eq!(renewed.status, 200, "{renewed:?}");
+    assert_eq!(renewed.json()["kind"], "workbench.session");
+    assert_eq!(renewed.json()["session_key"], session_key);
+    assert!(
+        renewed
+            .headers
+            .get("set-cookie")
+            .is_some_and(|value| value.contains("Max-Age=43200"))
+    );
 
     let replay = raw_http(
         origin,
@@ -852,6 +1953,232 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         Some("no-store")
     );
 
+    let review_permits = manager
+        .inner
+        .completion_review_admission()
+        .try_acquire_many_owned(planning::MAX_COMPLETION_REVIEWS_IN_FLIGHT as u32)
+        .expect("acquire all completion review permits");
+    let review_busy = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-busy-review",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "test-workbench-instance",
+                "expected_revision": 4,
+                "expected_phase_id": "phase-browser",
+                "operation": {
+                    "kind": "task_complete_review",
+                    "task_id": "browser-task",
+                    "outcome": "Reviewed browser completion.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("bound completion review admission");
+    assert_eq!(review_busy.status, 200, "{review_busy:?}");
+    assert_eq!(review_busy.json()["status"], "error", "{review_busy:?}");
+    assert_eq!(
+        review_busy.json()["error"]["details"]["kind"],
+        "workbench.busy",
+        "{review_busy:?}"
+    );
+    assert_eq!(
+        review_busy.json()["error"]["details"]["retry_with_same_request_id"],
+        true,
+        "{review_busy:?}"
+    );
+    drop(review_permits);
+
+    let planning = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-task-add",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "test-workbench-instance",
+                "expected_revision": 4,
+                "expected_phase_id": "phase-browser",
+                "operation": {
+                    "kind": "task_add",
+                    "goal_id": "goal-browser",
+                    "title": "  Add a browser task  ",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("dispatch browser planning request");
+    assert_eq!(planning.status, 200, "{planning:?}");
+    assert_eq!(
+        planning.json()["result"],
+        json!({
+            "kind": "workbench.task_mutation",
+            "ok": true,
+            "schema_version": 1,
+            "operation": "task_add",
+            "task_id": "browser-task",
+        })
+    );
+    {
+        let dispatched = seen.lock().expect("dispatched requests");
+        assert_eq!(dispatched.len(), 2);
+        let Op::Call(call) = &dispatched[1].op else {
+            panic!("planning request must be a call");
+        };
+        assert_eq!(
+            call.address,
+            crate::api::protocol::Address::Operation {
+                path: vec!["task".to_string(), "add".to_string()]
+            }
+        );
+        assert_eq!(call.input["label"], "Add a browser task");
+        assert_eq!(call.input["goal"], "goal-browser");
+        assert_eq!(
+            call.input[planning::PLANNING_CONTEXT_FIELD]["expected_daemon_instance_id"],
+            "test-workbench-instance"
+        );
+        assert_eq!(
+            call.input[planning::PLANNING_CONTEXT_FIELD]["expected_revision"],
+            4
+        );
+        assert_eq!(
+            call.input[planning::PLANNING_CONTEXT_FIELD]["expected_phase_id"],
+            "phase-browser"
+        );
+        assert!(
+            !planning.json().to_string().contains("goal-browser"),
+            "browser acknowledgement must not echo planning context"
+        );
+    }
+
+    let terminal_approval = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-terminal-approval",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "retired-daemon-instance",
+                "expected_revision": 3,
+                "expected_phase_id": "retired-phase",
+                "operation": {
+                    "kind": "task_complete_approve",
+                    "review_id": "evicted-review",
+                    "task_id": "terminal-task",
+                    "outcome": "Recorded the exact terminal browser outcome.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("replay terminal browser approval");
+    assert_eq!(terminal_approval.status, 200, "{terminal_approval:?}");
+    assert_eq!(
+        terminal_approval.json()["result"],
+        json!({
+            "kind": "workbench.task_mutation",
+            "ok": true,
+            "schema_version": 1,
+            "operation": "task_complete_approve",
+            "task_id": "terminal-task",
+        })
+    );
+    assert_eq!(
+        seen.lock().expect("dispatched requests").len(),
+        2,
+        "terminal approval replay must not dispatch a new task completion"
+    );
+    let replayed = replay_seen.lock().expect("terminal replay requests");
+    assert_eq!(replayed.len(), 1);
+    let Op::Call(call) = &replayed[0].op else {
+        panic!("terminal approval replay must be a task completion call");
+    };
+    assert_eq!(call.input["id"], "terminal-task");
+    assert_eq!(
+        call.input["log"],
+        "Recorded the exact terminal browser outcome."
+    );
+    assert_eq!(
+        call.input[planning::PLANNING_CONTEXT_FIELD]["expected_daemon_instance_id"],
+        "retired-daemon-instance"
+    );
+    assert_eq!(
+        replayed[0]
+            .workflow_confirmation
+            .as_ref()
+            .expect("terminal approval confirmation")
+            .outcome,
+        "Recorded the exact terminal browser outcome."
+    );
+    drop(replayed);
+
+    let canonical_approval = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": planning::PLANNING_PROTOCOL_VERSION,
+                "id": "browser-canonical-approval",
+                "session_key": session_key,
+                "expected_daemon_instance_id": "retired-daemon-instance",
+                "expected_revision": 3,
+                "expected_phase_id": "retired-phase",
+                "operation": {
+                    "kind": "task_complete_approve",
+                    "review_id": "evicted-canonical-review",
+                    "task_id": "canonical-task",
+                    "outcome": "Recorded the canonical browser outcome.",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("replay canonical browser approval");
+    assert_eq!(canonical_approval.status, 200, "{canonical_approval:?}");
+    assert_eq!(
+        canonical_approval.json()["result"],
+        json!({
+            "kind": "workbench.task_mutation",
+            "ok": true,
+            "schema_version": 1,
+            "operation": "task_complete_approve",
+            "task_id": "canonical-task",
+        })
+    );
+    let dispatched = seen.lock().expect("dispatched requests");
+    assert_eq!(dispatched.len(), 3);
+    assert_eq!(dispatched[2].id, "browser-canonical-approval");
+    drop(dispatched);
+    let probed = preparation_probe_seen
+        .lock()
+        .expect("atomic preparation probes");
+    assert_eq!(probed.len(), 1);
+    assert_eq!(probed[0].id, "browser-canonical-approval");
+    drop(probed);
+
     let session_id = cookie_pair
         .strip_prefix(&format!("{SESSION_COOKIE_PREFIX}{session_key}="))
         .expect("session cookie name");
@@ -861,7 +2188,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         .lock()
         .expect("workbench state")
         .sessions
-        .get_mut(session_id)
+        .get_mut(&session_credential_digest(session_id))
         .expect("HTTP session")
         .capabilities
         .retain(|capability| capability != "lane.focus");
@@ -936,29 +2263,33 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
-async fn matching_host_record_is_removed_but_foreign_generation_is_preserved() {
+async fn malformed_host_record_is_not_resumed() {
     let fixture = fixture();
-    let manager = test_manager(Arc::clone(&fixture.project));
-    manager.launch(&fixture.root).expect("launch workbench");
-    manager.shutdown().await;
+    let first =
+        test_manager_with_identity(Arc::clone(&fixture.project), "incompatible-first-instance");
+    let launch = first.launch(&fixture.root).expect("launch first workbench");
+    let (_, ticket) = launch_parts(&launch);
+    first
+        .inner
+        .redeem_ticket(ticket)
+        .expect("persist one resumable session");
+    first.shutdown().await;
 
-    let foreign = WorkbenchHostRecord {
-        schema_version: 1,
-        instance_id: "foreign-instance".to_string(),
-        pid: std::process::id(),
-        process_start_id: "foreign-start".to_string(),
-        origin: "http://127.0.0.1:1".to_string(),
-        assets_hash: "blake3:foreign".to_string(),
-        server_task_alive: false,
-        started_at: timestamp_now(),
-        updated_at: timestamp_now(),
-        last_error: None,
-    };
-    write_host_record(&manager.inner.host_record_path, &foreign).expect("write foreign record");
-    manager.inner.remove_owned_host_record();
+    let mut malformed: WorkbenchHostRecord = serde_json::from_slice(
+        &fs::read(&first.inner.host_record_path).expect("read retained host record"),
+    )
+    .expect("decode retained host record");
+    malformed.origin = "https://127.0.0.1:1".to_string();
+    write_host_record(&first.inner.host_record_path, &malformed)
+        .expect("write malformed host record");
+
+    let replacement = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "malformed-replacement-instance",
+    );
     assert!(
-        manager.inner.host_record_path.exists(),
-        "cleanup must preserve a foreign runtime generation"
+        replacement.host_status().is_none(),
+        "a live grant must not resume an invalid loopback origin"
     );
 }
 

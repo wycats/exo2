@@ -1,15 +1,20 @@
 use super::{
-    WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails, WorkbenchLaneSummary, WorkbenchPhase,
-    WorkbenchProjectIdentity, WorkbenchSnapshot, WorkbenchSnapshotWorkspace, WorkbenchSteering,
-    WorkbenchSuggestedAction, WorkbenchTask, WorkspaceRegistration,
+    WorkbenchDaemonIdentity, WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails,
+    WorkbenchLaneSummary, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
+    WorkbenchSnapshotWorkspace, WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask,
+    WorkbenchTaskProgress, WorkspaceRegistration,
 };
 use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
+use crate::phase_owner::PhaseOwnerViewContext;
 use crate::project::Project;
 use crate::steering::derive_phase_steering;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+const MAX_TASK_PROGRESS_ENTRIES: usize = 8;
+const MAX_TASK_PROGRESS_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct GitSnapshot {
@@ -32,20 +37,74 @@ pub(super) fn sample_git(root: &Path) -> GitSnapshot {
     }
 }
 
+pub(super) fn registered_git(registered: &WorkspaceRegistration) -> GitSnapshot {
+    GitSnapshot {
+        detached: registered.branch.is_none() && registered.head.is_some(),
+        branch: registered.branch.clone(),
+        head: registered.head.clone(),
+        dirty: false,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn build(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
+    daemon_instance_id: &str,
 ) -> Result<WorkbenchSnapshot> {
-    build_with_after_state_hook(project, registered, revision, || {})
+    let git = sample_git(&registered.root);
+    build_with_git(project, registered, revision, daemon_instance_id, git)
 }
 
+pub(super) fn build_with_git(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    git: GitSnapshot,
+) -> Result<WorkbenchSnapshot> {
+    build_with_git_and_after_state_hook(
+        project,
+        registered,
+        revision,
+        daemon_instance_id,
+        git,
+        || {},
+    )
+}
+
+#[cfg(test)]
 pub(super) fn build_with_after_state_hook(
     project: &Project,
     registered: &WorkspaceRegistration,
     revision: u64,
+    daemon_instance_id: &str,
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
+    let git = sample_git(&registered.root);
+    build_with_git_and_after_state_hook(
+        project,
+        registered,
+        revision,
+        daemon_instance_id,
+        git,
+        after_state,
+    )
+}
+
+fn build_with_git_and_after_state_hook(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    git: GitSnapshot,
+    after_state: impl FnOnce(),
+) -> Result<WorkbenchSnapshot> {
+    let mut workspace_project = project.clone();
+    workspace_project.workspace_root = Some(registered.root.clone());
+    let phase_owner_context =
+        PhaseOwnerViewContext::new(&registered.root, Some(&workspace_project));
     let loader = SqliteLoader::open(project.db_path())?;
     let transaction = loader
         .database()
@@ -87,9 +146,20 @@ pub(super) fn build_with_after_state_hook(
                 .ok_or_else(|| anyhow::anyhow!("focused lane phase details are missing"))
         })
         .transpose()?;
+    let planning_available = focused_phase
+        .map(|phase| {
+            loader.load_phase_owner(&phase.id).map(|owner| {
+                owner
+                    .as_ref()
+                    .is_none_or(|owner| phase_owner_context.owner_view(owner).owned_here)
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
     let phase = focused_phase
         .zip(focused_phase_details.as_ref())
         .map(|(phase, details)| WorkbenchPhase {
+            planning_available,
             id: phase.id.clone(),
             title: phase.title.clone(),
             status: phase.status.clone(),
@@ -103,10 +173,19 @@ pub(super) fn build_with_after_state_hook(
                     tasks: goal
                         .tasks
                         .iter()
-                        .map(|task| WorkbenchTask {
-                            id: task.id.clone(),
-                            title: task.title.clone(),
-                            status: task.status.clone(),
+                        .map(|task| {
+                            let (progress, progress_truncated) =
+                                bounded_task_progress(task.logs.iter().filter_map(|log| {
+                                    (log.kind == "progress")
+                                        .then_some((log.message.as_str(), log.created_at.as_str()))
+                                }));
+                            WorkbenchTask {
+                                id: task.id.clone(),
+                                title: task.title.clone(),
+                                status: task.status.clone(),
+                                progress,
+                                progress_truncated,
+                            }
                         })
                         .collect(),
                 })
@@ -150,7 +229,6 @@ pub(super) fn build_with_after_state_hook(
         .commit()
         .context("Failed to finish workbench snapshot read transaction")?;
 
-    let git = sample_git(&registered.root);
     let label = git
         .branch
         .clone()
@@ -170,6 +248,9 @@ pub(super) fn build_with_after_state_hook(
         project: WorkbenchProjectIdentity {
             id: project.id.to_string(),
         },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: daemon_instance_id.to_string(),
+        },
         workspace: WorkbenchSnapshotWorkspace {
             key: registered.key.clone(),
             label,
@@ -184,6 +265,55 @@ pub(super) fn build_with_after_state_hook(
         steering,
         diagnostics,
     })
+}
+
+fn bounded_task_progress<'a>(
+    mut logs: impl DoubleEndedIterator<Item = (&'a str, &'a str)>,
+) -> (Vec<WorkbenchTaskProgress>, bool) {
+    let mut progress = Vec::with_capacity(MAX_TASK_PROGRESS_ENTRIES);
+    let mut bytes = 0;
+    let mut truncated = false;
+
+    while let Some((message, created_at)) = logs.next_back() {
+        if progress.len() == MAX_TASK_PROGRESS_ENTRIES {
+            truncated = true;
+            break;
+        }
+
+        let remaining = MAX_TASK_PROGRESS_BYTES.saturating_sub(bytes);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let (message, message_truncated) = bounded_message(message, remaining);
+        bytes += message.len();
+        progress.push(WorkbenchTaskProgress {
+            message,
+            created_at: created_at.to_string(),
+        });
+        if message_truncated {
+            truncated = true;
+            break;
+        }
+    }
+
+    progress.reverse();
+    (progress, truncated)
+}
+
+fn bounded_message(message: &str, max_bytes: usize) -> (String, bool) {
+    if message.len() <= max_bytes {
+        return (message.to_string(), false);
+    }
+    if max_bytes <= 3 {
+        return (".".repeat(max_bytes), true);
+    }
+
+    let mut end = max_bytes - 3;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}...", &message[..end]), true)
 }
 
 fn lane_summary(
@@ -253,4 +383,27 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_progress_is_byte_bounded_on_utf8_boundaries() {
+        let oversized = "é".repeat(MAX_TASK_PROGRESS_BYTES);
+        let (progress, truncated) = bounded_task_progress(
+            [
+                ("Older progress.", "2026-07-30T00:00:00Z"),
+                (oversized.as_str(), "2026-07-30T00:01:00Z"),
+            ]
+            .into_iter(),
+        );
+
+        assert!(truncated);
+        assert_eq!(progress.len(), 1);
+        assert!(progress[0].message.len() <= MAX_TASK_PROGRESS_BYTES);
+        assert!(progress[0].message.ends_with("..."));
+        assert_eq!(progress[0].created_at, "2026-07-30T00:01:00Z");
+    }
 }

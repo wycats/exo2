@@ -2491,6 +2491,20 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
     writer
         .update_phase_status(&phase_id, "in-progress")
         .expect("start workbench phase");
+    writer
+        .add_goal(
+            &phase_id,
+            "planning-goal",
+            "Plan through the workbench",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add planning goal");
     let primary_lane_id = writer
         .add_workbench_lane("Primary lane", "Stay focused in primary", &phase_id)
         .expect("add primary lane");
@@ -2723,6 +2737,403 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         primary_snapshot["result"]["workspace"]["key"],
         linked_snapshot["result"]["workspace"]["key"]
     );
+
+    let planning_revision = primary_snapshot["result"]["revision"]
+        .as_u64()
+        .expect("planning snapshot revision");
+    let planning_daemon_instance_id = primary_snapshot["result"]["daemon"]["instance_id"].clone();
+    let planning_request = serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-add",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": planning_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_add",
+            "goal_id": "planning-goal",
+            "title": "Plan from the browser",
+        },
+    });
+    let planning_call = || {
+        let origin = origin.clone();
+        let body = planning_request.to_string();
+        let cookies = browser_cookies.clone();
+        async move {
+            send_workbench_http(&origin, "POST", "/api/command", Some(body), Some(&cookies))
+                .await
+                .expect("add task through workbench planning")
+                .json()
+        }
+    };
+    let (planning, concurrent_replay_a, concurrent_replay_b, concurrent_replay_c) = tokio::join!(
+        planning_call(),
+        planning_call(),
+        planning_call(),
+        planning_call()
+    );
+    for response in [
+        &planning,
+        &concurrent_replay_a,
+        &concurrent_replay_b,
+        &concurrent_replay_c,
+    ] {
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            response["result"]["kind"], "workbench.task_mutation",
+            "{response}"
+        );
+        assert_eq!(response["result"]["operation"], "task_add", "{response}");
+        assert_eq!(
+            response["result"]["task_id"], "plan-from-the-browser",
+            "{response}"
+        );
+    }
+
+    let (planning_event, planning_invalidation_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("planning invalidation event");
+    assert_eq!(planning_event, "invalidate");
+    assert!(planning_invalidation_revision > planning_revision);
+
+    let replay = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(planning_request.to_string()),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("replay planning request with the same identity")
+    .json();
+    assert_eq!(replay["status"], "ok", "{replay}");
+    assert_eq!(
+        replay["result"]["task_id"], "plan-from-the-browser",
+        "{replay}"
+    );
+
+    let runtime_ledger_path = exo::daemon::paths_for_workspace(&primary)
+        .expect("daemon paths")
+        .outcome_ledger_path();
+    let runtime_ledger = exosuit_storage::Connection::open(&runtime_ledger_path)
+        .expect("open planning runtime outcome ledger");
+    assert_eq!(
+        runtime_ledger
+            .execute(
+                "UPDATE daemon_request_outcomes
+                 SET instance_id = 'retired-instance', response_json = NULL, completed_at = NULL
+                 WHERE request_id = 'browser-primary-task-add'",
+                [],
+            )
+            .expect("simulate planning finalization loss"),
+        1,
+        "the planning request must have one runtime reservation"
+    );
+    let canonical_replay = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(planning_request.to_string()),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("replay committed planning request after finalization loss")
+    .json();
+    assert_eq!(canonical_replay["status"], "ok", "{canonical_replay}");
+    assert_eq!(
+        canonical_replay["result"]["task_id"], "plan-from-the-browser",
+        "{canonical_replay}"
+    );
+    assert!(
+        runtime_outcome_completed(&runtime_ledger_path, "browser-primary-task-add"),
+        "canonical planning replay must repair the runtime outcome"
+    );
+
+    let linked_after_planning = snapshot(
+        "browser-linked-after-planning",
+        browser_cookies.clone(),
+        linked_session_key.clone(),
+    )
+    .await;
+    assert_eq!(
+        linked_after_planning["result"]["revision"], planning_invalidation_revision,
+        "concurrent same-ID replay must not advance the workbench revision: {linked_after_planning}"
+    );
+    assert_eq!(
+        linked_after_planning["result"]["focused_lane"]["id"], linked_lane_id,
+        "shared planning writes must not replace sibling workspace focus"
+    );
+    let planning_tasks = linked_after_planning["result"]["phase"]["goals"]
+        .as_array()
+        .expect("linked phase goals")
+        .iter()
+        .find(|goal| goal["id"] == "planning-goal")
+        .expect("planning goal")["tasks"]
+        .as_array()
+        .expect("planning tasks");
+    assert_eq!(
+        planning_tasks
+            .iter()
+            .filter(|task| task["id"] == "plan-from-the-browser")
+            .count(),
+        1,
+        "same-ID replay must not duplicate the canonical task"
+    );
+
+    let stale = send_workbench_http(
+        &origin,
+        "POST",
+        "/api/command",
+        Some(
+            serde_json::json!({
+                "protocol_version": 2,
+                "id": "browser-primary-stale-update",
+                "session_key": primary_session_key,
+                "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+                "expected_revision": planning_revision,
+                "expected_phase_id": phase_id,
+                "operation": {
+                    "kind": "task_update",
+                    "task_id": "plan-from-the-browser",
+                    "title": "This stale edit must not land",
+                },
+            })
+            .to_string(),
+        ),
+        Some(&browser_cookies),
+    )
+    .await
+    .expect("reject stale planning request")
+    .json();
+    assert_eq!(stale["status"], "error", "{stale}");
+    assert_eq!(
+        stale["error"]["details"]["kind"], "workbench.stale_snapshot",
+        "{stale}"
+    );
+
+    let planning_command = |body: serde_json::Value| {
+        let origin = origin.clone();
+        let browser_cookies = browser_cookies.clone();
+        async move {
+            send_workbench_http(
+                &origin,
+                "POST",
+                "/api/command",
+                Some(body.to_string()),
+                Some(&browser_cookies),
+            )
+            .await
+            .expect("dispatch planning command")
+            .json()
+        }
+    };
+    let update_a = serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-update-a",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": planning_invalidation_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_update",
+            "task_id": "plan-from-the-browser",
+            "title": "Plan together in browser A",
+        },
+    });
+    let update_b = serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-update-b",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": planning_invalidation_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_update",
+            "task_id": "plan-from-the-browser",
+            "title": "Plan together in browser B",
+        },
+    });
+    let (update_a, update_b) = tokio::join!(planning_command(update_a), planning_command(update_b));
+    let (winning_title, stale_update) = match (
+        update_a["status"].as_str(),
+        update_b["status"].as_str(),
+    ) {
+        (Some("ok"), Some("error")) => ("Plan together in browser A", &update_b),
+        (Some("error"), Some("ok")) => ("Plan together in browser B", &update_a),
+        _ => panic!(
+            "one concurrent planning update must win and one must be stale: {update_a} {update_b}"
+        ),
+    };
+    assert_eq!(
+        stale_update["error"]["details"]["kind"], "workbench.stale_snapshot",
+        "{stale_update}"
+    );
+    let (_, update_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("task update invalidation");
+
+    let reorder = planning_command(serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-reorder",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": update_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_reorder",
+            "task_id": "plan-from-the-browser",
+            "position": 0,
+        },
+    }))
+    .await;
+    assert_eq!(reorder["status"], "ok", "{reorder}");
+    assert_eq!(reorder["result"]["operation"], "task_reorder", "{reorder}");
+    let (_, reorder_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("task reorder invalidation");
+
+    let start = planning_command(serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-start",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": reorder_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_start",
+            "task_id": "plan-from-the-browser",
+        },
+    }))
+    .await;
+    assert_eq!(start["status"], "ok", "{start}");
+    assert_eq!(start["result"]["operation"], "task_start", "{start}");
+    let (_, start_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("task start invalidation");
+
+    let log = planning_command(serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-task-log",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": start_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_log",
+            "task_id": "plan-from-the-browser",
+            "message": "Verified authoritative planning through both worktrees.",
+        },
+    }))
+    .await;
+    assert_eq!(log["status"], "ok", "{log}");
+    assert_eq!(log["result"]["operation"], "task_log", "{log}");
+    let (_, log_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("task log invalidation");
+
+    let review_request = serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-completion-review",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": log_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_complete_review",
+            "task_id": "plan-from-the-browser",
+            "outcome": "Implemented and verified shared browser planning.",
+        },
+    });
+    let review = planning_command(review_request.clone()).await;
+    assert_eq!(review["status"], "ok", "{review}");
+    assert_eq!(
+        review["result"]["kind"], "workbench.task_completion_review",
+        "{review}"
+    );
+    let review_id = review["result"]["review_id"]
+        .as_str()
+        .expect("completion review ID")
+        .to_string();
+    let review_replay = planning_command(review_request).await;
+    assert_eq!(
+        review_replay["result"]["review_id"], review_id,
+        "same-ID review replay must preserve the random review identity"
+    );
+
+    let foreign_approval = planning_command(serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-linked-foreign-approval",
+        "session_key": linked_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id.clone(),
+        "expected_revision": log_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_complete_approve",
+            "review_id": review_id,
+            "task_id": "plan-from-the-browser",
+            "outcome": "Implemented and verified shared browser planning.",
+        },
+    }))
+    .await;
+    assert_eq!(foreign_approval["status"], "error", "{foreign_approval}");
+    assert_eq!(
+        foreign_approval["error"]["details"]["kind"], "workbench.review_invalid",
+        "{foreign_approval}"
+    );
+
+    let approval_request = serde_json::json!({
+        "protocol_version": 2,
+        "id": "browser-primary-completion-approval",
+        "session_key": primary_session_key,
+        "expected_daemon_instance_id": planning_daemon_instance_id,
+        "expected_revision": log_revision,
+        "expected_phase_id": phase_id,
+        "operation": {
+            "kind": "task_complete_approve",
+            "review_id": review_id,
+            "task_id": "plan-from-the-browser",
+            "outcome": "Implemented and verified shared browser planning.",
+        },
+    });
+    let approval = planning_command(approval_request.clone()).await;
+    assert_eq!(approval["status"], "ok", "{approval}");
+    assert_eq!(
+        approval["result"]["operation"], "task_complete_approve",
+        "{approval}"
+    );
+    let (_, approval_revision) = read_workbench_event(&mut events)
+        .await
+        .expect("task approval invalidation");
+    let approval_replay = planning_command(approval_request).await;
+    assert_eq!(approval_replay["status"], "ok", "{approval_replay}");
+    assert_eq!(
+        approval_replay["result"]["task_id"], "plan-from-the-browser",
+        "{approval_replay}"
+    );
+
+    let linked_after_approval = snapshot(
+        "browser-linked-after-approval",
+        browser_cookies.clone(),
+        linked_session_key.clone(),
+    )
+    .await;
+    assert_eq!(
+        linked_after_approval["result"]["revision"], approval_revision,
+        "{linked_after_approval}"
+    );
+    let completed_task = linked_after_approval["result"]["phase"]["goals"]
+        .as_array()
+        .expect("linked phase goals")
+        .iter()
+        .find(|goal| goal["id"] == "planning-goal")
+        .expect("planning goal")["tasks"]
+        .as_array()
+        .expect("planning tasks")
+        .iter()
+        .find(|task| task["id"] == "plan-from-the-browser")
+        .expect("completed task");
+    assert_eq!(completed_task["status"], "completed");
+    assert_eq!(completed_task["title"], winning_title);
 
     let focus = send_workbench_http(
         &origin,

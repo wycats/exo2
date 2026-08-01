@@ -1,12 +1,14 @@
 use crate::api::protocol::{ErrorCode, WorkflowConfirmationDecision, WorkflowConfirmationInput};
 use crate::command::traits::MutableCommandContext;
-use crate::context::SqliteWriter;
 use crate::context::sqlite_loader::CompletionClaimStatus;
+use crate::context::{SqliteLoader, SqliteWriter};
 use crate::failure::ExoFailure;
+use crate::project::Project;
 use crate::steering::{
     CompletionOutcomeDigestSummary, ProgressMode, SteeringBlock, SuggestedAction, WorkIntent,
 };
 use serde::Serialize;
+use std::path::Path;
 
 const WORKFLOW_COMPLETION_CONFIRMATION_KIND: &str = "workflow_completion_confirmation";
 const OUTCOME_REVIEW_CONFIRMATION_ALIAS: &str = "outcome_review";
@@ -249,6 +251,62 @@ pub(super) fn task_workflow_confirmation(
             discuss: "Discuss what needs to change before updating completion state.",
         },
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct TaskCompletionReview {
+    pub task_id: String,
+    pub readiness_rationale: String,
+    pub proposed_outcome: String,
+    pub approval_evidence_present: bool,
+}
+
+/// Build the canonical task-completion review without recording evidence or
+/// changing task state.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn review_task_completion(
+    root: &Path,
+    project: Option<&Project>,
+    task_id: &str,
+    proposed_outcome: &str,
+) -> anyhow::Result<TaskCompletionReview> {
+    let db_path = crate::context::db_path(root, project);
+    let writer = SqliteWriter::open(&db_path)?;
+    let resolved = writer
+        .resolve_task_reference(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+    drop(writer);
+
+    let loader = SqliteLoader::open(&db_path)?;
+    let completion_digest = loader
+        .load_completion_outcome_digest("task", &resolved.task_id)
+        .ok()
+        .filter(|digest| !digest.claims.is_empty())
+        .map(crate::steering::completion_outcome_digest_summary_from_loader);
+    let claim = match loader.has_completion_claim("task", &resolved.task_id)? {
+        CompletionClaimStatus::NoClaim if task_id != resolved.task_id => {
+            loader.has_completion_claim("task", task_id)?
+        }
+        other => other,
+    };
+    let approval_evidence_present = matches!(
+        claim,
+        CompletionClaimStatus::HumanClaim | CompletionClaimStatus::AgentClaimAcknowledged
+    );
+    let review = task_workflow_confirmation(
+        &resolved.task_id,
+        proposed_outcome,
+        false,
+        completion_digest,
+    );
+
+    Ok(TaskCompletionReview {
+        task_id: resolved.task_id,
+        readiness_rationale: review.readiness_rationale,
+        proposed_outcome: review.proposed_outcome,
+        approval_evidence_present,
+    })
 }
 
 pub(super) fn completion_confirmation_failure_with_workflow(

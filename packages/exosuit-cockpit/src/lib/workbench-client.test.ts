@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import snapshotFixture from "./workbench-snapshot.v1.json";
+import type { WorkbenchPlanningRequest } from "./workbench";
 import {
   createWorkbenchRequestId,
   exchangeWorkbenchTicket,
@@ -49,6 +50,35 @@ describe("workbench browser client", () => {
         method: "POST",
         credentials: "same-origin",
         body: JSON.stringify({ ticket: "v1.ticket" }),
+      }),
+    );
+  });
+
+  it("renews the existing selector without exposing the cookie secret", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({
+        kind: "workbench.session",
+        ok: true,
+        schema_version: 1,
+        session_key: "session-selector",
+        project_id: "project-fixture",
+        workspace_key: "workspace-fixture",
+        expires_at: "2026-07-30T22:00:00Z",
+      }),
+    );
+
+    const session = await new WorkbenchClient(
+      "session-selector",
+      fetcher,
+    ).renewSession();
+
+    expect(session.expires_at).toBe("2026-07-30T22:00:00Z");
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/session/renew",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({ session_key: "session-selector" }),
       }),
     );
   });
@@ -157,6 +187,178 @@ describe("workbench browser client", () => {
 
     expect(snapshot.focused_lane?.id).toBe("lane-fixture");
     expect(snapshot.revision).toBe(7);
+  });
+
+  it("sends a revision-bound planning request and decodes its mutation", async () => {
+    const bodies: WorkbenchPlanningRequest[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (_path, init) => {
+        const request = JSON.parse(
+          String(init?.body),
+        ) as WorkbenchPlanningRequest;
+        bodies.push(request);
+        return jsonResponse({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: {
+            kind: "workbench.task_mutation",
+            ok: true,
+            schema_version: 1,
+            operation: "task_add",
+            task_id: "new-task",
+          },
+        });
+      });
+    const request: WorkbenchPlanningRequest = {
+      protocol_version: 2,
+      id: "01PLANNINGREQUEST0000000000",
+      session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
+      expected_revision: 7,
+      expected_phase_id: "phase-fixture",
+      operation: {
+        kind: "task_add",
+        goal_id: "host-goal",
+        title: "Add browser planning",
+      },
+    };
+
+    const result = await new WorkbenchClient(
+      "session-selector",
+      fetcher,
+    ).planning(request);
+
+    expect(result).toEqual({
+      kind: "workbench.task_mutation",
+      ok: true,
+      schema_version: 1,
+      operation: "task_add",
+      task_id: "new-task",
+    });
+    expect(bodies).toEqual([request]);
+  });
+
+  it("decodes the non-mutating task-completion review", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (_path, init) => {
+        const request = JSON.parse(String(init?.body));
+        return jsonResponse({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: {
+            kind: "workbench.task_completion_review",
+            ok: true,
+            schema_version: 1,
+            review_id: "review-selector",
+            task_id: "implement-host",
+            readiness_rationale: "All focused checks pass.",
+            proposed_outcome: "Implemented the local host.",
+            approval_evidence_present: false,
+          },
+        });
+      });
+
+    const result = await new WorkbenchClient(
+      "session-selector",
+      fetcher,
+    ).planning({
+      protocol_version: 2,
+      id: "01REVIEWREQUEST00000000000",
+      session_key: "session-selector",
+      expected_daemon_instance_id: "daemon-fixture",
+      expected_revision: 7,
+      expected_phase_id: "phase-fixture",
+      operation: {
+        kind: "task_complete_review",
+        task_id: "implement-host",
+        outcome: "Implemented the local host.",
+      },
+    });
+
+    expect(result.kind).toBe("workbench.task_completion_review");
+    expect(result).toMatchObject({
+      review_id: "review-selector",
+      proposed_outcome: "Implemented the local host.",
+    });
+  });
+
+  it("preserves the exact planning request for a declared same-ID retry", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (_path, init) => {
+        const request = JSON.parse(String(init?.body));
+        return jsonResponse({
+          protocol_version: 1,
+          id: request.id,
+          status: "error",
+          error: {
+            code: "precondition_failed",
+            message: "The workbench planning service is busy",
+            details: {
+              kind: "workbench.busy",
+              retry_with_same_request_id: true,
+            },
+          },
+        });
+      });
+
+    await expect(
+      new WorkbenchClient("session-selector", fetcher).planning({
+        protocol_version: 2,
+        id: "01BUSYREQUEST0000000000000",
+        session_key: "session-selector",
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+        operation: { kind: "task_start", task_id: "implement-host" },
+      }),
+    ).rejects.toMatchObject({
+      kind: "server_busy",
+      retryable: true,
+      retryWithSameRequestId: true,
+      detailKind: "workbench.busy",
+    } satisfies Partial<WorkbenchClientError>);
+  });
+
+  it("does not offer retry for an authoritative stale snapshot", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (_path, init) => {
+        const request = JSON.parse(String(init?.body));
+        return jsonResponse({
+          protocol_version: 1,
+          id: request.id,
+          status: "error",
+          error: {
+            code: "precondition_failed",
+            message: "The workbench snapshot is stale",
+            details: {
+              kind: "workbench.stale_snapshot",
+              retry_with_same_request_id: false,
+            },
+          },
+        });
+      });
+
+    await expect(
+      new WorkbenchClient("session-selector", fetcher).planning({
+        protocol_version: 2,
+        id: "01STALEREQUEST000000000000",
+        session_key: "session-selector",
+        expected_daemon_instance_id: "daemon-fixture",
+        expected_revision: 7,
+        expected_phase_id: "phase-fixture",
+        operation: { kind: "task_start", task_id: "implement-host" },
+      }),
+    ).rejects.toMatchObject({
+      retryable: false,
+      retryWithSameRequestId: false,
+      detailKind: "workbench.stale_snapshot",
+    } satisfies Partial<WorkbenchClientError>);
   });
 
   it("preserves the lane-focus request ID across a transport retry", async () => {
@@ -280,6 +482,9 @@ describe("workbench browser client", () => {
           return {
             ok: true,
             status: 200,
+            headers: new Headers({
+              "Content-Type": "application/json",
+            }),
             json: () =>
               new Promise<unknown>((_resolve, reject) => {
                 signal?.addEventListener(
@@ -301,6 +506,22 @@ describe("workbench browser client", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("identifies the unreadable response without exposing its body", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("<html>proxy failure</html>", {
+        status: 502,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      }),
+    );
+
+    await expect(
+      new WorkbenchClient("session-selector", fetcher).snapshot(),
+    ).rejects.toMatchObject({
+      message:
+        "Exo returned an unreadable workbench response (HTTP 502, text/html)",
+    } satisfies Partial<WorkbenchClientError>);
   });
 
   it("generates ULID-shaped browser request IDs", () => {

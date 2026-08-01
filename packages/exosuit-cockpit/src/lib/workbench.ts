@@ -31,6 +31,9 @@ export interface WorkbenchSnapshot {
   project: {
     id: string;
   };
+  daemon: {
+    instance_id: string;
+  };
   workspace: WorkbenchSnapshotWorkspace;
   lanes: WorkbenchLaneSummary[];
   focused_lane: WorkbenchLaneDetails | null;
@@ -64,6 +67,7 @@ export interface WorkbenchPhase {
   id: string;
   title: string;
   status: string;
+  planning_available: boolean;
   goals: WorkbenchGoal[];
 }
 
@@ -78,6 +82,13 @@ export interface WorkbenchTask {
   id: string;
   title: string;
   status: string;
+  progress?: WorkbenchTaskProgress[];
+  progress_truncated?: boolean;
+}
+
+export interface WorkbenchTaskProgress {
+  message: string;
+  created_at: string;
 }
 
 export interface WorkbenchSteering {
@@ -118,6 +129,91 @@ export interface WorkbenchCommandRequest {
     | { kind: "lane_focus"; lane_id: string };
 }
 
+export type WorkbenchPlanningOperation =
+  | { kind: "task_add"; goal_id: string; title: string }
+  | { kind: "task_update"; task_id: string; title: string }
+  | { kind: "task_reorder"; task_id: string; position: number }
+  | { kind: "task_start"; task_id: string }
+  | { kind: "task_log"; task_id: string; message: string }
+  | { kind: "task_complete_review"; task_id: string; outcome: string }
+  | {
+      kind: "task_complete_approve";
+      review_id: string;
+      task_id: string;
+      outcome: string;
+    };
+
+export interface WorkbenchPlanningBinding {
+  expected_daemon_instance_id: string;
+  expected_revision: number;
+  expected_phase_id: string;
+}
+
+export interface WorkbenchPlanningRequest {
+  protocol_version: 2;
+  id: string;
+  session_key: string;
+  expected_daemon_instance_id: string;
+  expected_revision: number;
+  expected_phase_id: string;
+  operation: WorkbenchPlanningOperation;
+}
+
+export interface WorkbenchTaskMutationResult {
+  kind: "workbench.task_mutation";
+  ok: true;
+  schema_version: 1;
+  operation:
+    | "task_add"
+    | "task_update"
+    | "task_reorder"
+    | "task_start"
+    | "task_log"
+    | "task_complete_approve";
+  task_id: string;
+}
+
+export interface WorkbenchTaskCompletionReview {
+  kind: "workbench.task_completion_review";
+  ok: true;
+  schema_version: 1;
+  review_id: string;
+  task_id: string;
+  readiness_rationale: string;
+  proposed_outcome: string;
+  approval_evidence_present: boolean;
+}
+
+export type WorkbenchPlanningResult =
+  | WorkbenchTaskMutationResult
+  | WorkbenchTaskCompletionReview;
+
+export function workbenchPlanningBinding(
+  snapshot: WorkbenchSnapshot,
+): WorkbenchPlanningBinding | null {
+  const lane = snapshot.focused_lane;
+  const phase = snapshot.phase;
+  if (
+    lane === null ||
+    phase === null ||
+    !lane.focused_here ||
+    lane.phase_id !== phase.id ||
+    lane.phase_status !== "in-progress" ||
+    phase.status !== "in-progress" ||
+    !phase.planning_available ||
+    snapshot.diagnostics.some(
+      (diagnostic) => diagnostic.code === "lane.phase_focus_mismatch",
+    )
+  ) {
+    return null;
+  }
+  return {
+    expected_daemon_instance_id: snapshot.daemon.instance_id,
+    expected_revision: snapshot.revision,
+    expected_phase_id: phase.id,
+  };
+}
+
 export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");
   literal(snapshot.kind, "workbench.snapshot", "kind");
@@ -126,6 +222,7 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   string(snapshot.observed_at, "observed_at");
   finiteNumber(snapshot.revision, "revision");
   project(snapshot.project);
+  string(record(snapshot.daemon, "daemon").instance_id, "daemon.instance_id");
   workspace(snapshot.workspace);
   array(snapshot.lanes, "lanes").forEach((lane) => laneSummary(lane));
   if (snapshot.focused_lane !== null) {
@@ -139,6 +236,40 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
     workbenchDiagnostic(diagnostic),
   );
   return value as WorkbenchSnapshot;
+}
+
+export function decodeWorkbenchPlanningResult(
+  value: unknown,
+): WorkbenchPlanningResult {
+  const result = record(value, "workbench planning result");
+  literal(result.ok, true, "planning.ok");
+  literal(result.schema_version, 1, "planning.schema_version");
+
+  if (result.kind === "workbench.task_completion_review") {
+    string(result.review_id, "planning.review_id");
+    string(result.task_id, "planning.task_id");
+    string(result.readiness_rationale, "planning.readiness_rationale");
+    string(result.proposed_outcome, "planning.proposed_outcome");
+    boolean(
+      result.approval_evidence_present,
+      "planning.approval_evidence_present",
+    );
+    return value as WorkbenchTaskCompletionReview;
+  }
+
+  literal(result.kind, "workbench.task_mutation", "planning.kind");
+  if (
+    result.operation !== "task_add" &&
+    result.operation !== "task_update" &&
+    result.operation !== "task_reorder" &&
+    result.operation !== "task_start" &&
+    result.operation !== "task_log" &&
+    result.operation !== "task_complete_approve"
+  ) {
+    invalid("planning.operation");
+  }
+  string(result.task_id, "planning.task_id");
+  return value as WorkbenchTaskMutationResult;
 }
 
 function project(value: unknown): void {
@@ -181,6 +312,7 @@ function phase(value: unknown): void {
   string(item.id, "phase.id");
   string(item.title, "phase.title");
   string(item.status, "phase.status");
+  boolean(item.planning_available, "phase.planning_available");
   array(item.goals, "phase.goals").forEach((goal) => {
     const goalItem = record(goal, "goal");
     string(goalItem.id, "goal.id");
@@ -191,6 +323,19 @@ function phase(value: unknown): void {
       string(taskItem.id, "task.id");
       string(taskItem.title, "task.title");
       string(taskItem.status, "task.status");
+      if (taskItem.progress !== undefined) {
+        array(taskItem.progress, "task.progress").forEach((progress) => {
+          const progressItem = record(progress, "task progress");
+          string(progressItem.message, "task.progress.message");
+          string(progressItem.created_at, "task.progress.created_at");
+        });
+      }
+      if (taskItem.progress_truncated !== undefined) {
+        boolean(
+          taskItem.progress_truncated,
+          "task.progress_truncated",
+        );
+      }
     });
   });
 }
