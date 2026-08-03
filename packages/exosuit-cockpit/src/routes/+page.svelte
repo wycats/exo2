@@ -36,12 +36,17 @@
     | "ready"
     | "session_required"
     | "session_expired"
+    | "client_update_required"
     | "workbench_busy"
     | "request_rejected"
     | "workspace_unavailable"
     | "transport_error";
 
-  type SessionRecoveryState = "connected" | "reconnecting" | "needs_launch";
+  type SessionRecoveryState =
+    | "connected"
+    | "reconnecting"
+    | "needs_launch"
+    | "reload_required";
 
   const SESSION_RENEW_INTERVAL_MS = 5 * 60_000;
 
@@ -264,6 +269,15 @@
           sessionRecoveryMessage = messageFrom(error);
           return;
         }
+        if (
+          error instanceof WorkbenchClientError &&
+          error.kind === "client_update_required"
+        ) {
+          sessionRecovery = "reload_required";
+          sessionRecoveryMessage = messageFrom(error);
+          refreshFailure = null;
+          return;
+        }
         recoveryAttempt += 1;
         const delay = Math.min(15_000, 1_000 * 2 ** Math.min(recoveryAttempt, 4));
         recoveryTimer = window.setTimeout(() => {
@@ -444,7 +458,17 @@
         screenRetryable =
           error instanceof WorkbenchClientError && error.retryable;
       } else {
-        refreshFailure = messageFrom(error);
+        if (
+          error instanceof WorkbenchClientError &&
+          error.kind === "client_update_required"
+        ) {
+          sessionRecovery = "reload_required";
+          sessionRecoveryMessage = messageFrom(error);
+          refreshFailure = null;
+          stopLiveUpdates?.();
+        } else {
+          refreshFailure = messageFrom(error);
+        }
         if (
           error instanceof WorkbenchClientError &&
           error.kind === "transport_error"
@@ -755,6 +779,10 @@
     }
   }
 
+  function reloadWorkbench(): void {
+    window.location.reload();
+  }
+
   function terminalFailure(error: unknown): boolean {
     return (
       error instanceof WorkbenchClientError &&
@@ -769,6 +797,8 @@
         return "session_required";
       case "session_expired":
         return "session_expired";
+      case "client_update_required":
+        return "client_update_required";
       case "server_busy":
         return "workbench_busy";
       case "command_failed":
@@ -799,6 +829,13 @@
         return {
           title: "Session expired",
           body: "Open a fresh Exo workbench link to continue.",
+        };
+      case "client_update_required":
+        return {
+          title: "Workbench update available",
+          body:
+            screenMessage ??
+            "Reload this page to use the current Exo workbench version.",
         };
       case "workbench_busy":
         return {
@@ -864,7 +901,9 @@
     onRetryPlanning={retryPlanning ? retryPendingPlanning : null}
     onRetrySession={sessionRecovery === "reconnecting"
       ? () => beginSessionRecovery?.()
-      : null}
+      : sessionRecovery === "reload_required"
+        ? reloadWorkbench
+        : null}
     onRefresh={() => void refreshSnapshot(false)}
     onPlan={submitPlanning}
     onApproveCompletion={approveCompletionReview}
@@ -887,6 +926,8 @@
           <Link2Off size={24} />
         {:else if screen === "session_expired"}
           <Route size={24} />
+        {:else if screen === "client_update_required"}
+          <RefreshCw size={24} />
         {:else if screen === "workbench_busy"}
           <AlertTriangle size={24} />
         {:else if screen === "request_rejected"}
@@ -899,7 +940,12 @@
       </div>
       <h1 id="state-title">{content.title}</h1>
       <p>{content.body}</p>
-      {#if screenRetryable}
+      {#if screen === "client_update_required"}
+        <button type="button" onclick={reloadWorkbench}>
+          <RefreshCw size={16} aria-hidden="true" />
+          Reload
+        </button>
+      {:else if screenRetryable}
         <button type="button" onclick={retryTransport}>
           <RefreshCw size={16} aria-hidden="true" />
           Retry

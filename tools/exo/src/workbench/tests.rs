@@ -168,7 +168,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
     let snapshot = WorkbenchSnapshot {
         kind: "workbench.snapshot",
         ok: true,
-        schema_version: 1,
+        schema_version: 2,
         observed_at: "2026-07-28T20:00:00.000Z".to_string(),
         revision: 7,
         project: WorkbenchProjectIdentity {
@@ -213,6 +213,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
                 }],
             }],
         }),
+        between_phases_context: None,
         steering: WorkbenchSteering {
             situation: "The local host implementation is active.".to_string(),
             next_actions: vec![WorkbenchSuggestedAction {
@@ -226,7 +227,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         diagnostics: vec![],
     };
     let fixture: JsonValue = serde_json::from_str(include_str!(
-        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v1.json"
+        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v2.json"
     ))
     .expect("parse cockpit snapshot fixture");
 
@@ -1083,6 +1084,178 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
             forbidden.display()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_projects_truthful_between_phase_context_for_the_workspace() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Trajectory Epoch", None, &[])
+        .expect("add epoch");
+    let finished_last = writer
+        .add_phase(&epoch, "Finished last", "regular", None, &[])
+        .expect("add first phase");
+    let later_in_roadmap = writer
+        .add_phase(&epoch, "Later in roadmap", "regular", None, &[])
+        .expect("add later phase");
+    let up_next = writer
+        .add_phase(&epoch, "Up next", "regular", None, &[])
+        .expect("add pending phase");
+
+    writer
+        .add_goal(
+            &finished_last,
+            "finished-goal",
+            "Finish the current slice",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add completed goal");
+    writer
+        .update_goal_status("finished-goal", "completed")
+        .expect("complete goal");
+    writer
+        .update_goal_completion_log(
+            "finished-goal",
+            &format!("Private evidence from {}", fixture.root.display()),
+        )
+        .expect("record private completion evidence");
+    writer
+        .add_goal(
+            &up_next,
+            "next-goal",
+            "Build the next slice",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add next goal");
+    writer
+        .replace_phase_rfcs(&up_next, &["10204".to_string()])
+        .expect("associate next RFC");
+
+    writer
+        .update_phase_status(&later_in_roadmap, "completed")
+        .expect("complete later roadmap phase first");
+    writer
+        .update_phase_status(&finished_last, "in-progress")
+        .expect("start first roadmap phase later");
+    let finished_lane = writer
+        .add_workbench_lane(
+            "Finished lane",
+            "Complete the current trajectory slice",
+            &finished_last,
+        )
+        .expect("add finished lane");
+    writer
+        .add_workbench_lane("Prepared lane", "Prepare the next slice", &up_next)
+        .expect("add prepared lane");
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    let workspace_text = workspace.to_string_lossy();
+    writer
+        .focus_workbench_lane(&workspace_text, &finished_lane, &finished_last)
+        .expect("focus active lane");
+    writer
+        .complete_phase_and_clear_lane_focus(&finished_last)
+        .expect("complete focused phase");
+    writer
+        .database()
+        .connection()
+        .execute(
+            "UPDATE phases SET completed_at = ?1 WHERE text_id = ?2",
+            ("2026-07-01T12:00:00+00:00", &later_in_roadmap),
+        )
+        .expect("set older completion evidence");
+    writer
+        .database()
+        .connection()
+        .execute(
+            "UPDATE phases SET completed_at = ?1 WHERE text_id = ?2",
+            ("2026-08-01T12:00:00+00:00", &finished_last),
+        )
+        .expect("set newer completion evidence");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
+    assert_eq!(snapshot.schema_version, 2);
+    assert!(snapshot.focused_lane.is_none());
+    assert!(snapshot.phase.is_none());
+
+    let context = snapshot
+        .between_phases_context
+        .as_ref()
+        .expect("between-phase context");
+    assert_eq!(context.epoch_id, epoch);
+    assert_eq!(context.pending_phases, 1);
+    assert_eq!(
+        context
+            .completed_phase
+            .as_ref()
+            .map(|phase| phase.id.as_str()),
+        Some(finished_last.as_str())
+    );
+    assert_eq!(
+        context
+            .completed_phase
+            .as_ref()
+            .map(|phase| phase.completed_at.as_str()),
+        Some("2026-08-01T12:00:00+00:00")
+    );
+    assert_eq!(
+        context.next_phase.as_ref().map(|phase| phase.id.as_str()),
+        Some(up_next.as_str())
+    );
+    assert_eq!(
+        context.next_phase.as_ref().map(|phase| phase.goal_count),
+        Some(1)
+    );
+    assert_eq!(
+        context.next_phase.as_ref().map(|phase| phase.rfc_count),
+        Some(1)
+    );
+
+    let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+    assert!(
+        !serialized.contains(&fixture.root.display().to_string()),
+        "browser trajectory must omit private completion evidence: {serialized}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_does_not_treat_an_unfocused_active_phase_as_between_phases() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Active Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Active without lane focus", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    let workspace = fixture.root.canonicalize().expect("canonical workspace");
+    writer
+        .set_workspace_active_phase(&workspace.to_string_lossy(), &phase)
+        .expect("focus phase without a lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
+    assert!(snapshot.focused_lane.is_none());
+    assert!(snapshot.phase.is_none());
+    assert!(snapshot.between_phases_context.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

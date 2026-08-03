@@ -8,7 +8,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v1.json";
+import snapshotFixture from "./workbench-snapshot.v2.json";
 import { decodeWorkbenchSnapshot } from "./workbench";
 import WorkbenchView from "./WorkbenchView.svelte";
 
@@ -774,6 +774,120 @@ describe("focus-only lane workbench", () => {
     ).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Focus Local workbench host" }),
+    ).toBeTruthy();
+  });
+
+  it("renders the completed phase, next phase, and its prepared lanes between phases", () => {
+    const snapshot = fixture();
+    snapshot.focused_lane = null;
+    snapshot.phase = null;
+    snapshot.lanes = snapshot.lanes.map((lane) =>
+      lane.id === "lane-next"
+        ? {
+            ...lane,
+            phase_title: "Project trajectory and workspace faces",
+            phase_status: "pending",
+            focused_here: false,
+          }
+        : {
+            ...lane,
+            state: "prepared",
+            phase_title: "Interactive lane planning",
+            phase_status: "completed",
+            focused_here: false,
+          },
+    );
+    snapshot.between_phases_context = {
+      epoch_id: "epoch-fixture",
+      epoch_title: "exo Everywhere",
+      completed_phase: {
+        id: "phase-fixture",
+        title: "Interactive lane planning",
+        completed_at: "2026-08-01T20:00:00Z",
+        goal_count: 2,
+        completed_goals: 2,
+      },
+      next_phase: {
+        id: "phase-next",
+        title: "Project trajectory and workspace faces",
+        goal_count: 2,
+        rfc_count: 1,
+      },
+      pending_phases: 2,
+    };
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Ready for what comes next" }),
+    ).toBeTruthy();
+    const trajectorySummary = document.querySelector(".trajectory-intro p");
+    expect(trajectorySummary?.textContent).toContain("exo Everywhere");
+    expect(trajectorySummary?.textContent).toContain("2 phases remaining");
+    expect(screen.getByText("Just finished")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Interactive lane planning" }),
+    ).toBeTruthy();
+    expect(screen.getByText("2 of 2 goals complete")).toBeTruthy();
+    expect(
+      document.querySelector('time[datetime="2026-08-01T20:00:00Z"]'),
+    ).toBeTruthy();
+    expect(screen.getByText("Up next")).toBeTruthy();
+    const nextPhaseHeading = screen.getByRole("heading", {
+      name: "Project trajectory and workspace faces",
+    });
+    expect(nextPhaseHeading).toBeTruthy();
+    const nextPhaseSummary = nextPhaseHeading
+      .closest("section")
+      ?.querySelector(".trajectory-meta");
+    expect(nextPhaseSummary?.textContent).toContain("2 goals");
+    expect(nextPhaseSummary?.textContent).toContain("1 RFC");
+    expect(
+      screen.getByRole("heading", { name: "Prepared lanes" }),
+    ).toBeTruthy();
+    expect(screen.getAllByText("Focus-only lane workspace")).toHaveLength(2);
+    expect(screen.getByText("Ready when this phase starts")).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "No lane focused here" }),
+    ).toBeNull();
+  });
+
+  it("states when the next phase does not have a prepared lane yet", () => {
+    const snapshot = fixture();
+    snapshot.focused_lane = null;
+    snapshot.phase = null;
+    snapshot.lanes = snapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: false,
+    }));
+    snapshot.between_phases_context = {
+      epoch_id: "epoch-fixture",
+      epoch_title: "exo Everywhere",
+      completed_phase: null,
+      next_phase: {
+        id: "phase-unprepared",
+        title: "Unprepared phase",
+        goal_count: 0,
+        rfc_count: 0,
+      },
+      pending_phases: 1,
+    };
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      screen.getByText("No lane is prepared for this phase yet."),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Completion history unavailable" }),
     ).toBeTruthy();
   });
 

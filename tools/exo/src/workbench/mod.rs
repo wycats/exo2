@@ -398,6 +398,7 @@ pub struct WorkbenchSnapshot {
     pub lanes: Vec<WorkbenchLaneSummary>,
     pub focused_lane: Option<WorkbenchLaneDetails>,
     pub phase: Option<WorkbenchPhase>,
+    pub between_phases_context: Option<WorkbenchBetweenPhasesContext>,
     pub steering: WorkbenchSteering,
     pub diagnostics: Vec<WorkbenchDiagnostic>,
 }
@@ -439,6 +440,32 @@ pub struct WorkbenchPhase {
     pub status: String,
     pub planning_available: bool,
     pub goals: Vec<WorkbenchGoal>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchBetweenPhasesContext {
+    pub epoch_id: String,
+    pub epoch_title: String,
+    pub completed_phase: Option<WorkbenchCompletedPhaseSummary>,
+    pub next_phase: Option<WorkbenchNextPhasePreview>,
+    pub pending_phases: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchCompletedPhaseSummary {
+    pub id: String,
+    pub title: String,
+    pub completed_at: String,
+    pub goal_count: usize,
+    pub completed_goals: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchNextPhasePreview {
+    pub id: String,
+    pub title: String,
+    pub goal_count: usize,
+    pub rfc_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

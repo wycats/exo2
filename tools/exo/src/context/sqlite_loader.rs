@@ -1135,12 +1135,20 @@ impl SqliteLoader {
         let conn = self.db.connection();
         let mut stmt = conn
             .prepare(
-                "SELECT id, text_id, title, status, kind, slug
+                "SELECT id, text_id, title, status, kind, slug, completed_at
                  FROM phases WHERE epoch_id = ? ORDER BY sort_key NULLS LAST, id",
             )
             .context("Failed to prepare phases query")?;
 
-        let phase_rows: Vec<(i64, String, String, String, String, Option<String>)> = stmt
+        let phase_rows: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = stmt
             .query_map([epoch_id], |row| {
                 Ok((
                     row.get(0)?,
@@ -1149,6 +1157,7 @@ impl SqliteLoader {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })
             .context("Failed to execute phases query")?
@@ -1156,7 +1165,7 @@ impl SqliteLoader {
             .context("Failed to read phase rows")?;
 
         let mut phases = Vec::with_capacity(phase_rows.len());
-        for (rowid, text_id, title, status, kind, slug) in phase_rows {
+        for (rowid, text_id, title, status, kind, slug, completed_at) in phase_rows {
             let goals = self
                 .load_goals(rowid)
                 .with_context(|| format!("Failed to load goals for phase '{text_id}'"))?;
@@ -1168,11 +1177,15 @@ impl SqliteLoader {
                 .with_context(|| format!("Failed to load aliases for phase '{text_id}'"))?;
             let ulid = parse_ulid(&text_id);
             let kind = kind.parse().unwrap_or_default();
+            let completed_at = completed_at
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .map(|value| value.with_timezone(&Utc));
 
             phases.push(Phase {
                 id: text_id,
                 title,
                 status,
+                completed_at,
                 goals,
                 rfcs,
                 kind,
@@ -2574,6 +2587,7 @@ impl SqliteLoader {
     ) -> Result<()> {
         let sort_keys = generate_sort_keys(phases.len());
         for (i, phase) in phases.iter().enumerate() {
+            let completed_at = phase.completed_at.as_ref().map(DateTime::<Utc>::to_rfc3339);
             // Check if phase already exists
             let exists: bool = conn
                 .query_row(
@@ -2595,6 +2609,14 @@ impl SqliteLoader {
                     "UPDATE phases_data SET sort_key = ?1 WHERE id = ?2 AND sort_key IS NULL",
                     (&sort_keys[i], phase_rowid),
                 )?;
+                if completed_at.is_some() {
+                    conn.execute(
+                        "UPDATE phases_data
+                         SET completed_at = COALESCE(completed_at, ?1)
+                         WHERE id = ?2",
+                        (&completed_at, phase_rowid),
+                    )?;
+                }
                 // Still need to check goals/tasks
                 self.import_goals(conn, phase_rowid, &phase.goals, result)?;
                 self.import_phase_rfcs(conn, phase_rowid, &phase.rfcs)?;
@@ -2604,8 +2626,9 @@ impl SqliteLoader {
             // Insert phase (normalize status: active→in-progress, bankrupt→abandoned)
             let normalized_status = Self::normalize_status(&phase.status);
             conn.execute(
-                "INSERT INTO phases_data (text_id, title, status, epoch_id, kind, slug, sort_key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO phases_data (
+                     text_id, title, status, epoch_id, kind, slug, sort_key, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     &phase.id,
                     &phase.title,
@@ -2614,6 +2637,7 @@ impl SqliteLoader {
                     phase.kind.as_str(),
                     phase.slug.as_deref(),
                     &sort_keys[i],
+                    &completed_at,
                 ),
             )
             .with_context(|| format!("Failed to insert phase '{}'", phase.id))?;
@@ -3654,6 +3678,7 @@ mod tests {
                     id: "phase-1".to_string(),
                     title: "Test Phase".to_string(),
                     status: "in-progress".to_string(),
+                    completed_at: None,
                     goals: vec![Goal {
                         id: "goal-1".to_string(),
                         label: "Test Goal".to_string(),

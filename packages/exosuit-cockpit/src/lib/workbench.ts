@@ -25,7 +25,7 @@ export interface WorkbenchWorkspaceIdentity {
 export interface WorkbenchSnapshot {
   kind: "workbench.snapshot";
   ok: true;
-  schema_version: 1;
+  schema_version: 2;
   observed_at: string;
   revision: number;
   project: {
@@ -38,6 +38,7 @@ export interface WorkbenchSnapshot {
   lanes: WorkbenchLaneSummary[];
   focused_lane: WorkbenchLaneDetails | null;
   phase: WorkbenchPhase | null;
+  between_phases_context: WorkbenchBetweenPhasesContext | null;
   steering: WorkbenchSteering;
   diagnostics: WorkbenchDiagnostic[];
 }
@@ -69,6 +70,29 @@ export interface WorkbenchPhase {
   status: string;
   planning_available: boolean;
   goals: WorkbenchGoal[];
+}
+
+export interface WorkbenchBetweenPhasesContext {
+  epoch_id: string;
+  epoch_title: string;
+  completed_phase: WorkbenchCompletedPhaseSummary | null;
+  next_phase: WorkbenchNextPhasePreview | null;
+  pending_phases: number;
+}
+
+export interface WorkbenchCompletedPhaseSummary {
+  id: string;
+  title: string;
+  completed_at: string;
+  goal_count: number;
+  completed_goals: number;
+}
+
+export interface WorkbenchNextPhasePreview {
+  id: string;
+  title: string;
+  goal_count: number;
+  rfc_count: number;
 }
 
 export interface WorkbenchGoal {
@@ -218,7 +242,7 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");
   literal(snapshot.kind, "workbench.snapshot", "kind");
   literal(snapshot.ok, true, "ok");
-  literal(snapshot.schema_version, 1, "schema_version");
+  literal(snapshot.schema_version, 2, "schema_version");
   string(snapshot.observed_at, "observed_at");
   finiteNumber(snapshot.revision, "revision");
   project(snapshot.project);
@@ -230,6 +254,9 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   }
   if (snapshot.phase !== null) {
     phase(snapshot.phase);
+  }
+  if (snapshot.between_phases_context !== null) {
+    betweenPhasesContext(snapshot.between_phases_context);
   }
   steering(snapshot.steering);
   array(snapshot.diagnostics, "diagnostics").forEach((diagnostic) =>
@@ -340,6 +367,42 @@ function phase(value: unknown): void {
   });
 }
 
+function betweenPhasesContext(value: unknown): void {
+  const item = record(value, "between_phases_context");
+  string(item.epoch_id, "between_phases_context.epoch_id");
+  string(item.epoch_title, "between_phases_context.epoch_title");
+  count(item.pending_phases, "between_phases_context.pending_phases");
+
+  if (item.completed_phase !== null) {
+    const completed = record(
+      item.completed_phase,
+      "between_phases_context.completed_phase",
+    );
+    string(completed.id, "between_phases_context.completed_phase.id");
+    string(completed.title, "between_phases_context.completed_phase.title");
+    string(
+      completed.completed_at,
+      "between_phases_context.completed_phase.completed_at",
+    );
+    count(
+      completed.goal_count,
+      "between_phases_context.completed_phase.goal_count",
+    );
+    count(
+      completed.completed_goals,
+      "between_phases_context.completed_phase.completed_goals",
+    );
+  }
+
+  if (item.next_phase !== null) {
+    const next = record(item.next_phase, "between_phases_context.next_phase");
+    string(next.id, "between_phases_context.next_phase.id");
+    string(next.title, "between_phases_context.next_phase.title");
+    count(next.goal_count, "between_phases_context.next_phase.goal_count");
+    count(next.rfc_count, "between_phases_context.next_phase.rfc_count");
+  }
+}
+
 function steering(value: unknown): void {
   const item = record(value, "steering");
   string(item.situation, "steering.situation");
@@ -408,6 +471,16 @@ function boolean(value: unknown, field: string): asserts value is boolean {
 
 function finiteNumber(value: unknown, field: string): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
+    invalid(field);
+  }
+}
+
+function count(value: unknown, field: string): asserts value is number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
     invalid(field);
   }
 }

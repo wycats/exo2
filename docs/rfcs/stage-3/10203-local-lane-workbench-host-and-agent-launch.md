@@ -462,7 +462,7 @@ startup workspace.
 interface WorkbenchSnapshot {
   kind: "workbench.snapshot";
   ok: true;
-  schema_version: 1;
+  schema_version: 2;
   observed_at: string;
   revision: number;
   project: {
@@ -479,6 +479,7 @@ interface WorkbenchSnapshot {
   lanes: WorkbenchLaneSummary[];
   focused_lane: WorkbenchLaneDetails | null;
   phase: WorkbenchPhase | null;
+  between_phases_context: WorkbenchBetweenPhasesContext | null;
   steering: WorkbenchSteering;
   diagnostics: WorkbenchDiagnostic[];
 }
@@ -515,6 +516,25 @@ interface WorkbenchPhase {
   }>;
 }
 
+interface WorkbenchBetweenPhasesContext {
+  epoch_id: string;
+  epoch_title: string;
+  completed_phase: {
+    id: string;
+    title: string;
+    completed_at: string;
+    goal_count: number;
+    completed_goals: number;
+  } | null;
+  next_phase: {
+    id: string;
+    title: string;
+    goal_count: number;
+    rfc_count: number;
+  } | null;
+  pending_phases: number;
+}
+
 interface WorkbenchSteering {
   situation: string;
   next_actions: Array<{
@@ -549,6 +569,15 @@ state root, sidecar path, runtime path, and process identity.
 `focused_lane` and `phase` are null while the lane rail remains available. An
 inconsistent legacy lane/phase focus is returned as a diagnostic using RFC
 10202's read behavior; the snapshot does not repair it.
+
+When a workspace remains anchored to a phase that has completed while its epoch
+still has pending work, `between_phases_context` presents the evidence-backed
+most recent completion, the next pending phase in roadmap order, and the number
+of pending phases. The completion summary is selected by its persisted
+completion timestamp rather than by roadmap position. Historical rows without
+completion evidence do not become the most-recent claim. Completion-log prose
+is intentionally omitted from this browser-safe projection. An in-progress
+phase without a focused lane is not a between-phases state.
 
 ### Events and freshness
 
@@ -614,6 +643,14 @@ priority, then shows branch, HEAD, dirty state, phase, goals, and tasks in a
 dense work-oriented layout. Only lanes whose phase is `in-progress` can be
 focused. Pending and completed-phase lanes remain available as context but
 their focus controls are disabled.
+
+When the workspace remains anchored to a completed phase and the epoch still
+has pending work, the main surface becomes a project-trajectory view rather
+than a generic no-focus prompt. It presents the evidence-backed most recent
+phase as **Just finished**, gives the next pending phase stronger **Up next**
+priority, and lists prepared lanes belonging to that next phase without making
+them focusable before the phase starts. A workspace whose phase is still
+`in-progress` but has no focused lane retains the ordinary no-focus state.
 
 An optional Coordination rail contains secondary machine context. If steering
 contains a suggested action, the rail shows only the first action's label and

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v1.json";
+import snapshotFixture from "./workbench-snapshot.v2.json";
 import type { WorkbenchPlanningRequest } from "./workbench";
 import {
   createWorkbenchRequestId,
@@ -187,6 +187,28 @@ describe("workbench browser client", () => {
 
     expect(snapshot.focused_lane?.id).toBe("lane-fixture");
     expect(snapshot.revision).toBe(7);
+  });
+
+  it("requires a client reload when the host snapshot is incompatible", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockImplementation(async (_path, init) => {
+      const request = JSON.parse(String(init?.body));
+      return jsonResponse({
+        protocol_version: 1,
+        id: request.id,
+        status: "ok",
+        result: { ...snapshotFixture, schema_version: 3 },
+      });
+    });
+
+    await expect(
+      new WorkbenchClient("session-selector", fetcher).snapshot(),
+    ).rejects.toMatchObject({
+      kind: "client_update_required",
+      retryable: false,
+      message:
+        "This page cannot read the current Exo workbench snapshot. Reload to use the current workbench version.",
+    } satisfies Partial<WorkbenchClientError>);
   });
 
   it("sends a revision-bound planning request and decodes its mutation", async () => {

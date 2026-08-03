@@ -15,6 +15,7 @@ const REQUEST_TIMEOUT_MS = 10_000;
 export type WorkbenchFailureKind =
   | "session_required"
   | "session_expired"
+  | "client_update_required"
   | "server_busy"
   | "workspace_unavailable"
   | "transport_error"
@@ -187,9 +188,8 @@ export class WorkbenchClient {
       return decodeWorkbenchSnapshot(result);
     } catch {
       throw new WorkbenchClientError(
-        "transport_error",
-        "Exo returned an invalid workbench snapshot",
-        true,
+        "client_update_required",
+        "This page cannot read the current Exo workbench snapshot. Reload to use the current workbench version.",
       );
     }
   }

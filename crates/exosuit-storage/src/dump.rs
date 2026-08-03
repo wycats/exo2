@@ -118,7 +118,14 @@ pub fn dump_tables(conn: &Connection) -> Result<Vec<TableDump>, DumpError> {
         conn,
         "phases_data",
         &[
-            "text_id", "title", "status", "epoch_id", "kind", "slug", "sort_key",
+            "text_id",
+            "title",
+            "status",
+            "epoch_id",
+            "kind",
+            "slug",
+            "sort_key",
+            "completed_at",
         ],
         &[("epoch_id", "epoch_text_id")],
         &HashMap::from([("epoch_id", &epoch_ids)]),
@@ -1239,10 +1246,10 @@ mod tests {
 
         // Phases
         conn.execute_batch(
-            "INSERT INTO phases_data(text_id, title, status, epoch_id, kind, slug, sort_key)
-                 VALUES('01PHASE_AAA', 'Phase Alpha', 'completed', 1, 'regular', 'phase-alpha', 'a');
-             INSERT INTO phases_data(text_id, title, status, epoch_id, kind, slug, sort_key)
-                 VALUES('01PHASE_BBB', 'Phase Beta', 'in-progress', 2, 'chore', 'phase-beta', 'b');",
+            "INSERT INTO phases_data(text_id, title, status, epoch_id, kind, slug, sort_key, completed_at)
+                 VALUES('01PHASE_AAA', 'Phase Alpha', 'completed', 1, 'regular', 'phase-alpha', 'a', '2026-01-16T12:00:00Z');
+             INSERT INTO phases_data(text_id, title, status, epoch_id, kind, slug, sort_key, completed_at)
+                 VALUES('01PHASE_BBB', 'Phase Beta', 'in-progress', 2, 'chore', 'phase-beta', 'b', NULL);",
         )
         .unwrap();
 

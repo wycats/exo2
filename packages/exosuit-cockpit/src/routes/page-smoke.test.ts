@@ -7,7 +7,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "$lib/workbench-snapshot.v1.json";
+import snapshotFixture from "$lib/workbench-snapshot.v2.json";
 import type { WorkbenchPlanningRequest } from "$lib/workbench";
 import Page from "./+page.svelte";
 
@@ -370,6 +370,52 @@ describe("cockpit page", () => {
       expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
       expect(screen.getByText("Revision 8")).toBeTruthy();
     });
+  });
+
+  it("retains the cockpit and requests one reload after a host snapshot upgrade", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    let snapshotReads = 0;
+    let renewalReads = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        renewalReads += 1;
+        return sessionResponse("session-selector");
+      }
+      snapshotReads += 1;
+      const request = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result:
+            snapshotReads === 1
+              ? snapshotFixture
+              : { ...snapshotFixture, schema_version: 3 },
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    expect(await screen.findByText("Workbench update available.")).toBeTruthy();
+    expect(screen.getByText("Updated", { selector: ".connection" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Reconnecting to Exo.")).toBeNull();
+    expect(screen.queryByText("Live refresh paused.")).toBeNull();
+    expect(renewalReads).toBe(0);
   });
 
   it("keeps an in-flight refresh alive while the event stream reconnects", async () => {
