@@ -287,6 +287,18 @@ fn phase_finish_uses_project_db_path_in_git_repo(backend: &str) {
         "phase finish should not recreate legacy root DB"
     );
     let loader = SqliteLoader::open(project.db_path()).expect("open project loader");
+    let state = loader.load_state().expect("load completed project state");
+    let completed_phase = state
+        .epochs
+        .iter()
+        .flat_map(|epoch| &epoch.phases)
+        .find(|phase| phase.id == phase_id)
+        .expect("completed phase");
+    assert_eq!(completed_phase.status, "completed");
+    assert!(
+        completed_phase.completed_at.is_some(),
+        "phase finish records portable completion evidence"
+    );
     assert!(
         loader
             .load_workbench_lane(&lane_id)

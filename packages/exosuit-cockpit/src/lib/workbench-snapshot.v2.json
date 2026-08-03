@@ -1,7 +1,7 @@
 {
   "kind": "workbench.snapshot",
   "ok": true,
-  "schema_version": 1,
+  "schema_version": 2,
   "observed_at": "2026-07-28T20:00:00.000Z",
   "revision": 7,
   "project": {
@@ -67,6 +67,7 @@
       }
     ]
   },
+  "between_phases_context": null,
   "steering": {
     "situation": "The local host implementation is active.",
     "next_actions": [

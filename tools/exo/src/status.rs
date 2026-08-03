@@ -11,7 +11,7 @@
 
 use crate::ExoResult;
 use crate::command::sidecar::SidecarRepoSyncStatus;
-use crate::context::AgentContext;
+use crate::context::{AgentContext, Epoch, Phase};
 use crate::phase_owner::{self, CurrentOwnerView, PhaseOwnerView};
 use crate::steering::{self, SteeringBlock};
 use crate::upgrade::UpgradeRegistry;
@@ -85,6 +85,7 @@ pub struct NextPhasePreview {
 pub struct CompletedPhaseContext {
     pub phase_id: String,
     pub phase_title: String,
+    pub completed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_log: Option<String>,
     pub goal_count: usize,
@@ -116,38 +117,51 @@ pub struct BetweenPhasesContext {
 /// Compute context for between-phases mode (RFC 00187).
 ///
 /// Shows the most recently completed phase and the next pending phase.
-fn compute_between_phases_context(context: &AgentContext) -> Option<BetweenPhasesContext> {
-    let active_epoch = context.find_workspace_active_epoch().ok().flatten()?;
-
-    // Find the most recently completed phase in this epoch
-    let completed_phase = active_epoch
-        .phases
+fn most_recent_completed_phase(phases: &[Phase]) -> Option<&Phase> {
+    phases
         .iter()
-        .rfind(|p| p.status == "completed")
-        .map(|phase| {
-            let goal_count = phase.goals.len();
-            let completed_goals = phase
-                .goals
-                .iter()
-                .filter(|t| t.status == "completed")
-                .count();
+        .filter(|phase| phase.status == "completed")
+        .filter_map(|phase| {
+            phase
+                .completed_at
+                .as_ref()
+                .map(|completed_at| (completed_at, phase))
+        })
+        .max_by(|left, right| left.0.cmp(right.0))
+        .map(|(_, phase)| phase)
+}
 
-            // Aggregate completion logs from goals (phase doesn't have its own completion_log)
-            let completion_log = phase
-                .goals
-                .iter()
-                .filter_map(|t| t.completion_log.as_ref())
-                .next_back()
-                .cloned();
+pub(crate) fn between_phases_context_for_epoch(active_epoch: &Epoch) -> BetweenPhasesContext {
+    // Find the most recently completed phase in this epoch
+    let completed_phase = most_recent_completed_phase(&active_epoch.phases).map(|phase| {
+        let goal_count = phase.goals.len();
+        let completed_goals = phase
+            .goals
+            .iter()
+            .filter(|t| t.status == "completed")
+            .count();
 
-            CompletedPhaseContext {
-                phase_id: phase.id.clone(),
-                phase_title: phase.title.clone(),
-                completion_log,
-                goal_count,
-                completed_goals,
-            }
-        });
+        // Aggregate completion logs from goals (phase doesn't have its own completion_log)
+        let completion_log = phase
+            .goals
+            .iter()
+            .filter_map(|t| t.completion_log.as_ref())
+            .next_back()
+            .cloned();
+
+        CompletedPhaseContext {
+            phase_id: phase.id.clone(),
+            phase_title: phase.title.clone(),
+            completed_at: phase
+                .completed_at
+                .as_ref()
+                .expect("selected completed phase has completion evidence")
+                .to_rfc3339(),
+            completion_log,
+            goal_count,
+            completed_goals,
+        }
+    });
 
     // Find the next pending phase
     let next_phase = active_epoch
@@ -163,13 +177,18 @@ fn compute_between_phases_context(context: &AgentContext) -> Option<BetweenPhase
 
     let is_epoch_finale = next_phase.is_none();
 
-    Some(BetweenPhasesContext {
+    BetweenPhasesContext {
         completed_phase,
         next_phase,
         epoch_id: active_epoch.id.clone(),
         epoch_title: active_epoch.title.clone(),
         is_epoch_finale,
-    })
+    }
+}
+
+fn compute_between_phases_context(context: &AgentContext) -> Option<BetweenPhasesContext> {
+    let active_epoch = context.find_workspace_active_epoch().ok().flatten()?;
+    Some(between_phases_context_for_epoch(active_epoch))
 }
 
 /// Build JSON output for `exo status`
@@ -444,4 +463,57 @@ fn confidence_bar(confidence: f32) -> String {
     let filled = (confidence * 5.0).round() as usize;
     let empty = 5 - filled.min(5);
     format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::PhaseKind;
+    use chrono::{DateTime, Utc};
+
+    fn completed_phase(id: &str, completed_at: Option<&str>) -> Phase {
+        Phase {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: "completed".to_string(),
+            completed_at: completed_at.map(|value| {
+                DateTime::parse_from_rfc3339(value)
+                    .expect("valid completion timestamp")
+                    .with_timezone(&Utc)
+            }),
+            goals: Vec::new(),
+            rfcs: Vec::new(),
+            kind: PhaseKind::Regular,
+            ulid: None,
+            slug: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn most_recent_completed_phase_uses_completion_evidence_not_roadmap_order() {
+        let phases = vec![
+            completed_phase("finished-last", Some("2026-08-01T12:00:00Z")),
+            completed_phase("later-in-roadmap", Some("2026-07-01T12:00:00Z")),
+        ];
+
+        assert_eq!(
+            most_recent_completed_phase(&phases).map(|phase| phase.id.as_str()),
+            Some("finished-last")
+        );
+    }
+
+    #[test]
+    fn most_recent_completed_phase_ignores_rows_without_completion_evidence() {
+        let phases = vec![
+            completed_phase("known", Some("2026-07-01T12:00:00Z")),
+            completed_phase("unknown", None),
+        ];
+
+        assert_eq!(
+            most_recent_completed_phase(&phases).map(|phase| phase.id.as_str()),
+            Some("known")
+        );
+        assert!(most_recent_completed_phase(&[completed_phase("unknown", None)]).is_none());
+    }
 }

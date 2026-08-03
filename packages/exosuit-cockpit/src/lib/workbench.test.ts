@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v1.json";
+import snapshotFixture from "./workbench-snapshot.v2.json";
 import { decodeWorkbenchSnapshot } from "./workbench";
 
 describe("workbench snapshot contract", () => {
-  it("decodes the Rust-owned version-one fixture", () => {
+  it("decodes the Rust-owned version-two fixture", () => {
     const snapshot = decodeWorkbenchSnapshot(snapshotFixture);
 
     expect(snapshot.kind).toBe("workbench.snapshot");
@@ -17,6 +17,57 @@ describe("workbench snapshot contract", () => {
         created_at: "2026-07-28T19:45:00Z",
       },
     ]);
+  });
+
+  it("decodes browser-safe between-phase trajectory context", () => {
+    const betweenPhases = structuredClone(snapshotFixture);
+    const mutable = betweenPhases as unknown as {
+      focused_lane: unknown;
+      phase: unknown;
+      between_phases_context: unknown;
+    };
+    mutable.focused_lane = null;
+    mutable.phase = null;
+    mutable.between_phases_context = {
+      epoch_id: "epoch-fixture",
+      epoch_title: "Workbench epoch",
+      completed_phase: {
+        id: "phase-fixture",
+        title: "Workbench foundation",
+        completed_at: "2026-08-01T20:00:00+00:00",
+        goal_count: 2,
+        completed_goals: 2,
+      },
+      next_phase: {
+        id: "phase-next",
+        title: "Next workbench slice",
+        goal_count: 1,
+        rfc_count: 1,
+      },
+      pending_phases: 2,
+    };
+
+    const decoded = decodeWorkbenchSnapshot(betweenPhases);
+    expect(decoded.between_phases_context?.completed_phase?.id).toBe(
+      "phase-fixture",
+    );
+    expect(decoded.between_phases_context?.next_phase?.id).toBe("phase-next");
+    expect(decoded.between_phases_context?.pending_phases).toBe(2);
+  });
+
+  it("rejects invalid between-phase counts", () => {
+    const malformed = structuredClone(snapshotFixture);
+    (malformed as { between_phases_context: unknown }).between_phases_context = {
+      epoch_id: "epoch-fixture",
+      epoch_title: "Workbench epoch",
+      completed_phase: null,
+      next_phase: null,
+      pending_phases: -1,
+    };
+
+    expect(() => decodeWorkbenchSnapshot(malformed)).toThrow(
+      "Invalid workbench snapshot field: between_phases_context.pending_phases",
+    );
   });
 
   it("requires explicit planning availability for a focused phase", () => {

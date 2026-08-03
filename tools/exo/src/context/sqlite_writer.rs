@@ -290,10 +290,17 @@ impl SqliteWriter {
     pub fn update_phase_status(&self, text_id: &str, status: &str) -> Result<()> {
         let savepoint =
             SqliteSavepoint::begin(self.db.connection(), "update_phase_status_savepoint")?;
+        let completed_at = Utc::now().to_rfc3339();
         let rows = savepoint
             .execute(
-                "UPDATE phases SET status = ?1 WHERE text_id = ?2",
-                (status, text_id),
+                "UPDATE phases
+                 SET status = ?1,
+                     completed_at = CASE
+                         WHEN ?1 = 'completed' THEN COALESCE(completed_at, ?3)
+                         ELSE NULL
+                     END
+                 WHERE text_id = ?2",
+                (status, text_id, &completed_at),
             )
             .context("Failed to update phase status")?;
         if rows == 0 {
@@ -572,10 +579,13 @@ impl SqliteWriter {
             "complete_phase_and_clear_lane_focus_savepoint",
         )?;
         let phase_id = resolve_id(&savepoint, "phases_data", phase_text_id)?;
+        let completed_at = Utc::now().to_rfc3339();
         let rows = savepoint
             .execute(
-                "UPDATE phases SET status = 'completed' WHERE id = ?1",
-                [phase_id],
+                "UPDATE phases
+                 SET status = 'completed', completed_at = COALESCE(completed_at, ?2)
+                 WHERE id = ?1",
+                (phase_id, &completed_at),
             )
             .context("Failed to complete phase")?;
         if rows == 0 {

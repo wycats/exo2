@@ -666,6 +666,14 @@ pub struct Phase {
     pub title: String,
     /// Status: "pending", "in-progress", "completed", "abandoned", or "deferred"
     pub status: String,
+    /// RFC3339 timestamp recording when this phase was completed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "completed_at",
+        alias = "completed-at"
+    )]
+    pub completed_at: Option<DateTime<Utc>>,
     /// Goals within this phase.
     #[serde(alias = "tasks")]
     pub goals: Vec<Goal>,
@@ -755,6 +763,8 @@ impl<'de> Deserialize<'de> for Phase {
             id: String,
             title: String,
             status: String,
+            #[serde(default, alias = "completed-at")]
+            completed_at: Option<DateTime<Utc>>,
             /// Legacy field name for phase goals
             #[serde(default)]
             tasks: Option<GoalsInput>,
@@ -807,6 +817,7 @@ impl<'de> Deserialize<'de> for Phase {
             id: input.id,
             title: input.title,
             status: normalized_status.to_string(),
+            completed_at: input.completed_at,
             goals,
             rfcs,
             kind: input.kind,

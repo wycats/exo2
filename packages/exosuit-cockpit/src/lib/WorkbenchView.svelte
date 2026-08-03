@@ -50,7 +50,11 @@
     snapshot: WorkbenchSnapshot;
     refreshing?: boolean;
     streamConnected?: boolean;
-    sessionRecovery?: "connected" | "reconnecting" | "needs_launch";
+    sessionRecovery?:
+      | "connected"
+      | "reconnecting"
+      | "needs_launch"
+      | "reload_required";
     sessionRecoveryMessage?: string | null;
     pendingLaneId?: string | null;
     focusFailure?: string | null;
@@ -125,6 +129,15 @@
   let hasCoordination = $derived(
     agentNextStep !== null || snapshot.diagnostics.length > 0,
   );
+  let preparedNextPhaseLanes = $derived.by(() => {
+    const nextPhase = snapshot.between_phases_context?.next_phase;
+    if (!nextPhase) {
+      return [];
+    }
+    return snapshot.lanes.filter(
+      (lane) => lane.phase_id === nextPhase.id && lane.state === "prepared",
+    );
+  });
   let planningBusy = $derived(
     pendingPlanningKind !== null || onRetryPlanning !== null,
   );
@@ -174,6 +187,13 @@
       return {
         label: "Paused",
         title: "This workbench session needs a current launch",
+        kind: "paused" as const,
+      };
+    }
+    if (sessionRecovery === "reload_required") {
+      return {
+        label: "Updated",
+        title: "Reload to use the current Exo workbench version",
         kind: "paused" as const,
       };
     }
@@ -304,6 +324,19 @@
           second: "2-digit",
         }).format(date);
   };
+
+  const completedTime = (value: string): string => {
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf())
+      ? value
+      : new Intl.DateTimeFormat(undefined, {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }).format(date);
+  };
+
+  const quantity = (count: number, singular: string): string =>
+    `${count} ${count === 1 ? singular : `${singular}s`}`;
 
   const diagnosticIcon = (diagnostic: WorkbenchDiagnostic) =>
     diagnostic.severity;
@@ -604,7 +637,7 @@
         type="button"
         title="Refresh workbench"
         aria-label="Refresh workbench"
-        disabled={refreshing || sessionRecovery === "reconnecting"}
+        disabled={refreshing || sessionRecovery !== "connected"}
         onclick={onRefresh}
       >
         <RefreshCw class={refreshing ? "spin" : undefined} size={17} aria-hidden="true" />
@@ -626,6 +659,17 @@
       </span>
       {#if onRetrySession}
         <button type="button" onclick={onRetrySession}>Try again</button>
+      {/if}
+    </div>
+  {:else if sessionRecovery === "reload_required"}
+    <div class="recovery-banner update-required" role="alert">
+      <RefreshCw size={17} aria-hidden="true" />
+      <span>
+        <strong>Workbench update available.</strong>
+        {sessionRecoveryMessage ?? "Reload this page to use the current Exo workbench version."}
+      </span>
+      {#if onRetrySession}
+        <button type="button" onclick={onRetrySession}>Reload</button>
       {/if}
     </div>
   {/if}
@@ -762,6 +806,96 @@
           <div class="lane-context">
             <span><Activity size={15} aria-hidden="true" />{snapshot.focused_lane.phase_title}</span>
             <span><GitBranch size={15} aria-hidden="true" />{snapshot.workspace.branch ?? "Detached HEAD"}</span>
+          </div>
+        </section>
+      {:else if snapshot.between_phases_context}
+        <section class="trajectory-view" aria-labelledby="trajectory-title">
+          <header class="trajectory-intro">
+            <span class="section-kicker">Project trajectory</span>
+            <h1 id="trajectory-title">Ready for what comes next</h1>
+            <p>
+              {snapshot.between_phases_context.epoch_title}
+              <span aria-hidden="true">·</span>
+              {quantity(snapshot.between_phases_context.pending_phases, "phase")} remaining
+            </p>
+          </header>
+
+          <div class="trajectory-stages">
+            <section class="trajectory-stage completed-stage" aria-labelledby="completed-stage-title">
+              <span class="trajectory-mark complete" aria-hidden="true">
+                <CheckCircle2 size={20} />
+              </span>
+              <div class="trajectory-copy">
+                <span class="trajectory-label">Just finished</span>
+                {#if snapshot.between_phases_context.completed_phase}
+                  <h2 id="completed-stage-title">
+                    {snapshot.between_phases_context.completed_phase.title}
+                  </h2>
+                  <p class="trajectory-meta">
+                    {snapshot.between_phases_context.completed_phase.completed_goals}
+                    of {snapshot.between_phases_context.completed_phase.goal_count}
+                    goals complete
+                    <span aria-hidden="true">·</span>
+                    <time datetime={snapshot.between_phases_context.completed_phase.completed_at}>
+                      {completedTime(snapshot.between_phases_context.completed_phase.completed_at)}
+                    </time>
+                  </p>
+                {:else}
+                  <h2 id="completed-stage-title">Completion history unavailable</h2>
+                  <p class="trajectory-meta">
+                    No completed phase has portable timing evidence yet.
+                  </p>
+                {/if}
+              </div>
+            </section>
+
+            <section class="trajectory-stage next-stage" aria-labelledby="next-stage-title">
+              <span class="trajectory-mark next" aria-hidden="true">
+                <Route size={20} />
+              </span>
+              <div class="trajectory-copy">
+                <span class="trajectory-label">Up next</span>
+                {#if snapshot.between_phases_context.next_phase}
+                  <h2 id="next-stage-title">
+                    {snapshot.between_phases_context.next_phase.title}
+                  </h2>
+                  <p class="trajectory-meta">
+                    {quantity(snapshot.between_phases_context.next_phase.goal_count, "goal")}
+                    <span aria-hidden="true">·</span>
+                    {quantity(snapshot.between_phases_context.next_phase.rfc_count, "RFC")}
+                  </p>
+
+                  <div class="prepared-lanes" aria-labelledby="prepared-lanes-title">
+                    <div class="prepared-lanes-heading">
+                      <h3 id="prepared-lanes-title">Prepared lanes</h3>
+                      <span>{preparedNextPhaseLanes.length}</span>
+                    </div>
+                    {#if preparedNextPhaseLanes.length > 0}
+                      <ul>
+                        {#each preparedNextPhaseLanes as lane (lane.id)}
+                          <li>
+                            <CircleDashed size={16} aria-hidden="true" />
+                            <span>
+                              <strong>{lane.title}</strong>
+                              <small>Ready when this phase starts</small>
+                            </span>
+                          </li>
+                        {/each}
+                      </ul>
+                    {:else}
+                      <p class="prepared-empty">
+                        No lane is prepared for this phase yet.
+                      </p>
+                    {/if}
+                  </div>
+                {:else}
+                  <h2 id="next-stage-title">No next phase scheduled</h2>
+                  <p class="trajectory-meta">
+                    The epoch has no pending phase in roadmap order.
+                  </p>
+                {/if}
+              </div>
+            </section>
           </div>
         </section>
       {:else}
@@ -2297,6 +2431,184 @@
     box-shadow: 0 8px 20px -18px rgba(23, 32, 31, 0.8);
   }
 
+  .trajectory-view {
+    min-height: 100%;
+    background: var(--surface);
+  }
+
+  .trajectory-intro {
+    padding: 34px clamp(24px, 5vw, 64px) 28px;
+    border-bottom: 1px solid var(--line-strong);
+    background: var(--surface-soft);
+  }
+
+  .trajectory-intro h1 {
+    max-width: 720px;
+    margin-top: 8px;
+    font-size: clamp(1.7rem, 3vw, 2.45rem);
+    line-height: 1.1;
+    text-wrap: balance;
+  }
+
+  .trajectory-intro p {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+
+  .trajectory-stages {
+    display: grid;
+  }
+
+  .trajectory-stage {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 36px minmax(0, 1fr);
+    gap: 15px;
+    padding: 28px clamp(24px, 5vw, 64px);
+  }
+
+  .completed-stage {
+    border-bottom: 1px solid var(--line);
+    background: var(--surface-soft);
+  }
+
+  .next-stage {
+    padding-top: 34px;
+    padding-bottom: 50px;
+  }
+
+  .trajectory-mark {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--muted);
+  }
+
+  .trajectory-mark.complete {
+    border-color: #b9cce1;
+    background: var(--blue-soft);
+    color: var(--blue);
+  }
+
+  .trajectory-mark.next {
+    border-color: #a9c9c2;
+    background: var(--teal-soft);
+    color: var(--teal);
+  }
+
+  .trajectory-copy {
+    min-width: 0;
+  }
+
+  .trajectory-label {
+    display: block;
+    color: var(--muted);
+    font-size: 0.66rem;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .trajectory-copy h2 {
+    max-width: 780px;
+    margin-top: 5px;
+    font-size: 1.08rem;
+    line-height: 1.25;
+    text-wrap: balance;
+  }
+
+  .next-stage .trajectory-copy h2 {
+    font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+  }
+
+  .trajectory-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 0.74rem;
+    line-height: 1.45;
+  }
+
+  .prepared-lanes {
+    max-width: 780px;
+    margin-top: 26px;
+    border-top: 1px solid var(--line-strong);
+  }
+
+  .prepared-lanes-heading {
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .prepared-lanes-heading h3 {
+    font-size: 0.76rem;
+  }
+
+  .prepared-lanes-heading > span {
+    min-width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border-radius: 4px;
+    background: var(--surface-quiet);
+    color: var(--muted);
+    font-size: 0.66rem;
+    font-weight: 750;
+  }
+
+  .prepared-lanes ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .prepared-lanes li {
+    min-height: 54px;
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+    padding: 9px 0;
+    border-top: 1px solid var(--line);
+    color: var(--teal);
+  }
+
+  .prepared-lanes li > span {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .prepared-lanes strong {
+    color: var(--ink);
+    font-size: 0.82rem;
+    line-height: 1.35;
+    text-wrap: pretty;
+  }
+
+  .prepared-lanes small,
+  .prepared-empty {
+    color: var(--muted);
+    font-size: 0.68rem;
+  }
+
+  .prepared-empty {
+    padding: 12px 0;
+    border-top: 1px solid var(--line);
+  }
+
   .no-focus {
     min-height: 300px;
     display: flex;
@@ -2595,9 +2907,16 @@
     }
 
     .intent-band,
-    .plan-section {
+    .plan-section,
+    .trajectory-intro,
+    .trajectory-stage {
       padding-right: 20px;
       padding-left: 20px;
+    }
+
+    .trajectory-stage {
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 11px;
     }
 
     .context-rail {

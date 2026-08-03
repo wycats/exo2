@@ -1,12 +1,14 @@
 use super::{
-    WorkbenchDaemonIdentity, WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails,
-    WorkbenchLaneSummary, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
+    WorkbenchBetweenPhasesContext, WorkbenchCompletedPhaseSummary, WorkbenchDaemonIdentity,
+    WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails, WorkbenchLaneSummary,
+    WorkbenchNextPhasePreview, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
     WorkbenchSnapshotWorkspace, WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask,
     WorkbenchTaskProgress, WorkspaceRegistration,
 };
-use crate::context::{ExoState, Phase, SqliteLoader, WorkbenchLaneData};
+use crate::context::{Epoch, ExoState, Phase, SqliteLoader, WorkbenchLaneData};
 use crate::phase_owner::PhaseOwnerViewContext;
 use crate::project::Project;
+use crate::status::between_phases_context_for_epoch;
 use crate::steering::derive_phase_steering;
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -118,7 +120,7 @@ fn build_with_git_and_after_state_hook(
     let focused_lane_id = loader
         .load_workspace_lane_focus(&workspace_root)?
         .map(|focus| focus.lane_id);
-    let focused_phase_id = loader.load_workspace_active_phase(&workspace_root)?;
+    let workspace_phase_id = loader.load_workspace_active_phase(&workspace_root)?;
 
     let lane_summaries = lanes
         .iter()
@@ -191,6 +193,34 @@ fn build_with_git_and_after_state_hook(
                 })
                 .collect(),
         });
+    let between_phases_context =
+        between_phases_epoch(&plan, workspace_phase_id.as_deref()).map(|epoch| {
+            let context = between_phases_context_for_epoch(epoch);
+            WorkbenchBetweenPhasesContext {
+                epoch_id: context.epoch_id,
+                epoch_title: context.epoch_title,
+                completed_phase: context.completed_phase.map(|phase| {
+                    WorkbenchCompletedPhaseSummary {
+                        id: phase.phase_id,
+                        title: phase.phase_title,
+                        completed_at: phase.completed_at,
+                        goal_count: phase.goal_count,
+                        completed_goals: phase.completed_goals,
+                    }
+                }),
+                next_phase: context.next_phase.map(|phase| WorkbenchNextPhasePreview {
+                    id: phase.id,
+                    title: phase.title,
+                    goal_count: phase.goal_count,
+                    rfc_count: phase.rfcs.len(),
+                }),
+                pending_phases: epoch
+                    .phases
+                    .iter()
+                    .filter(|phase| phase.status == "pending")
+                    .count(),
+            }
+        });
     let steering = focused_phase
         .zip(focused_phase_details.as_ref())
         .map_or_else(
@@ -224,7 +254,7 @@ fn build_with_git_and_after_state_hook(
                 }
             },
         );
-    let diagnostics = focus_diagnostics(focused_lane.as_ref(), focused_phase_id.as_deref());
+    let diagnostics = focus_diagnostics(focused_lane.as_ref(), workspace_phase_id.as_deref());
     transaction
         .commit()
         .context("Failed to finish workbench snapshot read transaction")?;
@@ -242,7 +272,7 @@ fn build_with_git_and_after_state_hook(
     Ok(WorkbenchSnapshot {
         kind: "workbench.snapshot",
         ok: true,
-        schema_version: 1,
+        schema_version: 2,
         observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         revision,
         project: WorkbenchProjectIdentity {
@@ -262,6 +292,7 @@ fn build_with_git_and_after_state_hook(
         lanes: lane_summaries,
         focused_lane,
         phase,
+        between_phases_context,
         steering,
         diagnostics,
     })
@@ -336,6 +367,15 @@ fn lane_summary(
 
 fn phase_for_id<'a>(plan: &'a ExoState, id: &str) -> Option<&'a Phase> {
     plan.find_phase_by_id(id).map(|info| info.phase)
+}
+
+fn between_phases_epoch<'a>(
+    plan: &'a ExoState,
+    workspace_phase_id: Option<&str>,
+) -> Option<&'a Epoch> {
+    let phase = plan.find_phase_by_id(workspace_phase_id?)?;
+    (phase.phase.status != "in-progress" && phase.epoch.derived_status() == "in-progress")
+        .then_some(phase.epoch)
 }
 
 fn focus_diagnostics(

@@ -132,6 +132,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "workbench_lanes",
         sql: include_str!("../migrations/V023__workbench_lanes.sql"),
     },
+    Migration {
+        version: 24,
+        name: "phase_completion_time",
+        sql: include_str!("../migrations/V024__phase_completion_time.sql"),
+    },
 ];
 
 /// Run all pending migrations on the given connection.
@@ -392,6 +397,75 @@ mod tests {
             )
             .expect("query migration history");
         assert_eq!(migration_applied, 1, "V023 should be recorded");
+    }
+
+    #[test]
+    fn v024_adds_and_backfills_phase_completion_time() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("exo.db");
+
+        {
+            let conn = Connection::open(&db_path).expect("open db");
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE IF NOT EXISTS __schema_history (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .expect("create history");
+
+            for migration in MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 23)
+            {
+                conn.execute_batch(migration.sql)
+                    .unwrap_or_else(|err| panic!("apply V{:03}: {err}", migration.version));
+                conn.execute(
+                    "INSERT INTO __schema_history (version, name) VALUES (?1, ?2)",
+                    (migration.version, migration.name),
+                )
+                .unwrap_or_else(|err| panic!("record V{:03}: {err}", migration.version));
+            }
+
+            conn.execute_batch(
+                "INSERT INTO epochs_data(text_id, title) VALUES('epoch', 'Epoch');
+                 INSERT INTO phases_data(text_id, title, status, epoch_id)
+                    VALUES('phase', 'Completed Phase', 'completed', 1);
+                 INSERT INTO goals_data(text_id, label, status, phase_id)
+                    VALUES('goal', 'Goal', 'completed', 1);
+                 INSERT INTO tasks_data(text_id, title, status, goal_id, completed_at)
+                    VALUES('older', 'Older', 'completed', 1, '2026-01-01T10:00:00+00:00');
+                 INSERT INTO tasks_data(text_id, title, status, goal_id, completed_at)
+                    VALUES('newer', 'Newer', 'completed', 1, '2026-02-01T10:00:00+00:00');",
+            )
+            .expect("seed completed phase");
+        }
+
+        let db = crate::open_database(&db_path).expect("upgrade db");
+        let conn = db.connection();
+        let columns = table_columns(conn, "phases_data");
+        assert!(columns.iter().any(|column| column == "completed_at"));
+
+        let completed_at: String = conn
+            .query_row(
+                "SELECT completed_at FROM phases_data WHERE text_id = 'phase'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read backfilled completion time");
+        assert_eq!(completed_at, "2026-02-01T10:00:00+00:00");
+
+        let migration_applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __schema_history
+                 WHERE version = 24 AND name = 'phase_completion_time'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migration history");
+        assert_eq!(migration_applied, 1, "V024 should be recorded");
     }
 
     fn table_columns(conn: &Connection, table: &str) -> Vec<String> {

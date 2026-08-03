@@ -109,6 +109,58 @@ fn status_prefers_next_phase_after_last_executed_phase(backend: &str) {
 }
 
 #[test_matrix(["sqlite"])]
+fn status_reports_latest_completed_phase_by_completion_time(backend: &str) {
+    let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
+    let root = temp.path();
+
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .status()
+        .expect("git init");
+    exo_init_with_storage(root, backend);
+    let finished_last = exo_active_phase_id(root);
+    let epoch_id = exo_active_epoch_id(root);
+    let later_in_roadmap =
+        exo_plan_add_phase_with_storage(root, backend, &epoch_id, "Later in roadmap", None, None);
+    exo_plan_add_phase_with_storage(root, backend, &epoch_id, "Still pending", None, None);
+    exo_plan_update_status_with_storage(root, backend, &later_in_roadmap, "completed");
+    exo_plan_update_status_with_storage(root, backend, &finished_last, "completed");
+
+    let conn =
+        Connection::open(exo::context::db_path_resolving_project(root)).expect("open exo db");
+    conn.execute(
+        "UPDATE phases_data SET completed_at = ?1 WHERE text_id = ?2",
+        ("2026-07-01T12:00:00+00:00", &later_in_roadmap),
+    )
+    .expect("set older completion evidence");
+    conn.execute(
+        "UPDATE phases_data SET completed_at = ?1 WHERE text_id = ?2",
+        ("2026-08-01T12:00:00+00:00", &finished_last),
+    )
+    .expect("set newer completion evidence");
+
+    let output = exo_cmd_with_storage(root, backend)
+        .args(["--format", "json", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&output).expect("valid status json");
+    let completed_phase = &output["result"]["between_phases_context"]["completed_phase"];
+
+    assert_eq!(
+        completed_phase["phase_id"], finished_last,
+        "status output: {output}"
+    );
+    assert_eq!(
+        completed_phase["completed_at"], "2026-08-01T12:00:00+00:00",
+        "status output: {output}"
+    );
+}
+
+#[test_matrix(["sqlite"])]
 fn phase_start_accepts_explicit_pending_phase_id(backend: &str) {
     let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
     let root = temp.path();

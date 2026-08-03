@@ -111,7 +111,8 @@ wrapping, task titles use pretty wrapping, and progress metadata occupies its
 own quieter line so that status does not collide with prose.
 
 These are view rules over the existing snapshot. They do not add a derived
-status to SQLite or change `WorkbenchSnapshot` schema version 1.
+status to SQLite or require a snapshot version beyond the current
+`WorkbenchSnapshot` schema version 2.
 
 ### Reviewing and approving completion
 
@@ -513,14 +514,15 @@ contains the changed entity, it does not acquire the issuing workspace's focus.
 
 ### Compatibility and rollout
 
-`WorkbenchSnapshot` remains schema version 1. Goal-progress presentation is
-derived in the client from existing task statuses. Each task may also carry an
-additive `progress` collection containing the message and timestamp of canonical
-progress logs plus an additive `progress_truncated` marker when the bounded
-recent window omits canonical history. The focused phase also carries the
-additive `planning_available` boolean derived from phase ownership; clients
-that do not understand it remain orientation-only rather than assuming write
-authority.
+`WorkbenchSnapshot` uses schema version 2 after RFC 10203's between-phase
+trajectory addition. This RFC does not introduce another snapshot version.
+Goal-progress presentation is derived in the client from existing task
+statuses. Each task may also carry an additive `progress` collection containing
+the message and timestamp of canonical progress logs plus an additive
+`progress_truncated` marker when the bounded recent window omits canonical
+history. The focused phase also carries the additive `planning_available`
+boolean derived from phase ownership; clients that do not understand it remain
+orientation-only rather than assuming write authority.
 
 The host accepts version-one snapshot and lane-focus requests while adding
 version-two planning requests. Older embedded clients continue to orient and
