@@ -300,6 +300,11 @@ The one-hour pre-redemption window accommodates asynchronous handoff between an
 agent and human without changing the credential's authority or the lifetime of
 the browser session created by a successful exchange.
 
+While at least one enrollment ticket remains unexpired and unredeemed, its
+pending capability keeps the issuing daemon and loopback host alive. Redemption
+or expiration releases that hold; without authenticated event-stream activity,
+the daemon then returns to its ordinary idle-shutdown policy.
+
 Signature comparison is constant-time. Invalid signature, unknown capability,
 wrong instance, wrong project, expired ticket, and previously redeemed ticket
 all return the same public `workbench.ticket_invalid` response. This prevents

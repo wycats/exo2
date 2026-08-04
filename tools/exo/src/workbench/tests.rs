@@ -332,6 +332,42 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
+async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let now = unix_seconds();
+    assert!(manager.has_live_pending_enrollment(now));
+
+    manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem enrollment ticket");
+    assert!(!manager.has_live_pending_enrollment(now));
+
+    let expiring = manager
+        .launch(&fixture.root)
+        .expect("launch workbench again");
+    let (_, expiring_ticket) = launch_parts(&expiring);
+    let expiring_payload = ticket_payload(expiring_ticket);
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pending_capabilities
+        .get_mut(&expiring_payload.capability_id)
+        .expect("pending enrollment")
+        .expires_at = now;
+    assert!(!manager.has_live_pending_enrollment(now));
+
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
 async fn ticket_persistence_failure_restores_the_one_time_capability() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
