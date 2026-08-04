@@ -4,7 +4,7 @@ export interface WorkbenchLaunchResult {
   schema_version: 1;
   url: string;
   expires_at: string;
-  expires_in_seconds: 300;
+  expires_in_seconds: 3600;
   reused_host: boolean;
   project: {
     id: string;

@@ -3100,7 +3100,7 @@ fn mcp_stdio_workbench_launch_returns_text_and_structured_url() {
         .expect("workbench launch fallback text");
     assert!(launch_text.contains(uri), "{launch_text}");
     assert!(
-        launch_text.contains("expires in five minutes"),
+        launch_text.contains("one-time browser enrollment link expires in one hour"),
         "{launch_text}"
     );
     assert_eq!(

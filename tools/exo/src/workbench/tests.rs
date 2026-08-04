@@ -261,7 +261,9 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     let manager = test_manager(Arc::clone(&fixture.project));
     let first = manager.launch(&fixture.root).expect("launch workbench");
     let (origin, ticket) = launch_parts(&first);
-    assert_eq!(first.expires_in_seconds, 300);
+    assert_eq!(first.expires_in_seconds, 3_600);
+    let payload = ticket_payload(ticket);
+    assert_eq!(payload.expires_at - payload.issued_at, 3_600);
     assert!(!first.reused_host);
     assert_eq!(first.project.id, fixture.project.id.as_str());
     assert!(

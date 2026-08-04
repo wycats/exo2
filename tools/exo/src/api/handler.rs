@@ -3086,7 +3086,7 @@ mod tests {
                 "workspace": { "label": "feature/lane-ui" },
             }),
             human_message: Some(
-                "Open the Exo workbench for feature/lane-ui:\nhttp://127.0.0.1:49152/#ticket=secret\n\nThis link expires in five minutes."
+                "Open the Exo workbench for feature/lane-ui:\nhttp://127.0.0.1:49152/#ticket=secret\n\nThis one-time browser enrollment link expires in one hour."
                     .to_string(),
             ),
             effect: Effect::Pure,

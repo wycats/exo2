@@ -27,7 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinHandle;
 
-const TICKET_LIFETIME: Duration = Duration::from_mins(5);
+const TICKET_LIFETIME: Duration = Duration::from_hours(1);
 const SESSION_RENEWAL_LIFETIME: Duration = Duration::from_hours(12);
 const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
 const SESSION_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
