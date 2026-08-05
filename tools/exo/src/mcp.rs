@@ -2791,8 +2791,8 @@ mod tests {
                 "ok": true,
                 "schema_version": 1,
                 "url": "http://127.0.0.1:49152/#ticket=secret",
-                "expires_at": "2026-07-28T20:05:00Z",
-                "expires_in_seconds": 300,
+                "expires_at": "2026-07-28T21:00:00Z",
+                "expires_in_seconds": 3600,
                 "reused_host": false,
                 "project": { "id": "project-1" },
                 "workspace": {
@@ -2831,6 +2831,10 @@ mod tests {
         assert_eq!(
             serialized["structuredContent"]["result"]["url"],
             "http://127.0.0.1:49152/#ticket=secret"
+        );
+        assert_eq!(
+            serialized["structuredContent"]["result"]["expires_in_seconds"],
+            3_600
         );
         assert!(
             !serde_json::to_string(&serialized)

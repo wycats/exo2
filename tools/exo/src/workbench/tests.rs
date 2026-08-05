@@ -261,7 +261,9 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     let manager = test_manager(Arc::clone(&fixture.project));
     let first = manager.launch(&fixture.root).expect("launch workbench");
     let (origin, ticket) = launch_parts(&first);
-    assert_eq!(first.expires_in_seconds, 300);
+    assert_eq!(first.expires_in_seconds, 3_600);
+    let payload = ticket_payload(ticket);
+    assert_eq!(payload.expires_at - payload.issued_at, 3_600);
     assert!(!first.reused_host);
     assert_eq!(first.project.id, fixture.project.id.as_str());
     assert!(
@@ -326,6 +328,42 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         !inactive_record.server_task_alive,
         "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let now = unix_seconds();
+    assert!(manager.has_live_pending_enrollment(now));
+
+    manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("redeem enrollment ticket");
+    assert!(!manager.has_live_pending_enrollment(now));
+
+    let expiring = manager
+        .launch(&fixture.root)
+        .expect("launch workbench again");
+    let (_, expiring_ticket) = launch_parts(&expiring);
+    let expiring_payload = ticket_payload(expiring_ticket);
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pending_capabilities
+        .get_mut(&expiring_payload.capability_id)
+        .expect("pending enrollment")
+        .expires_at = now;
+    assert!(!manager.has_live_pending_enrollment(now));
+
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]

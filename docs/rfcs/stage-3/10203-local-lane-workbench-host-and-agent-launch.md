@@ -66,9 +66,11 @@ exo workbench launch
 
 The command returns a local link together with a project identifier, an opaque
 workspace key and label, the daemon instance that issued the link, and the
-five-minute ticket expiration. The command is safe to repeat. The first launch
-starts the host; later launches reuse it and issue a fresh capability. Neither
-case changes canonical project state or opens a browser.
+one-hour enrollment-ticket expiration. The command is safe to repeat. The
+first launch starts the host; later launches reuse it and issue a fresh
+capability. Neither case changes canonical project state or opens a browser.
+The enrollment ticket is only the browser's one-time entry credential; after
+exchange, the independent renewable session lifetime governs the open cockpit.
 
 An agent invokes the same command through `exo-run`. MCP clients receive a
 normal text result containing the complete URL and expiration, plus structured
@@ -228,7 +230,7 @@ interface WorkbenchLaunchResult {
   schema_version: 1;
   url: string;
   expires_at: string;
-  expires_in_seconds: 300;
+  expires_in_seconds: 3600;
   reused_host: boolean;
   project: {
     id: string;
@@ -249,10 +251,11 @@ interface WorkbenchLaunchResult {
 ```
 
 `url` is a bearer capability and must be treated as secret until it expires.
-The human result labels it as a five-minute link and does not print the raw
-workspace path. `workspace.key` is an opaque, random daemon-lifetime identifier
-mapped to the validated canonical workspace root in memory. `workspace.label`
-is the branch name when attached and `detached@<short-head>` otherwise.
+The human result labels it as a one-time browser enrollment link with a
+one-hour lifetime and does not print the raw workspace path. `workspace.key` is
+an opaque, random daemon-lifetime identifier mapped to the validated canonical
+workspace root in memory. `workspace.label` is the branch name when attached
+and `detached@<short-head>` otherwise.
 
 The URL has the form:
 
@@ -288,11 +291,19 @@ interface WorkbenchTicketV1 {
 }
 ```
 
-Times are Unix seconds. `expires_at` is exactly 300 seconds after `issued_at`.
+Times are Unix seconds. `expires_at` is exactly 3,600 seconds after `issued_at`.
 `capability_id` is 256 bits of random data encoded without padding. The host
 keeps a pending capability record that maps the ID and workspace key to the
 validated root. A successful exchange consumes the pending record. A ticket is
 therefore signed, short-lived, workspace-bound, daemon-bound, and one-time.
+The one-hour pre-redemption window accommodates asynchronous handoff between an
+agent and human without changing the credential's authority or the lifetime of
+the browser session created by a successful exchange.
+
+While at least one enrollment ticket remains unexpired and unredeemed, its
+pending capability keeps the issuing daemon and loopback host alive. Redemption
+or expiration releases that hold; without authenticated event-stream activity,
+the daemon then returns to its ordinary idle-shutdown policy.
 
 Signature comparison is constant-time. Invalid signature, unknown capability,
 wrong instance, wrong project, expired ticket, and previously redeemed ticket

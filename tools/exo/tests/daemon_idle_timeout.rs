@@ -9,6 +9,10 @@
 mod test_support;
 
 use exo::daemon_transport::{DaemonClientStream, DaemonEndpoint};
+#[cfg(feature = "ui")]
+use std::io::{Read, Write};
+#[cfg(feature = "ui")]
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use test_case::test_matrix;
@@ -98,6 +102,51 @@ fn connect_to_daemon(
     }
 }
 
+#[cfg(feature = "ui")]
+fn redeem_workbench_ticket(origin: &str, ticket: &str) -> String {
+    let authority = origin
+        .strip_prefix("http://")
+        .expect("workbench origin should use HTTP");
+    let body = serde_json::json!({ "ticket": ticket }).to_string();
+    let request = format!(
+        "POST /api/session HTTP/1.1\r\nHost: {authority}\r\nOrigin: {origin}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(authority).expect("connect to workbench host");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set workbench response timeout");
+    stream
+        .write_all(request.as_bytes())
+        .expect("send workbench ticket exchange");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read workbench ticket exchange");
+    response
+}
+
+#[cfg(feature = "ui")]
+fn wait_for_clean_daemon_exit(child: &mut Child, max_wait: Duration) {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "daemon should exit cleanly: {status:?}");
+                return;
+            }
+            Ok(None) if start.elapsed() <= max_wait => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                panic!("daemon did not exit within {max_wait:?}");
+            }
+            Err(error) => panic!("error checking daemon status: {error}"),
+        }
+    }
+}
+
 #[test_matrix(["sqlite"])]
 fn test_daemon_exits_after_idle_timeout(backend: &str) {
     let temp = tempfile::tempdir().expect("failed to create tempdir");
@@ -159,6 +208,57 @@ fn test_daemon_exits_after_idle_timeout(backend: &str) {
     assert!(
         !paths.endpoint().is_connectable_blocking(),
         "daemon endpoint should not accept clients after daemon exit"
+    );
+}
+
+#[cfg(feature = "ui")]
+#[test_matrix(["sqlite"])]
+fn test_pending_workbench_enrollment_defers_idle_shutdown(backend: &str) {
+    let temp = tempfile::tempdir().expect("failed to create tempdir");
+    let workspace = create_test_workspace(&temp, backend);
+    let timeout_secs = 2;
+    let mut child = spawn_daemon(&workspace, timeout_secs).expect("failed to spawn daemon");
+    let _endpoint = wait_for_daemon_endpoint(&mut child, &workspace);
+
+    let launch = Command::new(env!("CARGO_BIN_EXE_exo"))
+        .args(["--format", "json", "workbench", "launch"])
+        .current_dir(&workspace)
+        .output()
+        .expect("launch workbench through daemon");
+    assert!(
+        launch.status.success(),
+        "workbench launch failed: {}",
+        String::from_utf8_lossy(&launch.stderr)
+    );
+    let launch: serde_json::Value =
+        serde_json::from_slice(&launch.stdout).expect("workbench launch JSON");
+    let url = launch["result"]["url"]
+        .as_str()
+        .expect("workbench launch URL");
+    let (origin, ticket) = url
+        .split_once("/#ticket=")
+        .expect("workbench launch URL contains ticket");
+
+    std::thread::sleep(Duration::from_secs(timeout_secs + 1));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "pending enrollment should keep the daemon alive beyond its idle timeout"
+    );
+
+    let response = redeem_workbench_ticket(origin, ticket);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "ticket exchange should succeed: {response}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "successful enrollment should refresh daemon activity"
+    );
+
+    wait_for_clean_daemon_exit(
+        &mut child,
+        Duration::from_secs(timeout_secs.saturating_add(3)),
     );
 }
 

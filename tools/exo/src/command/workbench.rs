@@ -44,7 +44,7 @@ impl Command for WorkbenchLaunch {
             .ok_or_else(|| anyhow::Error::new(daemon_required_failure()))?;
         let result = services.launch(ctx.root)?;
         let message = format!(
-            "Open the Exo workbench for {}:\n{}\n\nThis link expires in five minutes.",
+            "Open the Exo workbench for {}:\n{}\n\nThis one-time browser enrollment link expires in one hour.",
             result.workspace.label, result.url
         );
         Ok(CommandOutput::new(result, message))

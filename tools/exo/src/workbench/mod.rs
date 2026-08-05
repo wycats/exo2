@@ -27,7 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::JoinHandle;
 
-const TICKET_LIFETIME: Duration = Duration::from_mins(5);
+const TICKET_LIFETIME: Duration = Duration::from_hours(1);
 const SESSION_RENEWAL_LIFETIME: Duration = Duration::from_hours(12);
 const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
 const SESSION_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
@@ -669,6 +669,16 @@ impl WorkbenchHostManager {
         })
     }
 
+    pub(crate) fn has_live_pending_enrollment(&self, now: u64) -> bool {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return false;
+        };
+        state
+            .pending_capabilities
+            .retain(|_, pending| pending.expires_at > now);
+        !state.pending_capabilities.is_empty()
+    }
+
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
         self.snapshot_with_before_state_gate(workspace_root, || {})
     }
@@ -1024,6 +1034,7 @@ impl WorkbenchHostInner {
             WorkbenchSessionGrantV1::from(&session),
         );
         state.sessions.insert(credential_digest.clone(), session);
+        self.touch_daemon_activity();
         let result = (
             session_secret,
             WorkbenchSessionResult {

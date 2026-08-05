@@ -2767,6 +2767,7 @@ pub async fn run_daemon(
         Arc::clone(&last_activity),
         tokio::runtime::Handle::current(),
     );
+    let idle_workbench_host = workbench_host.clone();
     let runtime_services = DaemonRuntimeServices::new(workbench_host);
 
     // Build one daemon request dispatcher shared by IPC and the workbench HTTP adapter.
@@ -3113,6 +3114,13 @@ pub async fn run_daemon(
             let last = last_activity_checker.load(Ordering::Relaxed);
             let elapsed = now_secs().saturating_sub(last);
             if elapsed >= timeout {
+                if idle_workbench_host.has_live_pending_enrollment(now_secs()) {
+                    continue;
+                }
+                let refreshed_last = last_activity_checker.load(Ordering::Relaxed);
+                if now_secs().saturating_sub(refreshed_last) < timeout {
+                    continue;
+                }
                 eprintln!("exo daemon: idle timeout reached, shutting down");
                 return;
             }
