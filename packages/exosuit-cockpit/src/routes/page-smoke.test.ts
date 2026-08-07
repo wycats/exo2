@@ -577,6 +577,126 @@ describe("cockpit page", () => {
     ).toBe("lane-b");
   });
 
+  it("retains pending lane restoration while a queued refresh finishes during recovery", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const blockedRefresh = deferred<Response>();
+    const renewal = deferred<Response>();
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-a", "Lane A"],
+      ["lane-b", "Lane B"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    let laneBAttempts = 0;
+    let snapshotReads = 0;
+    let blockedRefreshRequestId = "";
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(
+        request.operation.kind === "lane_inspect"
+          ? `lane_inspect:${request.operation.lane_id}`
+          : request.operation.kind,
+      );
+      if (request.operation.kind === "snapshot") {
+        snapshotReads += 1;
+        if (snapshotReads === 2) {
+          blockedRefreshRequestId = request.id;
+          return blockedRefresh.promise;
+        }
+        snapshot.revision = snapshotReads === 1 ? 7 : 8;
+      }
+      if (
+        request.operation.kind === "lane_inspect" &&
+        request.operation.lane_id === "lane-b"
+      ) {
+        laneBAttempts += 1;
+        if (laneBAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.session_invalid",
+              ok: false,
+              message: "The workbench session is invalid",
+            }),
+            { status: 401 },
+          );
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane A, phase in progress" }),
+    );
+    await screen.findByRole("heading", { name: "Lane A" });
+
+    TestEventSource.instances[0]!.emit("invalidate");
+    await waitFor(() => expect(snapshotReads).toBe(2));
+    TestEventSource.instances[0]!.emit("invalidate");
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+
+    blockedRefresh.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: blockedRefreshRequestId,
+          status: "ok",
+          result: { ...snapshot, revision: 8 },
+        }),
+        { status: 200 },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    renewal.resolve(sessionResponse("session-selector"));
+
+    expect(await screen.findByRole("heading", { name: "Lane B" })).toBeTruthy();
+    expect(operations).toEqual([
+      "snapshot",
+      "lane_inspect:lane-a",
+      "snapshot",
+      "lane_inspect:lane-b",
+      "snapshot",
+      "lane_inspect:lane-b",
+    ]);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-b");
+  });
+
   it("enters recovery immediately when a live refresh returns an unreadable response", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const renewal = deferred<Response>();

@@ -537,7 +537,7 @@
   });
 
   async function refreshSnapshot(quiet: boolean): Promise<boolean> {
-    if (!client) {
+    if (!client || sessionRecovery !== "connected") {
       return false;
     }
     if (refreshing) {
@@ -682,7 +682,7 @@
       ) {
         confirmedLocalFocus = null;
       }
-      if (pendingRestoredLaneId) {
+      if (pendingRestoredLaneId && sessionRecovery === "connected") {
         const restoredLaneId = pendingRestoredLaneId;
         const restoredHistoryMode = pendingRestoredLaneHistoryMode;
         pendingRestoredLaneId = null;
