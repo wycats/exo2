@@ -323,6 +323,18 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
     drop(writer);
 
     let manager = test_manager(Arc::clone(&fixture.project));
+    let discovered = manager
+        .snapshot(&current_root)
+        .expect("discover sibling workspace");
+    let discovered_sibling = discovered
+        .project_workspaces
+        .iter()
+        .find(|workspace| !workspace.current)
+        .expect("discovered sibling workspace summary");
+    assert_eq!(discovered_sibling.label, "workspace-sibling");
+    assert_eq!(discovered_sibling.availability, "stale");
+    assert!(discovered_sibling.observed_at.is_none());
+
     manager
         .observe_workspace(&sibling_root)
         .expect("observe sibling workspace");

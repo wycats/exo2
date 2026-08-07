@@ -1081,7 +1081,6 @@ impl WorkbenchHostManager {
                 } else {
                     snapshot::GitSnapshot::unavailable()
                 };
-                let observed_at = (git.branch.is_some() || git.head.is_some()).then_some(now);
                 discovered.push(WorkspaceRegistration {
                     key: key.clone(),
                     root,
@@ -1089,7 +1088,7 @@ impl WorkbenchHostManager {
                     branch: git.branch,
                     head: git.head,
                     dirty: None,
-                    observed_at,
+                    observed_at: None,
                     registered_at: now,
                 });
             }

@@ -112,6 +112,8 @@
   let inspection = $state<WorkbenchLaneInspection | null>(null);
   let inspectionLoading = $state(false);
   let inspectionFailure = $state<string | null>(null);
+  let inspectionRetryLaneId = $state<string | null>(null);
+  let inspectionRetryHistoryMode = $state<InspectionHistoryMode>("none");
   let projectOverview = $state(false);
   let refreshing = $state(false);
   let streamConnected = $state(false);
@@ -354,6 +356,8 @@
       inspection = null;
       inspectionLoading = false;
       inspectionFailure = null;
+      inspectionRetryLaneId = null;
+      inspectionRetryHistoryMode = "none";
       projectOverview = false;
       inspectionRequestGeneration += 1;
       pendingFocus = null;
@@ -422,6 +426,24 @@
           screen = "session_required";
           return;
         }
+        if (
+          !ticket &&
+          !sessionKeyFromHistory(history.state) &&
+          sessionKeyFromHistory(resumeState) === sessionKey
+        ) {
+          const restoredState = retainSessionSelector(
+            {
+              ...resumeState,
+              ...workbenchHistoryState(history.state),
+            },
+            sessionKey,
+          );
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            restoredState,
+          );
+          retainTabResumeState(restoredState);
+        }
 
         client = new WorkbenchClient(sessionKey);
         if (!ticket) {
@@ -432,7 +454,7 @@
           inspectedLaneFromHistory(history.state) ??
           inspectedLaneFromHistory(resumeState);
         if (restoredLaneId) {
-          await inspectLane(restoredLaneId, "none");
+          await inspectLane(restoredLaneId, "none", true, true);
         } else {
           projectOverview =
             projectOverviewFromHistory(history.state) ||
@@ -468,7 +490,7 @@
       } else {
         const laneId = inspectedLaneFromHistory(event.state);
         if (laneId) {
-          void inspectLane(laneId, "none");
+          void inspectLane(laneId, "none", true, true);
         } else if (projectOverviewFromHistory(event.state)) {
           openProjectOverview("none");
         } else {
@@ -620,7 +642,7 @@
       (previousInspection.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
         previousInspection.revision !== nextSnapshot.revision)
     ) {
-      void inspectLane(previousInspection.lane.id, "none");
+      void inspectLane(previousInspection.lane.id, "none", true, true);
     }
     startLiveUpdates?.();
   }
@@ -660,6 +682,8 @@
     inspection = null;
     inspectionLoading = false;
     inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
     projectOverview = false;
     if (mode !== "none") {
       writeInspectionHistory(null, mode);
@@ -673,6 +697,8 @@
     inspection = null;
     inspectionLoading = false;
     inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
     projectOverview = true;
     if (mode === "none") {
       return;
@@ -692,11 +718,12 @@
     laneId: string,
     historyMode: InspectionHistoryMode = "push",
     retryOnStale = true,
+    preserveFocusedSelection = false,
   ): Promise<void> {
     if (!client || !snapshot || sessionRecovery !== "connected") {
       return;
     }
-    if (laneId === snapshot.focused_lane?.id) {
+    if (laneId === snapshot.focused_lane?.id && !preserveFocusedSelection) {
       clearInspection(historyMode);
       return;
     }
@@ -705,6 +732,8 @@
     const requestGeneration = ++inspectionRequestGeneration;
     inspectionLoading = true;
     inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
     try {
       const nextInspection = await activeClient.inspectLane(laneId);
       if (
@@ -720,15 +749,19 @@
         if (retryOnStale) {
           await refreshSnapshot(true);
           if (requestGeneration === inspectionRequestGeneration) {
-            await inspectLane(laneId, historyMode, false);
+            await inspectLane(laneId, historyMode, false, true);
           }
         } else {
           inspectionFailure =
             "This lane changed while it was opening. Retry from the current project view.";
+          inspectionRetryLaneId = laneId;
+          inspectionRetryHistoryMode = historyMode;
         }
         return;
       }
       inspection = nextInspection;
+      inspectionRetryLaneId = null;
+      inspectionRetryHistoryMode = "none";
       projectOverview = false;
       if (historyMode !== "none") {
         writeInspectionHistory(laneId, historyMode);
@@ -744,14 +777,28 @@
         error instanceof WorkbenchClientError &&
         error.detailKind === "workbench.lane_not_found"
       ) {
-        inspection = null;
+        openProjectOverview("replace");
         inspectionFailure =
           "That lane is no longer part of the current project plan.";
-        writeInspectionHistory(null, "replace");
+        inspectionRetryLaneId = null;
+        inspectionRetryHistoryMode = "none";
+      } else if (
+        error instanceof WorkbenchClientError &&
+        error.kind === "client_update_required"
+      ) {
+        inspectionFailure = null;
+        inspectionRetryLaneId = null;
+        inspectionRetryHistoryMode = "none";
+        sessionRecovery = "reload_required";
+        sessionRecoveryMessage = messageFrom(error);
+        refreshFailure = null;
+        stopLiveUpdates?.();
       } else if (terminalFailure(error)) {
         applyTerminalFailure(error);
       } else {
         inspectionFailure = messageFrom(error);
+        inspectionRetryLaneId = laneId;
+        inspectionRetryHistoryMode = historyMode;
       }
     } finally {
       if (requestGeneration === inspectionRequestGeneration) {
@@ -772,8 +819,10 @@
   }
 
   function retryInspection(): void {
-    if (inspection) {
-      void inspectLane(inspection.lane.id, "none");
+    if (inspectionRetryLaneId) {
+      const laneId = inspectionRetryLaneId;
+      const historyMode = inspectionRetryHistoryMode;
+      void inspectLane(laneId, historyMode, true, true);
     }
   }
 
@@ -1146,7 +1195,7 @@
     onOpenProject={() => openProjectOverview()}
     onCloseProject={() => clearInspection()}
     onCloseInspection={() => clearInspection()}
-    onRetryInspection={inspectionFailure && inspection
+    onRetryInspection={inspectionFailure && inspectionRetryLaneId
       ? retryInspection
       : null}
     onFocus={(laneId) => void focusInspectedLane(laneId)}
