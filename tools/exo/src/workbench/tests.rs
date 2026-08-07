@@ -445,6 +445,45 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
     manager.shutdown().await;
 }
 
+#[test]
+fn discovered_workspace_does_not_replace_a_concurrent_live_observation() {
+    let root = PathBuf::from("/tmp/exo-workbench-concurrent-observation");
+    let live = WorkspaceRegistration {
+        key: "workspace-key".to_string(),
+        root: root.clone(),
+        label: "live-workspace".to_string(),
+        branch: Some("wycats/live-workspace".to_string()),
+        head: Some("0123456789abcdef".to_string()),
+        dirty: Some(true),
+        observed_at: Some(42),
+        registered_at: 21,
+    };
+    let mut state = WorkbenchState::default();
+    state
+        .workspaces_by_root
+        .insert(root.clone(), live.key.clone());
+    state
+        .workspaces_by_key
+        .insert(live.key.clone(), live.clone());
+
+    let inserted = insert_discovered_workspace(
+        &mut state,
+        WorkspaceRegistration {
+            key: live.key.clone(),
+            root,
+            label: "discovered-workspace".to_string(),
+            branch: Some("wycats/discovered-workspace".to_string()),
+            head: Some("fedcba9876543210".to_string()),
+            dirty: None,
+            observed_at: None,
+            registered_at: 84,
+        },
+    );
+
+    assert!(!inserted);
+    assert_eq!(state.workspaces_by_key.get(&live.key), Some(&live));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unborn_workspace_is_a_live_project_workspace_observation() {
     let temp = tempfile::tempdir().expect("create unborn workbench fixture");

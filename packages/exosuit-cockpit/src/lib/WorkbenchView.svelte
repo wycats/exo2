@@ -449,7 +449,7 @@
       case "prepared":
         return "You are reviewing a prepared plan. Workspace focus has not changed.";
       case "historical":
-        return "You are reviewing completed project history. Workspace focus has not changed.";
+        return "You are reviewing project history. Workspace focus has not changed.";
     }
   };
 

@@ -1115,20 +1115,9 @@ impl WorkbenchHostManager {
             }
         }
         for workspace in discovered {
-            if state
-                .workspaces_by_key
-                .get(&workspace.key)
-                .is_some_and(|existing| existing.root != workspace.root)
-            {
-                continue;
+            if insert_discovered_workspace(&mut state, workspace) {
+                changed = true;
             }
-            state
-                .workspaces_by_root
-                .insert(workspace.root.clone(), workspace.key.clone());
-            state
-                .workspaces_by_key
-                .insert(workspace.key.clone(), workspace);
-            changed = true;
         }
         state.workspace_store_dirty |= changed;
         let registrations = state
@@ -1269,6 +1258,24 @@ impl WorkbenchHostManager {
         self.inner.persist_host_record();
         Ok((origin, false, secret))
     }
+}
+
+fn insert_discovered_workspace(
+    state: &mut WorkbenchState,
+    workspace: WorkspaceRegistration,
+) -> bool {
+    if state.workspaces_by_root.contains_key(&workspace.root)
+        || state.workspaces_by_key.contains_key(&workspace.key)
+    {
+        return false;
+    }
+    state
+        .workspaces_by_root
+        .insert(workspace.root.clone(), workspace.key.clone());
+    state
+        .workspaces_by_key
+        .insert(workspace.key.clone(), workspace);
+    true
 }
 
 impl WorkbenchHostInner {

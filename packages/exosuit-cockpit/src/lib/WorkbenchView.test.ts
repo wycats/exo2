@@ -1181,6 +1181,11 @@ describe("focus-only lane workbench", () => {
         "The first lane-centered cockpit is available for dogfood.",
       ),
     ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "You are reviewing project history. Workspace focus has not changed.",
+      ),
+    ).toBeTruthy();
     expect(screen.getByText("The reviewed foundation landed cleanly.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Focus in this workspace" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Add task/ })).toBeNull();
@@ -1190,5 +1195,28 @@ describe("focus-only lane workbench", () => {
     );
     expect(onCloseInspection).toHaveBeenCalledOnce();
     expect(onFocus).not.toHaveBeenCalled();
+  });
+
+  it("describes abandoned lane history without calling it completed", () => {
+    const value = structuredClone(inspectionFixture);
+    value.lane.phase_status = "abandoned";
+    value.phase.status = "abandoned";
+    const inspection = decodeWorkbenchLaneInspection(value);
+
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      inspection,
+      onCloseInspection: vi.fn(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(screen.getAllByText("Abandoned")).toHaveLength(2);
+    expect(
+      screen.getByText(
+        "You are reviewing project history. Workspace focus has not changed.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/completed project history/i)).toBeNull();
   });
 });
