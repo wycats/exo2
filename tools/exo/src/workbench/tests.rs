@@ -484,6 +484,54 @@ fn discovered_workspace_does_not_replace_a_concurrent_live_observation() {
     assert_eq!(state.workspaces_by_key.get(&live.key), Some(&live));
 }
 
+#[test]
+fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
+    let mut state = WorkbenchState::default();
+    for index in 0..MAX_PROJECT_WORKSPACES {
+        let key = format!("workspace-{index:03}");
+        let root = PathBuf::from(format!("/tmp/exo-workbench-{index:03}"));
+        state.workspaces_by_root.insert(root.clone(), key.clone());
+        state.workspaces_by_key.insert(
+            key.clone(),
+            WorkspaceRegistration {
+                key,
+                root,
+                label: format!("Workspace {index:03}"),
+                branch: None,
+                head: None,
+                dirty: None,
+                observed_at: Some(index as u64),
+                registered_at: index as u64,
+            },
+        );
+    }
+    let current_key = "workspace-current".to_string();
+    let current_root = PathBuf::from("/tmp/exo-workbench-current");
+    state
+        .workspaces_by_root
+        .insert(current_root.clone(), current_key.clone());
+    state.workspaces_by_key.insert(
+        current_key.clone(),
+        WorkspaceRegistration {
+            key: current_key.clone(),
+            root: current_root,
+            label: "Current workspace".to_string(),
+            branch: None,
+            head: None,
+            dirty: None,
+            observed_at: None,
+            registered_at: MAX_PROJECT_WORKSPACES as u64,
+        },
+    );
+
+    assert!(retain_project_workspace_limit(&mut state, &current_key));
+    assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
+    assert_eq!(state.workspaces_by_root.len(), MAX_PROJECT_WORKSPACES);
+    assert!(state.workspaces_by_key.contains_key(&current_key));
+    assert!(state.workspaces_by_key.contains_key("workspace-127"));
+    assert!(!state.workspaces_by_key.contains_key("workspace-000"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unborn_workspace_is_a_live_project_workspace_observation() {
     let temp = tempfile::tempdir().expect("create unborn workbench fixture");
@@ -512,6 +560,86 @@ async fn unborn_workspace_is_a_live_project_workspace_observation() {
     assert!(workspace.head.is_none());
     assert!(workspace.dirty.is_some());
     assert!(workspace.observed_at.is_some());
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn current_submodule_workspace_is_retained_without_a_worktree_index_entry() {
+    let temp = tempfile::tempdir().expect("create submodule workbench fixture");
+    let source = temp.path().join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    run_git(&source, &["init", "-b", "main"]);
+    fs::write(source.join("README.md"), "# Submodule source\n").expect("write source");
+    run_git(&source, &["add", "."]);
+    run_git(
+        &source,
+        &[
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo@example.invalid",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).expect("create parent repository");
+    run_git(&parent, &["init", "-b", "main"]);
+    fs::write(parent.join("README.md"), "# Parent\n").expect("write parent");
+    run_git(&parent, &["add", "."]);
+    run_git(
+        &parent,
+        &[
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo@example.invalid",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    run_git(
+        &parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            source.to_str().expect("source path"),
+            "modules/child",
+        ],
+    );
+
+    let child = parent
+        .join("modules/child")
+        .canonicalize()
+        .expect("canonical submodule workspace");
+    let project = Arc::new(Project::resolve(&child).expect("resolve submodule project"));
+    assert!(
+        !project
+            .worktree_index()
+            .is_some_and(|worktrees| worktrees.contains_key(&child))
+    );
+    fs::create_dir_all(
+        project
+            .db_path()
+            .parent()
+            .expect("project database has a parent"),
+    )
+    .expect("create project state root");
+    drop(SqliteWriter::open(project.db_path()).expect("initialize project database"));
+
+    let manager = test_manager(project);
+    let snapshot = manager
+        .snapshot(&child)
+        .expect("read submodule workspace snapshot");
+    assert_eq!(snapshot.project_workspaces.len(), 1);
+    assert!(snapshot.project_workspaces[0].current);
+    assert_eq!(snapshot.project_workspaces[0].availability, "live");
+    assert_eq!(snapshot.project_workspaces[0].key, snapshot.workspace.key);
     manager.shutdown().await;
 }
 

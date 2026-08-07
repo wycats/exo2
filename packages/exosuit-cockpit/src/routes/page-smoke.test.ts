@@ -2110,6 +2110,129 @@ describe("cockpit page", () => {
     expect(snapshotReads).toBe(3);
   });
 
+  it("expires a local focus confirmation when a newer snapshot contradicts it", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    const requestedLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-local-focus",
+      title: "Locally focused lane",
+      focused_here: false,
+    };
+    const remoteLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-remote-focus",
+      title: "Remotely focused lane",
+      focused_here: false,
+    };
+    initialSnapshot.lanes.push(requestedLane, remoteLane);
+
+    const contradictedSnapshot = structuredClone(initialSnapshot);
+    contradictedSnapshot.revision += 1;
+    contradictedSnapshot.focused_lane = {
+      ...contradictedSnapshot.focused_lane!,
+      id: remoteLane.id,
+      title: remoteLane.title,
+    };
+    contradictedSnapshot.lanes = contradictedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === remoteLane.id,
+    }));
+
+    const laterRequestedSnapshot = structuredClone(contradictedSnapshot);
+    laterRequestedSnapshot.revision += 1;
+    laterRequestedSnapshot.focused_lane = {
+      ...laterRequestedSnapshot.focused_lane!,
+      id: requestedLane.id,
+      title: requestedLane.title,
+    };
+    laterRequestedSnapshot.lanes = laterRequestedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === requestedLane.id,
+    }));
+
+    let currentSnapshot = initialSnapshot;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: laneInspection(
+              currentSnapshot,
+              request.operation.lane_id,
+              currentSnapshot.focused_lane?.id === request.operation.lane_id
+                ? "focused_here"
+                : "focusable_here",
+            ),
+          }),
+          { status: 200 },
+        );
+      }
+      if (request.operation.kind === "lane_focus") {
+        currentSnapshot = contradictedSnapshot;
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: { lane: { id: requestedLane.id } },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: currentSnapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Locally focused lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Locally focused lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus in this workspace" }),
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Locally focused lane" }),
+      ).toBeTruthy();
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Open project workspace overview" }),
+    );
+    expect(await screen.findByRole("heading", { name: "Workspaces" })).toBeTruthy();
+
+    currentSnapshot = laterRequestedSnapshot;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Workspaces" })).toBeTruthy();
+      expect(
+        workbenchHistoryState(history.state).exoWorkbenchProjectOverview,
+      ).toBe(true);
+    });
+  });
+
   it("reviews and approves an exact task outcome with distinct bound request IDs", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const planningRequests: WorkbenchPlanningRequest[] = [];

@@ -1037,10 +1037,16 @@ impl WorkbenchHostManager {
         let changed = previous.as_ref() != Some(&workspace);
         let new_registration = previous.is_none();
         state.workspaces_by_root.insert(root, key.clone());
-        state.workspaces_by_key.insert(key, workspace.clone());
-        state.workspace_store_dirty |= changed;
+        state
+            .workspaces_by_key
+            .insert(key.clone(), workspace.clone());
+        let registry_trimmed = retain_project_workspace_limit(&mut state, &key);
+        state.workspace_store_dirty |= changed || registry_trimmed;
         drop(state);
-        if let Err(error) = self.inner.persist_workspace_store_if_due(new_registration) {
+        if let Err(error) = self
+            .inner
+            .persist_workspace_store_if_due(new_registration || registry_trimmed)
+        {
             eprintln!("exo daemon: failed to persist workspace observation: {error}");
         }
         Ok((workspace, git))
@@ -1052,22 +1058,32 @@ impl WorkbenchHostManager {
     ) -> Result<Vec<WorkspaceProjection>> {
         let now = unix_seconds();
         let worktree_index = self.inner.project.worktree_index();
-        let known_roots = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?
-            .workspaces_by_root
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
+        let (known_roots, current_root) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            (
+                state
+                    .workspaces_by_root
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                state
+                    .workspaces_by_key
+                    .get(current_workspace_key)
+                    .map(|workspace| workspace.root.clone()),
+            )
+        };
 
         let mut discovered = Vec::new();
+        let discovery_capacity = MAX_PROJECT_WORKSPACES.saturating_sub(known_roots.len());
         if let Some(index) = worktree_index.as_ref() {
             let mut roots = index.keys().cloned().collect::<Vec<_>>();
             roots.sort();
             for root in roots {
-                if known_roots.contains(&root) || discovered.len() >= MAX_PROJECT_WORKSPACES {
+                if known_roots.contains(&root) || discovered.len() >= discovery_capacity {
                     continue;
                 }
                 let key = deterministic_workspace_key(&self.inner.project.id, &root);
@@ -1104,7 +1120,12 @@ impl WorkbenchHostManager {
             let removed = state
                 .workspaces_by_root
                 .keys()
-                .filter(|root| !index.contains_key(*root))
+                .filter(|root| {
+                    !current_root
+                        .as_ref()
+                        .is_some_and(|current| current == *root)
+                        && !index.contains_key(*root)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             for root in removed {
@@ -1119,6 +1140,7 @@ impl WorkbenchHostManager {
                 changed = true;
             }
         }
+        changed |= retain_project_workspace_limit(&mut state, current_workspace_key);
         state.workspace_store_dirty |= changed;
         let registrations = state
             .workspaces_by_key
@@ -1135,13 +1157,13 @@ impl WorkbenchHostManager {
             .into_iter()
             .map(|registration| {
                 let current = registration.key == current_workspace_key;
-                let unavailable = worktree_index
-                    .as_ref()
-                    .is_some_and(|index| index.get(&registration.root).copied().unwrap_or(true))
-                    || !self
+                let unavailable = !current
+                    && (worktree_index.as_ref().is_some_and(|index| {
+                        index.get(&registration.root).copied().unwrap_or(true)
+                    }) || !self
                         .inner
                         .validate_workspace(&registration.root)
-                        .is_ok_and(|resolved| resolved == registration.root.as_path());
+                        .is_ok_and(|resolved| resolved == registration.root.as_path()));
                 let availability = if unavailable {
                     "unavailable"
                 } else if current
@@ -1275,6 +1297,37 @@ fn insert_discovered_workspace(
     state
         .workspaces_by_key
         .insert(workspace.key.clone(), workspace);
+    true
+}
+
+fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_key: &str) -> bool {
+    if state.workspaces_by_key.len() <= MAX_PROJECT_WORKSPACES {
+        return false;
+    }
+
+    let mut registrations = state
+        .workspaces_by_key
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    registrations.sort_by(|left, right| {
+        (right.key == current_workspace_key)
+            .cmp(&(left.key == current_workspace_key))
+            .then_with(|| right.observed_at.cmp(&left.observed_at))
+            .then_with(|| right.registered_at.cmp(&left.registered_at))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let retained = registrations
+        .into_iter()
+        .take(MAX_PROJECT_WORKSPACES)
+        .map(|workspace| workspace.key)
+        .collect::<HashSet<_>>();
+    state
+        .workspaces_by_key
+        .retain(|key, _| retained.contains(key));
+    state
+        .workspaces_by_root
+        .retain(|_, key| retained.contains(key));
     true
 }
 
@@ -1612,6 +1665,7 @@ impl WorkbenchHostInner {
         state
             .workspaces_by_key
             .insert(grant.workspace_key.clone(), workspace);
+        retain_project_workspace_limit(&mut state, &grant.workspace_key);
         state.workspace_store_dirty = true;
         state.sessions.insert(
             credential_digest.to_string(),

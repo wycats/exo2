@@ -64,6 +64,12 @@
     requestId: string;
   }
 
+  interface ConfirmedLocalFocus {
+    laneId: string;
+    daemonInstanceId: string;
+    priorRevision: number;
+  }
+
   interface PreparedPlanningRequest {
     request: WorkbenchPlanningRequest;
   }
@@ -147,7 +153,7 @@
   let inspectionRequestedLaneId: string | null = null;
   let inspectionRequestedHistoryMode: InspectionHistoryMode = "none";
   let pendingRestoredLaneId: string | null = null;
-  let confirmedLocalFocusLaneId: string | null = null;
+  let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
     let events: EventSource | null = null;
@@ -367,7 +373,7 @@
       inspectionRequestedLaneId = null;
       inspectionRequestedHistoryMode = "none";
       pendingRestoredLaneId = null;
-      confirmedLocalFocusLaneId = null;
+      confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
       ambiguousFocus = null;
@@ -651,25 +657,36 @@
       planningEditorRebindToken += 1;
     }
     const confirmedFocusObserved =
-      confirmedLocalFocusLaneId !== null &&
-      nextSnapshot.focused_lane?.id === confirmedLocalFocusLaneId;
+      confirmedLocalFocus !== null &&
+      nextSnapshot.focused_lane?.id === confirmedLocalFocus.laneId;
     if (confirmedFocusObserved) {
-      confirmedLocalFocusLaneId = null;
+      confirmedLocalFocus = null;
       clearInspection("replace");
-    } else if (pendingRestoredLaneId) {
-      const restoredLaneId = pendingRestoredLaneId;
-      pendingRestoredLaneId = null;
-      void inspectLane(restoredLaneId, "none", true, true);
-    } else if (requestedLaneId) {
-      if (snapshotChanged) {
-        void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
+    } else {
+      if (
+        confirmedLocalFocus !== null &&
+        (nextSnapshot.daemon.instance_id !==
+          confirmedLocalFocus.daemonInstanceId ||
+          nextSnapshot.revision > confirmedLocalFocus.priorRevision)
+      ) {
+        confirmedLocalFocus = null;
       }
-    } else if (
-      previousInspection &&
-      (previousInspection.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
-        previousInspection.revision !== nextSnapshot.revision)
-    ) {
-      void inspectLane(previousInspection.lane.id, "none", true, true);
+      if (pendingRestoredLaneId) {
+        const restoredLaneId = pendingRestoredLaneId;
+        pendingRestoredLaneId = null;
+        void inspectLane(restoredLaneId, "none", true, true);
+      } else if (requestedLaneId) {
+        if (snapshotChanged) {
+          void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
+        }
+      } else if (
+        previousInspection &&
+        (previousInspection.daemon.instance_id !==
+          nextSnapshot.daemon.instance_id ||
+          previousInspection.revision !== nextSnapshot.revision)
+      ) {
+        void inspectLane(previousInspection.lane.id, "none", true, true);
+      }
     }
     startLiveUpdates?.();
   }
@@ -887,7 +904,13 @@
       if (client !== activeClient) {
         return;
       }
-      confirmedLocalFocusLaneId = laneId;
+      if (snapshot) {
+        confirmedLocalFocus = {
+          laneId,
+          daemonInstanceId: snapshot.daemon.instance_id,
+          priorRevision: snapshot.revision,
+        };
+      }
     } catch (error) {
       if (client !== activeClient) {
         return;

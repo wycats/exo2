@@ -114,6 +114,21 @@ describe("workbench browser client", () => {
     expect(sessionKeyFromHistory(pageState)).toBe("session-selector");
   });
 
+  it("preserves a legacy top-level selector beside SvelteKit page state", () => {
+    const routerState = {
+      "sveltekit:history": 4,
+      "sveltekit:navigation": 2,
+      "sveltekit:states": { exoWorkbenchInspectedLaneId: "lane-history" },
+      exoWorkbenchSessionKey: "legacy-session",
+    };
+
+    expect(sessionKeyFromHistory(routerState)).toBe("legacy-session");
+    expect(retainSessionSelector(routerState, "legacy-session")).toEqual({
+      exoWorkbenchSessionKey: "legacy-session",
+      exoWorkbenchInspectedLaneId: "lane-history",
+    });
+  });
+
   it("clears the fragment and retained selector before ticket exchange", () => {
     expect(
       prepareWorkbenchTicketExchange({

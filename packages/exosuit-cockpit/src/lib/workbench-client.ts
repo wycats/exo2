@@ -92,7 +92,14 @@ export function workbenchHistoryState(
     pageState !== null &&
     !Array.isArray(pageState)
   ) {
-    return pageState as Record<string, unknown>;
+    return {
+      ...Object.fromEntries(
+        Object.entries(historyState).filter(
+          ([key]) => !key.startsWith("sveltekit:"),
+        ),
+      ),
+      ...(pageState as Record<string, unknown>),
+    };
   }
   if (
     SVELTEKIT_HISTORY_INDEX_KEY in historyState ||
