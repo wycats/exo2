@@ -194,6 +194,7 @@ describe("focus-only lane workbench", () => {
     expect(screen.getByText("This workspace")).toBeTruthy();
     expect(screen.getByText("Live", { selector: ".workspace-availability" })).toBeTruthy();
     expect(screen.getByText("Stale", { selector: ".workspace-availability" })).toBeTruthy();
+    expect(screen.getByText(/Last observed .*2026/)).toBeTruthy();
     expect(screen.getByText("Cleanliness unknown")).toBeTruthy();
 
     const projectRow = screen.getByRole("button", {
@@ -217,6 +218,27 @@ describe("focus-only lane workbench", () => {
       screen.getByRole("button", { name: "Current work" }),
     );
     expect(onCloseProject).toHaveBeenCalledOnce();
+  });
+
+  it("labels unavailable Git identity without implying an unborn checkout", () => {
+    const snapshot = fixture();
+    Object.assign(snapshot.project_workspaces[1]!, {
+      availability: "unavailable",
+      observed_at: null,
+      branch: null,
+      head: null,
+      detached: false,
+    });
+
+    render(WorkbenchView, {
+      snapshot,
+      projectOverview: true,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(screen.getByText("Git identity unavailable")).toBeTruthy();
+    expect(screen.queryByText("Detached at unborn")).toBeNull();
   });
 
   it("opens the project overview from persistent project navigation", async () => {

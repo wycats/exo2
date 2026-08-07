@@ -345,15 +345,20 @@
   const taskAllowsPlanning = (task: WorkbenchTask): boolean =>
     ["pending", "in-progress"].includes(task.status);
 
-  const observedTime = (value: string): string => {
+  const observedTime = (value: string, includeDate = false): string => {
     const date = new Date(value);
     return Number.isNaN(date.valueOf())
       ? value
-      : new Intl.DateTimeFormat(undefined, {
-          hour: "numeric",
-          minute: "2-digit",
-          second: "2-digit",
-        }).format(date);
+      : new Intl.DateTimeFormat(
+          undefined,
+          includeDate
+            ? { dateStyle: "medium", timeStyle: "short" }
+            : {
+                hour: "numeric",
+                minute: "2-digit",
+                second: "2-digit",
+              },
+        ).format(date);
   };
 
   const completedTime = (value: string): string => {
@@ -402,8 +407,17 @@
 
   const workspaceGitLabel = (
     workspace: WorkbenchProjectWorkspaceSummary,
-  ): string =>
-    workspace.branch ?? `Detached at ${shortHead(workspace.head)}`;
+  ): string => {
+    if (workspace.branch) {
+      return workspace.branch;
+    }
+    if (workspace.head) {
+      return `Detached at ${shortHead(workspace.head)}`;
+    }
+    return workspace.availability === "unavailable"
+      ? "Git identity unavailable"
+      : "Unborn checkout";
+  };
 
   const workspaceCleanlinessLabel = (
     workspace: WorkbenchProjectWorkspaceSummary,
@@ -420,7 +434,8 @@
     if (!workspace.observed_at) {
       return "No live observation";
     }
-    return `${workspace.availability === "live" ? "Observed" : "Last observed"} ${observedTime(workspace.observed_at)}`;
+    const live = workspace.availability === "live";
+    return `${live ? "Observed" : "Last observed"} ${observedTime(workspace.observed_at, !live)}`;
   };
 
   const inspectionLabel = (

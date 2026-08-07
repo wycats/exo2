@@ -122,6 +122,18 @@ pub struct TaskLog {
     pub created_at: String,
 }
 
+fn bounded_task_log_from_row(row: &Row<'_>) -> exosuit_storage::rusqlite::Result<TaskLog> {
+    let message: Vec<u8> = row.get(1)?;
+    let valid_end = std::str::from_utf8(&message)
+        .map(|_| message.len())
+        .unwrap_or_else(|error| error.valid_up_to());
+    Ok(TaskLog {
+        kind: row.get(0)?,
+        message: String::from_utf8_lossy(&message[..valid_end]).into_owned(),
+        created_at: row.get(2)?,
+    })
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseDetailsTask {
@@ -691,15 +703,31 @@ impl SqliteLoader {
         let Some(active_phase_id) = self.resolve_active_phase_text_id(workspace_root)? else {
             return Ok(None);
         };
-        self.load_phase_details_impl(&active_phase_id)
+        self.load_phase_details_impl(&active_phase_id, None)
     }
 
     pub fn load_phase_details_by_id(&self, text_id: &str) -> Result<Option<PhaseDetailsData>> {
-        self.load_phase_details_impl(text_id)
+        self.load_phase_details_impl(text_id, None)
+    }
+
+    pub fn load_phase_details_by_id_with_bounded_progress(
+        &self,
+        text_id: &str,
+        max_progress_entries: usize,
+        max_progress_message_bytes: usize,
+    ) -> Result<Option<PhaseDetailsData>> {
+        self.load_phase_details_impl(
+            text_id,
+            Some((max_progress_entries, max_progress_message_bytes)),
+        )
     }
 
     /// Shared implementation: loads phase details for a specific phase.
-    fn load_phase_details_impl(&self, text_id: &str) -> Result<Option<PhaseDetailsData>> {
+    fn load_phase_details_impl(
+        &self,
+        text_id: &str,
+        progress_bounds: Option<(usize, usize)>,
+    ) -> Result<Option<PhaseDetailsData>> {
         let conn = self.db.connection();
 
         // Fetch phase + parent epoch (including epoch rowid and sort_key
@@ -817,6 +845,26 @@ impl SqliteLoader {
                  ORDER BY id",
             )
             .context("Failed to prepare task logs query")?;
+        let mut bounded_task_log_stmt = if progress_bounds.is_some() {
+            Some(
+                conn.prepare(
+                    "SELECT kind, message, created_at
+                     FROM (
+                         SELECT id, kind,
+                                substr(CAST(message AS BLOB), 1, ?2) AS message,
+                                created_at
+                         FROM task_logs
+                         WHERE task_id = ?1 AND kind = 'progress'
+                         ORDER BY id DESC
+                         LIMIT ?3
+                     )
+                     ORDER BY id",
+                )
+                .context("Failed to prepare bounded task progress query")?,
+            )
+        } else {
+            None
+        };
 
         let mut goals = Vec::with_capacity(goal_rows.len());
         for (
@@ -859,17 +907,40 @@ impl SqliteLoader {
                 task_completion_log,
             ) in task_rows
             {
-                let logs: Vec<TaskLog> = task_log_stmt
-                    .query_map([task_rowid], |row| {
-                        Ok(TaskLog {
-                            kind: row.get(0)?,
-                            message: row.get(1)?,
-                            created_at: row.get(2)?,
-                        })
-                    })
-                    .context("Failed to query task logs")?
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to read task logs")?;
+                let logs: Vec<TaskLog> =
+                    if let Some((max_progress_entries, max_progress_message_bytes)) =
+                        progress_bounds
+                    {
+                        let row_limit = i64::try_from(max_progress_entries.saturating_add(1))
+                            .unwrap_or(i64::MAX);
+                        // Keep enough trailing bytes to preserve the signal that a
+                        // multi-byte message exceeded the public byte budget.
+                        let byte_limit =
+                            i64::try_from(max_progress_message_bytes.saturating_add(4))
+                                .unwrap_or(i64::MAX);
+                        bounded_task_log_stmt
+                            .as_mut()
+                            .expect("bounded progress statement is prepared")
+                            .query_map(
+                                exosuit_storage::params![task_rowid, byte_limit, row_limit],
+                                bounded_task_log_from_row,
+                            )
+                            .context("Failed to query bounded task progress")?
+                            .collect::<Result<Vec<_>, _>>()
+                            .context("Failed to read bounded task progress")?
+                    } else {
+                        task_log_stmt
+                            .query_map([task_rowid], |row| {
+                                Ok(TaskLog {
+                                    kind: row.get(0)?,
+                                    message: row.get(1)?,
+                                    created_at: row.get(2)?,
+                                })
+                            })
+                            .context("Failed to query task logs")?
+                            .collect::<Result<Vec<_>, _>>()
+                            .context("Failed to read task logs")?
+                    };
 
                 tasks.push(PhaseDetailsTask {
                     id: task_id,

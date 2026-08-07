@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::api::protocol::{Effect, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
-use crate::context::SqliteWriter;
+use crate::context::{SqliteLoader, SqliteWriter};
 use serde_json::{Value as JsonValue, json};
 #[cfg(feature = "ui")]
 use std::collections::HashMap;
@@ -1699,6 +1699,9 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_inspection_projects_bounded_history_without_changing_focus() {
+    const MAX_PROGRESS_ENTRIES: usize = 8;
+    const MAX_PROGRESS_BYTES: usize = 16 * 1024;
+
     let fixture = fixture();
     let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
     let epoch = writer
@@ -1736,13 +1739,22 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
             &format!("Private note from {}", fixture.root.display()),
         )
         .expect("add private note");
+    for index in 0..10 {
+        writer
+            .add_task_log(
+                "historical-task",
+                "progress",
+                &format!("Historical progress update {index}."),
+            )
+            .expect("add progress");
+    }
     writer
         .add_task_log(
             "historical-task",
             "progress",
-            "Validated the historical browser flow.",
+            &"x".repeat(MAX_PROGRESS_BYTES + 128),
         )
-        .expect("add progress");
+        .expect("add oversized progress");
     writer
         .complete_task("historical-task", "The task landed cleanly.")
         .expect("complete task");
@@ -1763,6 +1775,25 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
         .update_phase_status(&phase, "completed")
         .expect("complete phase");
     drop(writer);
+
+    let loader = SqliteLoader::open(fixture.project.db_path()).expect("open project loader");
+    let bounded_details = loader
+        .load_phase_details_by_id_with_bounded_progress(
+            &phase,
+            MAX_PROGRESS_ENTRIES,
+            MAX_PROGRESS_BYTES,
+        )
+        .expect("load bounded inspection details")
+        .expect("bounded phase details");
+    let bounded_logs = &bounded_details.goals[0].tasks[0].logs;
+    assert_eq!(bounded_logs.len(), MAX_PROGRESS_ENTRIES + 1);
+    assert!(bounded_logs.iter().all(|log| log.kind == "progress"));
+    assert!(
+        bounded_logs
+            .iter()
+            .all(|log| log.message.len() <= MAX_PROGRESS_BYTES + 4)
+    );
+    drop(loader);
 
     let manager = test_manager(Arc::clone(&fixture.project));
     let before = manager
@@ -1791,9 +1822,10 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
     );
     assert_eq!(inspection.phase.goals[0].tasks[0].progress.len(), 1);
     assert_eq!(
-        inspection.phase.goals[0].tasks[0].progress[0].message,
-        "Validated the historical browser flow."
+        inspection.phase.goals[0].tasks[0].progress[0].message.len(),
+        MAX_PROGRESS_BYTES
     );
+    assert!(inspection.phase.goals[0].tasks[0].progress_truncated);
     assert_eq!(before.focused_lane, after.focused_lane);
 
     let serialized = serde_json::to_string(&inspection).expect("serialize inspection");

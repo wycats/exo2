@@ -406,6 +406,81 @@ describe("cockpit page", () => {
     });
   });
 
+  it("restores a popped lane selection after session recovery", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const renewal = deferred<Response>();
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.revision = 8;
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Recovered history lane",
+      state: "prepared",
+      phase_id: "phase-history",
+      phase_title: "Historical delivery",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    let snapshotReads = 0;
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      snapshotReads += 1;
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      if (snapshotReads === 2) {
+        return new Response(
+          JSON.stringify({
+            kind: "workbench.session_invalid",
+            ok: false,
+            message: "The workbench session is invalid",
+          }),
+          { status: 401 },
+        );
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : { ...snapshot, revision: snapshotReads === 1 ? 7 : 8 };
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+    window.dispatchEvent(
+      new PopStateEvent("popstate", {
+        state: {
+          exoWorkbenchSessionKey: "session-selector",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      }),
+    );
+
+    renewal.resolve(sessionResponse("session-selector"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Recovered history lane" }),
+    ).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "snapshot", "snapshot", "lane_inspect"]);
+  });
+
   it("enters recovery immediately when a live refresh returns an unreadable response", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const renewal = deferred<Response>();
@@ -1317,7 +1392,7 @@ describe("cockpit page", () => {
         inspectedLaneIds.push(request.operation.lane_id);
         if (request.operation.lane_id === "lane-b") {
           laneBAttempts += 1;
-          if (laneBAttempts === 1) {
+          if (laneBAttempts <= 2) {
             return new Response(
               JSON.stringify({
                 protocol_version: 1,
@@ -1359,12 +1434,17 @@ describe("cockpit page", () => {
       screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
     );
     await screen.findByText("Lane B is temporarily unavailable");
+    snapshot.revision += 1;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await waitFor(() => expect(laneBAttempts).toBe(2));
     await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(
       await screen.findByRole("heading", { name: "Lane B" }),
     ).toBeTruthy();
-    expect(inspectedLaneIds).toEqual(["lane-a", "lane-b", "lane-b"]);
+    expect(inspectedLaneIds).toEqual(["lane-a", "lane-b", "lane-b", "lane-b"]);
     expect(
       workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
     ).toBe("lane-b");

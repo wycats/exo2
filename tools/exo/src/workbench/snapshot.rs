@@ -153,7 +153,11 @@ pub(super) fn inspect_with_git(
     let phase = phase_for_id(&plan, &lane.execution_phase_id)
         .ok_or_else(|| anyhow::anyhow!("workbench lane references a missing phase"))?;
     let details = loader
-        .load_phase_details_by_id(&phase.id)?
+        .load_phase_details_by_id_with_bounded_progress(
+            &phase.id,
+            MAX_TASK_PROGRESS_ENTRIES,
+            MAX_TASK_PROGRESS_BYTES,
+        )?
         .ok_or_else(|| anyhow::anyhow!("lane phase details are missing"))?;
     let relationship = match phase.status.as_str() {
         "in-progress" if summary.focused_here => "focused_here",

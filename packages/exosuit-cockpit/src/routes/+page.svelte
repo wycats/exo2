@@ -502,7 +502,12 @@
       } else {
         const laneId = inspectedLaneFromHistory(event.state);
         if (laneId) {
-          void inspectLane(laneId, "none", true, true);
+          if (sessionRecovery === "connected") {
+            void inspectLane(laneId, "none", true, true);
+          } else {
+            pendingRestoredLaneId = laneId;
+            projectOverview = false;
+          }
         } else if (projectOverviewFromHistory(event.state)) {
           openProjectOverview("none");
         } else {
@@ -614,6 +619,8 @@
     const previousInspection = inspection;
     const requestedLaneId = inspectionRequestedLaneId;
     const requestedHistoryMode = inspectionRequestedHistoryMode;
+    const retryLaneId = inspectionRetryLaneId;
+    const retryHistoryMode = inspectionRetryHistoryMode;
     const snapshotChanged =
       previousSnapshot === null ||
       previousSnapshot.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
@@ -679,6 +686,8 @@
         if (snapshotChanged) {
           void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
         }
+      } else if (retryLaneId && snapshotChanged) {
+        void inspectLane(retryLaneId, retryHistoryMode, true, true);
       } else if (
         previousInspection &&
         (previousInspection.daemon.instance_id !==
@@ -730,6 +739,7 @@
     inspectionRetryHistoryMode = "none";
     inspectionRequestedLaneId = null;
     inspectionRequestedHistoryMode = "none";
+    pendingRestoredLaneId = null;
     projectOverview = false;
     if (mode !== "none") {
       writeInspectionHistory(null, mode);
@@ -747,6 +757,7 @@
     inspectionRetryHistoryMode = "none";
     inspectionRequestedLaneId = null;
     inspectionRequestedHistoryMode = "none";
+    pendingRestoredLaneId = null;
     projectOverview = true;
     if (mode === "none") {
       return;
