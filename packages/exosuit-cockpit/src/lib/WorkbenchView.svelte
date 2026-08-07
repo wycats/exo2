@@ -11,15 +11,18 @@
     CircleDashed,
     CircleDot,
     CirclePlay,
+    Clock3,
     ClipboardCheck,
     Compass,
     GitBranch,
     GitCommitHorizontal,
     Info,
     Layers3,
+    LayoutDashboard,
     ListTodo,
     LoaderCircle,
     MessageSquareText,
+    Monitor,
     PanelLeft,
     Pencil,
     Plus,
@@ -39,8 +42,10 @@
     type WorkbenchDiagnostic,
     type WorkbenchGoal,
     type WorkbenchLaneSummary,
+    type WorkbenchLaneInspection,
     type WorkbenchPlanningBinding,
     type WorkbenchPlanningOperation,
+    type WorkbenchProjectWorkspaceSummary,
     type WorkbenchSnapshot,
     type WorkbenchTask,
     type WorkbenchTaskCompletionReview,
@@ -48,6 +53,10 @@
 
   interface Props {
     snapshot: WorkbenchSnapshot;
+    inspection?: WorkbenchLaneInspection | null;
+    inspectionLoading?: boolean;
+    inspectionFailure?: string | null;
+    projectOverview?: boolean;
     refreshing?: boolean;
     streamConnected?: boolean;
     sessionRecovery?:
@@ -68,6 +77,11 @@
     planningEditorRebindToken?: number;
     pendingPlanningKind?: WorkbenchPlanningOperation["kind"] | null;
     completionReview?: WorkbenchTaskCompletionReview | null;
+    onInspect?: (laneId: string) => void;
+    onOpenProject?: () => void;
+    onCloseProject?: () => void;
+    onCloseInspection?: () => void;
+    onRetryInspection?: (() => void) | null;
     onFocus: (laneId: string) => void;
     onRetryFocus?: (() => void) | null;
     onRetryPlanning?: (() => void) | null;
@@ -83,6 +97,10 @@
 
   let {
     snapshot,
+    inspection = null,
+    inspectionLoading = false,
+    inspectionFailure = null,
+    projectOverview = false,
     refreshing = false,
     streamConnected = false,
     sessionRecovery = "connected",
@@ -96,6 +114,11 @@
     planningEditorRebindToken = 0,
     pendingPlanningKind = null,
     completionReview = null,
+    onInspect = () => {},
+    onOpenProject = () => {},
+    onCloseProject = () => {},
+    onCloseInspection = () => {},
+    onRetryInspection = null,
     onFocus,
     onRetryFocus = null,
     onRetryPlanning = null,
@@ -138,6 +161,14 @@
       (lane) => lane.phase_id === nextPhase.id && lane.state === "prepared",
     );
   });
+  let liveProjectWorkspaces = $derived(
+    snapshot.project_workspaces.filter(
+      (workspace) => workspace.availability === "live",
+    ).length,
+  );
+  let nonLiveProjectWorkspaces = $derived(
+    snapshot.project_workspaces.length - liveProjectWorkspaces,
+  );
   let planningBusy = $derived(
     pendingPlanningKind !== null || onRetryPlanning !== null,
   );
@@ -349,12 +380,77 @@
       return `Focusing ${lane.title}`;
     }
     if (lane.focused_here) {
-      return `${lane.title}, focused`;
+      return inspection
+        ? `Return to current work in ${lane.title}`
+        : `${lane.title}, focused`;
     }
-    if (!lanePhaseActive(lane)) {
-      return `${lane.title}, phase ${displayStatus(lane.phase_status)}`;
+    return `Inspect ${lane.title}, phase ${displayStatus(lane.phase_status)}`;
+  };
+
+  const workspaceAvailabilityLabel = (
+    workspace: WorkbenchProjectWorkspaceSummary,
+  ): string => {
+    switch (workspace.availability) {
+      case "live":
+        return "Live";
+      case "stale":
+        return "Stale";
+      case "unavailable":
+        return "Unavailable";
     }
-    return `Focus ${lane.title}`;
+  };
+
+  const workspaceGitLabel = (
+    workspace: WorkbenchProjectWorkspaceSummary,
+  ): string =>
+    workspace.branch ?? `Detached at ${shortHead(workspace.head)}`;
+
+  const workspaceCleanlinessLabel = (
+    workspace: WorkbenchProjectWorkspaceSummary,
+  ): string => {
+    if (workspace.dirty === null) {
+      return "Cleanliness unknown";
+    }
+    return workspace.dirty ? "Modified" : "Clean";
+  };
+
+  const workspaceObservationLabel = (
+    workspace: WorkbenchProjectWorkspaceSummary,
+  ): string => {
+    if (!workspace.observed_at) {
+      return "No live observation";
+    }
+    return `${workspace.availability === "live" ? "Observed" : "Last observed"} ${observedTime(workspace.observed_at)}`;
+  };
+
+  const inspectionLabel = (
+    relationship: WorkbenchLaneInspection["relationship"],
+  ): string => {
+    switch (relationship) {
+      case "focused_here":
+        return "Current work";
+      case "focusable_here":
+        return "Available lane";
+      case "prepared":
+        return "Future plan";
+      case "historical":
+        return "Project history";
+    }
+  };
+
+  const inspectionContext = (
+    relationship: WorkbenchLaneInspection["relationship"],
+  ): string => {
+    switch (relationship) {
+      case "focused_here":
+        return "This is the current execution stream for this workspace.";
+      case "focusable_here":
+        return "You are reviewing another active lane. Workspace focus has not changed.";
+      case "prepared":
+        return "You are reviewing a prepared plan. Workspace focus has not changed.";
+      case "historical":
+        return "You are reviewing completed project history. Workspace focus has not changed.";
+    }
   };
 
   const goalProgressLabel = (goal: WorkbenchGoal): string => {
@@ -428,13 +524,52 @@
     if (laneRail?.matches(":popover-open")) {
       laneRail.hidePopover();
     }
-    onFocus(laneId);
+    onInspect(laneId);
   }
 
-  function toggleNavigationFallback(event: MouseEvent): void {
-    const button = event.currentTarget as HTMLButtonElement;
-    if (!("commandForElement" in button)) {
-      laneRail?.togglePopover();
+  function selectWorkspaceLane(
+    workspace: WorkbenchProjectWorkspaceSummary,
+  ): void {
+    if (workspace.focused_lane) {
+      selectLane(workspace.focused_lane.id);
+    }
+  }
+
+  function selectProjectOverview(): void {
+    if (laneRail?.matches(":popover-open")) {
+      laneRail.hidePopover();
+    }
+    onOpenProject();
+  }
+
+  const supportsCommandInvoker = (): boolean =>
+    typeof HTMLButtonElement !== "undefined" &&
+    "commandForElement" in HTMLButtonElement.prototype;
+
+  function toggleNavigationFallback(): void {
+    if (!compactNavigation || supportsCommandInvoker()) {
+      return;
+    }
+    const wasOpen = laneRail?.matches(":popover-open") ?? false;
+    requestAnimationFrame(() => {
+      if (!compactNavigation || !laneRail?.isConnected) {
+        return;
+      }
+      const isOpen = laneRail.matches(":popover-open");
+      if (wasOpen && isOpen) {
+        laneRail.hidePopover();
+      } else if (!wasOpen && !isOpen) {
+        laneRail.showPopover();
+      }
+    });
+  }
+
+  function closeNavigationFallback(): void {
+    if (supportsCommandInvoker()) {
+      return;
+    }
+    if (laneRail?.matches(":popover-open")) {
+      laneRail.hidePopover();
     }
   }
 
@@ -624,8 +759,8 @@
       <button
         class="icon-button lane-invoker"
         type="button"
-        title="Open project lanes"
-        aria-label="Open project lanes"
+        title="Open project navigation"
+        aria-label="Open project navigation"
         commandfor="lane-navigation"
         command="toggle-popover"
         onclick={toggleNavigationFallback}
@@ -709,34 +844,75 @@
     </div>
   {/if}
 
+  {#if inspectionFailure}
+    <div class="failure-banner inspection-failure" role="alert">
+      <Info size={18} aria-hidden="true" />
+      <span><strong>Lane view unavailable.</strong> {inspectionFailure}</span>
+      {#if onRetryInspection}
+        <button type="button" onclick={onRetryInspection}>Retry</button>
+      {/if}
+    </div>
+  {/if}
+
+  {#if inspectionLoading}
+    <div class="inspection-loading" role="status">
+      <LoaderCircle class="spin" size={16} aria-hidden="true" />
+      Opening the selected lane…
+    </div>
+  {/if}
+
   <div class:has-coordination={hasCoordination} class="workspace-grid">
     <aside
       bind:this={laneRail}
       class="lane-rail"
       id="lane-navigation"
-      aria-label="Project lanes"
+      aria-label="Project navigation"
       popover={compactNavigation ? "auto" : undefined}
     >
       <div class="rail-heading">
         <div>
           <span class="section-kicker">Project</span>
-          <h2>Lanes</h2>
+          <h2>Navigate</h2>
         </div>
         <div class="rail-heading-actions">
-          <span class="count" aria-label={`${snapshot.lanes.length} lanes`}>
-            {snapshot.lanes.length}
+          <span class="count" aria-label={`${snapshot.project_workspaces.length} workspaces`}>
+            {snapshot.project_workspaces.length}
           </span>
           <button
             class="icon-button rail-close"
             type="button"
-            title="Close project lanes"
-            aria-label="Close project lanes"
+            title="Close project navigation"
+            aria-label="Close project navigation"
             commandfor="lane-navigation"
             command="hide-popover"
+            onclick={closeNavigationFallback}
           >
             <X size={16} aria-hidden="true" />
           </button>
         </div>
+      </div>
+
+      <button
+        class:selected={projectOverview}
+        class="project-row"
+        type="button"
+        aria-current={projectOverview ? "page" : undefined}
+        aria-label="Open project workspace overview"
+        disabled={interactionDisabled}
+        onclick={selectProjectOverview}
+      >
+        <span class="project-row-icon" aria-hidden="true">
+          <LayoutDashboard size={17} />
+        </span>
+        <span class="lane-copy">
+          <strong>Workspaces</strong>
+          <span>{quantity(snapshot.project_workspaces.length, "Git worktree")}</span>
+        </span>
+      </button>
+
+      <div class="rail-subheading">
+        <span>Lanes</span>
+        <span>{snapshot.lanes.length}</span>
       </div>
 
       {#if snapshot.lanes.length === 0}
@@ -749,17 +925,17 @@
           {#each snapshot.lanes as lane (lane.id)}
             <button
               class:focused={lane.focused_here}
+              class:selected={inspection?.lane.id === lane.id ||
+                (!inspection && !projectOverview && lane.focused_here)}
               class="lane-row"
               type="button"
-              aria-current={lane.focused_here ? "page" : undefined}
-              aria-label={laneTitle(lane)}
-              title={!lanePhaseActive(lane)
-                ? "This lane’s phase is not active"
+              aria-current={inspection?.lane.id === lane.id ||
+              (!inspection && !projectOverview && lane.focused_here)
+                ? "page"
                 : undefined}
+              aria-label={laneTitle(lane)}
               disabled={interactionDisabled ||
-                pendingLaneId !== null ||
-                lane.focused_here ||
-                !lanePhaseActive(lane)}
+                pendingLaneId !== null}
               onclick={() => selectLane(lane.id)}
             >
               <span class="lane-state" aria-hidden="true">
@@ -793,6 +969,249 @@
     </aside>
 
     <main class="main-surface">
+      {#if inspection}
+        <section class="inspection-band" aria-labelledby="inspection-lane-title">
+          <div class="inspection-heading">
+            <div>
+              <span class="section-kicker">{inspectionLabel(inspection.relationship)}</span>
+              <span class={`status-label ${statusTone(inspection.lane.phase_status)}`}>
+                {statusLabel(inspection.lane.phase_status)}
+              </span>
+            </div>
+            <button
+              class="secondary-button"
+              type="button"
+              onclick={onCloseInspection}
+            >
+              <X size={15} aria-hidden="true" />
+              Back to current work
+            </button>
+          </div>
+          <h1 id="inspection-lane-title">{inspection.lane.title}</h1>
+          <p class="lane-intent">{inspection.lane.intent}</p>
+          <div class="lane-context">
+            <span><Activity size={15} aria-hidden="true" />{inspection.phase.title}</span>
+            <span><Route size={15} aria-hidden="true" />Read-only lane view</span>
+          </div>
+          <div class="inspection-context" role="status">
+            <Info size={17} aria-hidden="true" />
+            <span>{inspectionContext(inspection.relationship)}</span>
+            {#if inspection.can_focus_here}
+              <button
+                class="primary-button"
+                type="button"
+                disabled={pendingLaneId !== null || interactionDisabled}
+                onclick={() => onFocus(inspection.lane.id)}
+              >
+                {#if pendingLaneId === inspection.lane.id}
+                  <LoaderCircle class="spin" size={15} aria-hidden="true" />
+                  Focusing
+                {:else}
+                  <Target size={15} aria-hidden="true" />
+                  Focus in this workspace
+                {/if}
+              </button>
+            {/if}
+          </div>
+        </section>
+
+        <section class="inspection-plan" aria-labelledby="inspection-phase-title">
+          <div class="section-heading">
+            <div>
+              <span class="section-kicker">Lane plan</span>
+              <h2 id="inspection-phase-title">{inspection.phase.title}</h2>
+            </div>
+            <span class={`status-label ${statusTone(inspection.phase.status)}`}>
+              {statusLabel(inspection.phase.status)}
+            </span>
+          </div>
+
+          {#if inspection.phase.goals.length === 0}
+            <div class="inspection-empty">
+              <ListTodo size={19} aria-hidden="true" />
+              This lane does not have a recorded goal plan.
+            </div>
+          {:else}
+            <div class="inspection-goals">
+              {#each inspection.phase.goals as goal (goal.id)}
+                <article class="inspection-goal">
+                  <div class="inspection-goal-heading">
+                    <span class="goal-mark" aria-hidden="true">
+                      {#if statusTone(goal.status) === "complete"}
+                        <CheckCircle2 size={19} />
+                      {:else if statusTone(goal.status) === "active"}
+                        <CircleDot size={19} />
+                      {:else}
+                        <Circle size={19} />
+                      {/if}
+                    </span>
+                    <div>
+                      <h3>{goal.title}</h3>
+                      <span class="inspection-status">{goalProgressLabel(goal)}</span>
+                    </div>
+                  </div>
+                  {#if goal.outcome}
+                    <div class="inspection-outcome">
+                      <span>Recorded outcome{goal.outcome_truncated ? " (excerpt)" : ""}</span>
+                      <p>{goal.outcome}</p>
+                    </div>
+                  {/if}
+                  {#if goal.tasks.length > 0}
+                    <ul class="inspection-task-list">
+                      {#each goal.tasks as task (task.id)}
+                        <li>
+                          <div class="inspection-task-heading">
+                            <span aria-hidden="true">
+                              {#if statusTone(task.status) === "complete"}
+                                <Check size={16} />
+                              {:else if statusTone(task.status) === "active"}
+                                <CircleDot size={16} />
+                              {:else}
+                                <Circle size={16} />
+                              {/if}
+                            </span>
+                            <strong>{task.title}</strong>
+                            <span>{statusLabel(task.status)}</span>
+                          </div>
+                          {#if task.outcome}
+                            <p class="inspection-task-outcome">
+                              {task.outcome}{task.outcome_truncated ? " …" : ""}
+                            </p>
+                          {/if}
+                          {#if task.progress && task.progress.length > 0}
+                            <details class="inspection-progress">
+                              <summary>
+                                {progressSummary(task.progress.length, task.progress_truncated)}
+                              </summary>
+                              <ol>
+                                {#each task.progress as update (`${update.created_at}-${update.message}`)}
+                                  <li>
+                                    <time datetime={update.created_at}>{completedTime(update.created_at)}</time>
+                                    <p>{update.message}</p>
+                                  </li>
+                                {/each}
+                              </ol>
+                            </details>
+                          {/if}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </article>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {:else if projectOverview}
+        <section class="project-dashboard" aria-labelledby="project-dashboard-title">
+          <header class="project-dashboard-intro">
+            <div class="project-dashboard-heading">
+              <div>
+                <span class="section-kicker">Project overview</span>
+                <h1 id="project-dashboard-title">Workspaces</h1>
+              </div>
+              <button
+                class="secondary-button"
+                type="button"
+                onclick={onCloseProject}
+              >
+                <Target size={15} aria-hidden="true" />
+                {snapshot.focused_lane ? "Current work" : "Workspace context"}
+              </button>
+            </div>
+            <p>
+              Known Git worktrees and the execution stream most recently observed in each.
+            </p>
+            <dl class="project-dashboard-summary">
+              <div>
+                <dt>Workspaces</dt>
+                <dd>{snapshot.project_workspaces.length}</dd>
+              </div>
+              <div>
+                <dt>Live</dt>
+                <dd>{liveProjectWorkspaces}</dd>
+              </div>
+              <div>
+                <dt>Not live</dt>
+                <dd>{nonLiveProjectWorkspaces}</dd>
+              </div>
+            </dl>
+          </header>
+
+          <div class="workspace-directory">
+            <div class="workspace-directory-heading">
+              <div>
+                <span class="section-kicker">Project views</span>
+                <h2>Known workspaces</h2>
+              </div>
+              <span>{quantity(snapshot.project_workspaces.length, "workspace")}</span>
+            </div>
+
+            <div class="workspace-list" role="list" aria-label="Project workspaces">
+              {#each snapshot.project_workspaces as workspace (workspace.key)}
+                <article
+                  class:current={workspace.current}
+                  class={`workspace-face ${workspace.availability}`}
+                  role="listitem"
+                >
+                  <div class="workspace-face-heading">
+                    <span class="workspace-face-icon" aria-hidden="true">
+                      <Monitor size={18} />
+                    </span>
+                    <div>
+                      <h3>{workspace.label}</h3>
+                      <p>{workspaceGitLabel(workspace)}</p>
+                    </div>
+                    <div class="workspace-face-labels">
+                      {#if workspace.current}
+                        <span class="workspace-current">This workspace</span>
+                      {/if}
+                      <span class={`workspace-availability ${workspace.availability}`}>
+                        {workspaceAvailabilityLabel(workspace)}
+                      </span>
+                    </div>
+                  </div>
+
+                  <dl class="workspace-facts">
+                    <div>
+                      <dt>Current work</dt>
+                      <dd>
+                        {#if workspace.focused_lane}
+                          <button
+                            class="workspace-lane-link"
+                            type="button"
+                            onclick={() => selectWorkspaceLane(workspace)}
+                          >
+                            <Target size={14} aria-hidden="true" />
+                            {workspace.focused_lane.title}
+                          </button>
+                        {:else}
+                          <span>No lane focused</span>
+                        {/if}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Phase</dt>
+                      <dd>{workspace.active_phase?.title ?? "No active phase"}</dd>
+                    </div>
+                    <div>
+                      <dt>Git state</dt>
+                      <dd>{workspaceCleanlinessLabel(workspace)}</dd>
+                    </div>
+                    <div>
+                      <dt>Freshness</dt>
+                      <dd>
+                        <Clock3 size={13} aria-hidden="true" />
+                        {workspaceObservationLabel(workspace)}
+                      </dd>
+                    </div>
+                  </dl>
+                </article>
+              {/each}
+            </div>
+          </div>
+        </section>
+      {:else}
       {#if snapshot.focused_lane}
         <section class="intent-band" aria-labelledby="lane-title">
           <div class="intent-heading">
@@ -1402,6 +1821,7 @@
           {/if}
         </section>
       {/if}
+      {/if}
     </main>
 
     {#if hasCoordination}
@@ -1699,6 +2119,24 @@
     color: #7a5213;
   }
 
+  .failure-banner.inspection-failure {
+    border-bottom-color: #c8d1cf;
+    background: var(--surface-quiet);
+    color: #3f4b49;
+  }
+
+  .inspection-loading {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 0.76rem;
+  }
+
   .failure-banner button {
     border: 1px solid #ce858a;
     border-radius: 5px;
@@ -1820,6 +2258,56 @@
     gap: 4px;
   }
 
+  .project-row {
+    width: 100%;
+    min-height: 52px;
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    align-items: center;
+    gap: 9px;
+    padding: 8px 9px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--ink);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .project-row:hover:not(:disabled),
+  .project-row.selected {
+    border-color: var(--line-strong);
+    background: var(--surface-quiet);
+  }
+
+  .project-row:disabled {
+    cursor: default;
+    opacity: 0.58;
+  }
+
+  .project-row-icon {
+    color: var(--blue);
+  }
+
+  .rail-subheading {
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 10px 7px 2px;
+    padding-top: 9px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.64rem;
+    font-weight: 750;
+    text-transform: uppercase;
+  }
+
+  .rail-subheading > span:last-child {
+    font-variant-numeric: tabular-nums;
+  }
+
   .lane-row {
     width: 100%;
     min-height: 58px;
@@ -1841,9 +2329,9 @@
     background: var(--surface-soft);
   }
 
-  .lane-row.focused {
-    border-color: #a9c9c2;
-    background: var(--teal-soft);
+  .lane-row.selected {
+    border-color: var(--line-strong);
+    background: var(--surface-quiet);
   }
 
   .lane-row:disabled {
@@ -1908,12 +2396,257 @@
   .main-surface {
     min-width: 0;
     background: var(--surface-soft);
+    container-type: inline-size;
   }
 
-  .intent-band {
+  .project-dashboard {
+    min-height: 100%;
+    background: var(--surface);
+  }
+
+  .project-dashboard-intro {
+    padding: 32px clamp(24px, 5vw, 64px) 26px;
+    border-bottom: 1px solid var(--line-strong);
+    background: var(--surface-soft);
+  }
+
+  .project-dashboard-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 18px;
+  }
+
+  .project-dashboard-heading h1 {
+    margin-top: 7px;
+    font-size: clamp(1.7rem, 3vw, 2.35rem);
+    line-height: 1.1;
+    text-wrap: balance;
+  }
+
+  .project-dashboard-intro > p {
+    max-width: 680px;
+    margin-top: 11px;
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .project-dashboard-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 28px;
+    margin: 22px 0 0;
+  }
+
+  .project-dashboard-summary > div {
+    min-width: 76px;
+  }
+
+  .project-dashboard-summary dt,
+  .workspace-facts dt {
+    color: var(--muted);
+    font-size: 0.62rem;
+    font-weight: 750;
+    text-transform: uppercase;
+  }
+
+  .project-dashboard-summary dd {
+    margin: 3px 0 0;
+    font-size: 1.15rem;
+    font-weight: 760;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .workspace-directory {
+    padding: 28px clamp(24px, 5vw, 64px) 52px;
+  }
+
+  .workspace-directory-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 13px;
+    border-bottom: 1px solid var(--line-strong);
+  }
+
+  .workspace-directory-heading h2 {
+    margin-top: 3px;
+    font-size: 1.1rem;
+  }
+
+  .workspace-directory-heading > span {
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+
+  .workspace-list {
+    display: grid;
+  }
+
+  .workspace-face {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(220px, 0.85fr) minmax(360px, 1.15fr);
+    gap: clamp(24px, 4vw, 56px);
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .workspace-face.current {
+    box-shadow: inset 3px 0 var(--teal);
+    padding-left: 14px;
+  }
+
+  .workspace-face-heading {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    align-content: start;
+    gap: 2px 10px;
+  }
+
+  .workspace-face-icon {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    grid-row: 1 / span 2;
+    place-items: center;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface-soft);
+    color: var(--muted);
+  }
+
+  .workspace-face.current .workspace-face-icon {
+    border-color: #a9c9c2;
+    background: var(--teal-soft);
+    color: var(--teal);
+  }
+
+  .workspace-face-heading h3 {
+    overflow: hidden;
+    font-size: 0.9rem;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-face-heading p {
+    overflow: hidden;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 0.7rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-face-labels {
+    grid-column: 2;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+  }
+
+  .workspace-current,
+  .workspace-availability {
+    display: inline-flex;
+    width: fit-content;
+    align-items: center;
+    border-radius: 4px;
+    padding: 3px 6px;
+    background: var(--surface-quiet);
+    color: var(--muted);
+    font-size: 0.61rem;
+    font-weight: 750;
+  }
+
+  .workspace-current,
+  .workspace-availability.live {
+    background: var(--teal-soft);
+    color: var(--teal);
+  }
+
+  .workspace-availability.stale {
+    background: var(--amber-soft);
+    color: var(--amber);
+  }
+
+  .workspace-availability.unavailable {
+    background: var(--red-soft);
+    color: var(--red);
+  }
+
+  .workspace-facts {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 17px 24px;
+    margin: 0;
+  }
+
+  .workspace-facts > div {
+    min-width: 0;
+  }
+
+  .workspace-facts dd {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    overflow: hidden;
+    margin: 5px 0 0;
+    color: #34413f;
+    font-size: 0.74rem;
+    line-height: 1.4;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-lane-link {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    overflow: hidden;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--blue);
+    font: inherit;
+    font-weight: 700;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .workspace-lane-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .intent-band,
+  .inspection-band {
     padding: 30px clamp(24px, 4vw, 54px);
     border-bottom: 1px solid var(--line);
     background: var(--surface);
+  }
+
+  .inspection-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+  }
+
+  .inspection-heading > div {
+    display: flex;
+    align-items: center;
+    gap: 9px;
   }
 
   .intent-heading {
@@ -1950,12 +2683,33 @@
     color: var(--amber);
   }
 
-  .intent-band h1 {
+  .intent-band h1,
+  .inspection-band h1 {
     margin-top: 12px;
     max-width: 820px;
     font-size: clamp(1.55rem, 2.3vw, 2.15rem);
     line-height: 1.12;
     text-wrap: balance;
+  }
+
+  .inspection-context {
+    max-width: 820px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 22px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+
+  .inspection-context > span {
+    flex: 1;
+  }
+
+  .inspection-context .primary-button {
+    flex: none;
   }
 
   .lane-intent {
@@ -1976,8 +2730,134 @@
     font-size: 0.76rem;
   }
 
-  .plan-section {
+  .plan-section,
+  .inspection-plan {
     padding: 26px clamp(24px, 4vw, 54px) 48px;
+  }
+
+  .inspection-goals {
+    display: grid;
+  }
+
+  .inspection-goal {
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .inspection-goal-heading {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .inspection-goal-heading h3 {
+    font-size: 0.92rem;
+    line-height: 1.35;
+    text-wrap: pretty;
+  }
+
+  .inspection-status {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+
+  .inspection-outcome {
+    margin: 16px 0 4px 30px;
+    padding-left: 12px;
+    border-left: 2px solid #9fb7d2;
+  }
+
+  .inspection-outcome > span {
+    color: var(--blue);
+    font-size: 0.64rem;
+    font-weight: 750;
+    text-transform: uppercase;
+  }
+
+  .inspection-outcome p {
+    margin-top: 5px;
+    color: #34413f;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    text-wrap: pretty;
+  }
+
+  .inspection-task-list {
+    display: grid;
+    margin: 16px 0 0 30px;
+    padding: 0;
+    list-style: none;
+  }
+
+  .inspection-task-list > li {
+    padding: 11px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .inspection-task-heading {
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 8px;
+  }
+
+  .inspection-task-heading strong {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    text-wrap: pretty;
+  }
+
+  .inspection-task-heading > span:last-child {
+    color: var(--muted);
+    font-size: 0.68rem;
+  }
+
+  .inspection-task-outcome {
+    margin: 7px 0 0 26px;
+    color: #43504e;
+    font-size: 0.76rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .inspection-progress {
+    margin: 8px 0 0 26px;
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+
+  .inspection-progress summary {
+    cursor: pointer;
+    color: var(--blue);
+    font-weight: 700;
+  }
+
+  .inspection-progress ol {
+    display: grid;
+    gap: 10px;
+    margin: 10px 0 0;
+    padding-left: 18px;
+  }
+
+  .inspection-progress time {
+    font-size: 0.64rem;
+  }
+
+  .inspection-progress p {
+    margin-top: 2px;
+    color: #43504e;
+    line-height: 1.45;
+  }
+
+  .inspection-empty {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 24px 0;
+    color: var(--muted);
+    font-size: 0.8rem;
   }
 
   .section-heading {
@@ -2791,6 +3671,26 @@
     }
   }
 
+  @container (max-width: 720px) {
+    .workspace-face {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .workspace-facts {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .workspace-facts > div:first-child {
+      grid-column: 1 / -1;
+    }
+
+    .workspace-lane-link {
+      white-space: normal;
+      text-wrap: pretty;
+    }
+  }
+
   @media (max-width: 1120px) {
     .workspace-grid,
     .workspace-grid.has-coordination {
@@ -2907,11 +3807,37 @@
     }
 
     .intent-band,
+    .inspection-band,
+    .inspection-plan,
     .plan-section,
+    .project-dashboard-intro,
+    .workspace-directory,
     .trajectory-intro,
     .trajectory-stage {
       padding-right: 20px;
       padding-left: 20px;
+    }
+
+    .inspection-heading,
+    .inspection-context,
+    .project-dashboard-heading {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .workspace-face {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .workspace-facts {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 13px;
+    }
+
+    .inspection-task-list,
+    .inspection-outcome {
+      margin-left: 0;
     }
 
     .trajectory-stage {

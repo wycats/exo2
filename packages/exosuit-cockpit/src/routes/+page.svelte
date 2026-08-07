@@ -8,12 +8,17 @@
     Route,
     WifiOff,
   } from "@lucide/svelte";
+  import {
+    pushState as pushPageState,
+    replaceState as replacePageState,
+  } from "$app/navigation";
   import { onMount } from "svelte";
 
   import WorkbenchView from "$lib/WorkbenchView.svelte";
   import {
     workbenchPlanningBinding,
     type WorkbenchPlanningBinding,
+    type WorkbenchLaneInspection,
     type WorkbenchPlanningOperation,
     type WorkbenchPlanningRequest,
     type WorkbenchSnapshot,
@@ -26,6 +31,7 @@
     prepareWorkbenchTicketExchange,
     retainSessionSelector,
     sessionKeyFromHistory,
+    workbenchHistoryState,
     WorkbenchClient,
     WorkbenchClientError,
     type WorkbenchFailureKind,
@@ -49,6 +55,9 @@
     | "reload_required";
 
   const SESSION_RENEW_INTERVAL_MS = 5 * 60_000;
+  const INSPECTED_LANE_HISTORY_KEY = "exoWorkbenchInspectedLaneId";
+  const PROJECT_OVERVIEW_HISTORY_KEY = "exoWorkbenchProjectOverview";
+  const TAB_RESUME_STATE_KEY = "exoWorkbenchResumeState";
 
   interface FocusRequest {
     laneId: string;
@@ -71,8 +80,39 @@
     expectedPhaseId: string;
   }
 
+  function readTabResumeState(): Record<string, unknown> {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(TAB_RESUME_STATE_KEY) ?? "null");
+      return typeof value === "object" && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function retainTabResumeState(state: Record<string, unknown>): void {
+    try {
+      sessionStorage.setItem(TAB_RESUME_STATE_KEY, JSON.stringify(state));
+    } catch {
+      // History state remains the in-session navigation source of truth.
+    }
+  }
+
+  function clearTabResumeState(): void {
+    try {
+      sessionStorage.removeItem(TAB_RESUME_STATE_KEY);
+    } catch {
+      // A fresh launch still clears the retained selector from history state.
+    }
+  }
+
   let screen = $state<ScreenState>("loading");
   let snapshot = $state<WorkbenchSnapshot | null>(null);
+  let inspection = $state<WorkbenchLaneInspection | null>(null);
+  let inspectionLoading = $state(false);
+  let inspectionFailure = $state<string | null>(null);
+  let projectOverview = $state(false);
   let refreshing = $state(false);
   let streamConnected = $state(false);
   let pendingFocus = $state<FocusRequest | null>(null);
@@ -101,6 +141,7 @@
   let stopLiveUpdates: (() => void) | null = null;
   let beginSessionRecovery: (() => void) | null = null;
   let snapshotRefreshGeneration = 0;
+  let inspectionRequestGeneration = 0;
 
   onMount(() => {
     let events: EventSource | null = null;
@@ -310,6 +351,11 @@
       stopUpdates();
       client = null;
       snapshot = null;
+      inspection = null;
+      inspectionLoading = false;
+      inspectionFailure = null;
+      projectOverview = false;
+      inspectionRequestGeneration += 1;
       pendingFocus = null;
       retryFocus = null;
       ambiguousFocus = null;
@@ -340,21 +386,34 @@
       screenRetryable = false;
       retryBootstrap = null;
       try {
+        const resumeState =
+          !ticket && restoredSessionKey === undefined
+            ? readTabResumeState()
+            : {};
         let sessionKey =
           restoredSessionKey === undefined
-            ? sessionKeyFromHistory(history.state)
+            ? sessionKeyFromHistory(history.state) ??
+              sessionKeyFromHistory(resumeState)
             : restoredSessionKey;
         if (ticket || sessionKey !== client?.sessionKey) {
           resetClientState();
         }
         if (ticket) {
-          prepareWorkbenchTicketExchange(history, location);
+          clearTabResumeState();
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            prepareWorkbenchTicketExchange(history.state),
+          );
           const session = await exchangeWorkbenchTicket(ticket);
           if (!isCurrent()) {
             return;
           }
           sessionKey = session.session_key;
-          retainSessionSelector(history, location, sessionKey);
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            retainSessionSelector(history.state, sessionKey),
+          );
+          retainTabResumeState(workbenchHistoryState(history.state));
         }
         if (!isCurrent()) {
           return;
@@ -369,6 +428,16 @@
           await client.renewSession();
         }
         await refreshSnapshot(false);
+        const restoredLaneId =
+          inspectedLaneFromHistory(history.state) ??
+          inspectedLaneFromHistory(resumeState);
+        if (restoredLaneId) {
+          await inspectLane(restoredLaneId, "none");
+        } else {
+          projectOverview =
+            projectOverviewFromHistory(history.state) ||
+            projectOverviewFromHistory(resumeState);
+        }
       } catch (error) {
         if (isCurrent()) {
           if (
@@ -389,14 +458,27 @@
       }
     };
     const bootstrapRestoredSession = (event: PopStateEvent) => {
+      const restoredState = workbenchHistoryState(event.state);
+      if (sessionKeyFromHistory(restoredState)) {
+        retainTabResumeState(restoredState);
+      }
       const restoredSessionKey = sessionKeyFromHistory(event.state);
       if (restoredSessionKey !== client?.sessionKey) {
         void bootstrap(undefined, restoredSessionKey);
+      } else {
+        const laneId = inspectedLaneFromHistory(event.state);
+        if (laneId) {
+          void inspectLane(laneId, "none");
+        } else if (projectOverviewFromHistory(event.state)) {
+          openProjectOverview("none");
+        } else {
+          clearInspection("none");
+        }
       }
     };
     window.addEventListener("hashchange", bootstrapFreshTicket);
     window.addEventListener("popstate", bootstrapRestoredSession);
-    void bootstrap();
+    queueMicrotask(() => void bootstrap());
 
     return () => {
       bootstrapGeneration += 1;
@@ -494,6 +576,7 @@
   }
 
   function applySnapshot(nextSnapshot: WorkbenchSnapshot): void {
+    const previousInspection = inspection;
     snapshot = nextSnapshot;
     screen = "ready";
     screenMessage = null;
@@ -532,7 +615,166 @@
       planningEditorRebindPending = false;
       planningEditorRebindToken += 1;
     }
+    if (
+      previousInspection &&
+      (previousInspection.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
+        previousInspection.revision !== nextSnapshot.revision)
+    ) {
+      void inspectLane(previousInspection.lane.id, "none");
+    }
     startLiveUpdates?.();
+  }
+
+  type InspectionHistoryMode = "push" | "replace" | "none";
+
+  function inspectedLaneFromHistory(state: unknown): string | null {
+    const laneId = workbenchHistoryState(state)[INSPECTED_LANE_HISTORY_KEY];
+    return typeof laneId === "string" && laneId.length > 0 ? laneId : null;
+  }
+
+  function projectOverviewFromHistory(state: unknown): boolean {
+    return workbenchHistoryState(state)[PROJECT_OVERVIEW_HISTORY_KEY] === true;
+  }
+
+  function writeInspectionHistory(
+    laneId: string | null,
+    mode: Exclude<InspectionHistoryMode, "none">,
+  ): void {
+    const nextState = { ...workbenchHistoryState(history.state) };
+    if (laneId) {
+      nextState[INSPECTED_LANE_HISTORY_KEY] = laneId;
+    } else {
+      delete nextState[INSPECTED_LANE_HISTORY_KEY];
+    }
+    delete nextState[PROJECT_OVERVIEW_HISTORY_KEY];
+    if (mode === "push") {
+      pushPageState("", nextState);
+    } else {
+      replacePageState("", nextState);
+    }
+    retainTabResumeState(nextState);
+  }
+
+  function clearInspection(mode: InspectionHistoryMode = "push"): void {
+    inspectionRequestGeneration += 1;
+    inspection = null;
+    inspectionLoading = false;
+    inspectionFailure = null;
+    projectOverview = false;
+    if (mode !== "none") {
+      writeInspectionHistory(null, mode);
+    }
+  }
+
+  function openProjectOverview(
+    mode: InspectionHistoryMode = "push",
+  ): void {
+    inspectionRequestGeneration += 1;
+    inspection = null;
+    inspectionLoading = false;
+    inspectionFailure = null;
+    projectOverview = true;
+    if (mode === "none") {
+      return;
+    }
+    const nextState = { ...workbenchHistoryState(history.state) };
+    delete nextState[INSPECTED_LANE_HISTORY_KEY];
+    nextState[PROJECT_OVERVIEW_HISTORY_KEY] = true;
+    if (mode === "push") {
+      pushPageState("", nextState);
+    } else {
+      replacePageState("", nextState);
+    }
+    retainTabResumeState(nextState);
+  }
+
+  async function inspectLane(
+    laneId: string,
+    historyMode: InspectionHistoryMode = "push",
+    retryOnStale = true,
+  ): Promise<void> {
+    if (!client || !snapshot || sessionRecovery !== "connected") {
+      return;
+    }
+    if (laneId === snapshot.focused_lane?.id) {
+      clearInspection(historyMode);
+      return;
+    }
+
+    const activeClient = client;
+    const requestGeneration = ++inspectionRequestGeneration;
+    inspectionLoading = true;
+    inspectionFailure = null;
+    try {
+      const nextInspection = await activeClient.inspectLane(laneId);
+      if (
+        client !== activeClient ||
+        requestGeneration !== inspectionRequestGeneration
+      ) {
+        return;
+      }
+      if (
+        nextInspection.daemon.instance_id !== snapshot.daemon.instance_id ||
+        nextInspection.revision !== snapshot.revision
+      ) {
+        if (retryOnStale) {
+          await refreshSnapshot(true);
+          if (requestGeneration === inspectionRequestGeneration) {
+            await inspectLane(laneId, historyMode, false);
+          }
+        } else {
+          inspectionFailure =
+            "This lane changed while it was opening. Retry from the current project view.";
+        }
+        return;
+      }
+      inspection = nextInspection;
+      projectOverview = false;
+      if (historyMode !== "none") {
+        writeInspectionHistory(laneId, historyMode);
+      }
+    } catch (error) {
+      if (
+        client !== activeClient ||
+        requestGeneration !== inspectionRequestGeneration
+      ) {
+        return;
+      }
+      if (
+        error instanceof WorkbenchClientError &&
+        error.detailKind === "workbench.lane_not_found"
+      ) {
+        inspection = null;
+        inspectionFailure =
+          "That lane is no longer part of the current project plan.";
+        writeInspectionHistory(null, "replace");
+      } else if (terminalFailure(error)) {
+        applyTerminalFailure(error);
+      } else {
+        inspectionFailure = messageFrom(error);
+      }
+    } finally {
+      if (requestGeneration === inspectionRequestGeneration) {
+        inspectionLoading = false;
+      }
+    }
+  }
+
+  function selectLane(laneId: string): void {
+    void inspectLane(laneId);
+  }
+
+  async function focusInspectedLane(laneId: string): Promise<void> {
+    await focusLane(laneId);
+    if (snapshot?.focused_lane?.id === laneId) {
+      clearInspection("replace");
+    }
+  }
+
+  function retryInspection(): void {
+    if (inspection) {
+      void inspectLane(inspection.lane.id, "none");
+    }
   }
 
   function preparedPlanningApprovesReview(
@@ -883,6 +1125,10 @@
 {#if screen === "ready" && snapshot}
   <WorkbenchView
     {snapshot}
+    {inspection}
+    {inspectionLoading}
+    {inspectionFailure}
+    {projectOverview}
     {refreshing}
     {streamConnected}
     {sessionRecovery}
@@ -896,7 +1142,14 @@
     {planningEditorRebindToken}
     pendingPlanningKind={pendingPlanning?.request.operation.kind ?? null}
     completionReview={completionReview?.review ?? null}
-    onFocus={(laneId) => void focusLane(laneId)}
+    onInspect={selectLane}
+    onOpenProject={() => openProjectOverview()}
+    onCloseProject={() => clearInspection()}
+    onCloseInspection={() => clearInspection()}
+    onRetryInspection={inspectionFailure && inspection
+      ? retryInspection
+      : null}
+    onFocus={(laneId) => void focusInspectedLane(laneId)}
     onRetryFocus={retryFocus ? retryPendingFocus : null}
     onRetryPlanning={retryPlanning ? retryPendingPlanning : null}
     onRetrySession={sessionRecovery === "reconnecting"

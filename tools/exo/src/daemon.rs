@@ -2767,6 +2767,12 @@ pub async fn run_daemon(
         Arc::clone(&last_activity),
         tokio::runtime::Handle::current(),
     );
+    if let Err(error) = workbench_host.observe_workspace(workspace.as_ref()) {
+        diagnostics.record(
+            "workbench.workspace_observation_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+    }
     let idle_workbench_host = workbench_host.clone();
     let runtime_services = DaemonRuntimeServices::new(workbench_host);
 
@@ -2807,6 +2813,16 @@ pub async fn run_daemon(
                 request_admission,
                 diagnostics.clone(),
                 move || {
+                    let observed_workspace =
+                        req.workspace_root.as_deref().unwrap_or(workspace.as_ref());
+                    if let Err(error) =
+                        handler_runtime_services.observe_workspace(observed_workspace)
+                    {
+                        diagnostics.record(
+                            "workbench.workspace_observation_failed",
+                            serde_json::json!({ "error": error.to_string() }),
+                        );
+                    }
                     let recovery_request = compatible_protocol_v1_approval_request_id(
                         &workspace,
                         project.as_ref(),

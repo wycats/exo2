@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v2.json";
+import inspectionFixture from "./workbench-lane-inspection.v1.json";
+import snapshotFixture from "./workbench-snapshot.v3.json";
 import type { WorkbenchPlanningRequest } from "./workbench";
 import {
   createWorkbenchRequestId,
@@ -84,26 +85,12 @@ describe("workbench browser client", () => {
   });
 
   it("keeps the public session selector in same-entry history state", () => {
-    const replaceState = vi.fn();
-    const history = {
-      state: { unrelated: "kept" },
-      replaceState,
-    };
-
-    retainSessionSelector(
-      history,
-      { pathname: "/workbench", search: "?view=current" },
-      "session-selector",
-    );
-
-    expect(replaceState).toHaveBeenCalledWith(
-      {
-        unrelated: "kept",
-        exoWorkbenchSessionKey: "session-selector",
-      },
-      "",
-      "/workbench?view=current",
-    );
+    expect(
+      retainSessionSelector({ unrelated: "kept" }, "session-selector"),
+    ).toEqual({
+      unrelated: "kept",
+      exoWorkbenchSessionKey: "session-selector",
+    });
     expect(
       sessionKeyFromHistory({
         exoWorkbenchSessionKey: "session-selector",
@@ -111,24 +98,29 @@ describe("workbench browser client", () => {
     ).toBe("session-selector");
   });
 
-  it("clears the fragment and retained selector before ticket exchange", () => {
-    const replaceState = vi.fn();
-    prepareWorkbenchTicketExchange(
-      {
-        state: {
-          unrelated: "kept",
-          exoWorkbenchSessionKey: "old-session",
-        },
-        replaceState,
-      },
-      { pathname: "/workbench", search: "?view=current" },
-    );
+  it("derives page state without copying SvelteKit navigation metadata", () => {
+    const routerState = {
+      "sveltekit:history": 4,
+      "sveltekit:navigation": 2,
+      "sveltekit:states": { unrelated: "kept" },
+    };
 
-    expect(replaceState).toHaveBeenCalledWith(
-      { unrelated: "kept" },
-      "",
-      "/workbench?view=current",
-    );
+    const pageState = retainSessionSelector(routerState, "session-selector");
+
+    expect(pageState).toEqual({
+      unrelated: "kept",
+      exoWorkbenchSessionKey: "session-selector",
+    });
+    expect(sessionKeyFromHistory(pageState)).toBe("session-selector");
+  });
+
+  it("clears the fragment and retained selector before ticket exchange", () => {
+    expect(
+      prepareWorkbenchTicketExchange({
+        unrelated: "kept",
+        exoWorkbenchSessionKey: "old-session",
+      }),
+    ).toEqual({ unrelated: "kept" });
   });
 
   it("requires a fresh link after an ambiguous ticket exchange", async () => {
@@ -189,6 +181,33 @@ describe("workbench browser client", () => {
     expect(snapshot.revision).toBe(7);
   });
 
+  it("inspects a lane through the pure browser-safe operation", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockImplementation(async (_path, init) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request).toMatchObject({
+        protocol_version: 1,
+        session_key: "session-selector",
+        operation: { kind: "lane_inspect", lane_id: "lane-history" },
+      });
+      return jsonResponse({
+        protocol_version: 1,
+        id: request.id,
+        status: "ok",
+        result: inspectionFixture,
+      });
+    });
+
+    const inspection = await new WorkbenchClient(
+      "session-selector",
+      fetcher,
+    ).inspectLane("lane-history");
+
+    expect(inspection.relationship).toBe("historical");
+    expect(inspection.lane.id).toBe("lane-history");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("requires a client reload when the host snapshot is incompatible", async () => {
     const fetcher = vi.fn<typeof fetch>();
     fetcher.mockImplementation(async (_path, init) => {
@@ -197,7 +216,7 @@ describe("workbench browser client", () => {
         protocol_version: 1,
         id: request.id,
         status: "ok",
-        result: { ...snapshotFixture, schema_version: 3 },
+        result: { ...snapshotFixture, schema_version: 4 },
       });
     });
 

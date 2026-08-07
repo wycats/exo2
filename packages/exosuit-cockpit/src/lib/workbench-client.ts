@@ -1,7 +1,9 @@
 import {
+  decodeWorkbenchLaneInspection,
   decodeWorkbenchPlanningResult,
   decodeWorkbenchSnapshot,
   type WorkbenchCommandRequest,
+  type WorkbenchLaneInspection,
   type WorkbenchPlanningRequest,
   type WorkbenchPlanningResult,
   type WorkbenchSessionResult,
@@ -9,6 +11,9 @@ import {
 } from "./workbench";
 
 const SESSION_HISTORY_KEY = "exoWorkbenchSessionKey";
+const SVELTEKIT_HISTORY_INDEX_KEY = "sveltekit:history";
+const SVELTEKIT_NAVIGATION_INDEX_KEY = "sveltekit:navigation";
+const SVELTEKIT_PAGE_STATE_KEY = "sveltekit:states";
 const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const REQUEST_TIMEOUT_MS = 10_000;
 
@@ -67,45 +72,56 @@ export function launchTicketFromHash(hash: string): string | null {
 }
 
 export function sessionKeyFromHistory(state: unknown): string | null {
-  if (typeof state !== "object" || state === null || Array.isArray(state)) {
-    return null;
-  }
-  const sessionKey = (state as Record<string, unknown>)[SESSION_HISTORY_KEY];
+  const sessionKey = workbenchHistoryState(state)[SESSION_HISTORY_KEY];
   return typeof sessionKey === "string" && sessionKey.length > 0
     ? sessionKey
     : null;
 }
 
+export function workbenchHistoryState(
+  state: unknown,
+): Record<string, unknown> {
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    return {};
+  }
+
+  const historyState = state as Record<string, unknown>;
+  const pageState = historyState[SVELTEKIT_PAGE_STATE_KEY];
+  if (
+    typeof pageState === "object" &&
+    pageState !== null &&
+    !Array.isArray(pageState)
+  ) {
+    return pageState as Record<string, unknown>;
+  }
+  if (
+    SVELTEKIT_HISTORY_INDEX_KEY in historyState ||
+    SVELTEKIT_NAVIGATION_INDEX_KEY in historyState ||
+    SVELTEKIT_PAGE_STATE_KEY in historyState
+  ) {
+    return Object.fromEntries(
+      Object.entries(historyState).filter(([key]) => !key.startsWith("sveltekit:")),
+    );
+  }
+  return historyState;
+}
+
 export function retainSessionSelector(
-  history: Pick<History, "replaceState" | "state">,
-  location: Pick<Location, "pathname" | "search">,
+  state: unknown,
   sessionKey: string,
-): void {
-  const prior =
-    typeof history.state === "object" &&
-    history.state !== null &&
-    !Array.isArray(history.state)
-      ? history.state
-      : {};
-  history.replaceState(
-    { ...prior, [SESSION_HISTORY_KEY]: sessionKey },
-    "",
-    `${location.pathname}${location.search}`,
-  );
+): Record<string, unknown> {
+  return {
+    ...workbenchHistoryState(state),
+    [SESSION_HISTORY_KEY]: sessionKey,
+  };
 }
 
 export function prepareWorkbenchTicketExchange(
-  history: Pick<History, "replaceState" | "state">,
-  location: Pick<Location, "pathname" | "search">,
-): void {
-  const prior =
-    typeof history.state === "object" &&
-    history.state !== null &&
-    !Array.isArray(history.state)
-      ? { ...history.state }
-      : {};
+  state: unknown,
+): Record<string, unknown> {
+  const prior = { ...workbenchHistoryState(state) };
   delete prior[SESSION_HISTORY_KEY];
-  history.replaceState(prior, "", `${location.pathname}${location.search}`);
+  return prior;
 }
 
 export async function exchangeWorkbenchTicket(
@@ -190,6 +206,23 @@ export class WorkbenchClient {
       throw new WorkbenchClientError(
         "client_update_required",
         "This page cannot read the current Exo workbench snapshot. Reload to use the current workbench version.",
+      );
+    }
+  }
+
+  async inspectLane(laneId: string): Promise<WorkbenchLaneInspection> {
+    const result = await this.dispatch({
+      protocol_version: 1,
+      id: createWorkbenchRequestId(),
+      session_key: this.sessionKey,
+      operation: { kind: "lane_inspect", lane_id: laneId },
+    });
+    try {
+      return decodeWorkbenchLaneInspection(result);
+    } catch {
+      throw new WorkbenchClientError(
+        "client_update_required",
+        "This page cannot read the current lane inspection. Reload to use the current workbench version.",
       );
     }
   }

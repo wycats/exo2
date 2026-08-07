@@ -1,11 +1,16 @@
 use super::{
     WorkbenchBetweenPhasesContext, WorkbenchCompletedPhaseSummary, WorkbenchDaemonIdentity,
-    WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails, WorkbenchLaneSummary,
-    WorkbenchNextPhasePreview, WorkbenchPhase, WorkbenchProjectIdentity, WorkbenchSnapshot,
-    WorkbenchSnapshotWorkspace, WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask,
-    WorkbenchTaskProgress, WorkspaceRegistration,
+    WorkbenchDiagnostic, WorkbenchGoal, WorkbenchLaneDetails, WorkbenchLaneInspection,
+    WorkbenchLaneSummary, WorkbenchNextPhasePreview, WorkbenchPhase, WorkbenchProjectIdentity,
+    WorkbenchProjectWorkspaceSummary, WorkbenchSnapshot, WorkbenchSnapshotWorkspace,
+    WorkbenchSteering, WorkbenchSuggestedAction, WorkbenchTask, WorkbenchTaskProgress,
+    WorkbenchWorkspaceLaneSummary, WorkbenchWorkspacePhaseSummary, WorkspaceProjection,
+    WorkspaceRegistration,
 };
+use crate::api::protocol::ErrorCode;
+use crate::context::sqlite_loader::PhaseDetailsData;
 use crate::context::{Epoch, ExoState, Phase, SqliteLoader, WorkbenchLaneData};
+use crate::failure::ExoFailure;
 use crate::phase_owner::PhaseOwnerViewContext;
 use crate::project::Project;
 use crate::status::between_phases_context_for_epoch;
@@ -17,20 +22,20 @@ use std::process::{Command, Stdio};
 
 const MAX_TASK_PROGRESS_ENTRIES: usize = 8;
 const MAX_TASK_PROGRESS_BYTES: usize = 16 * 1024;
+const MAX_OUTCOME_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct GitSnapshot {
     pub(super) branch: Option<String>,
     pub(super) head: Option<String>,
     pub(super) detached: bool,
-    pub(super) dirty: bool,
+    pub(super) dirty: Option<bool>,
 }
 
 pub(super) fn sample_git(root: &Path) -> GitSnapshot {
     let branch = git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
     let head = git_stdout(root, &["rev-parse", "HEAD"]);
-    let dirty =
-        git_stdout(root, &["status", "--porcelain=v1"]).is_some_and(|output| !output.is_empty());
+    let dirty = git_stdout(root, &["status", "--porcelain=v1"]).map(|output| !output.is_empty());
     GitSnapshot {
         detached: branch.is_none() && head.is_some(),
         branch,
@@ -39,12 +44,34 @@ pub(super) fn sample_git(root: &Path) -> GitSnapshot {
     }
 }
 
+pub(super) fn sample_git_identity(root: &Path) -> GitSnapshot {
+    let branch = git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let head = git_stdout(root, &["rev-parse", "HEAD"]);
+    GitSnapshot {
+        detached: branch.is_none() && head.is_some(),
+        branch,
+        head,
+        dirty: None,
+    }
+}
+
+impl GitSnapshot {
+    pub(super) const fn unavailable() -> Self {
+        Self {
+            branch: None,
+            head: None,
+            detached: false,
+            dirty: None,
+        }
+    }
+}
+
 pub(super) fn registered_git(registered: &WorkspaceRegistration) -> GitSnapshot {
     GitSnapshot {
         detached: registered.branch.is_none() && registered.head.is_some(),
         branch: registered.branch.clone(),
         head: registered.head.clone(),
-        dirty: false,
+        dirty: registered.dirty,
     }
 }
 
@@ -66,14 +93,103 @@ pub(super) fn build_with_git(
     daemon_instance_id: &str,
     git: GitSnapshot,
 ) -> Result<WorkbenchSnapshot> {
+    let project_workspaces = vec![WorkspaceProjection {
+        registration: registered.clone(),
+        availability: "live",
+        current: true,
+    }];
+    build_with_git_and_workspaces(
+        project,
+        registered,
+        revision,
+        daemon_instance_id,
+        git,
+        project_workspaces,
+    )
+}
+
+pub(super) fn build_with_git_and_workspaces(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    git: GitSnapshot,
+    project_workspaces: Vec<WorkspaceProjection>,
+) -> Result<WorkbenchSnapshot> {
     build_with_git_and_after_state_hook(
         project,
         registered,
         revision,
         daemon_instance_id,
         git,
+        project_workspaces,
         || {},
     )
+}
+
+pub(super) fn inspect_with_git(
+    project: &Project,
+    registered: &WorkspaceRegistration,
+    revision: u64,
+    daemon_instance_id: &str,
+    lane_id: &str,
+    git: GitSnapshot,
+) -> Result<WorkbenchLaneInspection> {
+    let loader = SqliteLoader::open(project.db_path())?;
+    let transaction = loader
+        .database()
+        .connection()
+        .unchecked_transaction()
+        .context("Failed to begin lane inspection read transaction")?;
+    let plan = loader.load_state()?;
+    let lane = loader
+        .load_workbench_lane(lane_id)?
+        .ok_or_else(|| anyhow::Error::new(lane_inspection_not_found(lane_id)))?;
+    let workspace_root = registered.root.to_string_lossy();
+    let focused_lane_id = loader
+        .load_workspace_lane_focus(&workspace_root)?
+        .map(|focus| focus.lane_id);
+    let summary = lane_summary(&plan, &lane, focused_lane_id.as_deref())?;
+    let phase = phase_for_id(&plan, &lane.execution_phase_id)
+        .ok_or_else(|| anyhow::anyhow!("workbench lane references a missing phase"))?;
+    let details = loader
+        .load_phase_details_by_id(&phase.id)?
+        .ok_or_else(|| anyhow::anyhow!("lane phase details are missing"))?;
+    let relationship = match phase.status.as_str() {
+        "in-progress" if summary.focused_here => "focused_here",
+        "in-progress" => "focusable_here",
+        "pending" => "prepared",
+        _ => "historical",
+    };
+    let can_focus_here = relationship == "focusable_here";
+    let phase = workbench_phase(phase, &details, false, true);
+    transaction
+        .commit()
+        .context("Failed to finish lane inspection read transaction")?;
+
+    Ok(WorkbenchLaneInspection {
+        kind: "workbench.lane_inspection",
+        ok: true,
+        schema_version: 1,
+        observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        revision,
+        project: WorkbenchProjectIdentity {
+            id: project.id.to_string(),
+        },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: daemon_instance_id.to_string(),
+        },
+        workspace: workspace_snapshot(registered, git),
+        relationship: relationship.to_string(),
+        can_focus_here,
+        lane: WorkbenchLaneDetails {
+            summary,
+            intent: lane.intent,
+            created_at: lane.created_at,
+            updated_at: lane.updated_at,
+        },
+        phase,
+    })
 }
 
 #[cfg(test)]
@@ -85,12 +201,18 @@ pub(super) fn build_with_after_state_hook(
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
     let git = sample_git(&registered.root);
+    let project_workspaces = vec![WorkspaceProjection {
+        registration: registered.clone(),
+        availability: "live",
+        current: true,
+    }];
     build_with_git_and_after_state_hook(
         project,
         registered,
         revision,
         daemon_instance_id,
         git,
+        project_workspaces,
         after_state,
     )
 }
@@ -101,6 +223,7 @@ fn build_with_git_and_after_state_hook(
     revision: u64,
     daemon_instance_id: &str,
     git: GitSnapshot,
+    project_workspaces: Vec<WorkspaceProjection>,
     after_state: impl FnOnce(),
 ) -> Result<WorkbenchSnapshot> {
     let mut workspace_project = project.clone();
@@ -126,6 +249,8 @@ fn build_with_git_and_after_state_hook(
         .iter()
         .map(|lane| lane_summary(&plan, lane, focused_lane_id.as_deref()))
         .collect::<Result<Vec<_>>>()?;
+    let project_workspaces =
+        project_workspace_summaries(&loader, &plan, &lanes, project_workspaces)?;
     let focused_lane = focused_lane_id
         .as_deref()
         .and_then(|id| lanes.iter().find(|lane| lane.text_id == id))
@@ -160,39 +285,7 @@ fn build_with_git_and_after_state_hook(
         .unwrap_or(false);
     let phase = focused_phase
         .zip(focused_phase_details.as_ref())
-        .map(|(phase, details)| WorkbenchPhase {
-            planning_available,
-            id: phase.id.clone(),
-            title: phase.title.clone(),
-            status: phase.status.clone(),
-            goals: details
-                .goals
-                .iter()
-                .map(|goal| WorkbenchGoal {
-                    id: goal.id.clone(),
-                    title: goal.title.clone(),
-                    status: goal.status.clone(),
-                    tasks: goal
-                        .tasks
-                        .iter()
-                        .map(|task| {
-                            let (progress, progress_truncated) =
-                                bounded_task_progress(task.logs.iter().filter_map(|log| {
-                                    (log.kind == "progress")
-                                        .then_some((log.message.as_str(), log.created_at.as_str()))
-                                }));
-                            WorkbenchTask {
-                                id: task.id.clone(),
-                                title: task.title.clone(),
-                                status: task.status.clone(),
-                                progress,
-                                progress_truncated,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-        });
+        .map(|(phase, details)| workbench_phase(phase, details, planning_available, false));
     let between_phases_context =
         between_phases_epoch(&plan, workspace_phase_id.as_deref()).map(|epoch| {
             let context = between_phases_context_for_epoch(epoch);
@@ -259,6 +352,90 @@ fn build_with_git_and_after_state_hook(
         .commit()
         .context("Failed to finish workbench snapshot read transaction")?;
 
+    Ok(WorkbenchSnapshot {
+        kind: "workbench.snapshot",
+        ok: true,
+        schema_version: 3,
+        observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        revision,
+        project: WorkbenchProjectIdentity {
+            id: project.id.to_string(),
+        },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: daemon_instance_id.to_string(),
+        },
+        workspace: workspace_snapshot(registered, git),
+        project_workspaces,
+        lanes: lane_summaries,
+        focused_lane,
+        phase,
+        between_phases_context,
+        steering,
+        diagnostics,
+    })
+}
+
+fn workbench_phase(
+    phase: &Phase,
+    details: &PhaseDetailsData,
+    planning_available: bool,
+    include_outcomes: bool,
+) -> WorkbenchPhase {
+    WorkbenchPhase {
+        planning_available,
+        id: phase.id.clone(),
+        title: phase.title.clone(),
+        status: phase.status.clone(),
+        goals: details
+            .goals
+            .iter()
+            .map(|goal| {
+                let (outcome, outcome_truncated) = if include_outcomes {
+                    bounded_outcome(goal.completion_log.as_deref())
+                } else {
+                    (None, false)
+                };
+                WorkbenchGoal {
+                    id: goal.id.clone(),
+                    title: goal.title.clone(),
+                    status: goal.status.clone(),
+                    outcome,
+                    outcome_truncated,
+                    tasks: goal
+                        .tasks
+                        .iter()
+                        .map(|task| {
+                            let (progress, progress_truncated) =
+                                bounded_task_progress(task.logs.iter().filter_map(|log| {
+                                    (log.kind == "progress")
+                                        .then_some((log.message.as_str(), log.created_at.as_str()))
+                                }));
+                            let (outcome, outcome_truncated) = if include_outcomes {
+                                bounded_outcome(task.completion_log.as_deref())
+                            } else {
+                                (None, false)
+                            };
+                            WorkbenchTask {
+                                id: task.id.clone(),
+                                title: task.title.clone(),
+                                status: task.status.clone(),
+                                outcome,
+                                outcome_truncated,
+                                progress,
+                                progress_truncated,
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn workspace_snapshot(
+    registered: &WorkspaceRegistration,
+    git: GitSnapshot,
+) -> WorkbenchSnapshotWorkspace {
     let label = git
         .branch
         .clone()
@@ -268,34 +445,94 @@ fn build_with_git_and_after_state_hook(
                 .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
         })
         .unwrap_or_else(|| registered.label.clone());
+    WorkbenchSnapshotWorkspace {
+        key: registered.key.clone(),
+        label,
+        branch: git.branch,
+        head: git.head,
+        detached: git.detached,
+        dirty: git.dirty.unwrap_or(true),
+    }
+}
 
-    Ok(WorkbenchSnapshot {
-        kind: "workbench.snapshot",
-        ok: true,
-        schema_version: 2,
-        observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        revision,
-        project: WorkbenchProjectIdentity {
-            id: project.id.to_string(),
-        },
-        daemon: WorkbenchDaemonIdentity {
-            instance_id: daemon_instance_id.to_string(),
-        },
-        workspace: WorkbenchSnapshotWorkspace {
-            key: registered.key.clone(),
-            label,
-            branch: git.branch,
-            head: git.head,
-            detached: git.detached,
-            dirty: git.dirty,
-        },
-        lanes: lane_summaries,
-        focused_lane,
-        phase,
-        between_phases_context,
-        steering,
-        diagnostics,
-    })
+fn project_workspace_summaries(
+    loader: &SqliteLoader,
+    plan: &ExoState,
+    lanes: &[WorkbenchLaneData],
+    projections: Vec<WorkspaceProjection>,
+) -> Result<Vec<WorkbenchProjectWorkspaceSummary>> {
+    projections
+        .into_iter()
+        .map(|projection| {
+            let workspace_root = projection.registration.root.to_string_lossy();
+            let focused_lane =
+                loader
+                    .load_workspace_lane_focus(&workspace_root)?
+                    .and_then(|focus| {
+                        lanes
+                            .iter()
+                            .find(|lane| lane.text_id == focus.lane_id)
+                            .and_then(|lane| {
+                                let phase = phase_for_id(plan, &lane.execution_phase_id)?;
+                                Some(WorkbenchWorkspaceLaneSummary {
+                                    id: lane.text_id.clone(),
+                                    title: lane.title.clone(),
+                                    state: lane.state.clone(),
+                                    phase_id: phase.id.clone(),
+                                    phase_title: phase.title.clone(),
+                                    phase_status: phase.status.clone(),
+                                })
+                            })
+                    });
+            let active_phase = loader
+                .load_workspace_active_phase(&workspace_root)?
+                .and_then(|phase_id| phase_for_id(plan, &phase_id))
+                .map(|phase| WorkbenchWorkspacePhaseSummary {
+                    id: phase.id.clone(),
+                    title: phase.title.clone(),
+                    status: phase.status.clone(),
+                });
+            let registration = projection.registration;
+            let detached = registration.branch.is_none() && registration.head.is_some();
+            Ok(WorkbenchProjectWorkspaceSummary {
+                key: registration.key,
+                label: registration.label,
+                current: projection.current,
+                availability: projection.availability.to_string(),
+                observed_at: registration
+                    .observed_at
+                    .map(super::timestamp_for_unix_seconds),
+                branch: registration.branch,
+                head: registration.head,
+                detached,
+                dirty: registration.dirty,
+                focused_lane,
+                active_phase,
+            })
+        })
+        .collect()
+}
+
+fn bounded_outcome(outcome: Option<&str>) -> (Option<String>, bool) {
+    match outcome {
+        Some(outcome) => {
+            let (outcome, truncated) = bounded_message(outcome, MAX_OUTCOME_BYTES);
+            (Some(outcome), truncated)
+        }
+        None => (None, false),
+    }
+}
+
+fn lane_inspection_not_found(lane_id: &str) -> ExoFailure {
+    ExoFailure::new(
+        ErrorCode::NotFound,
+        format!("Workbench lane not found: {lane_id}"),
+        ExoFailure::orienting_steering(vec![]),
+    )
+    .with_details(serde_json::json!({
+        "kind": "workbench.lane_not_found",
+        "lane_id": lane_id,
+    }))
 }
 
 fn bounded_task_progress<'a>(
@@ -445,5 +682,16 @@ mod tests {
         assert!(progress[0].message.len() <= MAX_TASK_PROGRESS_BYTES);
         assert!(progress[0].message.ends_with("..."));
         assert_eq!(progress[0].created_at, "2026-07-30T00:01:00Z");
+    }
+
+    #[test]
+    fn recorded_outcomes_are_byte_bounded_on_utf8_boundaries() {
+        let oversized = "é".repeat(MAX_OUTCOME_BYTES);
+        let (outcome, truncated) = bounded_outcome(Some(&oversized));
+        let outcome = outcome.expect("bounded outcome");
+
+        assert!(truncated);
+        assert!(outcome.len() <= MAX_OUTCOME_BYTES);
+        assert!(outcome.ends_with("..."));
     }
 }

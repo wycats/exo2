@@ -4,7 +4,7 @@ use super::traits::{Command, CommandBox, CommandContext, CommandOutput};
 use crate::workbench::daemon_required_failure;
 use anyhow::Result as ExoResult;
 
-#[derive(Debug, Clone, Copy, exospec::ExoSpec)]
+#[derive(Debug, Clone, exospec::ExoSpec)]
 #[exo(namespace = "workbench", description = "Local lane workbench commands")]
 pub enum WorkbenchCommands {
     #[exo(effect = "pure", description = "Launch the local lane workbench")]
@@ -15,6 +15,15 @@ pub enum WorkbenchCommands {
         description = "Read the current lane workbench snapshot"
     )]
     Snapshot,
+
+    #[exo(
+        effect = "pure",
+        description = "Inspect a workbench lane without focusing it"
+    )]
+    Inspect {
+        #[exo(positional, description = "Lane ID")]
+        id: String,
+    },
 }
 
 impl WorkbenchCommands {
@@ -22,7 +31,40 @@ impl WorkbenchCommands {
         Ok(match self {
             Self::Launch => CommandBox::pure(WorkbenchLaunch),
             Self::Snapshot => CommandBox::pure(WorkbenchSnapshot),
+            Self::Inspect { id } => CommandBox::pure(WorkbenchInspect::new(id)),
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkbenchInspect {
+    id: String,
+}
+
+impl WorkbenchInspect {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+impl Command for WorkbenchInspect {
+    fn namespace(&self) -> &'static str {
+        "workbench"
+    }
+
+    fn operation(&self) -> &'static str {
+        "inspect"
+    }
+
+    fn execute(&self, ctx: &CommandContext<'_>) -> ExoResult<CommandOutput> {
+        let services = ctx
+            .runtime_services
+            .ok_or_else(|| anyhow::Error::new(daemon_required_failure()))?;
+        Ok(CommandOutput::data(services.inspect(ctx.root, &self.id)?))
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect a workbench lane without focusing it"
     }
 }
 
@@ -104,7 +146,7 @@ mod tests {
     #[test]
     fn registered_workbench_commands_are_pure_replayable_reads() {
         let spec = CommandSpec::from_registry(&default_registry());
-        for operation in ["launch", "snapshot"] {
+        for operation in ["launch", "snapshot", "inspect"] {
             let operation = spec
                 .operation("workbench", operation)
                 .expect("registered workbench operation");
@@ -122,6 +164,9 @@ mod tests {
             WorkbenchSnapshot
                 .execute(&direct_context())
                 .expect_err("direct snapshot must fail"),
+            WorkbenchInspect::new("lane-history")
+                .execute(&direct_context())
+                .expect_err("direct inspection must fail"),
         ] {
             let failure = error
                 .downcast_ref::<ExoFailure>()

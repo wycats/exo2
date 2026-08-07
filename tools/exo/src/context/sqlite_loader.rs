@@ -131,6 +131,7 @@ pub struct PhaseDetailsTask {
     pub notes: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub completion_log: Option<String>,
     pub logs: Vec<TaskLog>,
 }
 
@@ -779,6 +780,7 @@ impl SqliteLoader {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
 
         let goal_rows: Vec<GoalDetailRow> = goal_stmt
@@ -800,7 +802,7 @@ impl SqliteLoader {
 
         let mut task_stmt = conn
             .prepare(
-                "SELECT id, text_id, title, status, notes, started_at, completed_at
+                "SELECT id, text_id, title, status, notes, started_at, completed_at, completion_log
                  FROM tasks
                  WHERE goal_id = ?
                  ORDER BY sort_key NULLS LAST, id",
@@ -838,6 +840,7 @@ impl SqliteLoader {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 })
                 .context("Failed to query active phase tasks")?
@@ -853,6 +856,7 @@ impl SqliteLoader {
                 task_notes,
                 task_started_at,
                 task_completed_at,
+                task_completion_log,
             ) in task_rows
             {
                 let logs: Vec<TaskLog> = task_log_stmt
@@ -874,6 +878,7 @@ impl SqliteLoader {
                     notes: task_notes,
                     started_at: task_started_at,
                     completed_at: task_completed_at,
+                    completion_log: task_completion_log,
                     logs,
                 });
             }

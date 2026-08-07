@@ -168,7 +168,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
     let snapshot = WorkbenchSnapshot {
         kind: "workbench.snapshot",
         ok: true,
-        schema_version: 2,
+        schema_version: 3,
         observed_at: "2026-07-28T20:00:00.000Z".to_string(),
         revision: 7,
         project: WorkbenchProjectIdentity {
@@ -185,6 +185,45 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
             detached: false,
             dirty: true,
         },
+        project_workspaces: vec![
+            WorkbenchProjectWorkspaceSummary {
+                key: "workspace-fixture".to_string(),
+                label: "main".to_string(),
+                current: true,
+                availability: "live".to_string(),
+                observed_at: Some("2026-07-28T20:00:00Z".to_string()),
+                branch: Some("main".to_string()),
+                head: Some("0123456789abcdef".to_string()),
+                detached: false,
+                dirty: Some(true),
+                focused_lane: Some(WorkbenchWorkspaceLaneSummary {
+                    id: "lane-fixture".to_string(),
+                    title: "Local workbench host".to_string(),
+                    state: "executing".to_string(),
+                    phase_id: "phase-fixture".to_string(),
+                    phase_title: "Workbench foundation".to_string(),
+                    phase_status: "in-progress".to_string(),
+                }),
+                active_phase: Some(WorkbenchWorkspacePhaseSummary {
+                    id: "phase-fixture".to_string(),
+                    title: "Workbench foundation".to_string(),
+                    status: "in-progress".to_string(),
+                }),
+            },
+            WorkbenchProjectWorkspaceSummary {
+                key: "workspace-sibling".to_string(),
+                label: "feature/dashboard".to_string(),
+                current: false,
+                availability: "stale".to_string(),
+                observed_at: Some("2026-07-28T19:55:00Z".to_string()),
+                branch: Some("feature/dashboard".to_string()),
+                head: Some("fedcba9876543210".to_string()),
+                detached: false,
+                dirty: None,
+                focused_lane: None,
+                active_phase: None,
+            },
+        ],
         lanes: vec![summary.clone()],
         focused_lane: Some(WorkbenchLaneDetails {
             summary,
@@ -201,10 +240,14 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
                 id: "host-goal".to_string(),
                 title: "Establish local host and launch".to_string(),
                 status: "in-progress".to_string(),
+                outcome: None,
+                outcome_truncated: false,
                 tasks: vec![WorkbenchTask {
                     id: "implement-host".to_string(),
                     title: "Implement host".to_string(),
                     status: "in-progress".to_string(),
+                    outcome: None,
+                    outcome_truncated: false,
                     progress: vec![WorkbenchTaskProgress {
                         message: "Captured browser evidence.".to_string(),
                         created_at: "2026-07-28T19:45:00Z".to_string(),
@@ -227,12 +270,273 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         diagnostics: vec![],
     };
     let fixture: JsonValue = serde_json::from_str(include_str!(
-        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v2.json"
+        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v3.json"
     ))
     .expect("parse cockpit snapshot fixture");
 
     assert_eq!(
         serde_json::to_value(snapshot).expect("serialize Rust snapshot"),
+        fixture
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("project-workspace-sibling");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workspace-sibling",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    fs::write(linked.join("sibling-dirty.txt"), "dirty\n").expect("dirty sibling worktree");
+
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Workspace Faces", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Workspace Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    let current_lane = writer
+        .add_workbench_lane("Current workspace", "Work in the primary checkout", &phase)
+        .expect("add current lane");
+    let sibling_lane = writer
+        .add_workbench_lane("Sibling workspace", "Work in the linked checkout", &phase)
+        .expect("add sibling lane");
+    let current_root = fixture.root.canonicalize().expect("canonical current root");
+    let sibling_root = linked.canonicalize().expect("canonical sibling root");
+    writer
+        .focus_workbench_lane(&current_root.to_string_lossy(), &current_lane, &phase)
+        .expect("focus current lane");
+    writer
+        .focus_workbench_lane(&sibling_root.to_string_lossy(), &sibling_lane, &phase)
+        .expect("focus sibling lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager
+        .observe_workspace(&sibling_root)
+        .expect("observe sibling workspace");
+    let snapshot = manager
+        .snapshot(&current_root)
+        .expect("read project snapshot");
+    assert_eq!(snapshot.schema_version, 3);
+    assert_eq!(snapshot.project_workspaces.len(), 2);
+
+    let current = snapshot
+        .project_workspaces
+        .iter()
+        .find(|workspace| workspace.current)
+        .expect("current workspace summary");
+    assert_eq!(current.key, snapshot.workspace.key);
+    assert_eq!(current.availability, "live");
+    assert_eq!(
+        current.focused_lane.as_ref().map(|lane| lane.id.as_str()),
+        Some(current_lane.as_str())
+    );
+
+    let sibling = snapshot
+        .project_workspaces
+        .iter()
+        .find(|workspace| !workspace.current)
+        .expect("sibling workspace summary");
+    assert_eq!(sibling.label, "workspace-sibling");
+    assert_eq!(sibling.availability, "live");
+    assert_eq!(sibling.dirty, Some(true));
+    assert_eq!(
+        sibling.focused_lane.as_ref().map(|lane| lane.id.as_str()),
+        Some(sibling_lane.as_str())
+    );
+    assert_eq!(
+        sibling.active_phase.as_ref().map(|phase| phase.id.as_str()),
+        Some(phase.as_str())
+    );
+    let sibling_key = sibling.key.clone();
+    let serialized = serde_json::to_string(&snapshot).expect("serialize project snapshot");
+    assert!(!serialized.contains(&current_root.display().to_string()));
+    assert!(!serialized.contains(&sibling_root.display().to_string()));
+
+    let replacement = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "replacement-workbench-instance",
+    );
+    let restored = replacement
+        .snapshot(&current_root)
+        .expect("restore project workspace observations");
+    assert_eq!(
+        restored
+            .project_workspaces
+            .iter()
+            .find(|workspace| workspace.label == "workspace-sibling")
+            .map(|workspace| workspace.key.as_str()),
+        Some(sibling_key.as_str())
+    );
+    replacement.shutdown().await;
+
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let sibling = state
+            .workspaces_by_key
+            .get_mut(&sibling_key)
+            .expect("registered sibling workspace");
+        sibling.observed_at = Some(
+            unix_seconds()
+                .saturating_sub(WORKSPACE_OBSERVATION_FRESH_LIFETIME.as_secs())
+                .saturating_sub(1),
+        );
+    }
+    let stale = manager
+        .snapshot(&current_root)
+        .expect("read stale workspace");
+    assert_eq!(
+        stale
+            .project_workspaces
+            .iter()
+            .find(|workspace| workspace.key == sibling_key)
+            .map(|workspace| workspace.availability.as_str()),
+        Some("stale")
+    );
+
+    fs::remove_dir_all(&sibling_root).expect("remove sibling worktree directory");
+    let unavailable = manager
+        .snapshot(&current_root)
+        .expect("read unavailable workspace");
+    assert_eq!(
+        unavailable
+            .project_workspaces
+            .iter()
+            .find(|workspace| workspace.key == sibling_key)
+            .map(|workspace| workspace.availability.as_str()),
+        Some("unavailable")
+    );
+
+    run_git(&fixture.root, &["worktree", "prune", "--expire", "now"]);
+    let pruned = manager
+        .snapshot(&current_root)
+        .expect("read pruned project");
+    assert!(
+        pruned
+            .project_workspaces
+            .iter()
+            .all(|workspace| workspace.key != sibling_key),
+        "Git worktree removal ends workspace retention"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unborn_workspace_is_a_live_project_workspace_observation() {
+    let temp = tempfile::tempdir().expect("create unborn workbench fixture");
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).expect("create unborn workspace");
+    run_git(&root, &["init", "-b", "main"]);
+    let project = Arc::new(Project::resolve(&root).expect("resolve unborn project"));
+    fs::create_dir_all(
+        project
+            .db_path()
+            .parent()
+            .expect("project database has a parent"),
+    )
+    .expect("create project state root");
+    drop(SqliteWriter::open(project.db_path()).expect("initialize project database"));
+
+    let manager = test_manager(project);
+    let snapshot = manager.snapshot(&root).expect("read unborn snapshot");
+    assert_eq!(snapshot.workspace.branch.as_deref(), Some("main"));
+    assert!(snapshot.workspace.head.is_none());
+    assert_eq!(snapshot.project_workspaces.len(), 1);
+    let workspace = &snapshot.project_workspaces[0];
+    assert!(workspace.current);
+    assert_eq!(workspace.availability, "live");
+    assert_eq!(workspace.branch.as_deref(), Some("main"));
+    assert!(workspace.head.is_none());
+    assert!(workspace.dirty.is_some());
+    assert!(workspace.observed_at.is_some());
+    manager.shutdown().await;
+}
+
+#[test]
+fn rust_lane_inspection_serialization_matches_the_cockpit_contract_fixture() {
+    let inspection = WorkbenchLaneInspection {
+        kind: "workbench.lane_inspection",
+        ok: true,
+        schema_version: 1,
+        observed_at: "2026-08-06T20:00:00.000Z".to_string(),
+        revision: 9,
+        project: WorkbenchProjectIdentity {
+            id: "project-fixture".to_string(),
+        },
+        daemon: WorkbenchDaemonIdentity {
+            instance_id: "daemon-fixture".to_string(),
+        },
+        workspace: WorkbenchSnapshotWorkspace {
+            key: "workspace-fixture".to_string(),
+            label: "main".to_string(),
+            branch: Some("main".to_string()),
+            head: Some("0123456789abcdef".to_string()),
+            detached: false,
+            dirty: true,
+        },
+        relationship: "historical".to_string(),
+        can_focus_here: false,
+        lane: WorkbenchLaneDetails {
+            summary: WorkbenchLaneSummary {
+                id: "lane-history".to_string(),
+                title: "Completed cockpit foundation".to_string(),
+                state: "executing".to_string(),
+                phase_id: "phase-history".to_string(),
+                phase_title: "Cockpit foundation".to_string(),
+                phase_status: "completed".to_string(),
+                focused_here: false,
+            },
+            intent: "Establish the first useful lane workbench".to_string(),
+            created_at: "2026-07-28T19:00:00Z".to_string(),
+            updated_at: "2026-08-05T19:30:00Z".to_string(),
+        },
+        phase: WorkbenchPhase {
+            id: "phase-history".to_string(),
+            title: "Cockpit foundation".to_string(),
+            status: "completed".to_string(),
+            planning_available: false,
+            goals: vec![WorkbenchGoal {
+                id: "foundation-goal".to_string(),
+                title: "Build the first cockpit".to_string(),
+                status: "completed".to_string(),
+                outcome: Some(
+                    "The first lane-centered cockpit is available for dogfood.".to_string(),
+                ),
+                outcome_truncated: false,
+                tasks: vec![WorkbenchTask {
+                    id: "ship-foundation".to_string(),
+                    title: "Ship the foundation".to_string(),
+                    status: "completed".to_string(),
+                    outcome: Some("The reviewed foundation landed cleanly.".to_string()),
+                    outcome_truncated: false,
+                    progress: vec![WorkbenchTaskProgress {
+                        message: "Validated the final browser flow.".to_string(),
+                        created_at: "2026-08-05T18:45:00Z".to_string(),
+                    }],
+                    progress_truncated: false,
+                }],
+            }],
+        },
+    };
+    let fixture: JsonValue = serde_json::from_str(include_str!(
+        "../../../../packages/exosuit-cockpit/src/lib/workbench-lane-inspection.v1.json"
+    ))
+    .expect("parse cockpit inspection fixture");
+
+    assert_eq!(
+        serde_json::to_value(inspection).expect("serialize Rust lane inspection"),
         fixture
     );
 }
@@ -434,6 +738,12 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
             .get_mut(&digest)
             .expect("first durable session")
             .expires_at = short_expiry;
+        state
+            .session_grants
+            .get_mut(&digest)
+            .expect("first durable session")
+            .capabilities
+            .retain(|capability| capability != "workbench.inspect");
     }
     first_manager
         .inner
@@ -443,6 +753,10 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
     let persisted = fs::read_to_string(&store_path).expect("read durable session");
     assert!(!persisted.contains(&session_secret));
     assert!(persisted.contains(&digest));
+    assert!(
+        !persisted.contains("workbench.inspect"),
+        "the fixture must represent a session minted before inspection shipped"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -479,6 +793,10 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
     );
     assert_eq!(restored.workspace_key, session.workspace_key);
     assert_eq!(restored.id, digest);
+    assert!(
+        restored.allows("workbench.inspect"),
+        "a snapshot-capable durable session gains the compatible inspection read"
+    );
     let stale_generation = planning::WorkbenchPlanningContext {
         schema_version: 1,
         session_id: restored.id.clone(),
@@ -542,6 +860,12 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
         "{renewed_over_same_origin:?}"
     );
     assert_eq!(renewed_over_same_origin.json()["kind"], "workbench.session");
+    assert!(
+        fs::read_to_string(&store_path)
+            .expect("read upgraded durable session")
+            .contains("workbench.inspect"),
+        "renewal persists the upgraded capability set"
+    );
     replacement.shutdown().await;
 }
 
@@ -777,6 +1101,7 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
     assert_eq!(
         payload.capabilities,
         std::iter::once("workbench.snapshot".to_string())
+            .chain(std::iter::once("workbench.inspect".to_string()))
             .chain(std::iter::once("lane.focus".to_string()))
             .chain(
                 planning::PLANNING_CAPABILITIES
@@ -1125,6 +1450,134 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lane_inspection_projects_bounded_history_without_changing_focus() {
+    let fixture = fixture();
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Inspection Epoch", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Historical Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .add_goal(
+            &phase,
+            "historical-goal",
+            "Complete the historical slice",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("add goal");
+    writer
+        .add_task(
+            "historical-goal",
+            "historical-task",
+            "Land the historical slice",
+            None,
+        )
+        .expect("add task");
+    writer
+        .add_task_log(
+            "historical-task",
+            "note",
+            &format!("Private note from {}", fixture.root.display()),
+        )
+        .expect("add private note");
+    writer
+        .add_task_log(
+            "historical-task",
+            "progress",
+            "Validated the historical browser flow.",
+        )
+        .expect("add progress");
+    writer
+        .complete_task("historical-task", "The task landed cleanly.")
+        .expect("complete task");
+    writer
+        .update_goal_status("historical-goal", "completed")
+        .expect("complete goal");
+    writer
+        .update_goal_completion_log("historical-goal", "The historical slice is available.")
+        .expect("record goal outcome");
+    let lane = writer
+        .add_workbench_lane(
+            "Historical Lane",
+            "Explain how the project arrived here",
+            &phase,
+        )
+        .expect("add historical lane");
+    writer
+        .update_phase_status(&phase, "completed")
+        .expect("complete phase");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let before = manager
+        .snapshot(&fixture.root)
+        .expect("read focus before inspection");
+    let inspection = manager
+        .inspect(&fixture.root, &lane)
+        .expect("inspect historical lane");
+    let after = manager
+        .snapshot(&fixture.root)
+        .expect("read focus after inspection");
+
+    assert_eq!(inspection.kind, "workbench.lane_inspection");
+    assert_eq!(inspection.schema_version, 1);
+    assert_eq!(inspection.relationship, "historical");
+    assert!(!inspection.can_focus_here);
+    assert_eq!(inspection.lane.summary.id, lane);
+    assert!(!inspection.phase.planning_available);
+    assert_eq!(
+        inspection.phase.goals[0].outcome.as_deref(),
+        Some("The historical slice is available.")
+    );
+    assert_eq!(
+        inspection.phase.goals[0].tasks[0].outcome.as_deref(),
+        Some("The task landed cleanly.")
+    );
+    assert_eq!(inspection.phase.goals[0].tasks[0].progress.len(), 1);
+    assert_eq!(
+        inspection.phase.goals[0].tasks[0].progress[0].message,
+        "Validated the historical browser flow."
+    );
+    assert_eq!(before.focused_lane, after.focused_lane);
+
+    let serialized = serde_json::to_string(&inspection).expect("serialize inspection");
+    for forbidden in [
+        fixture.root.as_path(),
+        fixture.project.state_root.as_path(),
+        fixture.project.db_path().as_path(),
+    ] {
+        assert!(
+            !serialized.contains(&forbidden.display().to_string()),
+            "inspection must not expose {}: {serialized}",
+            forbidden.display()
+        );
+    }
+
+    let error = manager
+        .inspect(&fixture.root, "missing-lane")
+        .expect_err("missing lane must fail");
+    let failure = error
+        .downcast_ref::<crate::failure::ExoFailure>()
+        .expect("structured missing-lane failure");
+    assert_eq!(
+        failure.error.code,
+        crate::api::protocol::ErrorCode::NotFound
+    );
+    assert_eq!(
+        failure.error.details.as_ref().expect("failure details")["kind"],
+        "workbench.lane_not_found"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn snapshot_projects_truthful_between_phase_context_for_the_workspace() {
     let fixture = fixture();
     let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
@@ -1226,7 +1679,7 @@ async fn snapshot_projects_truthful_between_phase_context_for_the_workspace() {
 
     let manager = test_manager(Arc::clone(&fixture.project));
     let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
-    assert_eq!(snapshot.schema_version, 2);
+    assert_eq!(snapshot.schema_version, 3);
     assert!(snapshot.focused_lane.is_none());
     assert!(snapshot.phase.is_none());
 
@@ -2164,6 +2617,43 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         Some("no-store")
     );
 
+    let inspection = raw_http(
+        origin,
+        "POST",
+        "/api/command",
+        Some(
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "id": "browser-inspection",
+                "session_key": session_key,
+                "operation": {
+                    "kind": "lane_inspect",
+                    "lane_id": "lane-history",
+                },
+            })
+            .to_string(),
+        ),
+        Some(cookie_pair),
+        Some(origin),
+    )
+    .await
+    .expect("dispatch browser lane inspection");
+    assert_eq!(inspection.status, 200, "{inspection:?}");
+    {
+        let dispatched = seen.lock().expect("dispatched requests");
+        assert_eq!(dispatched.len(), 2);
+        assert_eq!(dispatched[1].id, "browser-inspection");
+        let Op::Call(call) = &dispatched[1].op else {
+            panic!("lane inspection must dispatch an operation call");
+        };
+        assert!(matches!(
+            &call.address,
+            crate::api::protocol::Address::Operation { path }
+                if path.as_slice() == ["workbench", "inspect"]
+        ));
+        assert_eq!(call.input, json!({ "id": "lane-history" }));
+    }
+
     let review_permits = manager
         .inner
         .completion_review_admission()
@@ -2246,8 +2736,8 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     );
     {
         let dispatched = seen.lock().expect("dispatched requests");
-        assert_eq!(dispatched.len(), 2);
-        let Op::Call(call) = &dispatched[1].op else {
+        assert_eq!(dispatched.len(), 3);
+        let Op::Call(call) = &dispatched[2].op else {
             panic!("planning request must be a call");
         };
         assert_eq!(
@@ -2315,7 +2805,7 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
     );
     assert_eq!(
         seen.lock().expect("dispatched requests").len(),
-        2,
+        3,
         "terminal approval replay must not dispatch a new task completion"
     );
     let replayed = replay_seen.lock().expect("terminal replay requests");
@@ -2380,8 +2870,8 @@ async fn http_surface_enforces_origin_session_capability_and_body_bounds() {
         })
     );
     let dispatched = seen.lock().expect("dispatched requests");
-    assert_eq!(dispatched.len(), 3);
-    assert_eq!(dispatched[2].id, "browser-canonical-approval");
+    assert_eq!(dispatched.len(), 4);
+    assert_eq!(dispatched[3].id, "browser-canonical-approval");
     drop(dispatched);
     let probed = preparation_probe_seen
         .lock()

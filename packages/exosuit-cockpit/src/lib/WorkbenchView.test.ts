@@ -8,11 +8,19 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v2.json";
-import { decodeWorkbenchSnapshot } from "./workbench";
+import inspectionFixture from "./workbench-lane-inspection.v1.json";
+import snapshotFixture from "./workbench-snapshot.v3.json";
+import {
+  decodeWorkbenchLaneInspection,
+  decodeWorkbenchSnapshot,
+} from "./workbench";
 import WorkbenchView from "./WorkbenchView.svelte";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 const fixture = () => {
   const value = structuredClone(snapshotFixture);
@@ -87,14 +95,143 @@ describe("focus-only lane workbench", () => {
     });
 
     const invoker = screen.getByRole("button", {
-      name: "Open project lanes",
+      name: "Open project navigation",
     });
     const navigator = screen.getByRole("complementary", {
-      name: "Project lanes",
+      name: "Project navigation",
     });
     expect(invoker.getAttribute("commandfor")).toBe("lane-navigation");
     expect(invoker.getAttribute("command")).toBe("toggle-popover");
     expect(navigator.id).toBe("lane-navigation");
+  });
+
+  it("keeps the compact lane invoker toggleable with the command fallback", async () => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn(() => ({
+        matches: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 1;
+      }),
+    );
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const invoker = screen.getByRole("button", {
+      name: "Open project navigation",
+    });
+    const navigator = screen.getByRole("complementary", {
+      name: "Project navigation",
+    });
+    let open = false;
+    const matches = vi
+      .spyOn(navigator, "matches")
+      .mockImplementation((selector) => selector === ":popover-open" && open);
+    const showPopover = vi.fn(() => {
+      open = true;
+    });
+    const hidePopover = vi.fn(() => {
+      open = false;
+    });
+    Object.defineProperties(navigator, {
+      showPopover: { configurable: true, value: showPopover },
+      hidePopover: { configurable: true, value: hidePopover },
+    });
+
+    await fireEvent.click(invoker);
+    expect(showPopover).toHaveBeenCalledOnce();
+    expect(open).toBe(true);
+
+    await fireEvent.click(invoker);
+    expect(hidePopover).toHaveBeenCalledOnce();
+    expect(open).toBe(false);
+    matches.mockRestore();
+  });
+
+  it("renders project workspaces without treating them as execution focus", async () => {
+    const snapshot = fixture();
+    snapshot.project_workspaces[1]!.focused_lane = {
+      id: "lane-next",
+      title: "Focus-only lane workspace",
+      state: "prepared",
+      phase_id: "phase-next",
+      phase_title: "Lane workspace delivery",
+      phase_status: "in-progress",
+    };
+    snapshot.project_workspaces[1]!.active_phase = {
+      id: "phase-next",
+      title: "Lane workspace delivery",
+      status: "in-progress",
+    };
+    const onInspect = vi.fn();
+    const onCloseProject = vi.fn();
+
+    render(WorkbenchView, {
+      snapshot,
+      projectOverview: true,
+      onInspect,
+      onCloseProject,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Workspaces" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("list", { name: "Project workspaces" }).children,
+    ).toHaveLength(2);
+    expect(screen.getByText("This workspace")).toBeTruthy();
+    expect(screen.getByText("Live", { selector: ".workspace-availability" })).toBeTruthy();
+    expect(screen.getByText("Stale", { selector: ".workspace-availability" })).toBeTruthy();
+    expect(screen.getByText("Cleanliness unknown")).toBeTruthy();
+
+    const projectRow = screen.getByRole("button", {
+      name: "Open project workspace overview",
+    });
+    const focusedLane = screen.getByRole("button", {
+      name: "Local workbench host, focused",
+    });
+    expect(projectRow.classList.contains("selected")).toBe(true);
+    expect(projectRow.getAttribute("aria-current")).toBe("page");
+    expect(focusedLane.classList.contains("focused")).toBe(true);
+    expect(focusedLane.classList.contains("selected")).toBe(false);
+    expect(focusedLane.hasAttribute("aria-current")).toBe(false);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus-only lane workspace" }),
+    );
+    expect(onInspect).toHaveBeenCalledWith("lane-next");
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Current work" }),
+    );
+    expect(onCloseProject).toHaveBeenCalledOnce();
+  });
+
+  it("opens the project overview from persistent project navigation", async () => {
+    const onOpenProject = vi.fn();
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      onOpenProject,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Open project workspace overview" }),
+    );
+    expect(onOpenProject).toHaveBeenCalledOnce();
   });
 
   it("distinguishes underway goals from goals that have not started", () => {
@@ -717,21 +854,24 @@ describe("focus-only lane workbench", () => {
     ).toBeTruthy();
   });
 
-  it("focuses another existing lane through the only mutable control", async () => {
+  it("inspects another lane without changing workspace focus", async () => {
+    const onInspect = vi.fn();
     const onFocus = vi.fn();
     render(WorkbenchView, {
       snapshot: fixture(),
+      onInspect,
       onFocus,
       onRefresh: vi.fn(),
     });
 
     await fireEvent.click(
       screen.getByRole("button", {
-        name: "Focus Focus-only lane workspace",
+        name: "Inspect Focus-only lane workspace, phase in progress",
       }),
     );
 
-    expect(onFocus).toHaveBeenCalledWith("lane-next");
+    expect(onInspect).toHaveBeenCalledWith("lane-next");
+    expect(onFocus).not.toHaveBeenCalled();
   });
 
   it("renders pending focus and retryable failure without changing local state", async () => {
@@ -773,7 +913,9 @@ describe("focus-only lane workbench", () => {
       screen.getByRole("heading", { name: "No lane focused here" }),
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Focus Local workbench host" }),
+      screen.getByRole("button", {
+        name: "Inspect Local workbench host, phase in progress",
+      }),
     ).toBeTruthy();
   });
 
@@ -955,7 +1097,7 @@ describe("focus-only lane workbench", () => {
     ).toHaveProperty("disabled", true);
   });
 
-  it("keeps completed-phase lanes visible without making them focusable", async () => {
+  it("opens completed lanes as read-only project history", async () => {
     const snapshot = fixture();
     snapshot.lanes.push({
       id: "lane-history",
@@ -966,26 +1108,26 @@ describe("focus-only lane workbench", () => {
       phase_status: "completed",
       focused_here: false,
     });
+    const onInspect = vi.fn();
     const onFocus = vi.fn();
 
     render(WorkbenchView, {
       snapshot,
+      onInspect,
       onFocus,
       onRefresh: vi.fn(),
     });
 
     const completedLane = screen.getByRole("button", {
-      name: "Completed lane, phase completed",
+      name: "Inspect Completed lane, phase completed",
     });
-    expect(completedLane).toHaveProperty("disabled", true);
-    expect(completedLane.getAttribute("title")).toBe(
-      "This lane’s phase is not active",
-    );
+    expect(completedLane).toHaveProperty("disabled", false);
     await fireEvent.click(completedLane);
+    expect(onInspect).toHaveBeenCalledWith("lane-history");
     expect(onFocus).not.toHaveBeenCalled();
   });
 
-  it("keeps pending-phase lanes visible without making them focusable", async () => {
+  it("opens pending lanes as read-only future plans", async () => {
     const snapshot = fixture();
     snapshot.lanes.push({
       id: "lane-future",
@@ -996,22 +1138,57 @@ describe("focus-only lane workbench", () => {
       phase_status: "pending",
       focused_here: false,
     });
+    const onInspect = vi.fn();
     const onFocus = vi.fn();
 
     render(WorkbenchView, {
       snapshot,
+      onInspect,
       onFocus,
       onRefresh: vi.fn(),
     });
 
     const futureLane = screen.getByRole("button", {
-      name: "Future lane, phase pending",
+      name: "Inspect Future lane, phase pending",
     });
-    expect(futureLane).toHaveProperty("disabled", true);
-    expect(futureLane.getAttribute("title")).toBe(
-      "This lane’s phase is not active",
-    );
+    expect(futureLane).toHaveProperty("disabled", false);
     await fireEvent.click(futureLane);
+    expect(onInspect).toHaveBeenCalledWith("lane-future");
+    expect(onFocus).not.toHaveBeenCalled();
+  });
+
+  it("renders bounded outcomes and progress without planning controls", async () => {
+    const inspection = decodeWorkbenchLaneInspection(
+      structuredClone(inspectionFixture),
+    );
+    const onCloseInspection = vi.fn();
+    const onFocus = vi.fn();
+
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      inspection,
+      onCloseInspection,
+      onFocus,
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Completed cockpit foundation" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Project history")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "The first lane-centered cockpit is available for dogfood.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("The reviewed foundation landed cleanly.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Focus in this workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Add task/ })).toBeNull();
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Back to current work" }),
+    );
+    expect(onCloseInspection).toHaveBeenCalledOnce();
     expect(onFocus).not.toHaveBeenCalled();
   });
 });
