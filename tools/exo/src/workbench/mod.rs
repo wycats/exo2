@@ -1058,12 +1058,26 @@ impl WorkbenchHostManager {
     ) -> Result<Vec<WorkspaceProjection>> {
         let now = unix_seconds();
         let worktree_index = self.inner.project.worktree_index();
-        let (known_roots, current_root) = {
+        let (known_roots, current_root, live_grant_keys_by_root) = {
             let state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            let mut live_grant_keys_by_root = HashMap::<PathBuf, (u64, String)>::new();
+            for grant in state.session_grants.values().filter(|grant| {
+                grant.project_id == self.inner.project.id.as_str() && grant.is_live(now)
+            }) {
+                let replace = live_grant_keys_by_root
+                    .get(&grant.workspace_root)
+                    .is_none_or(|(last_activity, _)| *last_activity < grant.last_activity);
+                if replace {
+                    live_grant_keys_by_root.insert(
+                        grant.workspace_root.clone(),
+                        (grant.last_activity, grant.workspace_key.clone()),
+                    );
+                }
+            }
             (
                 state
                     .workspaces_by_root
@@ -1074,6 +1088,7 @@ impl WorkbenchHostManager {
                     .workspaces_by_key
                     .get(current_workspace_key)
                     .map(|workspace| workspace.root.clone()),
+                live_grant_keys_by_root,
             )
         };
 
@@ -1086,7 +1101,10 @@ impl WorkbenchHostManager {
                 if known_roots.contains(&root) || discovered.len() >= discovery_capacity {
                     continue;
                 }
-                let key = deterministic_workspace_key(&self.inner.project.id, &root);
+                let key = live_grant_keys_by_root
+                    .get(&root)
+                    .map(|(_, key)| key.clone())
+                    .unwrap_or_else(|| deterministic_workspace_key(&self.inner.project.id, &root));
                 let git = if index.get(&root) == Some(&false)
                     && self
                         .inner
@@ -1305,6 +1323,31 @@ fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_
         return false;
     }
 
+    let now = unix_seconds();
+    let mut protected = HashSet::from([current_workspace_key.to_string()]);
+    protected.extend(
+        state
+            .pending_capabilities
+            .values()
+            .filter(|pending| pending.expires_at > now)
+            .map(|pending| pending.workspace_key.clone()),
+    );
+    protected.extend(
+        state
+            .sessions
+            .values()
+            .filter(|session| session.is_live(now))
+            .map(|session| session.workspace_key.clone()),
+    );
+    protected.extend(
+        state
+            .session_grants
+            .values()
+            .filter(|grant| grant.is_live(now))
+            .map(|grant| grant.workspace_key.clone()),
+    );
+    protected.retain(|key| state.workspaces_by_key.contains_key(key));
+
     let mut registrations = state
         .workspaces_by_key
         .values()
@@ -1313,13 +1356,18 @@ fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_
     registrations.sort_by(|left, right| {
         (right.key == current_workspace_key)
             .cmp(&(left.key == current_workspace_key))
+            .then_with(|| {
+                protected
+                    .contains(&right.key)
+                    .cmp(&protected.contains(&left.key))
+            })
             .then_with(|| right.observed_at.cmp(&left.observed_at))
             .then_with(|| right.registered_at.cmp(&left.registered_at))
             .then_with(|| left.key.cmp(&right.key))
     });
     let retained = registrations
         .into_iter()
-        .take(MAX_PROJECT_WORKSPACES)
+        .take(MAX_PROJECT_WORKSPACES.max(protected.len()))
         .map(|workspace| workspace.key)
         .collect::<HashSet<_>>();
     state

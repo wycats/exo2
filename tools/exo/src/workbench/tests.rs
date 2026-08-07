@@ -323,6 +323,34 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
     drop(writer);
 
     let manager = test_manager(Arc::clone(&fixture.project));
+    let legacy_sibling_key = "w".repeat(43);
+    let legacy_selector = "s".repeat(43);
+    let legacy_credential_digest = "a".repeat(64);
+    let now = unix_seconds();
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .session_grants
+        .insert(
+            legacy_credential_digest.clone(),
+            WorkbenchSessionGrantV1 {
+                credential_digest: legacy_credential_digest,
+                selector: legacy_selector,
+                project_id: fixture.project.id.to_string(),
+                workspace_key: legacy_sibling_key.clone(),
+                workspace_root: sibling_root.clone(),
+                capabilities: vec!["workbench.snapshot".to_string()],
+                created_at: now,
+                last_activity: now,
+                expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+            },
+        );
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist legacy sibling session grant");
     let discovered = manager
         .snapshot(&current_root)
         .expect("discover sibling workspace");
@@ -331,6 +359,7 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
         .iter()
         .find(|workspace| !workspace.current)
         .expect("discovered sibling workspace summary");
+    assert_eq!(discovered_sibling.key, legacy_sibling_key);
     assert_eq!(discovered_sibling.label, "workspace-sibling");
     assert_eq!(discovered_sibling.availability, "stale");
     assert!(discovered_sibling.observed_at.is_none());
@@ -523,13 +552,53 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             registered_at: MAX_PROJECT_WORKSPACES as u64,
         },
     );
+    let now = unix_seconds();
+    state.pending_capabilities.insert(
+        "pending-capability".to_string(),
+        PendingCapability {
+            workspace_key: "workspace-000".to_string(),
+            expires_at: now.saturating_add(TICKET_LIFETIME.as_secs()),
+        },
+    );
+    state.sessions.insert(
+        "live-session".to_string(),
+        WorkbenchSession {
+            id: "live-session".to_string(),
+            selector: "live-selector".to_string(),
+            project_id: "project-fixture".to_string(),
+            workspace_key: "workspace-001".to_string(),
+            workspace_root: PathBuf::from("/tmp/exo-workbench-001"),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            created_at: now,
+            last_activity: now,
+            expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+            last_persisted_at: now,
+        },
+    );
+    state.session_grants.insert(
+        "live-grant".to_string(),
+        WorkbenchSessionGrantV1 {
+            credential_digest: "live-grant".to_string(),
+            selector: "grant-selector".to_string(),
+            project_id: "project-fixture".to_string(),
+            workspace_key: "workspace-002".to_string(),
+            workspace_root: PathBuf::from("/tmp/exo-workbench-002"),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            created_at: now,
+            last_activity: now,
+            expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+        },
+    );
 
     assert!(retain_project_workspace_limit(&mut state, &current_key));
     assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
     assert_eq!(state.workspaces_by_root.len(), MAX_PROJECT_WORKSPACES);
     assert!(state.workspaces_by_key.contains_key(&current_key));
+    assert!(state.workspaces_by_key.contains_key("workspace-000"));
+    assert!(state.workspaces_by_key.contains_key("workspace-001"));
+    assert!(state.workspaces_by_key.contains_key("workspace-002"));
     assert!(state.workspaces_by_key.contains_key("workspace-127"));
-    assert!(!state.workspaces_by_key.contains_key("workspace-000"));
+    assert!(!state.workspaces_by_key.contains_key("workspace-003"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
