@@ -153,6 +153,7 @@
   let inspectionRequestedLaneId: string | null = null;
   let inspectionRequestedHistoryMode: InspectionHistoryMode = "none";
   let pendingRestoredLaneId: string | null = null;
+  let pendingRestoredLaneHistoryMode: InspectionHistoryMode = "none";
   let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
@@ -373,6 +374,7 @@
       inspectionRequestedLaneId = null;
       inspectionRequestedHistoryMode = "none";
       pendingRestoredLaneId = null;
+      pendingRestoredLaneHistoryMode = "none";
       confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
@@ -467,6 +469,7 @@
           inspectedLaneFromHistory(history.state) ??
           inspectedLaneFromHistory(resumeState);
         pendingRestoredLaneId = restoredLaneId;
+        pendingRestoredLaneHistoryMode = "none";
         projectOverview =
           !restoredLaneId &&
           (projectOverviewFromHistory(history.state) ||
@@ -506,6 +509,7 @@
             void inspectLane(laneId, "none", true, true);
           } else {
             pendingRestoredLaneId = laneId;
+            pendingRestoredLaneHistoryMode = "none";
             projectOverview = false;
           }
         } else if (projectOverviewFromHistory(event.state)) {
@@ -680,8 +684,10 @@
       }
       if (pendingRestoredLaneId) {
         const restoredLaneId = pendingRestoredLaneId;
+        const restoredHistoryMode = pendingRestoredLaneHistoryMode;
         pendingRestoredLaneId = null;
-        void inspectLane(restoredLaneId, "none", true, true);
+        pendingRestoredLaneHistoryMode = "none";
+        void inspectLane(restoredLaneId, restoredHistoryMode, true, true);
       } else if (requestedLaneId) {
         if (snapshotChanged) {
           void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
@@ -740,6 +746,7 @@
     inspectionRequestedLaneId = null;
     inspectionRequestedHistoryMode = "none";
     pendingRestoredLaneId = null;
+    pendingRestoredLaneHistoryMode = "none";
     projectOverview = false;
     if (mode !== "none") {
       writeInspectionHistory(null, mode);
@@ -758,6 +765,7 @@
     inspectionRequestedLaneId = null;
     inspectionRequestedHistoryMode = "none";
     pendingRestoredLaneId = null;
+    pendingRestoredLaneHistoryMode = "none";
     projectOverview = true;
     if (mode === "none") {
       return;
@@ -855,6 +863,9 @@
         refreshFailure = null;
         stopLiveUpdates?.();
       } else if (terminalFailure(error)) {
+        pendingRestoredLaneId = laneId;
+        pendingRestoredLaneHistoryMode = historyMode;
+        projectOverview = false;
         applyTerminalFailure(error);
       } else {
         inspectionFailure = messageFrom(error);
