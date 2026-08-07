@@ -1,13 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import snapshotFixture from "./workbench-snapshot.v2.json";
-import { decodeWorkbenchSnapshot } from "./workbench";
+import inspectionFixture from "./workbench-lane-inspection.v1.json";
+import snapshotFixture from "./workbench-snapshot.v3.json";
+import {
+  decodeWorkbenchLaneInspection,
+  decodeWorkbenchSnapshot,
+} from "./workbench";
 
 describe("workbench snapshot contract", () => {
-  it("decodes the Rust-owned version-two fixture", () => {
+  it("decodes the Rust-owned version-three fixture", () => {
     const snapshot = decodeWorkbenchSnapshot(snapshotFixture);
 
     expect(snapshot.kind).toBe("workbench.snapshot");
+    expect(snapshot.project_workspaces).toHaveLength(2);
+    expect(snapshot.project_workspaces[0]?.current).toBe(true);
+    expect(snapshot.project_workspaces[1]?.availability).toBe("stale");
+    expect(snapshot.project_workspaces[1]?.dirty).toBeNull();
     expect(snapshot.focused_lane?.id).toBe("lane-fixture");
     expect(snapshot.phase?.planning_available).toBe(true);
     expect(snapshot.phase?.goals[0]?.tasks[0]?.id).toBe("implement-host");
@@ -17,6 +25,28 @@ describe("workbench snapshot contract", () => {
         created_at: "2026-07-28T19:45:00Z",
       },
     ]);
+  });
+
+  it("requires one project workspace to match the session workspace", () => {
+    const malformed = structuredClone(snapshotFixture);
+    malformed.project_workspaces[0]!.current = false;
+
+    expect(() => decodeWorkbenchSnapshot(malformed)).toThrow(
+      "Invalid workbench snapshot field: project_workspaces.current",
+    );
+  });
+
+  it("rejects unknown project workspace availability", () => {
+    const malformed = structuredClone(snapshotFixture);
+    (
+      malformed.project_workspaces[1] as {
+        availability: string;
+      }
+    ).availability = "probably-live";
+
+    expect(() => decodeWorkbenchSnapshot(malformed)).toThrow(
+      "Invalid workbench snapshot field: project_workspace.availability",
+    );
   });
 
   it("decodes browser-safe between-phase trajectory context", () => {
@@ -109,6 +139,32 @@ describe("workbench snapshot contract", () => {
 
     expect(() => decodeWorkbenchSnapshot(malformed)).toThrow(
       "Invalid workbench snapshot field: suggested_action.confidence",
+    );
+  });
+});
+
+describe("workbench lane inspection contract", () => {
+  it("decodes the Rust-owned version-one fixture", () => {
+    const inspection = decodeWorkbenchLaneInspection(inspectionFixture);
+
+    expect(inspection.kind).toBe("workbench.lane_inspection");
+    expect(inspection.relationship).toBe("historical");
+    expect(inspection.can_focus_here).toBe(false);
+    expect(inspection.lane.id).toBe("lane-history");
+    expect(inspection.phase.goals[0]?.outcome).toBe(
+      "The first lane-centered cockpit is available for dogfood.",
+    );
+    expect(inspection.phase.goals[0]?.tasks[0]?.outcome).toBe(
+      "The reviewed foundation landed cleanly.",
+    );
+  });
+
+  it("rejects an unknown inspection relationship", () => {
+    const malformed = structuredClone(inspectionFixture);
+    (malformed as { relationship: string }).relationship = "active_elsewhere";
+
+    expect(() => decodeWorkbenchLaneInspection(malformed)).toThrow(
+      "Invalid workbench snapshot field: inspection.relationship",
     );
   });
 });

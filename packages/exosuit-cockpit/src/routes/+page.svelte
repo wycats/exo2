@@ -8,12 +8,17 @@
     Route,
     WifiOff,
   } from "@lucide/svelte";
+  import {
+    pushState as pushPageState,
+    replaceState as replacePageState,
+  } from "$app/navigation";
   import { onMount } from "svelte";
 
   import WorkbenchView from "$lib/WorkbenchView.svelte";
   import {
     workbenchPlanningBinding,
     type WorkbenchPlanningBinding,
+    type WorkbenchLaneInspection,
     type WorkbenchPlanningOperation,
     type WorkbenchPlanningRequest,
     type WorkbenchSnapshot,
@@ -26,6 +31,7 @@
     prepareWorkbenchTicketExchange,
     retainSessionSelector,
     sessionKeyFromHistory,
+    workbenchHistoryState,
     WorkbenchClient,
     WorkbenchClientError,
     type WorkbenchFailureKind,
@@ -49,10 +55,19 @@
     | "reload_required";
 
   const SESSION_RENEW_INTERVAL_MS = 5 * 60_000;
+  const INSPECTED_LANE_HISTORY_KEY = "exoWorkbenchInspectedLaneId";
+  const PROJECT_OVERVIEW_HISTORY_KEY = "exoWorkbenchProjectOverview";
+  const TAB_RESUME_STATE_KEY = "exoWorkbenchResumeState";
 
   interface FocusRequest {
     laneId: string;
     requestId: string;
+  }
+
+  interface ConfirmedLocalFocus {
+    laneId: string;
+    daemonInstanceId: string;
+    priorRevision: number;
   }
 
   interface PreparedPlanningRequest {
@@ -71,8 +86,41 @@
     expectedPhaseId: string;
   }
 
+  function readTabResumeState(): Record<string, unknown> {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(TAB_RESUME_STATE_KEY) ?? "null");
+      return typeof value === "object" && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function retainTabResumeState(state: Record<string, unknown>): void {
+    try {
+      sessionStorage.setItem(TAB_RESUME_STATE_KEY, JSON.stringify(state));
+    } catch {
+      // History state remains the in-session navigation source of truth.
+    }
+  }
+
+  function clearTabResumeState(): void {
+    try {
+      sessionStorage.removeItem(TAB_RESUME_STATE_KEY);
+    } catch {
+      // A fresh launch still clears the retained selector from history state.
+    }
+  }
+
   let screen = $state<ScreenState>("loading");
   let snapshot = $state<WorkbenchSnapshot | null>(null);
+  let inspection = $state<WorkbenchLaneInspection | null>(null);
+  let inspectionLoading = $state(false);
+  let inspectionFailure = $state<string | null>(null);
+  let inspectionRetryLaneId = $state<string | null>(null);
+  let inspectionRetryHistoryMode = $state<InspectionHistoryMode>("none");
+  let projectOverview = $state(false);
   let refreshing = $state(false);
   let streamConnected = $state(false);
   let pendingFocus = $state<FocusRequest | null>(null);
@@ -101,6 +149,12 @@
   let stopLiveUpdates: (() => void) | null = null;
   let beginSessionRecovery: (() => void) | null = null;
   let snapshotRefreshGeneration = 0;
+  let inspectionRequestGeneration = 0;
+  let inspectionRequestedLaneId: string | null = null;
+  let inspectionRequestedHistoryMode: InspectionHistoryMode = "none";
+  let pendingRestoredLaneId: string | null = null;
+  let pendingRestoredLaneHistoryMode: InspectionHistoryMode = "none";
+  let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
     let events: EventSource | null = null;
@@ -310,6 +364,18 @@
       stopUpdates();
       client = null;
       snapshot = null;
+      inspection = null;
+      inspectionLoading = false;
+      inspectionFailure = null;
+      inspectionRetryLaneId = null;
+      inspectionRetryHistoryMode = "none";
+      projectOverview = false;
+      inspectionRequestGeneration += 1;
+      inspectionRequestedLaneId = null;
+      inspectionRequestedHistoryMode = "none";
+      pendingRestoredLaneId = null;
+      pendingRestoredLaneHistoryMode = "none";
+      confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
       ambiguousFocus = null;
@@ -340,21 +406,34 @@
       screenRetryable = false;
       retryBootstrap = null;
       try {
+        const resumeState =
+          !ticket && restoredSessionKey === undefined
+            ? readTabResumeState()
+            : {};
         let sessionKey =
           restoredSessionKey === undefined
-            ? sessionKeyFromHistory(history.state)
+            ? sessionKeyFromHistory(history.state) ??
+              sessionKeyFromHistory(resumeState)
             : restoredSessionKey;
         if (ticket || sessionKey !== client?.sessionKey) {
           resetClientState();
         }
         if (ticket) {
-          prepareWorkbenchTicketExchange(history, location);
+          clearTabResumeState();
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            prepareWorkbenchTicketExchange(history.state),
+          );
           const session = await exchangeWorkbenchTicket(ticket);
           if (!isCurrent()) {
             return;
           }
           sessionKey = session.session_key;
-          retainSessionSelector(history, location, sessionKey);
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            retainSessionSelector(history.state, sessionKey),
+          );
+          retainTabResumeState(workbenchHistoryState(history.state));
         }
         if (!isCurrent()) {
           return;
@@ -363,11 +442,38 @@
           screen = "session_required";
           return;
         }
+        if (
+          !ticket &&
+          !sessionKeyFromHistory(history.state) &&
+          sessionKeyFromHistory(resumeState) === sessionKey
+        ) {
+          const restoredState = retainSessionSelector(
+            {
+              ...resumeState,
+              ...workbenchHistoryState(history.state),
+            },
+            sessionKey,
+          );
+          replacePageState(
+            `${location.pathname}${location.search}`,
+            restoredState,
+          );
+          retainTabResumeState(restoredState);
+        }
 
         client = new WorkbenchClient(sessionKey);
         if (!ticket) {
           await client.renewSession();
         }
+        const restoredLaneId =
+          inspectedLaneFromHistory(history.state) ??
+          inspectedLaneFromHistory(resumeState);
+        pendingRestoredLaneId = restoredLaneId;
+        pendingRestoredLaneHistoryMode = "none";
+        projectOverview =
+          !restoredLaneId &&
+          (projectOverviewFromHistory(history.state) ||
+            projectOverviewFromHistory(resumeState));
         await refreshSnapshot(false);
       } catch (error) {
         if (isCurrent()) {
@@ -389,14 +495,33 @@
       }
     };
     const bootstrapRestoredSession = (event: PopStateEvent) => {
+      const restoredState = workbenchHistoryState(event.state);
+      if (sessionKeyFromHistory(restoredState)) {
+        retainTabResumeState(restoredState);
+      }
       const restoredSessionKey = sessionKeyFromHistory(event.state);
       if (restoredSessionKey !== client?.sessionKey) {
         void bootstrap(undefined, restoredSessionKey);
+      } else {
+        const laneId = inspectedLaneFromHistory(event.state);
+        if (laneId) {
+          if (sessionRecovery === "connected") {
+            void inspectLane(laneId, "none", true, true);
+          } else {
+            pendingRestoredLaneId = laneId;
+            pendingRestoredLaneHistoryMode = "none";
+            projectOverview = false;
+          }
+        } else if (projectOverviewFromHistory(event.state)) {
+          openProjectOverview("none");
+        } else {
+          clearInspection("none");
+        }
       }
     };
     window.addEventListener("hashchange", bootstrapFreshTicket);
     window.addEventListener("popstate", bootstrapRestoredSession);
-    void bootstrap();
+    queueMicrotask(() => void bootstrap());
 
     return () => {
       bootstrapGeneration += 1;
@@ -412,7 +537,7 @@
   });
 
   async function refreshSnapshot(quiet: boolean): Promise<boolean> {
-    if (!client) {
+    if (!client || sessionRecovery !== "connected") {
       return false;
     }
     if (refreshing) {
@@ -494,6 +619,16 @@
   }
 
   function applySnapshot(nextSnapshot: WorkbenchSnapshot): void {
+    const previousSnapshot = snapshot;
+    const previousInspection = inspection;
+    const requestedLaneId = inspectionRequestedLaneId;
+    const requestedHistoryMode = inspectionRequestedHistoryMode;
+    const retryLaneId = inspectionRetryLaneId;
+    const retryHistoryMode = inspectionRetryHistoryMode;
+    const snapshotChanged =
+      previousSnapshot === null ||
+      previousSnapshot.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
+      previousSnapshot.revision !== nextSnapshot.revision;
     snapshot = nextSnapshot;
     screen = "ready";
     screenMessage = null;
@@ -532,7 +667,234 @@
       planningEditorRebindPending = false;
       planningEditorRebindToken += 1;
     }
+    const confirmedFocusObserved =
+      confirmedLocalFocus !== null &&
+      nextSnapshot.focused_lane?.id === confirmedLocalFocus.laneId;
+    if (confirmedFocusObserved) {
+      confirmedLocalFocus = null;
+      clearInspection("replace");
+    } else {
+      if (
+        confirmedLocalFocus !== null &&
+        (nextSnapshot.daemon.instance_id !==
+          confirmedLocalFocus.daemonInstanceId ||
+          nextSnapshot.revision > confirmedLocalFocus.priorRevision)
+      ) {
+        confirmedLocalFocus = null;
+      }
+      if (pendingRestoredLaneId && sessionRecovery === "connected") {
+        const restoredLaneId = pendingRestoredLaneId;
+        const restoredHistoryMode = pendingRestoredLaneHistoryMode;
+        pendingRestoredLaneId = null;
+        pendingRestoredLaneHistoryMode = "none";
+        void inspectLane(restoredLaneId, restoredHistoryMode, true, true);
+      } else if (requestedLaneId) {
+        if (snapshotChanged) {
+          void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
+        }
+      } else if (retryLaneId && snapshotChanged) {
+        void inspectLane(retryLaneId, retryHistoryMode, true, true);
+      } else if (
+        previousInspection &&
+        (previousInspection.daemon.instance_id !==
+          nextSnapshot.daemon.instance_id ||
+          previousInspection.revision !== nextSnapshot.revision)
+      ) {
+        void inspectLane(previousInspection.lane.id, "none", true, true);
+      }
+    }
     startLiveUpdates?.();
+  }
+
+  type InspectionHistoryMode = "push" | "replace" | "none";
+
+  function inspectedLaneFromHistory(state: unknown): string | null {
+    const laneId = workbenchHistoryState(state)[INSPECTED_LANE_HISTORY_KEY];
+    return typeof laneId === "string" && laneId.length > 0 ? laneId : null;
+  }
+
+  function projectOverviewFromHistory(state: unknown): boolean {
+    return workbenchHistoryState(state)[PROJECT_OVERVIEW_HISTORY_KEY] === true;
+  }
+
+  function writeInspectionHistory(
+    laneId: string | null,
+    mode: Exclude<InspectionHistoryMode, "none">,
+  ): void {
+    const nextState = { ...workbenchHistoryState(history.state) };
+    if (laneId) {
+      nextState[INSPECTED_LANE_HISTORY_KEY] = laneId;
+    } else {
+      delete nextState[INSPECTED_LANE_HISTORY_KEY];
+    }
+    delete nextState[PROJECT_OVERVIEW_HISTORY_KEY];
+    if (mode === "push") {
+      pushPageState("", nextState);
+    } else {
+      replacePageState("", nextState);
+    }
+    retainTabResumeState(nextState);
+  }
+
+  function clearInspection(mode: InspectionHistoryMode = "push"): void {
+    inspectionRequestGeneration += 1;
+    inspection = null;
+    inspectionLoading = false;
+    inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
+    inspectionRequestedLaneId = null;
+    inspectionRequestedHistoryMode = "none";
+    pendingRestoredLaneId = null;
+    pendingRestoredLaneHistoryMode = "none";
+    projectOverview = false;
+    if (mode !== "none") {
+      writeInspectionHistory(null, mode);
+    }
+  }
+
+  function openProjectOverview(
+    mode: InspectionHistoryMode = "push",
+  ): void {
+    inspectionRequestGeneration += 1;
+    inspection = null;
+    inspectionLoading = false;
+    inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
+    inspectionRequestedLaneId = null;
+    inspectionRequestedHistoryMode = "none";
+    pendingRestoredLaneId = null;
+    pendingRestoredLaneHistoryMode = "none";
+    projectOverview = true;
+    if (mode === "none") {
+      return;
+    }
+    const nextState = { ...workbenchHistoryState(history.state) };
+    delete nextState[INSPECTED_LANE_HISTORY_KEY];
+    nextState[PROJECT_OVERVIEW_HISTORY_KEY] = true;
+    if (mode === "push") {
+      pushPageState("", nextState);
+    } else {
+      replacePageState("", nextState);
+    }
+    retainTabResumeState(nextState);
+  }
+
+  async function inspectLane(
+    laneId: string,
+    historyMode: InspectionHistoryMode = "push",
+    retryOnStale = true,
+    preserveFocusedSelection = false,
+  ): Promise<void> {
+    if (!client || !snapshot || sessionRecovery !== "connected") {
+      return;
+    }
+    if (laneId === snapshot.focused_lane?.id && !preserveFocusedSelection) {
+      clearInspection(historyMode);
+      return;
+    }
+
+    const activeClient = client;
+    const requestGeneration = ++inspectionRequestGeneration;
+    inspectionRequestedLaneId = laneId;
+    inspectionRequestedHistoryMode = historyMode;
+    inspectionLoading = true;
+    inspectionFailure = null;
+    inspectionRetryLaneId = null;
+    inspectionRetryHistoryMode = "none";
+    try {
+      const nextInspection = await activeClient.inspectLane(laneId);
+      if (
+        client !== activeClient ||
+        requestGeneration !== inspectionRequestGeneration
+      ) {
+        return;
+      }
+      if (
+        nextInspection.daemon.instance_id !== snapshot.daemon.instance_id ||
+        nextInspection.revision !== snapshot.revision
+      ) {
+        if (retryOnStale) {
+          await refreshSnapshot(true);
+          if (requestGeneration === inspectionRequestGeneration) {
+            await inspectLane(laneId, historyMode, false, true);
+          }
+        } else {
+          inspectionFailure =
+            "This lane changed while it was opening. Retry from the current project view.";
+          inspectionRetryLaneId = laneId;
+          inspectionRetryHistoryMode = historyMode;
+        }
+        return;
+      }
+      inspection = nextInspection;
+      inspectionRetryLaneId = null;
+      inspectionRetryHistoryMode = "none";
+      projectOverview = false;
+      if (historyMode !== "none") {
+        writeInspectionHistory(laneId, historyMode);
+      }
+    } catch (error) {
+      if (
+        client !== activeClient ||
+        requestGeneration !== inspectionRequestGeneration
+      ) {
+        return;
+      }
+      if (
+        error instanceof WorkbenchClientError &&
+        error.detailKind === "workbench.lane_not_found"
+      ) {
+        openProjectOverview("replace");
+        inspectionFailure =
+          "That lane is no longer part of the current project plan.";
+        inspectionRetryLaneId = null;
+        inspectionRetryHistoryMode = "none";
+      } else if (
+        error instanceof WorkbenchClientError &&
+        error.kind === "client_update_required"
+      ) {
+        inspectionFailure = null;
+        inspectionRetryLaneId = null;
+        inspectionRetryHistoryMode = "none";
+        sessionRecovery = "reload_required";
+        sessionRecoveryMessage = messageFrom(error);
+        refreshFailure = null;
+        stopLiveUpdates?.();
+      } else if (terminalFailure(error)) {
+        pendingRestoredLaneId = laneId;
+        pendingRestoredLaneHistoryMode = historyMode;
+        projectOverview = false;
+        applyTerminalFailure(error);
+      } else {
+        inspectionFailure = messageFrom(error);
+        inspectionRetryLaneId = laneId;
+        inspectionRetryHistoryMode = historyMode;
+      }
+    } finally {
+      if (requestGeneration === inspectionRequestGeneration) {
+        inspectionRequestedLaneId = null;
+        inspectionRequestedHistoryMode = "none";
+        inspectionLoading = false;
+      }
+    }
+  }
+
+  function selectLane(laneId: string): void {
+    void inspectLane(laneId);
+  }
+
+  async function focusInspectedLane(laneId: string): Promise<void> {
+    await focusLane(laneId);
+  }
+
+  function retryInspection(): void {
+    if (inspectionRetryLaneId) {
+      const laneId = inspectionRetryLaneId;
+      const historyMode = inspectionRetryHistoryMode;
+      void inspectLane(laneId, historyMode, true, true);
+    }
   }
 
   function preparedPlanningApprovesReview(
@@ -561,6 +923,16 @@
     focusFailure = null;
     try {
       await activeClient.focusLane(laneId, requestId);
+      if (client !== activeClient) {
+        return;
+      }
+      if (snapshot) {
+        confirmedLocalFocus = {
+          laneId,
+          daemonInstanceId: snapshot.daemon.instance_id,
+          priorRevision: snapshot.revision,
+        };
+      }
     } catch (error) {
       if (client !== activeClient) {
         return;
@@ -883,6 +1255,10 @@
 {#if screen === "ready" && snapshot}
   <WorkbenchView
     {snapshot}
+    {inspection}
+    {inspectionLoading}
+    {inspectionFailure}
+    {projectOverview}
     {refreshing}
     {streamConnected}
     {sessionRecovery}
@@ -896,7 +1272,14 @@
     {planningEditorRebindToken}
     pendingPlanningKind={pendingPlanning?.request.operation.kind ?? null}
     completionReview={completionReview?.review ?? null}
-    onFocus={(laneId) => void focusLane(laneId)}
+    onInspect={selectLane}
+    onOpenProject={() => openProjectOverview()}
+    onCloseProject={() => clearInspection()}
+    onCloseInspection={() => clearInspection()}
+    onRetryInspection={inspectionFailure && inspectionRetryLaneId
+      ? retryInspection
+      : null}
+    onFocus={(laneId) => void focusInspectedLane(laneId)}
     onRetryFocus={retryFocus ? retryPendingFocus : null}
     onRetryPlanning={retryPlanning ? retryPendingPlanning : null}
     onRetrySession={sessionRecovery === "reconnecting"

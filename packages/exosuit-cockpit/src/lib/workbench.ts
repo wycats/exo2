@@ -25,7 +25,7 @@ export interface WorkbenchWorkspaceIdentity {
 export interface WorkbenchSnapshot {
   kind: "workbench.snapshot";
   ok: true;
-  schema_version: 2;
+  schema_version: 3;
   observed_at: string;
   revision: number;
   project: {
@@ -35,6 +35,7 @@ export interface WorkbenchSnapshot {
     instance_id: string;
   };
   workspace: WorkbenchSnapshotWorkspace;
+  project_workspaces: WorkbenchProjectWorkspaceSummary[];
   lanes: WorkbenchLaneSummary[];
   focused_lane: WorkbenchLaneDetails | null;
   phase: WorkbenchPhase | null;
@@ -43,9 +44,61 @@ export interface WorkbenchSnapshot {
   diagnostics: WorkbenchDiagnostic[];
 }
 
+export interface WorkbenchLaneInspection {
+  kind: "workbench.lane_inspection";
+  ok: true;
+  schema_version: 1;
+  observed_at: string;
+  revision: number;
+  project: {
+    id: string;
+  };
+  daemon: {
+    instance_id: string;
+  };
+  workspace: WorkbenchSnapshotWorkspace;
+  relationship:
+    | "focused_here"
+    | "focusable_here"
+    | "prepared"
+    | "historical";
+  can_focus_here: boolean;
+  lane: WorkbenchLaneDetails;
+  phase: WorkbenchPhase;
+}
+
 export interface WorkbenchSnapshotWorkspace extends WorkbenchWorkspaceIdentity {
   detached: boolean;
   dirty: boolean;
+}
+
+export interface WorkbenchProjectWorkspaceSummary {
+  key: string;
+  label: string;
+  current: boolean;
+  availability: "live" | "stale" | "unavailable";
+  observed_at: string | null;
+  branch: string | null;
+  head: string | null;
+  detached: boolean;
+  dirty: boolean | null;
+  focused_lane: WorkbenchWorkspaceLaneSummary | null;
+  active_phase: WorkbenchWorkspacePhaseSummary | null;
+}
+
+export interface WorkbenchWorkspaceLaneSummary {
+  id: string;
+  title: string;
+  state: "prepared" | "executing";
+  phase_id: string;
+  phase_title: string;
+  phase_status: string;
+}
+
+export interface WorkbenchWorkspacePhaseSummary {
+  id: string;
+  title: string;
+  status: string;
 }
 
 export interface WorkbenchLaneSummary {
@@ -99,6 +152,8 @@ export interface WorkbenchGoal {
   id: string;
   title: string;
   status: string;
+  outcome?: string;
+  outcome_truncated?: boolean;
   tasks: WorkbenchTask[];
 }
 
@@ -106,6 +161,8 @@ export interface WorkbenchTask {
   id: string;
   title: string;
   status: string;
+  outcome?: string;
+  outcome_truncated?: boolean;
   progress?: WorkbenchTaskProgress[];
   progress_truncated?: boolean;
 }
@@ -150,6 +207,7 @@ export interface WorkbenchCommandRequest {
   session_key: string;
   operation:
     | { kind: "snapshot" }
+    | { kind: "lane_inspect"; lane_id: string }
     | { kind: "lane_focus"; lane_id: string };
 }
 
@@ -242,12 +300,27 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");
   literal(snapshot.kind, "workbench.snapshot", "kind");
   literal(snapshot.ok, true, "ok");
-  literal(snapshot.schema_version, 2, "schema_version");
+  literal(snapshot.schema_version, 3, "schema_version");
   string(snapshot.observed_at, "observed_at");
   finiteNumber(snapshot.revision, "revision");
   project(snapshot.project);
   string(record(snapshot.daemon, "daemon").instance_id, "daemon.instance_id");
   workspace(snapshot.workspace);
+  const projectWorkspaces = array(
+    snapshot.project_workspaces,
+    "project_workspaces",
+  );
+  projectWorkspaces.forEach((workspace) => projectWorkspaceSummary(workspace));
+  const currentWorkspaces = projectWorkspaces.filter(
+    (workspace) => record(workspace, "project workspace").current === true,
+  );
+  if (
+    currentWorkspaces.length !== 1 ||
+    record(currentWorkspaces[0], "current project workspace").key !==
+      record(snapshot.workspace, "workspace").key
+  ) {
+    invalid("project_workspaces.current");
+  }
   array(snapshot.lanes, "lanes").forEach((lane) => laneSummary(lane));
   if (snapshot.focused_lane !== null) {
     laneDetails(snapshot.focused_lane);
@@ -263,6 +336,39 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
     workbenchDiagnostic(diagnostic),
   );
   return value as WorkbenchSnapshot;
+}
+
+export function decodeWorkbenchLaneInspection(
+  value: unknown,
+): WorkbenchLaneInspection {
+  const inspection = record(value, "workbench lane inspection");
+  literal(
+    inspection.kind,
+    "workbench.lane_inspection",
+    "inspection.kind",
+  );
+  literal(inspection.ok, true, "inspection.ok");
+  literal(inspection.schema_version, 1, "inspection.schema_version");
+  string(inspection.observed_at, "inspection.observed_at");
+  finiteNumber(inspection.revision, "inspection.revision");
+  project(inspection.project);
+  string(
+    record(inspection.daemon, "inspection.daemon").instance_id,
+    "inspection.daemon.instance_id",
+  );
+  workspace(inspection.workspace);
+  if (
+    inspection.relationship !== "focused_here" &&
+    inspection.relationship !== "focusable_here" &&
+    inspection.relationship !== "prepared" &&
+    inspection.relationship !== "historical"
+  ) {
+    invalid("inspection.relationship");
+  }
+  boolean(inspection.can_focus_here, "inspection.can_focus_here");
+  laneDetails(inspection.lane, "inspection.lane");
+  phase(inspection.phase, "inspection.phase");
+  return value as WorkbenchLaneInspection;
 }
 
 export function decodeWorkbenchPlanningResult(
@@ -313,6 +419,44 @@ function workspace(value: unknown): void {
   boolean(item.dirty, "workspace.dirty");
 }
 
+function projectWorkspaceSummary(value: unknown): void {
+  const item = record(value, "project workspace");
+  string(item.key, "project_workspace.key");
+  string(item.label, "project_workspace.label");
+  boolean(item.current, "project_workspace.current");
+  if (
+    item.availability !== "live" &&
+    item.availability !== "stale" &&
+    item.availability !== "unavailable"
+  ) {
+    invalid("project_workspace.availability");
+  }
+  nullableString(item.observed_at, "project_workspace.observed_at");
+  nullableString(item.branch, "project_workspace.branch");
+  nullableString(item.head, "project_workspace.head");
+  boolean(item.detached, "project_workspace.detached");
+  if (item.dirty !== null) {
+    boolean(item.dirty, "project_workspace.dirty");
+  }
+  if (item.focused_lane !== null) {
+    const lane = record(item.focused_lane, "project workspace focused lane");
+    string(lane.id, "project_workspace.focused_lane.id");
+    string(lane.title, "project_workspace.focused_lane.title");
+    if (lane.state !== "prepared" && lane.state !== "executing") {
+      invalid("project_workspace.focused_lane.state");
+    }
+    string(lane.phase_id, "project_workspace.focused_lane.phase_id");
+    string(lane.phase_title, "project_workspace.focused_lane.phase_title");
+    string(lane.phase_status, "project_workspace.focused_lane.phase_status");
+  }
+  if (item.active_phase !== null) {
+    const phase = record(item.active_phase, "project workspace active phase");
+    string(phase.id, "project_workspace.active_phase.id");
+    string(phase.title, "project_workspace.active_phase.title");
+    string(phase.status, "project_workspace.active_phase.status");
+  }
+}
+
 function laneSummary(value: unknown): void {
   const lane = record(value, "lane");
   string(lane.id, "lane.id");
@@ -326,30 +470,42 @@ function laneSummary(value: unknown): void {
   boolean(lane.focused_here, "lane.focused_here");
 }
 
-function laneDetails(value: unknown): void {
+function laneDetails(value: unknown, field = "focused_lane"): void {
   laneSummary(value);
-  const lane = record(value, "focused_lane");
-  string(lane.intent, "focused_lane.intent");
-  string(lane.created_at, "focused_lane.created_at");
-  string(lane.updated_at, "focused_lane.updated_at");
+  const lane = record(value, field);
+  string(lane.intent, `${field}.intent`);
+  string(lane.created_at, `${field}.created_at`);
+  string(lane.updated_at, `${field}.updated_at`);
 }
 
-function phase(value: unknown): void {
-  const item = record(value, "phase");
-  string(item.id, "phase.id");
-  string(item.title, "phase.title");
-  string(item.status, "phase.status");
-  boolean(item.planning_available, "phase.planning_available");
-  array(item.goals, "phase.goals").forEach((goal) => {
+function phase(value: unknown, field = "phase"): void {
+  const item = record(value, field);
+  string(item.id, `${field}.id`);
+  string(item.title, `${field}.title`);
+  string(item.status, `${field}.status`);
+  boolean(item.planning_available, `${field}.planning_available`);
+  array(item.goals, `${field}.goals`).forEach((goal) => {
     const goalItem = record(goal, "goal");
     string(goalItem.id, "goal.id");
     string(goalItem.title, "goal.title");
     string(goalItem.status, "goal.status");
+    if (goalItem.outcome !== undefined) {
+      string(goalItem.outcome, "goal.outcome");
+    }
+    if (goalItem.outcome_truncated !== undefined) {
+      boolean(goalItem.outcome_truncated, "goal.outcome_truncated");
+    }
     array(goalItem.tasks, "goal.tasks").forEach((task) => {
       const taskItem = record(task, "task");
       string(taskItem.id, "task.id");
       string(taskItem.title, "task.title");
       string(taskItem.status, "task.status");
+      if (taskItem.outcome !== undefined) {
+        string(taskItem.outcome, "task.outcome");
+      }
+      if (taskItem.outcome_truncated !== undefined) {
+        boolean(taskItem.outcome_truncated, "task.outcome_truncated");
+      }
       if (taskItem.progress !== undefined) {
         array(taskItem.progress, "task.progress").forEach((progress) => {
           const progressItem = record(progress, "task progress");

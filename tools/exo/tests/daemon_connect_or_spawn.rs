@@ -2714,6 +2714,14 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             response["result"]["kind"], "workbench.snapshot",
             "{response}"
         );
+        assert_eq!(response["result"]["schema_version"], 3, "{response}");
+        assert_eq!(
+            response["result"]["project_workspaces"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "both linked worktrees should be visible as project workspaces: {response}"
+        );
         assert!(
             !response
                 .to_string()
@@ -2737,6 +2745,40 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         primary_snapshot["result"]["workspace"]["key"],
         linked_snapshot["result"]["workspace"]["key"]
     );
+    for (snapshot, current_lane, sibling_lane) in [
+        (&primary_snapshot, &primary_lane_id, &linked_lane_id),
+        (&linked_snapshot, &linked_lane_id, &primary_lane_id),
+    ] {
+        let current_key = &snapshot["result"]["workspace"]["key"];
+        let workspaces = snapshot["result"]["project_workspaces"]
+            .as_array()
+            .expect("project workspace summaries");
+        let current = workspaces
+            .iter()
+            .find(|workspace| workspace["current"] == true)
+            .expect("current project workspace");
+        let sibling = workspaces
+            .iter()
+            .find(|workspace| workspace["current"] == false)
+            .expect("sibling project workspace");
+        assert_eq!(&current["key"], current_key, "{snapshot}");
+        assert_eq!(current["availability"], "live", "{snapshot}");
+        assert_eq!(
+            current["focused_lane"]["id"],
+            serde_json::Value::String((*current_lane).clone()),
+            "{snapshot}"
+        );
+        assert_eq!(sibling["availability"], "live", "{snapshot}");
+        assert_eq!(
+            sibling["focused_lane"]["id"],
+            serde_json::Value::String((*sibling_lane).clone()),
+            "{snapshot}"
+        );
+        assert!(
+            sibling["observed_at"].as_str().is_some(),
+            "live sibling observations carry freshness evidence: {snapshot}"
+        );
+    }
 
     let planning_revision = primary_snapshot["result"]["revision"]
         .as_u64()

@@ -7,8 +7,62 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "$lib/workbench-snapshot.v2.json";
+import snapshotFixture from "$lib/workbench-snapshot.v3.json";
 import type { WorkbenchPlanningRequest } from "$lib/workbench";
+import { workbenchHistoryState } from "$lib/workbench-client";
+
+vi.mock("$app/navigation", () => {
+  const metadata = (state: Record<string, unknown>, historyIndex: number) => ({
+    "sveltekit:history": historyIndex,
+    "sveltekit:navigation":
+      typeof state["sveltekit:navigation"] === "number"
+        ? state["sveltekit:navigation"]
+        : 0,
+    "sveltekit:pageurl": location.href,
+  });
+  const resolvedUrl = (url: string | URL) =>
+    url === "" ? `${location.pathname}${location.search}${location.hash}` : url;
+
+  return {
+    pushState: (url: string | URL, state: Record<string, unknown>) => {
+      const current =
+        typeof history.state === "object" && history.state !== null
+          ? (history.state as Record<string, unknown>)
+          : {};
+      const historyIndex =
+        typeof current["sveltekit:history"] === "number"
+          ? Number(current["sveltekit:history"]) + 1
+          : 1;
+      history.pushState(
+        {
+          ...metadata(current, historyIndex),
+          "sveltekit:states": state,
+        },
+        "",
+        resolvedUrl(url),
+      );
+    },
+    replaceState: (url: string | URL, state: Record<string, unknown>) => {
+      const current =
+        typeof history.state === "object" && history.state !== null
+          ? (history.state as Record<string, unknown>)
+          : {};
+      const historyIndex =
+        typeof current["sveltekit:history"] === "number"
+          ? Number(current["sveltekit:history"])
+          : 0;
+      history.replaceState(
+        {
+          ...metadata(current, historyIndex),
+          "sveltekit:states": state,
+        },
+        "",
+        resolvedUrl(url),
+      );
+    },
+  };
+});
+
 import Page from "./+page.svelte";
 
 class TestEventSource {
@@ -71,8 +125,46 @@ function sessionResponse(sessionKey: string): Response {
   );
 }
 
+function laneInspection(
+  snapshot: typeof snapshotFixture,
+  laneId: string,
+  relationship: "focused_here" | "focusable_here" | "prepared" | "historical" =
+    "focusable_here",
+) {
+  const lane = snapshot.lanes.find((candidate) => candidate.id === laneId);
+  if (!lane || !snapshot.phase) {
+    throw new Error(`missing lane inspection fixture for ${laneId}`);
+  }
+  return {
+    kind: "workbench.lane_inspection",
+    ok: true,
+    schema_version: 1,
+    observed_at: snapshot.observed_at,
+    revision: snapshot.revision,
+    project: snapshot.project,
+    daemon: snapshot.daemon,
+    workspace: snapshot.workspace,
+    relationship,
+    can_focus_here: relationship === "focusable_here",
+    lane: {
+      ...lane,
+      intent: `Inspect ${lane.title} without changing focus`,
+      created_at: "2026-07-28T19:00:00Z",
+      updated_at: "2026-08-05T19:30:00Z",
+    },
+    phase: {
+      ...snapshot.phase,
+      id: lane.phase_id,
+      title: lane.phase_title,
+      status: lane.phase_status,
+      planning_available: false,
+    },
+  };
+}
+
 beforeEach(() => {
   history.replaceState({}, "", "/");
+  sessionStorage.clear();
   TestEventSource.instances = [];
   vi.stubGlobal("EventSource", TestEventSource);
 });
@@ -127,7 +219,9 @@ describe("cockpit page", () => {
       await screen.findByRole("heading", { name: "Local workbench host" }),
     ).toBeTruthy();
     expect(location.hash).toBe("");
-    expect(history.state.exoWorkbenchSessionKey).toBe("session-selector");
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "session-selector",
+    );
     await waitFor(() => {
       expect(TestEventSource.instances[0]?.url).toBe(
         "/api/events?session_key=session-selector",
@@ -312,6 +406,297 @@ describe("cockpit page", () => {
     });
   });
 
+  it("restores a popped lane selection after session recovery", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const renewal = deferred<Response>();
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.revision = 8;
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Recovered history lane",
+      state: "prepared",
+      phase_id: "phase-history",
+      phase_title: "Historical delivery",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    let snapshotReads = 0;
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      snapshotReads += 1;
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      if (snapshotReads === 2) {
+        return new Response(
+          JSON.stringify({
+            kind: "workbench.session_invalid",
+            ok: false,
+            message: "The workbench session is invalid",
+          }),
+          { status: 401 },
+        );
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : { ...snapshot, revision: snapshotReads === 1 ? 7 : 8 };
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+    window.dispatchEvent(
+      new PopStateEvent("popstate", {
+        state: {
+          exoWorkbenchSessionKey: "session-selector",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      }),
+    );
+
+    renewal.resolve(sessionResponse("session-selector"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Recovered history lane" }),
+    ).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "snapshot", "snapshot", "lane_inspect"]);
+  });
+
+  it("preserves a newly selected lane when its inspection starts session recovery", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const renewal = deferred<Response>();
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-a", "Lane A"],
+      ["lane-b", "Lane B"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    let laneBAttempts = 0;
+    let snapshotReads = 0;
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(
+        request.operation.kind === "lane_inspect"
+          ? `lane_inspect:${request.operation.lane_id}`
+          : request.operation.kind,
+      );
+      if (
+        request.operation.kind === "lane_inspect" &&
+        request.operation.lane_id === "lane-b"
+      ) {
+        laneBAttempts += 1;
+        if (laneBAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.session_invalid",
+              ok: false,
+              message: "The workbench session is invalid",
+            }),
+            { status: 401 },
+          );
+        }
+      }
+      if (request.operation.kind === "snapshot") {
+        snapshotReads += 1;
+        snapshot.revision = snapshotReads === 1 ? 7 : 8;
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane A, phase in progress" }),
+    );
+    await screen.findByRole("heading", { name: "Lane A" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+
+    renewal.resolve(sessionResponse("session-selector"));
+
+    expect(await screen.findByRole("heading", { name: "Lane B" })).toBeTruthy();
+    expect(operations).toEqual([
+      "snapshot",
+      "lane_inspect:lane-a",
+      "lane_inspect:lane-b",
+      "snapshot",
+      "lane_inspect:lane-b",
+    ]);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-b");
+  });
+
+  it("retains pending lane restoration while a queued refresh finishes during recovery", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const blockedRefresh = deferred<Response>();
+    const renewal = deferred<Response>();
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-a", "Lane A"],
+      ["lane-b", "Lane B"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    let laneBAttempts = 0;
+    let snapshotReads = 0;
+    let blockedRefreshRequestId = "";
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      if (path === "/api/session/renew") {
+        return renewal.promise;
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(
+        request.operation.kind === "lane_inspect"
+          ? `lane_inspect:${request.operation.lane_id}`
+          : request.operation.kind,
+      );
+      if (request.operation.kind === "snapshot") {
+        snapshotReads += 1;
+        if (snapshotReads === 2) {
+          blockedRefreshRequestId = request.id;
+          return blockedRefresh.promise;
+        }
+        snapshot.revision = snapshotReads === 1 ? 7 : 8;
+      }
+      if (
+        request.operation.kind === "lane_inspect" &&
+        request.operation.lane_id === "lane-b"
+      ) {
+        laneBAttempts += 1;
+        if (laneBAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.session_invalid",
+              ok: false,
+              message: "The workbench session is invalid",
+            }),
+            { status: 401 },
+          );
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane A, phase in progress" }),
+    );
+    await screen.findByRole("heading", { name: "Lane A" });
+
+    TestEventSource.instances[0]!.emit("invalidate");
+    await waitFor(() => expect(snapshotReads).toBe(2));
+    TestEventSource.instances[0]!.emit("invalidate");
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+
+    blockedRefresh.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: blockedRefreshRequestId,
+          status: "ok",
+          result: { ...snapshot, revision: 8 },
+        }),
+        { status: 200 },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    renewal.resolve(sessionResponse("session-selector"));
+
+    expect(await screen.findByRole("heading", { name: "Lane B" })).toBeTruthy();
+    expect(operations).toEqual([
+      "snapshot",
+      "lane_inspect:lane-a",
+      "snapshot",
+      "lane_inspect:lane-b",
+      "snapshot",
+      "lane_inspect:lane-b",
+    ]);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-b");
+  });
+
   it("enters recovery immediately when a live refresh returns an unreadable response", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
     const renewal = deferred<Response>();
@@ -394,7 +779,7 @@ describe("cockpit page", () => {
           result:
             snapshotReads === 1
               ? snapshotFixture
-              : { ...snapshotFixture, schema_version: 3 },
+              : { ...snapshotFixture, schema_version: 4 },
         }),
         { status: 200 },
       );
@@ -608,7 +993,9 @@ describe("cockpit page", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(sessionAttempts).toBe(1);
     expect(location.hash).toBe("");
-    expect(history.state.exoWorkbenchSessionKey).toBeUndefined();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchSessionKey,
+    ).toBeUndefined();
   });
 
   it("retries the same ticket after an authoritative busy response", async () => {
@@ -659,7 +1046,9 @@ describe("cockpit page", () => {
       await screen.findByRole("heading", { name: "Local workbench host" }),
     ).toBeTruthy();
     expect(submittedTickets).toEqual(["v1.busy-ticket", "v1.busy-ticket"]);
-    expect(history.state.exoWorkbenchSessionKey).toBe("session-selector");
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "session-selector",
+    );
   });
 
   it("does not offer an inert retry for a rejected ticket exchange", async () => {
@@ -727,7 +1116,9 @@ describe("cockpit page", () => {
       await screen.findByRole("heading", { name: "Local workbench host" }),
     ).toBeTruthy();
     expect(location.hash).toBe("");
-    expect(history.state.exoWorkbenchSessionKey).toBe("fresh-session");
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "fresh-session",
+    );
     expect(TestEventSource.instances).toHaveLength(1);
   });
 
@@ -781,6 +1172,215 @@ describe("cockpit page", () => {
     ).toBeTruthy();
   });
 
+  it("restores the session and inspected lane from SvelteKit page state", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Completed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      },
+      "",
+      "/",
+    );
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Completed lane" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Project history")).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "lane_inspect"]);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/session/renew",
+      expect.objectContaining({
+        body: JSON.stringify({ session_key: "restored-session" }),
+      }),
+    );
+  });
+
+  it("restores the saved lane after the initial snapshot retry succeeds", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Completed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      },
+      "",
+      "/",
+    );
+    let snapshotAttempts = 0;
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      if (request.operation.kind === "snapshot") {
+        snapshotAttempts += 1;
+        if (snapshotAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "error",
+              error: {
+                code: "internal",
+                message: "Snapshot temporarily unavailable",
+              },
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+
+    expect(await screen.findByText("Snapshot temporarily unavailable")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Completed lane" }),
+    ).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "snapshot", "lane_inspect"]);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-history");
+  });
+
+  it("restores the current entry from tab-local state after reload", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Completed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {},
+      },
+      "",
+      "/",
+    );
+    sessionStorage.setItem(
+      "exoWorkbenchResumeState",
+      JSON.stringify({
+        exoWorkbenchSessionKey: "restored-session",
+        exoWorkbenchInspectedLaneId: "lane-history",
+      }),
+    );
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Completed lane" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Project history")).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "lane_inspect"]);
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "restored-session",
+    );
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Open project workspace overview" }),
+    );
+    expect(
+      JSON.parse(sessionStorage.getItem("exoWorkbenchResumeState") ?? "null")
+        .exoWorkbenchSessionKey,
+    ).toBe("restored-session");
+  });
+
   for (const staleResult of ["completion", "failure"] as const) {
     it(`ignores a superseded ticket exchange ${staleResult}`, async () => {
       history.replaceState({}, "", "/#ticket=v1.stale-ticket");
@@ -816,7 +1416,9 @@ describe("cockpit page", () => {
       expect(
         await screen.findByRole("heading", { name: "Local workbench host" }),
       ).toBeTruthy();
-      expect(history.state.exoWorkbenchSessionKey).toBe("fresh-session");
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "fresh-session",
+      );
 
       if (staleResult === "completion") {
         staleExchange.resolve(sessionResponse("stale-session"));
@@ -826,7 +1428,9 @@ describe("cockpit page", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(history.state.exoWorkbenchSessionKey).toBe("fresh-session");
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "fresh-session",
+      );
       expect(
         screen.getByRole("heading", { name: "Local workbench host" }),
       ).toBeTruthy();
@@ -836,6 +1440,684 @@ describe("cockpit page", () => {
       expect(TestEventSource.instances).toHaveLength(1);
     });
   }
+
+  it("navigates into completed lane history without changing focus", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Completed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id, "historical")
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Completed lane, phase completed",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Completed lane" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Project history")).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-history");
+    expect(operations).toEqual(["snapshot", "lane_inspect"]);
+
+    history.back();
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Local workbench host" }),
+      ).toBeTruthy();
+    });
+    expect(operations).toEqual(["snapshot", "lane_inspect"]);
+
+    history.forward();
+    expect(
+      await screen.findByRole("heading", { name: "Completed lane" }),
+    ).toBeTruthy();
+    expect(operations).toEqual(["snapshot", "lane_inspect", "lane_inspect"]);
+  });
+
+  it("offers a retry when the first lane inspection fails", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-retry",
+      title: "Retry lane",
+      state: "prepared",
+      phase_id: "phase-fixture",
+      phase_title: "Workbench foundation",
+      phase_status: "in-progress",
+      focused_here: false,
+    });
+    let attempts = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        attempts += 1;
+        if (attempts === 1) {
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "error",
+              error: {
+                code: "temporarily_unavailable",
+                message: "Lane inspection is temporarily unavailable",
+              },
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Retry lane, phase in progress",
+      }),
+    );
+    expect(
+      await screen.findByText("Lane inspection is temporarily unavailable"),
+    ).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Retry lane" }),
+    ).toBeTruthy();
+    expect(attempts).toBe(2);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-retry");
+  });
+
+  it("retries the lane that failed rather than the lane already displayed", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-a", "Lane A"],
+      ["lane-b", "Lane B"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    const inspectedLaneIds: string[] = [];
+    let laneBAttempts = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectedLaneIds.push(request.operation.lane_id);
+        if (request.operation.lane_id === "lane-b") {
+          laneBAttempts += 1;
+          if (laneBAttempts <= 2) {
+            return new Response(
+              JSON.stringify({
+                protocol_version: 1,
+                id: request.id,
+                status: "error",
+                error: {
+                  code: "temporarily_unavailable",
+                  message: "Lane B is temporarily unavailable",
+                },
+              }),
+              { status: 200 },
+            );
+          }
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane A, phase in progress" }),
+    );
+    await screen.findByRole("heading", { name: "Lane A" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
+    );
+    await screen.findByText("Lane B is temporarily unavailable");
+    snapshot.revision += 1;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await waitFor(() => expect(laneBAttempts).toBe(2));
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Lane B" }),
+    ).toBeTruthy();
+    expect(inspectedLaneIds).toEqual(["lane-a", "lane-b", "lane-b", "lane-b"]);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-b");
+  });
+
+  it("keeps an inspected lane selected when another client focuses it", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    const inspectedLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-inspected",
+      title: "Inspected lane",
+      focused_here: false,
+    };
+    initialSnapshot.lanes.push(inspectedLane);
+    const focusedSnapshot = structuredClone(initialSnapshot);
+    focusedSnapshot.revision += 1;
+    focusedSnapshot.focused_lane = {
+      ...focusedSnapshot.focused_lane!,
+      id: inspectedLane.id,
+      title: inspectedLane.title,
+    };
+    focusedSnapshot.lanes = focusedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === inspectedLane.id,
+    }));
+    let currentSnapshot = initialSnapshot;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(
+              currentSnapshot,
+              request.operation.lane_id,
+              currentSnapshot.focused_lane?.id === request.operation.lane_id
+                ? "focused_here"
+                : "focusable_here",
+            )
+          : currentSnapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Inspected lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Inspected lane" });
+    currentSnapshot = focusedSnapshot;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "This is the current execution stream for this workspace.",
+      ),
+    ).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-inspected");
+  });
+
+  it("returns to the project dashboard when an inspected lane disappears", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    initialSnapshot.lanes.push({
+      id: "lane-removed",
+      title: "Removed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      focused_here: false,
+    });
+    const updatedSnapshot = structuredClone(initialSnapshot);
+    updatedSnapshot.revision += 1;
+    updatedSnapshot.lanes = updatedSnapshot.lanes.filter(
+      (lane) => lane.id !== "lane-removed",
+    );
+    let currentSnapshot = initialSnapshot;
+    let inspectionAttempts = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectionAttempts += 1;
+        if (inspectionAttempts > 1) {
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "error",
+              error: {
+                code: "not_found",
+                message: "Workbench lane not found: lane-removed",
+                details: {
+                  kind: "workbench.lane_not_found",
+                  lane_id: "lane-removed",
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: laneInspection(
+              initialSnapshot,
+              request.operation.lane_id,
+              "historical",
+            ),
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: currentSnapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Removed lane, phase completed",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Removed lane" });
+    currentSnapshot = updatedSnapshot;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Workspaces" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("That lane is no longer part of the current project plan."),
+    ).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchProjectOverview,
+    ).toBe(true);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBeUndefined();
+  });
+
+  it("requires a reload when lane inspection uses a newer schema", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-new-schema",
+      title: "New schema lane",
+      state: "prepared",
+      phase_id: "phase-fixture",
+      phase_title: "Workbench foundation",
+      phase_status: "in-progress",
+      focused_here: false,
+    });
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? {
+              ...laneInspection(snapshot, request.operation.lane_id),
+              schema_version: 2,
+            }
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect New schema lane, phase in progress",
+      }),
+    );
+
+    expect(await screen.findByText("Workbench update available.")).toBeTruthy();
+    expect(screen.queryByText("Lane view unavailable.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+  });
+
+  it("keeps the project workspace overview in browser navigation state", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const operations: string[] = [];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      operations.push(request.operation.kind);
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: structuredClone(snapshotFixture),
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Open project workspace overview" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Workspaces" }),
+    ).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchProjectOverview,
+    ).toBe(true);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBeUndefined();
+    expect(operations).toEqual(["snapshot"]);
+
+    history.back();
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Local workbench host" }),
+      ).toBeTruthy();
+    });
+
+    history.forward();
+    expect(
+      await screen.findByRole("heading", { name: "Workspaces" }),
+    ).toBeTruthy();
+    expect(operations).toEqual(["snapshot"]);
+  });
+
+  it("keeps the newest lane selection when an older inspection arrives late", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-slow", "Slow lane"],
+      ["lane-fast", "Fast lane"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    const slowInspection = deferred<Response>();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (
+        request.operation.kind === "lane_inspect" &&
+        request.operation.lane_id === "lane-slow"
+      ) {
+        return slowInspection.promise;
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(snapshot, request.operation.lane_id)
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Slow lane, phase in progress",
+      }),
+    );
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Fast lane, phase in progress",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Fast lane" }),
+    ).toBeTruthy();
+
+    const slowRequest = JSON.parse(
+      String(
+        fetcher.mock.calls.find(([, init]) => {
+          const request = JSON.parse(String(init?.body));
+          return request.operation?.lane_id === "lane-slow";
+        })?.[1]?.body,
+      ),
+    );
+    slowInspection.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: slowRequest.id,
+          status: "ok",
+          result: laneInspection(snapshot, "lane-slow"),
+        }),
+        { status: 200 },
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(
+      screen.getByRole("heading", { name: "Fast lane" }),
+    ).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-fast");
+  });
+
+  it("keeps the lane being opened when a newer snapshot arrives", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-a", "Lane A"],
+      ["lane-b", "Lane B"],
+    ] as const) {
+      initialSnapshot.lanes.push({
+        id,
+        title,
+        state: "prepared",
+        phase_id: "phase-fixture",
+        phase_title: "Workbench foundation",
+        phase_status: "in-progress",
+        focused_here: false,
+      });
+    }
+    const updatedSnapshot = structuredClone(initialSnapshot);
+    updatedSnapshot.revision += 1;
+    let currentSnapshot = initialSnapshot;
+    let laneBAttempts = 0;
+    let firstLaneBRequestId = "";
+    const firstLaneBInspection = deferred<Response>();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (
+        request.operation.kind === "lane_inspect" &&
+        request.operation.lane_id === "lane-b"
+      ) {
+        laneBAttempts += 1;
+        if (laneBAttempts === 1) {
+          firstLaneBRequestId = request.id;
+          return firstLaneBInspection.promise;
+        }
+      }
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? laneInspection(currentSnapshot, request.operation.lane_id)
+          : currentSnapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane A, phase in progress" }),
+    );
+    await screen.findByRole("heading", { name: "Lane A" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Inspect Lane B, phase in progress" }),
+    );
+    await waitFor(() => expect(laneBAttempts).toBe(1));
+
+    currentSnapshot = updatedSnapshot;
+    TestEventSource.instances[0]!.emit("invalidate");
+
+    await waitFor(() => expect(laneBAttempts).toBe(2));
+    expect(
+      await screen.findByRole("heading", { name: "Lane B" }),
+    ).toBeTruthy();
+    firstLaneBInspection.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: firstLaneBRequestId,
+          status: "ok",
+          result: laneInspection(initialSnapshot, "lane-b"),
+        }),
+        { status: 200 },
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByRole("heading", { name: "Lane B" })).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-b");
+  });
 
   it("uses a new request ID for deliberate retry after a command response", async () => {
     history.replaceState({}, "", "/#ticket=v1.launch-ticket");
@@ -866,6 +2148,17 @@ describe("cockpit page", () => {
         );
       }
       const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: laneInspection(snapshot, request.operation.lane_id),
+          }),
+          { status: 200 },
+        );
+      }
       if (request.operation.kind === "lane_focus") {
         focusRequestIds.push(request.id);
         return new Response(
@@ -905,7 +2198,13 @@ describe("cockpit page", () => {
     await screen.findByRole("heading", { name: "Local workbench host" });
 
     await fireEvent.click(
-      screen.getByRole("button", { name: "Focus Retry lane" }),
+      screen.getByRole("button", {
+        name: "Inspect Retry lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Retry lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus in this workspace" }),
     );
     await screen.findByText("The lane phase is temporarily unavailable");
     await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -945,6 +2244,20 @@ describe("cockpit page", () => {
           return sessionResponse("session-selector");
         }
         const request = JSON.parse(String(init?.body));
+        if (request.operation.kind === "lane_inspect") {
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: laneInspection(
+                initialSnapshot,
+                request.operation.lane_id,
+              ),
+            }),
+            { status: 200 },
+          );
+        }
         if (request.operation.kind === "lane_focus") {
           focusAttempts += 1;
           throw new TypeError("response lost");
@@ -965,7 +2278,13 @@ describe("cockpit page", () => {
     await screen.findByRole("heading", { name: "Local workbench host" });
 
     await fireEvent.click(
-      screen.getByRole("button", { name: "Focus Ambiguous lane" }),
+      screen.getByRole("button", {
+        name: "Inspect Ambiguous lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Ambiguous lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus in this workspace" }),
     );
 
     await waitFor(() => expect(focusAttempts).toBe(2));
@@ -977,6 +2296,236 @@ describe("cockpit page", () => {
         screen.queryByText("The workbench command could not reach Exo"),
       ).toBeNull();
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
+  });
+
+  it("returns to current work after a confirmed focus survives refresh failure", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    const recoveryLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-focus-recovery",
+      title: "Focus recovery lane",
+      focused_here: false,
+    };
+    initialSnapshot.lanes.push(recoveryLane);
+    const focusedSnapshot = structuredClone(initialSnapshot);
+    focusedSnapshot.revision += 1;
+    focusedSnapshot.focused_lane = {
+      ...focusedSnapshot.focused_lane!,
+      id: recoveryLane.id,
+      title: recoveryLane.title,
+    };
+    focusedSnapshot.lanes = focusedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === recoveryLane.id,
+    }));
+    let snapshotReads = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: laneInspection(initialSnapshot, request.operation.lane_id),
+          }),
+          { status: 200 },
+        );
+      }
+      if (request.operation.kind === "lane_focus") {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: { lane: { id: recoveryLane.id } },
+          }),
+          { status: 200 },
+        );
+      }
+      snapshotReads += 1;
+      if (snapshotReads === 2) {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "error",
+            error: {
+              code: "internal",
+              message: "Focus refresh temporarily unavailable",
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshotReads === 1 ? initialSnapshot : focusedSnapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Focus recovery lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Focus recovery lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus in this workspace" }),
+    );
+
+    expect(
+      await screen.findByText("Focus refresh temporarily unavailable"),
+    ).toBeTruthy();
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBe("lane-focus-recovery");
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Back to current work" }),
+      ).toBeNull();
+      expect(
+        workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+      ).toBeUndefined();
+    });
+    expect(snapshotReads).toBe(3);
+  });
+
+  it("expires a local focus confirmation when a newer snapshot contradicts it", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const initialSnapshot = structuredClone(snapshotFixture);
+    const requestedLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-local-focus",
+      title: "Locally focused lane",
+      focused_here: false,
+    };
+    const remoteLane = {
+      ...initialSnapshot.lanes[0]!,
+      id: "lane-remote-focus",
+      title: "Remotely focused lane",
+      focused_here: false,
+    };
+    initialSnapshot.lanes.push(requestedLane, remoteLane);
+
+    const contradictedSnapshot = structuredClone(initialSnapshot);
+    contradictedSnapshot.revision += 1;
+    contradictedSnapshot.focused_lane = {
+      ...contradictedSnapshot.focused_lane!,
+      id: remoteLane.id,
+      title: remoteLane.title,
+    };
+    contradictedSnapshot.lanes = contradictedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === remoteLane.id,
+    }));
+
+    const laterRequestedSnapshot = structuredClone(contradictedSnapshot);
+    laterRequestedSnapshot.revision += 1;
+    laterRequestedSnapshot.focused_lane = {
+      ...laterRequestedSnapshot.focused_lane!,
+      id: requestedLane.id,
+      title: requestedLane.title,
+    };
+    laterRequestedSnapshot.lanes = laterRequestedSnapshot.lanes.map((lane) => ({
+      ...lane,
+      focused_here: lane.id === requestedLane.id,
+    }));
+
+    let currentSnapshot = initialSnapshot;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: laneInspection(
+              currentSnapshot,
+              request.operation.lane_id,
+              currentSnapshot.focused_lane?.id === request.operation.lane_id
+                ? "focused_here"
+                : "focusable_here",
+            ),
+          }),
+          { status: 200 },
+        );
+      }
+      if (request.operation.kind === "lane_focus") {
+        currentSnapshot = contradictedSnapshot;
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: { lane: { id: requestedLane.id } },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: currentSnapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Locally focused lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Locally focused lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Focus in this workspace" }),
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Locally focused lane" }),
+      ).toBeTruthy();
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Open project workspace overview" }),
+    );
+    expect(await screen.findByRole("heading", { name: "Workspaces" })).toBeTruthy();
+
+    currentSnapshot = laterRequestedSnapshot;
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Workspaces" })).toBeTruthy();
+      expect(
+        workbenchHistoryState(history.state).exoWorkbenchProjectOverview,
+      ).toBe(true);
     });
   });
 

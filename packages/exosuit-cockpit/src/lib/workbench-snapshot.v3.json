@@ -1,7 +1,7 @@
 {
   "kind": "workbench.snapshot",
   "ok": true,
-  "schema_version": 2,
+  "schema_version": 3,
   "observed_at": "2026-07-28T20:00:00.000Z",
   "revision": 7,
   "project": {
@@ -18,6 +18,45 @@
     "detached": false,
     "dirty": true
   },
+  "project_workspaces": [
+    {
+      "key": "workspace-fixture",
+      "label": "main",
+      "current": true,
+      "availability": "live",
+      "observed_at": "2026-07-28T20:00:00Z",
+      "branch": "main",
+      "head": "0123456789abcdef",
+      "detached": false,
+      "dirty": true,
+      "focused_lane": {
+        "id": "lane-fixture",
+        "title": "Local workbench host",
+        "state": "executing",
+        "phase_id": "phase-fixture",
+        "phase_title": "Workbench foundation",
+        "phase_status": "in-progress"
+      },
+      "active_phase": {
+        "id": "phase-fixture",
+        "title": "Workbench foundation",
+        "status": "in-progress"
+      }
+    },
+    {
+      "key": "workspace-sibling",
+      "label": "feature/dashboard",
+      "current": false,
+      "availability": "stale",
+      "observed_at": "2026-07-28T19:55:00Z",
+      "branch": "feature/dashboard",
+      "head": "fedcba9876543210",
+      "detached": false,
+      "dirty": null,
+      "focused_lane": null,
+      "active_phase": null
+    }
+  ],
   "lanes": [
     {
       "id": "lane-fixture",

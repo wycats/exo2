@@ -32,7 +32,11 @@ const SESSION_RENEWAL_LIFETIME: Duration = Duration::from_hours(12);
 const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
 const SESSION_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
 const SESSION_STORE_SCHEMA_VERSION: u8 = 1;
+const WORKSPACE_STORE_SCHEMA_VERSION: u8 = 1;
+const WORKSPACE_OBSERVATION_FRESH_LIFETIME: Duration = Duration::from_mins(5);
+const WORKSPACE_STORE_PERSIST_INTERVAL: Duration = Duration::from_mins(1);
 const MAX_SESSIONS: usize = 64;
+const MAX_PROJECT_WORKSPACES: usize = 128;
 const MAX_EVENT_STREAMS: usize = 32;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_COOKIE_PREFIX: &str = "exo_workbench_session_";
@@ -161,6 +165,14 @@ impl DaemonRuntimeServices {
         self.host.snapshot(workspace_root)
     }
 
+    pub fn inspect(&self, workspace_root: &Path, lane_id: &str) -> Result<WorkbenchLaneInspection> {
+        self.host.inspect(workspace_root, lane_id)
+    }
+
+    pub fn observe_workspace(&self, workspace_root: &Path) -> Result<()> {
+        self.host.observe_workspace(workspace_root)
+    }
+
     pub fn revision_after_write(&self) -> u64 {
         self.host.revision_after_write()
     }
@@ -229,7 +241,9 @@ struct WorkbenchHostInner {
     runtime: Handle,
     host_record_path: PathBuf,
     session_store_path: PathBuf,
+    workspace_store_path: PathBuf,
     session_store_gate: Mutex<()>,
+    workspace_store_gate: Mutex<()>,
     last_activity: Arc<AtomicU64>,
     revision: AtomicU64,
     project_state_gate: Mutex<()>,
@@ -253,6 +267,8 @@ struct WorkbenchState {
         HashMap<planning::CompletionReviewRequestKey, planning::CompletionReviewRequestRecord>,
     completion_reviews: HashMap<String, planning::CompletionReviewRecord>,
     completion_review_sequence: u64,
+    workspace_store_dirty: bool,
+    workspace_store_persisted_at: u64,
 }
 
 struct BoundHost {
@@ -268,13 +284,23 @@ struct BoundHost {
     task: Option<JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceRegistration {
     pub(crate) key: String,
     pub(crate) root: PathBuf,
     pub(crate) label: String,
     pub(crate) branch: Option<String>,
     pub(crate) head: Option<String>,
+    pub(crate) dirty: Option<bool>,
+    pub(crate) observed_at: Option<u64>,
+    pub(crate) registered_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WorkspaceProjection {
+    pub(super) registration: WorkspaceRegistration,
+    pub(super) availability: &'static str,
+    pub(super) current: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +342,55 @@ struct WorkbenchSessionStoreV1 {
     schema_version: u8,
     project_id: String,
     sessions: Vec<WorkbenchSessionGrantV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchWorkspaceStoreEntryV1 {
+    key: String,
+    root: PathBuf,
+    label: String,
+    branch: Option<String>,
+    head: Option<String>,
+    dirty: Option<bool>,
+    observed_at: Option<u64>,
+    registered_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchWorkspaceStoreV1 {
+    schema_version: u8,
+    project_id: String,
+    workspaces: Vec<WorkbenchWorkspaceStoreEntryV1>,
+}
+
+impl From<WorkspaceRegistration> for WorkbenchWorkspaceStoreEntryV1 {
+    fn from(workspace: WorkspaceRegistration) -> Self {
+        Self {
+            key: workspace.key,
+            root: workspace.root,
+            label: workspace.label,
+            branch: workspace.branch,
+            head: workspace.head,
+            dirty: workspace.dirty,
+            observed_at: workspace.observed_at,
+            registered_at: workspace.registered_at,
+        }
+    }
+}
+
+impl From<WorkbenchWorkspaceStoreEntryV1> for WorkspaceRegistration {
+    fn from(workspace: WorkbenchWorkspaceStoreEntryV1) -> Self {
+        Self {
+            key: workspace.key,
+            root: workspace.root,
+            label: workspace.label,
+            branch: workspace.branch,
+            head: workspace.head,
+            dirty: workspace.dirty,
+            observed_at: workspace.observed_at,
+            registered_at: workspace.registered_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,12 +470,29 @@ pub struct WorkbenchSnapshot {
     pub project: WorkbenchProjectIdentity,
     pub daemon: WorkbenchDaemonIdentity,
     pub workspace: WorkbenchSnapshotWorkspace,
+    pub project_workspaces: Vec<WorkbenchProjectWorkspaceSummary>,
     pub lanes: Vec<WorkbenchLaneSummary>,
     pub focused_lane: Option<WorkbenchLaneDetails>,
     pub phase: Option<WorkbenchPhase>,
     pub between_phases_context: Option<WorkbenchBetweenPhasesContext>,
     pub steering: WorkbenchSteering,
     pub diagnostics: Vec<WorkbenchDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkbenchLaneInspection {
+    pub kind: &'static str,
+    pub ok: bool,
+    pub schema_version: u8,
+    pub observed_at: String,
+    pub revision: u64,
+    pub project: WorkbenchProjectIdentity,
+    pub daemon: WorkbenchDaemonIdentity,
+    pub workspace: WorkbenchSnapshotWorkspace,
+    pub relationship: String,
+    pub can_focus_here: bool,
+    pub lane: WorkbenchLaneDetails,
+    pub phase: WorkbenchPhase,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -411,6 +503,38 @@ pub struct WorkbenchSnapshotWorkspace {
     pub head: Option<String>,
     pub detached: bool,
     pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchProjectWorkspaceSummary {
+    pub key: String,
+    pub label: String,
+    pub current: bool,
+    pub availability: String,
+    pub observed_at: Option<String>,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub detached: bool,
+    pub dirty: Option<bool>,
+    pub focused_lane: Option<WorkbenchWorkspaceLaneSummary>,
+    pub active_phase: Option<WorkbenchWorkspacePhaseSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchWorkspaceLaneSummary {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub phase_id: String,
+    pub phase_title: String,
+    pub phase_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchWorkspacePhaseSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -473,6 +597,10 @@ pub struct WorkbenchGoal {
     pub id: String,
     pub title: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub outcome_truncated: bool,
     pub tasks: Vec<WorkbenchTask>,
 }
 
@@ -481,6 +609,10 @@ pub struct WorkbenchTask {
     pub id: String,
     pub title: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub outcome_truncated: bool,
     pub progress: Vec<WorkbenchTaskProgress>,
     #[serde(skip_serializing_if = "is_false")]
     pub progress_truncated: bool,
@@ -548,8 +680,10 @@ impl WorkbenchHostManager {
         let (write_tx, _) = broadcast::channel(16);
         let host_record_path = runtime_dir.join("workbench.host.json");
         let session_store_path = runtime_dir.join("workbench.sessions.json");
+        let workspace_store_path = runtime_dir.join("workbench.workspaces.json");
+        let now = unix_seconds();
         let mut state = WorkbenchState::default();
-        match read_session_store(&session_store_path, project.id.as_str(), unix_seconds()) {
+        match read_session_store(&session_store_path, project.id.as_str(), now) {
             Ok(grants) => state.session_grants = grants,
             Err(error) => {
                 eprintln!(
@@ -558,6 +692,25 @@ impl WorkbenchHostManager {
                 );
             }
         }
+        match read_workspace_store(&workspace_store_path, project.id.as_str()) {
+            Ok(workspaces) => {
+                for workspace in workspaces {
+                    state
+                        .workspaces_by_root
+                        .insert(workspace.root.clone(), workspace.key.clone());
+                    state
+                        .workspaces_by_key
+                        .insert(workspace.key.clone(), workspace);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "exo daemon: failed to read workbench workspace store at {}: {error}",
+                    workspace_store_path.display()
+                );
+            }
+        }
+        state.workspace_store_persisted_at = now;
         if !state.session_grants.is_empty() {
             state.preferred_port = resumable_host_port(&host_record_path);
         }
@@ -569,7 +722,9 @@ impl WorkbenchHostManager {
                 runtime,
                 host_record_path,
                 session_store_path,
+                workspace_store_path,
                 session_store_gate: Mutex::new(()),
+                workspace_store_gate: Mutex::new(()),
                 last_activity,
                 revision: AtomicU64::new(0),
                 project_state_gate: Mutex::new(()),
@@ -620,6 +775,7 @@ impl WorkbenchHostManager {
             project_id: self.inner.project.id.to_string(),
             workspace_key: workspace.key.clone(),
             capabilities: std::iter::once("workbench.snapshot")
+                .chain(std::iter::once("workbench.inspect"))
                 .chain(std::iter::once("lane.focus"))
                 .chain(planning::PLANNING_CAPABILITIES)
                 .map(str::to_string)
@@ -683,12 +839,41 @@ impl WorkbenchHostManager {
         self.snapshot_with_before_state_gate(workspace_root, || {})
     }
 
+    pub fn inspect(&self, workspace_root: &Path, lane_id: &str) -> Result<WorkbenchLaneInspection> {
+        let (workspace, git) = self.register_workspace_with_git(workspace_root)?;
+        let _project_state_guard = self.inner.project_state_gate.lock().map_err(|_| {
+            anyhow::Error::new(workbench_failure(
+                "workbench.inspection_unavailable",
+                "The lane inspection is temporarily unavailable",
+            ))
+        })?;
+        snapshot::inspect_with_git(
+            &self.inner.project,
+            &workspace,
+            self.inner.revision.load(Ordering::Acquire),
+            &self.inner.instance_id,
+            lane_id,
+            git,
+        )
+        .map_err(|error| {
+            if error.downcast_ref::<ExoFailure>().is_some() {
+                error
+            } else {
+                anyhow::Error::new(workbench_failure(
+                    "workbench.inspection_unavailable",
+                    "The lane inspection is temporarily unavailable",
+                ))
+            }
+        })
+    }
+
     fn snapshot_with_before_state_gate(
         &self,
         workspace_root: &Path,
         before_state_gate: impl FnOnce(),
     ) -> Result<WorkbenchSnapshot> {
         let (workspace, git) = self.register_workspace_with_git(workspace_root)?;
+        let project_workspaces = self.project_workspace_projections(&workspace.key)?;
         before_state_gate();
         let _project_state_guard = self.inner.project_state_gate.lock().map_err(|_| {
             anyhow::Error::new(workbench_failure(
@@ -696,12 +881,13 @@ impl WorkbenchHostManager {
                 "The workbench snapshot is temporarily unavailable",
             ))
         })?;
-        snapshot::build_with_git(
+        snapshot::build_with_git_and_workspaces(
             &self.inner.project,
             &workspace,
             self.inner.revision.load(Ordering::Acquire),
             &self.inner.instance_id,
             git,
+            project_workspaces,
         )
         .map_err(|_| {
             anyhow::Error::new(workbench_failure(
@@ -758,6 +944,11 @@ impl WorkbenchHostManager {
             task.abort();
             let _ = task.await;
         }
+        if let Err(error) = self.inner.persist_workspace_store_if_due(true) {
+            eprintln!(
+                "exo daemon: failed to persist workbench workspaces during shutdown: {error}"
+            );
+        }
         if let Err(error) = self.inner.persist_session_store() {
             eprintln!("exo daemon: failed to persist workbench sessions during shutdown: {error}");
         }
@@ -767,6 +958,10 @@ impl WorkbenchHostManager {
     fn register_workspace(&self, workspace_root: &Path) -> Result<WorkspaceRegistration> {
         self.register_workspace_with_git(workspace_root)
             .map(|(workspace, _)| workspace)
+    }
+
+    pub fn observe_workspace(&self, workspace_root: &Path) -> Result<()> {
+        self.register_workspace(workspace_root).map(drop)
     }
 
     fn register_workspace_with_git(
@@ -793,27 +988,228 @@ impl WorkbenchHostManager {
                 .max_by_key(|grant| grant.last_activity)
                 .map(|grant| grant.workspace_key.clone())
         });
-        let key = key.unwrap_or(random_token()?);
-        let label = git
-            .branch
-            .clone()
-            .or_else(|| {
-                git.head
-                    .as_deref()
-                    .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
-            })
-            .unwrap_or_else(|| "detached".to_string());
+        let key = key.unwrap_or_else(|| deterministic_workspace_key(&self.inner.project.id, &root));
+        if state
+            .workspaces_by_key
+            .get(&key)
+            .is_some_and(|workspace| workspace.root != root)
+        {
+            return Err(anyhow::anyhow!("workbench workspace key collision"));
+        }
+        let previous = state.workspaces_by_key.get(&key).cloned();
+        let observed_git = git.branch.is_some() || git.head.is_some() || git.dirty.is_some();
+        let branch = if observed_git {
+            git.branch.clone()
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.branch.clone())
+        };
+        let head = if observed_git {
+            git.head.clone()
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.head.clone())
+        };
+        let dirty = if observed_git {
+            git.dirty
+        } else {
+            previous.as_ref().and_then(|workspace| workspace.dirty)
+        };
+        let label = workspace_label(branch.as_deref(), head.as_deref(), &key);
         let workspace = WorkspaceRegistration {
             key: key.clone(),
             root: root.clone(),
             label,
-            branch: git.branch.clone(),
-            head: git.head.clone(),
+            branch,
+            head,
+            dirty,
+            observed_at: observed_git.then_some(now).or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|workspace| workspace.observed_at)
+            }),
+            registered_at: previous
+                .as_ref()
+                .map_or(now, |workspace| workspace.registered_at),
         };
+        let changed = previous.as_ref() != Some(&workspace);
+        let new_registration = previous.is_none();
         state.workspaces_by_root.insert(root, key.clone());
-        state.workspaces_by_key.insert(key, workspace.clone());
+        state
+            .workspaces_by_key
+            .insert(key.clone(), workspace.clone());
+        let registry_trimmed = retain_project_workspace_limit(&mut state, &key);
+        state.workspace_store_dirty |= changed || registry_trimmed;
         drop(state);
+        if let Err(error) = self
+            .inner
+            .persist_workspace_store_if_due(new_registration || registry_trimmed)
+        {
+            eprintln!("exo daemon: failed to persist workspace observation: {error}");
+        }
         Ok((workspace, git))
+    }
+
+    fn project_workspace_projections(
+        &self,
+        current_workspace_key: &str,
+    ) -> Result<Vec<WorkspaceProjection>> {
+        let now = unix_seconds();
+        let worktree_index = self.inner.project.worktree_index();
+        let (known_roots, current_root, live_grant_keys_by_root) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            let mut live_grant_keys_by_root = HashMap::<PathBuf, (u64, String)>::new();
+            for grant in state.session_grants.values().filter(|grant| {
+                grant.project_id == self.inner.project.id.as_str() && grant.is_live(now)
+            }) {
+                let replace = live_grant_keys_by_root
+                    .get(&grant.workspace_root)
+                    .is_none_or(|(last_activity, _)| *last_activity < grant.last_activity);
+                if replace {
+                    live_grant_keys_by_root.insert(
+                        grant.workspace_root.clone(),
+                        (grant.last_activity, grant.workspace_key.clone()),
+                    );
+                }
+            }
+            (
+                state
+                    .workspaces_by_root
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                state
+                    .workspaces_by_key
+                    .get(current_workspace_key)
+                    .map(|workspace| workspace.root.clone()),
+                live_grant_keys_by_root,
+            )
+        };
+
+        let mut discovered = Vec::new();
+        let discovery_capacity = MAX_PROJECT_WORKSPACES.saturating_sub(known_roots.len());
+        if let Some(index) = worktree_index.as_ref() {
+            let mut roots = index.keys().cloned().collect::<Vec<_>>();
+            roots.sort();
+            for root in roots {
+                if known_roots.contains(&root) || discovered.len() >= discovery_capacity {
+                    continue;
+                }
+                let key = live_grant_keys_by_root
+                    .get(&root)
+                    .map(|(_, key)| key.clone())
+                    .unwrap_or_else(|| deterministic_workspace_key(&self.inner.project.id, &root));
+                let git = if index.get(&root) == Some(&false)
+                    && self
+                        .inner
+                        .validate_workspace(&root)
+                        .is_ok_and(|resolved| resolved == root)
+                {
+                    snapshot::sample_git_identity(&root)
+                } else {
+                    snapshot::GitSnapshot::unavailable()
+                };
+                discovered.push(WorkspaceRegistration {
+                    key: key.clone(),
+                    root,
+                    label: workspace_label(git.branch.as_deref(), git.head.as_deref(), &key),
+                    branch: git.branch,
+                    head: git.head,
+                    dirty: None,
+                    observed_at: None,
+                    registered_at: now,
+                });
+            }
+        }
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let mut changed = false;
+        if let Some(index) = worktree_index.as_ref() {
+            let removed = state
+                .workspaces_by_root
+                .keys()
+                .filter(|root| {
+                    !current_root
+                        .as_ref()
+                        .is_some_and(|current| current == *root)
+                        && !index.contains_key(*root)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for root in removed {
+                if let Some(key) = state.workspaces_by_root.remove(&root) {
+                    state.workspaces_by_key.remove(&key);
+                    changed = true;
+                }
+            }
+        }
+        for workspace in discovered {
+            if insert_discovered_workspace(&mut state, workspace) {
+                changed = true;
+            }
+        }
+        changed |= retain_project_workspace_limit(&mut state, current_workspace_key);
+        state.workspace_store_dirty |= changed;
+        let registrations = state
+            .workspaces_by_key
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(state);
+
+        if let Err(error) = self.inner.persist_workspace_store_if_due(changed) {
+            eprintln!("exo daemon: failed to persist workspace registrations: {error}");
+        }
+
+        let mut projections = registrations
+            .into_iter()
+            .map(|registration| {
+                let current = registration.key == current_workspace_key;
+                let unavailable = !current
+                    && (worktree_index.as_ref().is_some_and(|index| {
+                        index.get(&registration.root).copied().unwrap_or(true)
+                    }) || !self
+                        .inner
+                        .validate_workspace(&registration.root)
+                        .is_ok_and(|resolved| resolved == registration.root.as_path()));
+                let availability = if unavailable {
+                    "unavailable"
+                } else if current
+                    || registration.observed_at.is_some_and(|observed_at| {
+                        observed_at.saturating_add(WORKSPACE_OBSERVATION_FRESH_LIFETIME.as_secs())
+                            > now
+                    })
+                {
+                    "live"
+                } else {
+                    "stale"
+                };
+                WorkspaceProjection {
+                    registration,
+                    availability,
+                    current,
+                }
+            })
+            .collect::<Vec<_>>();
+        projections.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| left.registration.label.cmp(&right.registration.label))
+                .then_with(|| left.registration.key.cmp(&right.registration.key))
+        });
+        projections.truncate(MAX_PROJECT_WORKSPACES);
+        Ok(projections)
     }
 
     fn ensure_host(&self) -> Result<(String, bool, [u8; 32])> {
@@ -902,6 +1298,85 @@ impl WorkbenchHostManager {
         self.inner.persist_host_record();
         Ok((origin, false, secret))
     }
+}
+
+fn insert_discovered_workspace(
+    state: &mut WorkbenchState,
+    workspace: WorkspaceRegistration,
+) -> bool {
+    if state.workspaces_by_root.contains_key(&workspace.root)
+        || state.workspaces_by_key.contains_key(&workspace.key)
+    {
+        return false;
+    }
+    state
+        .workspaces_by_root
+        .insert(workspace.root.clone(), workspace.key.clone());
+    state
+        .workspaces_by_key
+        .insert(workspace.key.clone(), workspace);
+    true
+}
+
+fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_key: &str) -> bool {
+    if state.workspaces_by_key.len() <= MAX_PROJECT_WORKSPACES {
+        return false;
+    }
+
+    let now = unix_seconds();
+    let mut protected = HashSet::from([current_workspace_key.to_string()]);
+    protected.extend(
+        state
+            .pending_capabilities
+            .values()
+            .filter(|pending| pending.expires_at > now)
+            .map(|pending| pending.workspace_key.clone()),
+    );
+    protected.extend(
+        state
+            .sessions
+            .values()
+            .filter(|session| session.is_live(now))
+            .map(|session| session.workspace_key.clone()),
+    );
+    protected.extend(
+        state
+            .session_grants
+            .values()
+            .filter(|grant| grant.is_live(now))
+            .map(|grant| grant.workspace_key.clone()),
+    );
+    protected.retain(|key| state.workspaces_by_key.contains_key(key));
+
+    let mut registrations = state
+        .workspaces_by_key
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    registrations.sort_by(|left, right| {
+        (right.key == current_workspace_key)
+            .cmp(&(left.key == current_workspace_key))
+            .then_with(|| {
+                protected
+                    .contains(&right.key)
+                    .cmp(&protected.contains(&left.key))
+            })
+            .then_with(|| right.observed_at.cmp(&left.observed_at))
+            .then_with(|| right.registered_at.cmp(&left.registered_at))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let retained = registrations
+        .into_iter()
+        .take(MAX_PROJECT_WORKSPACES.max(protected.len()))
+        .map(|workspace| workspace.key)
+        .collect::<HashSet<_>>();
+    state
+        .workspaces_by_key
+        .retain(|key, _| retained.contains(key));
+    state
+        .workspaces_by_root
+        .retain(|_, key| retained.contains(key));
+    true
 }
 
 impl WorkbenchHostInner {
@@ -1023,7 +1498,7 @@ impl WorkbenchHostInner {
             project_id: payload.project_id.clone(),
             workspace_key: payload.workspace_key.clone(),
             workspace_root: workspace.root,
-            capabilities: payload.capabilities,
+            capabilities: upgraded_session_capabilities(payload.capabilities),
             created_at: now,
             last_activity: now,
             expires_at: session_expires_at,
@@ -1193,22 +1668,7 @@ impl WorkbenchHostInner {
             return false;
         }
         let git = snapshot::sample_git(&root);
-        let label = git
-            .branch
-            .clone()
-            .or_else(|| {
-                git.head
-                    .as_deref()
-                    .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
-            })
-            .unwrap_or_else(|| "detached".to_string());
-        let workspace = WorkspaceRegistration {
-            key: grant.workspace_key.clone(),
-            root: root.clone(),
-            label,
-            branch: git.branch,
-            head: git.head,
-        };
+        let observed_git = git.branch.is_some() || git.head.is_some() || git.dirty.is_some();
 
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -1228,12 +1688,50 @@ impl WorkbenchHostInner {
         {
             return false;
         }
+        let previous = state.workspaces_by_key.get(&grant.workspace_key).cloned();
+        let branch = if observed_git {
+            git.branch
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.branch.clone())
+        };
+        let head = if observed_git {
+            git.head
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.head.clone())
+        };
+        let dirty = if observed_git {
+            git.dirty
+        } else {
+            previous.as_ref().and_then(|workspace| workspace.dirty)
+        };
+        let workspace = WorkspaceRegistration {
+            key: grant.workspace_key.clone(),
+            root: root.clone(),
+            label: workspace_label(branch.as_deref(), head.as_deref(), &grant.workspace_key),
+            branch,
+            head,
+            dirty,
+            observed_at: observed_git.then_some(now).or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|workspace| workspace.observed_at)
+            }),
+            registered_at: previous
+                .as_ref()
+                .map_or(grant.created_at, |workspace| workspace.registered_at),
+        };
         state
             .workspaces_by_root
             .insert(root, grant.workspace_key.clone());
         state
             .workspaces_by_key
             .insert(grant.workspace_key.clone(), workspace);
+        retain_project_workspace_limit(&mut state, &grant.workspace_key);
+        state.workspace_store_dirty = true;
         state.sessions.insert(
             credential_digest.to_string(),
             WorkbenchSession {
@@ -1249,6 +1747,10 @@ impl WorkbenchHostInner {
                 last_persisted_at: grant.last_activity,
             },
         );
+        drop(state);
+        if let Err(error) = self.persist_workspace_store_if_due(true) {
+            eprintln!("exo daemon: failed to persist restored workspace: {error}");
+        }
         true
     }
 
@@ -1321,6 +1823,51 @@ impl WorkbenchHostInner {
         };
         write_session_store(&self.session_store_path, &store)
             .with_context(|| format!("write {}", self.session_store_path.display()))
+    }
+
+    fn persist_workspace_store_if_due(&self, force: bool) -> Result<()> {
+        let _gate = self
+            .workspace_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench workspace store is unavailable"))?;
+        let now = unix_seconds();
+        let store = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            if !state.workspace_store_dirty
+                || (!force
+                    && state
+                        .workspace_store_persisted_at
+                        .saturating_add(WORKSPACE_STORE_PERSIST_INTERVAL.as_secs())
+                        > now)
+            {
+                return Ok(());
+            }
+            let mut workspaces = state
+                .workspaces_by_key
+                .values()
+                .cloned()
+                .map(WorkbenchWorkspaceStoreEntryV1::from)
+                .collect::<Vec<_>>();
+            workspaces.sort_by(|left, right| left.key.cmp(&right.key));
+            workspaces.truncate(MAX_PROJECT_WORKSPACES);
+            state.workspace_store_dirty = false;
+            state.workspace_store_persisted_at = now;
+            WorkbenchWorkspaceStoreV1 {
+                schema_version: WORKSPACE_STORE_SCHEMA_VERSION,
+                project_id: self.project.id.to_string(),
+                workspaces,
+            }
+        };
+        if let Err(error) = write_workspace_store(&self.workspace_store_path, &store) {
+            if let Ok(mut state) = self.state.lock() {
+                state.workspace_store_dirty = true;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn server_stopped(&self, error: Option<String>) {
@@ -1404,6 +1951,21 @@ impl WorkbenchSession {
     }
 }
 
+fn upgraded_session_capabilities(mut capabilities: Vec<String>) -> Vec<String> {
+    let snapshot_index = capabilities
+        .iter()
+        .position(|capability| capability == "workbench.snapshot");
+    let has_inspection = capabilities
+        .iter()
+        .any(|capability| capability == "workbench.inspect");
+    if let Some(snapshot_index) = snapshot_index
+        && !has_inspection
+    {
+        capabilities.insert(snapshot_index + 1, "workbench.inspect".to_string());
+    }
+    capabilities
+}
+
 impl WorkbenchSessionGrantV1 {
     const fn is_live(&self, now: u64) -> bool {
         self.expires_at > now
@@ -1460,6 +2022,21 @@ fn workbench_failure(kind: &'static str, message: &'static str) -> ExoFailure {
     .with_details(serde_json::json!({ "kind": kind }))
 }
 
+fn deterministic_workspace_key(project_id: &crate::project::ProjectId, root: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(project_id.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(root.as_os_str().as_encoded_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes())
+}
+
+fn workspace_label(branch: Option<&str>, head: Option<&str>, key: &str) -> String {
+    branch
+        .map(ToString::to_string)
+        .or_else(|| head.map(|head| format!("detached@{}", &head[..head.len().min(8)])))
+        .unwrap_or_else(|| format!("Workspace {}", &key[..key.len().min(8)]))
+}
+
 fn random_bytes() -> Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).context("read workbench random bytes")?;
@@ -1497,7 +2074,7 @@ fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn timestamp_for_unix_seconds(seconds: u64) -> String {
+pub(super) fn timestamp_for_unix_seconds(seconds: u64) -> String {
     DateTime::from_timestamp(i64::try_from(seconds).unwrap_or(i64::MAX), 0)
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
         .to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -1549,7 +2126,10 @@ fn read_session_store(
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
         })
-        .map(|grant| (grant.credential_digest.clone(), grant))
+        .map(|mut grant| {
+            grant.capabilities = upgraded_session_capabilities(grant.capabilities);
+            (grant.credential_digest.clone(), grant)
+        })
         .collect())
 }
 
@@ -1561,6 +2141,65 @@ fn write_session_store(path: &Path, store: &WorkbenchSessionStoreV1) -> Result<(
     let content = serde_json::to_vec(store)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".workbench.sessions.json.exo-tmp.")
+        .tempfile_in(parent)?;
+    use std::io::Write as _;
+    temporary.write_all(&content)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .persist(path)
+        .map(drop)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn read_workspace_store(path: &Path, project_id: &str) -> Result<Vec<WorkspaceRegistration>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let store: WorkbenchWorkspaceStoreV1 =
+        serde_json::from_slice(&bytes).context("decode workbench workspace store")?;
+    if store.schema_version != WORKSPACE_STORE_SCHEMA_VERSION || store.project_id != project_id {
+        return Ok(Vec::new());
+    }
+
+    let mut keys = HashSet::new();
+    let mut roots = HashSet::new();
+    Ok(store
+        .workspaces
+        .into_iter()
+        .filter(|workspace| {
+            workspace.root.is_absolute()
+                && valid_public_token(&workspace.key)
+                && keys.insert(workspace.key.clone())
+                && roots.insert(workspace.root.clone())
+        })
+        .take(MAX_PROJECT_WORKSPACES)
+        .map(WorkspaceRegistration::from)
+        .collect())
+}
+
+fn write_workspace_store(path: &Path, store: &WorkbenchWorkspaceStoreV1) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workbench workspace store path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let content = serde_json::to_vec(store)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".workbench.workspaces.json.exo-tmp.")
         .tempfile_in(parent)?;
     use std::io::Write as _;
     temporary.write_all(&content)?;

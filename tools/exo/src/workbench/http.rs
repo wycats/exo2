@@ -62,6 +62,7 @@ enum BrowserCommandRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BrowserOperation {
     Snapshot,
+    LaneInspect { lane_id: String },
     LaneFocus { lane_id: String },
 }
 
@@ -261,6 +262,13 @@ async fn run_v1_command(
                 path: vec!["workbench".to_string(), "snapshot".to_string()],
             },
             json!({}),
+        ),
+        BrowserOperation::LaneInspect { lane_id } => (
+            "workbench.inspect",
+            Address::Operation {
+                path: vec!["workbench".to_string(), "inspect".to_string()],
+            },
+            json!({ "id": lane_id }),
         ),
         BrowserOperation::LaneFocus { lane_id } => (
             "lane.focus",
@@ -522,14 +530,28 @@ fn browser_safe_response(mut response: ResponseEnvelope, capability: &str) -> Re
         .map_or(ErrorCode::Internal, |error| error.code);
     let message = match capability {
         "workbench.snapshot" => "The workbench snapshot is temporarily unavailable",
+        "workbench.inspect" => "The lane inspection could not be completed",
         "lane.focus" => "The lane focus request could not be completed",
         _ => "The workbench command could not be completed",
     };
+    let safe_details = (capability == "workbench.inspect")
+        .then(|| {
+            response
+                .error
+                .as_ref()?
+                .details
+                .as_ref()?
+                .get("kind")?
+                .as_str()
+        })
+        .flatten()
+        .filter(|kind| *kind == "workbench.lane_not_found")
+        .map(|kind| json!({ "kind": kind }));
     response.result = None;
     response.error = Some(ErrorBody {
         code,
         message: message.to_string(),
-        details: None,
+        details: safe_details,
     });
     response
 }
