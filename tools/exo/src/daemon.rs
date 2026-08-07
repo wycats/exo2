@@ -2616,6 +2616,12 @@ pub fn cleanup_old_events_with_project(workspace_root: &Path, project: Option<&P
 /// This is the entry point for `exo daemon run --workspace <path>`.
 /// The daemon listens on the platform daemon endpoint and handles requests using the
 /// same `handle_request` function as the stdio-based JSON server.
+fn workbench_read_observes_workspace_during_execution(request: &RequestEnvelope) -> bool {
+    request_command_path(request).is_some_and(|(namespace, operation)| {
+        namespace == "workbench" && matches!(operation.as_str(), "snapshot" | "inspect")
+    })
+}
+
 pub async fn run_daemon(
     workspace_path: PathBuf,
     idle_timeout_secs: Option<u64>,
@@ -2813,15 +2819,17 @@ pub async fn run_daemon(
                 request_admission,
                 diagnostics.clone(),
                 move || {
-                    let observed_workspace =
-                        req.workspace_root.as_deref().unwrap_or(workspace.as_ref());
-                    if let Err(error) =
-                        handler_runtime_services.observe_workspace(observed_workspace)
-                    {
-                        diagnostics.record(
-                            "workbench.workspace_observation_failed",
-                            serde_json::json!({ "error": error.to_string() }),
-                        );
+                    if !workbench_read_observes_workspace_during_execution(&req) {
+                        let observed_workspace =
+                            req.workspace_root.as_deref().unwrap_or(workspace.as_ref());
+                        if let Err(error) =
+                            handler_runtime_services.observe_workspace(observed_workspace)
+                        {
+                            diagnostics.record(
+                                "workbench.workspace_observation_failed",
+                                serde_json::json!({ "error": error.to_string() }),
+                            );
+                        }
                     }
                     let recovery_request = compatible_protocol_v1_approval_request_id(
                         &workspace,
@@ -3533,6 +3541,36 @@ mod tests {
             }
         }))
         .expect("workspace request")
+    }
+
+    fn request_for_operation(path: &[&str]) -> RequestEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "id": "operation-observation-test",
+            "op": {
+                "kind": "call",
+                "params": {
+                    "address": { "kind": "operation", "path": path },
+                    "input": {}
+                }
+            }
+        }))
+        .expect("operation request")
+    }
+
+    #[test]
+    fn workbench_reads_observe_the_workspace_inside_the_command() {
+        for operation in ["snapshot", "inspect"] {
+            assert!(workbench_read_observes_workspace_during_execution(
+                &request_for_operation(&["workbench", operation]),
+            ));
+        }
+        assert!(!workbench_read_observes_workspace_during_execution(
+            &request_for_operation(&["phase", "status"]),
+        ));
+        assert!(!workbench_read_observes_workspace_during_execution(
+            &request_for_operation(&["workbench", "launch"]),
+        ));
     }
 
     #[test]

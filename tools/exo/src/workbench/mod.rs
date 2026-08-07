@@ -1668,26 +1668,7 @@ impl WorkbenchHostInner {
             return false;
         }
         let git = snapshot::sample_git(&root);
-        let label = git
-            .branch
-            .clone()
-            .or_else(|| {
-                git.head
-                    .as_deref()
-                    .map(|head| format!("detached@{}", &head[..head.len().min(8)]))
-            })
-            .unwrap_or_else(|| "detached".to_string());
-        let observed_at = git.head.is_some().then_some(now);
-        let workspace = WorkspaceRegistration {
-            key: grant.workspace_key.clone(),
-            root: root.clone(),
-            label,
-            branch: git.branch,
-            head: git.head,
-            dirty: git.dirty,
-            observed_at,
-            registered_at: grant.created_at,
-        };
+        let observed_git = git.branch.is_some() || git.head.is_some() || git.dirty.is_some();
 
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -1707,6 +1688,42 @@ impl WorkbenchHostInner {
         {
             return false;
         }
+        let previous = state.workspaces_by_key.get(&grant.workspace_key).cloned();
+        let branch = if observed_git {
+            git.branch
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.branch.clone())
+        };
+        let head = if observed_git {
+            git.head
+        } else {
+            previous
+                .as_ref()
+                .and_then(|workspace| workspace.head.clone())
+        };
+        let dirty = if observed_git {
+            git.dirty
+        } else {
+            previous.as_ref().and_then(|workspace| workspace.dirty)
+        };
+        let workspace = WorkspaceRegistration {
+            key: grant.workspace_key.clone(),
+            root: root.clone(),
+            label: workspace_label(branch.as_deref(), head.as_deref(), &grant.workspace_key),
+            branch,
+            head,
+            dirty,
+            observed_at: observed_git.then_some(now).or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|workspace| workspace.observed_at)
+            }),
+            registered_at: previous
+                .as_ref()
+                .map_or(grant.created_at, |workspace| workspace.registered_at),
+        };
         state
             .workspaces_by_root
             .insert(root, grant.workspace_key.clone());

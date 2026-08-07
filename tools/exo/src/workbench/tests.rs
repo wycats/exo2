@@ -629,6 +629,44 @@ async fn unborn_workspace_is_a_live_project_workspace_observation() {
     assert!(workspace.head.is_none());
     assert!(workspace.dirty.is_some());
     assert!(workspace.observed_at.is_some());
+
+    let now = unix_seconds();
+    let credential_digest = "u".repeat(64);
+    let selector = "unborn-session-selector";
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .session_grants
+        .insert(
+            credential_digest.clone(),
+            WorkbenchSessionGrantV1 {
+                credential_digest: credential_digest.clone(),
+                selector: selector.to_string(),
+                project_id: manager.inner.project.id.to_string(),
+                workspace_key: snapshot.workspace.key.clone(),
+                workspace_root: root.canonicalize().expect("canonical unborn workspace"),
+                capabilities: vec!["workbench.snapshot".to_string()],
+                created_at: now,
+                last_activity: now,
+                expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+            },
+        );
+    assert!(manager.inner.restore_session(selector, &credential_digest));
+    let restored = manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .workspaces_by_key
+        .get(&snapshot.workspace.key)
+        .cloned()
+        .expect("restored unborn workspace");
+    assert_eq!(restored.branch.as_deref(), Some("main"));
+    assert!(restored.head.is_none());
+    assert!(restored.dirty.is_some());
+    assert!(restored.observed_at.is_some());
     manager.shutdown().await;
 }
 
@@ -1701,6 +1739,7 @@ async fn snapshot_is_workspace_scoped_and_redacts_local_paths() {
 async fn lane_inspection_projects_bounded_history_without_changing_focus() {
     const MAX_PROGRESS_ENTRIES: usize = 8;
     const MAX_PROGRESS_BYTES: usize = 16 * 1024;
+    const MAX_OUTCOME_BYTES: usize = 16 * 1024;
 
     let fixture = fixture();
     let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
@@ -1756,7 +1795,7 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
         )
         .expect("add oversized progress");
     writer
-        .complete_task("historical-task", "The task landed cleanly.")
+        .complete_task("historical-task", &"y".repeat(MAX_OUTCOME_BYTES + 128))
         .expect("complete task");
     writer
         .update_goal_status("historical-goal", "completed")
@@ -1778,10 +1817,11 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
 
     let loader = SqliteLoader::open(fixture.project.db_path()).expect("open project loader");
     let bounded_details = loader
-        .load_phase_details_by_id_with_bounded_progress(
+        .load_phase_details_by_id_with_bounded_history(
             &phase,
             MAX_PROGRESS_ENTRIES,
             MAX_PROGRESS_BYTES,
+            MAX_OUTCOME_BYTES,
         )
         .expect("load bounded inspection details")
         .expect("bounded phase details");
@@ -1792,6 +1832,12 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
         bounded_logs
             .iter()
             .all(|log| log.message.len() <= MAX_PROGRESS_BYTES + 4)
+    );
+    assert!(
+        bounded_details.goals[0].tasks[0]
+            .completion_log
+            .as_ref()
+            .is_some_and(|outcome| outcome.len() <= MAX_OUTCOME_BYTES + 4)
     );
     drop(loader);
 
@@ -1817,9 +1863,13 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
         Some("The historical slice is available.")
     );
     assert_eq!(
-        inspection.phase.goals[0].tasks[0].outcome.as_deref(),
-        Some("The task landed cleanly.")
+        inspection.phase.goals[0].tasks[0]
+            .outcome
+            .as_ref()
+            .map(String::len),
+        Some(MAX_OUTCOME_BYTES)
     );
+    assert!(inspection.phase.goals[0].tasks[0].outcome_truncated);
     assert_eq!(inspection.phase.goals[0].tasks[0].progress.len(), 1);
     assert_eq!(
         inspection.phase.goals[0].tasks[0].progress[0].message.len(),
