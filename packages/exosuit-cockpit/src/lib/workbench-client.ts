@@ -11,6 +11,7 @@ import {
 } from "./workbench";
 
 const SESSION_HISTORY_KEY = "exoWorkbenchSessionKey";
+const PAIRING_RESUME_REQUEST_HISTORY_KEY = "exoWorkbenchPairingResumeRequestId";
 const SVELTEKIT_HISTORY_INDEX_KEY = "sveltekit:history";
 const SVELTEKIT_NAVIGATION_INDEX_KEY = "sveltekit:navigation";
 const SVELTEKIT_PAGE_STATE_KEY = "sveltekit:states";
@@ -65,6 +66,35 @@ interface HttpErrorBody {
   message?: string;
 }
 
+export interface WorkbenchPairingSummary {
+  selector: string;
+  workspace_label: string;
+  created_at: string;
+  last_used_at: string;
+  expires_at: string;
+  nickname: string | null;
+  status: "active" | "revoked";
+  revoked_at: string | null;
+  current: boolean;
+}
+
+export interface WorkbenchPairingListResult {
+  kind: "workbench.pairing.list";
+  ok: true;
+  schema_version: 1;
+  pairings: WorkbenchPairingSummary[];
+}
+
+export interface WorkbenchPairingMutationResult {
+  kind:
+    | "workbench.pairing.revoke"
+    | "workbench.pairing.rename"
+    | "workbench.pairing.forget";
+  ok: true;
+  schema_version: 1;
+  selector: string;
+}
+
 export function launchTicketFromHash(hash: string): string | null {
   const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
   const ticket = new URLSearchParams(fragment).get("ticket")?.trim();
@@ -75,6 +105,15 @@ export function sessionKeyFromHistory(state: unknown): string | null {
   const sessionKey = workbenchHistoryState(state)[SESSION_HISTORY_KEY];
   return typeof sessionKey === "string" && sessionKey.length > 0
     ? sessionKey
+    : null;
+}
+
+export function pairingResumeRequestIdFromHistory(state: unknown): string | null {
+  const requestId = workbenchHistoryState(state)[
+    PAIRING_RESUME_REQUEST_HISTORY_KEY
+  ];
+  return typeof requestId === "string" && requestId.length === 43
+    ? requestId
     : null;
 }
 
@@ -123,23 +162,49 @@ export function retainSessionSelector(
   };
 }
 
+export function retainPairingResumeRequestId(
+  state: unknown,
+  requestId: string,
+): Record<string, unknown> {
+  return {
+    ...workbenchHistoryState(state),
+    [PAIRING_RESUME_REQUEST_HISTORY_KEY]: requestId,
+  };
+}
+
+export function clearPairingResumeRequestId(
+  state: unknown,
+): Record<string, unknown> {
+  const next = { ...workbenchHistoryState(state) };
+  delete next[PAIRING_RESUME_REQUEST_HISTORY_KEY];
+  return next;
+}
+
 export function prepareWorkbenchTicketExchange(
   state: unknown,
 ): Record<string, unknown> {
   const prior = { ...workbenchHistoryState(state) };
   delete prior[SESSION_HISTORY_KEY];
+  delete prior[PAIRING_RESUME_REQUEST_HISTORY_KEY];
   return prior;
+}
+
+export function usesPublishedWorkbenchEntry(
+  protocol = globalThis.location?.protocol,
+): boolean {
+  return protocol === "https:";
 }
 
 export async function exchangeWorkbenchTicket(
   ticket: string,
   fetcher: Fetcher = fetch,
+  published = usesPublishedWorkbenchEntry(),
 ): Promise<WorkbenchSessionResult> {
   try {
     const response = await request(
       fetcher,
-      "/api/session",
-      { ticket },
+      published ? "/api/pairing/enroll" : "/api/session",
+      published ? { schema_version: 1, ticket } : { ticket },
       "The workbench session could not be opened",
     );
     return decodeSession(response);
@@ -155,6 +220,42 @@ export async function exchangeWorkbenchTicket(
     }
     throw error;
   }
+}
+
+export async function resumeWorkbenchPairing(
+  requestId: string,
+  fetcher: Fetcher = fetch,
+): Promise<WorkbenchSessionResult> {
+  return decodeSession(
+    await request(
+      fetcher,
+      "/api/pairing/resume",
+      { schema_version: 1, request_id: requestId },
+      "The paired workbench session could not be resumed",
+    ),
+  );
+}
+
+export function createWorkbenchPairingResumeRequestId(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let encoded = "";
+  let accumulator = 0;
+  let bits = 0;
+  for (const byte of bytes) {
+    accumulator = (accumulator << 8) | byte;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      encoded += alphabet[(accumulator >> bits) & 63];
+    }
+  }
+  if (bits > 0) {
+    encoded += alphabet[(accumulator << (6 - bits)) & 63];
+  }
+  return encoded;
 }
 
 export function createWorkbenchRequestId(now = Date.now()): string {
@@ -198,6 +299,64 @@ export class WorkbenchClient {
       );
     }
     return session;
+  }
+
+  async pairings(): Promise<WorkbenchPairingListResult> {
+    return decodePairingList(
+      await readRequest(
+        this.fetcher,
+        `/api/pairings?${new URLSearchParams({
+          session_key: this.sessionKey,
+        })}`,
+        "Browser pairings could not be loaded",
+      ),
+    );
+  }
+
+  async revokePairing(
+    selector: string,
+  ): Promise<WorkbenchPairingMutationResult> {
+    return decodePairingMutation(
+      await request(
+        this.fetcher,
+        "/api/pairing/revoke",
+        { schema_version: 1, session_key: this.sessionKey, selector },
+        "The browser pairing could not be revoked",
+      ),
+      "workbench.pairing.revoke",
+    );
+  }
+
+  async renamePairing(
+    selector: string,
+    nickname: string,
+  ): Promise<WorkbenchPairingMutationResult> {
+    return decodePairingMutation(
+      await request(
+        this.fetcher,
+        "/api/pairing/rename",
+        {
+          schema_version: 1,
+          session_key: this.sessionKey,
+          selector,
+          nickname,
+        },
+        "The browser pairing could not be renamed",
+      ),
+      "workbench.pairing.rename",
+    );
+  }
+
+  async forgetPairing(): Promise<WorkbenchPairingMutationResult> {
+    return decodePairingMutation(
+      await request(
+        this.fetcher,
+        "/api/pairing/forget",
+        { schema_version: 1, session_key: this.sessionKey },
+        "This browser could not forget the workspace",
+      ),
+      "workbench.pairing.forget",
+    );
   }
 
   async snapshot(): Promise<WorkbenchSnapshot> {
@@ -317,16 +476,45 @@ async function request(
   body: unknown,
   transportMessage: string,
 ): Promise<unknown> {
+  return jsonRequest(
+    fetcher,
+    path,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    transportMessage,
+  );
+}
+
+async function readRequest(
+  fetcher: Fetcher,
+  path: string,
+  transportMessage: string,
+): Promise<unknown> {
+  return jsonRequest(
+    fetcher,
+    path,
+    { method: "GET", credentials: "same-origin" },
+    transportMessage,
+  );
+}
+
+async function jsonRequest(
+  fetcher: Fetcher,
+  path: string,
+  init: RequestInit,
+  transportMessage: string,
+): Promise<unknown> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     let response: Response;
     try {
       response = await fetcher(path, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        ...init,
         signal: controller.signal,
       });
     } catch {
@@ -360,6 +548,59 @@ async function request(
   }
 }
 
+function decodePairingList(value: unknown): WorkbenchPairingListResult {
+  const result = asRecord(value);
+  if (
+    result.kind !== "workbench.pairing.list" ||
+    result.ok !== true ||
+    result.schema_version !== 1 ||
+    !Array.isArray(result.pairings) ||
+    !result.pairings.every(validPairingSummary)
+  ) {
+    throw new WorkbenchClientError(
+      "transport_error",
+      "Exo returned an invalid browser pairing list",
+      true,
+    );
+  }
+  return value as WorkbenchPairingListResult;
+}
+
+function decodePairingMutation(
+  value: unknown,
+  expectedKind: WorkbenchPairingMutationResult["kind"],
+): WorkbenchPairingMutationResult {
+  const result = asRecord(value);
+  if (
+    result.kind !== expectedKind ||
+    result.ok !== true ||
+    result.schema_version !== 1 ||
+    typeof result.selector !== "string"
+  ) {
+    throw new WorkbenchClientError(
+      "transport_error",
+      "Exo returned an invalid browser pairing result",
+      true,
+    );
+  }
+  return value as WorkbenchPairingMutationResult;
+}
+
+function validPairingSummary(value: unknown): boolean {
+  const pairing = asRecord(value);
+  return (
+    typeof pairing.selector === "string" &&
+    typeof pairing.workspace_label === "string" &&
+    typeof pairing.created_at === "string" &&
+    typeof pairing.last_used_at === "string" &&
+    typeof pairing.expires_at === "string" &&
+    (pairing.nickname === null || typeof pairing.nickname === "string") &&
+    (pairing.status === "active" || pairing.status === "revoked") &&
+    (pairing.revoked_at === null || typeof pairing.revoked_at === "string") &&
+    typeof pairing.current === "boolean"
+  );
+}
+
 function httpFailure(status: number, value: unknown): WorkbenchClientError {
   const error =
     typeof value === "object" && value !== null && !Array.isArray(value)
@@ -369,10 +610,13 @@ function httpFailure(status: number, value: unknown): WorkbenchClientError {
   switch (error.kind) {
     case "workbench.ticket_invalid":
     case "workbench.session_invalid":
+    case "workbench.pairing_invalid":
+    case "workbench.pairing_expired":
       return new WorkbenchClientError("session_expired", message);
     case "workbench.workspace_unavailable":
       return new WorkbenchClientError("workspace_unavailable", message);
     case "workbench.busy":
+    case "workbench.pairing_busy":
       return new WorkbenchClientError("server_busy", message, true);
     default:
       return new WorkbenchClientError(

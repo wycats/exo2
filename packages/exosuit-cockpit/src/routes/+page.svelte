@@ -25,16 +25,23 @@
     type WorkbenchTaskCompletionReview,
   } from "$lib/workbench";
   import {
+    clearPairingResumeRequestId,
+    createWorkbenchPairingResumeRequestId,
     createWorkbenchRequestId,
     exchangeWorkbenchTicket,
     launchTicketFromHash,
+    pairingResumeRequestIdFromHistory,
     prepareWorkbenchTicketExchange,
+    resumeWorkbenchPairing,
+    retainPairingResumeRequestId,
     retainSessionSelector,
     sessionKeyFromHistory,
+    usesPublishedWorkbenchEntry,
     workbenchHistoryState,
     WorkbenchClient,
     WorkbenchClientError,
     type WorkbenchFailureKind,
+    type WorkbenchPairingSummary,
   } from "$lib/workbench-client";
 
   type ScreenState =
@@ -140,6 +147,11 @@
   let retryBootstrap = $state<(() => void) | null>(null);
   let sessionRecovery = $state<SessionRecoveryState>("connected");
   let sessionRecoveryMessage = $state<string | null>(null);
+  let pairingAvailable = $state(false);
+  let pairings = $state<WorkbenchPairingSummary[] | null>(null);
+  let pairingsLoading = $state(false);
+  let pairingFailure = $state<string | null>(null);
+  let pendingPairingSelector = $state<string | null>(null);
 
   let client: WorkbenchClient | null = null;
   let ambiguousFocus: FocusRequest | null = null;
@@ -157,6 +169,8 @@
   let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
+    const publishedEntry = usesPublishedWorkbenchEntry(location.protocol);
+    pairingAvailable = publishedEntry;
     let events: EventSource | null = null;
     let pollTimer: number | null = null;
     let renewalTimer: number | null = null;
@@ -286,8 +300,38 @@
         recoveryTimer = null;
       }
     };
+    const resumePublishedSession = async (): Promise<WorkbenchClient> => {
+      const resumeState = readTabResumeState();
+      const requestId =
+        pairingResumeRequestIdFromHistory(history.state) ??
+        pairingResumeRequestIdFromHistory(resumeState) ??
+        createWorkbenchPairingResumeRequestId();
+      const pendingState = retainPairingResumeRequestId(
+        {
+          ...resumeState,
+          ...workbenchHistoryState(history.state),
+        },
+        requestId,
+      );
+      replacePageState(
+        `${location.pathname}${location.search}`,
+        pendingState,
+      );
+      retainTabResumeState(pendingState);
+      const session = await resumeWorkbenchPairing(requestId);
+      const resumedState = retainSessionSelector(
+        clearPairingResumeRequestId(history.state),
+        session.session_key,
+      );
+      replacePageState(
+        `${location.pathname}${location.search}`,
+        resumedState,
+      );
+      retainTabResumeState(resumedState);
+      return new WorkbenchClient(session.session_key);
+    };
     const recoverSession = async () => {
-      const activeClient = client;
+      let activeClient = client;
       if (!activeClient || snapshot === null || recoveryInFlight) {
         return;
       }
@@ -298,7 +342,20 @@
       sessionRecovery = "reconnecting";
       sessionRecoveryMessage = null;
       try {
-        await activeClient.renewSession();
+        try {
+          await activeClient.renewSession();
+        } catch (error) {
+          if (
+            publishedEntry &&
+            error instanceof WorkbenchClientError &&
+            error.kind === "session_expired"
+          ) {
+            activeClient = await resumePublishedSession();
+            client = activeClient;
+          } else {
+            throw error;
+          }
+        }
         if (client !== activeClient) {
           return;
         }
@@ -439,8 +496,16 @@
           return;
         }
         if (!sessionKey) {
-          screen = "session_required";
-          return;
+          if (!publishedEntry) {
+            screen = "session_required";
+            return;
+          }
+          const resumedClient = await resumePublishedSession();
+          if (!isCurrent()) {
+            return;
+          }
+          client = resumedClient;
+          sessionKey = resumedClient.sessionKey;
         }
         if (
           !ticket &&
@@ -461,9 +526,22 @@
           retainTabResumeState(restoredState);
         }
 
-        client = new WorkbenchClient(sessionKey);
+        client ??= new WorkbenchClient(sessionKey);
         if (!ticket) {
-          await client.renewSession();
+          try {
+            await client.renewSession();
+          } catch (error) {
+            if (
+              publishedEntry &&
+              error instanceof WorkbenchClientError &&
+              error.kind === "session_expired"
+            ) {
+              client = await resumePublishedSession();
+              sessionKey = client.sessionKey;
+            } else {
+              throw error;
+            }
+          }
         }
         const restoredLaneId =
           inspectedLaneFromHistory(history.state) ??
@@ -478,6 +556,13 @@
       } catch (error) {
         if (isCurrent()) {
           if (
+            !ticket &&
+            publishedEntry &&
+            error instanceof WorkbenchClientError &&
+            error.retryable
+          ) {
+            retryBootstrap = () => void bootstrap();
+          } else if (
             ticket &&
             error instanceof WorkbenchClientError &&
             error.kind === "server_busy"
@@ -1144,15 +1229,129 @@
       beginSessionRecovery?.();
       return;
     }
-    if (client) {
-      void refreshSnapshot(false);
-    } else {
+    if (retryBootstrap) {
       retryBootstrap?.();
+    } else if (client) {
+      void refreshSnapshot(false);
     }
   }
 
   function reloadWorkbench(): void {
     window.location.reload();
+  }
+
+  async function loadPairings(): Promise<void> {
+    const activeClient = client;
+    if (!pairingAvailable || !activeClient || pairingsLoading) {
+      return;
+    }
+    pairingsLoading = true;
+    pairingFailure = null;
+    try {
+      const result = await activeClient.pairings();
+      if (client === activeClient) {
+        pairings = result.pairings;
+      }
+    } catch (error) {
+      if (client !== activeClient) {
+        return;
+      }
+      pairingFailure = messageFrom(error);
+      if (
+        error instanceof WorkbenchClientError &&
+        error.kind === "session_expired"
+      ) {
+        beginSessionRecovery?.();
+      }
+    } finally {
+      if (client === activeClient) {
+        pairingsLoading = false;
+      }
+    }
+  }
+
+  async function revokePairing(selector: string): Promise<void> {
+    const activeClient = client;
+    if (!activeClient || pendingPairingSelector !== null) {
+      return;
+    }
+    pendingPairingSelector = selector;
+    pairingFailure = null;
+    try {
+      await activeClient.revokePairing(selector);
+      if (client === activeClient) {
+        pairings = null;
+        await loadPairings();
+      }
+    } catch (error) {
+      if (client === activeClient) {
+        pairingFailure = messageFrom(error);
+      }
+    } finally {
+      if (client === activeClient) {
+        pendingPairingSelector = null;
+      }
+    }
+  }
+
+  async function renamePairing(selector: string, nickname: string): Promise<void> {
+    const activeClient = client;
+    if (!activeClient || pendingPairingSelector !== null) {
+      return;
+    }
+    pendingPairingSelector = selector;
+    pairingFailure = null;
+    try {
+      await activeClient.renamePairing(selector, nickname);
+      if (client === activeClient) {
+        pairings = pairings?.map((pairing) =>
+          pairing.selector === selector ? { ...pairing, nickname } : pairing,
+        ) ?? null;
+      }
+    } catch (error) {
+      if (client === activeClient) {
+        pairingFailure = messageFrom(error);
+      }
+    } finally {
+      if (pendingPairingSelector === selector) {
+        pendingPairingSelector = null;
+      }
+    }
+  }
+
+  async function forgetCurrentPairing(): Promise<void> {
+    const activeClient = client;
+    if (!activeClient || pendingPairingSelector !== null) {
+      return;
+    }
+    const currentSelector =
+      pairings?.find((pairing) => pairing.current)?.selector ?? "current";
+    pendingPairingSelector = currentSelector;
+    pairingFailure = null;
+    try {
+      await activeClient.forgetPairing();
+      if (client !== activeClient) {
+        return;
+      }
+      stopLiveUpdates?.();
+      client = null;
+      snapshot = null;
+      pairings = null;
+      clearTabResumeState();
+      replacePageState(`${location.pathname}${location.search}`, {});
+      screen = "session_expired";
+      screenMessage =
+        "This browser no longer has access to this workspace. Open a current enrollment link to pair it again.";
+      screenRetryable = false;
+    } catch (error) {
+      if (client === activeClient) {
+        pairingFailure = messageFrom(error);
+      }
+    } finally {
+      if (pendingPairingSelector === currentSelector) {
+        pendingPairingSelector = null;
+      }
+    }
   }
 
   function terminalFailure(error: unknown): boolean {
@@ -1200,7 +1399,8 @@
       case "session_expired":
         return {
           title: "Session expired",
-          body: "Open a fresh Exo workbench link to continue.",
+          body:
+            screenMessage ?? "Open a fresh Exo workbench link to continue.",
         };
       case "client_update_required":
         return {
@@ -1263,6 +1463,11 @@
     {streamConnected}
     {sessionRecovery}
     {sessionRecoveryMessage}
+    {pairingAvailable}
+    {pairings}
+    {pairingsLoading}
+    {pairingFailure}
+    {pendingPairingSelector}
     pendingLaneId={pendingFocus?.laneId ?? null}
     {focusFailure}
     {refreshFailure}
@@ -1288,6 +1493,11 @@
         ? reloadWorkbench
         : null}
     onRefresh={() => void refreshSnapshot(false)}
+    onOpenPairings={() => void loadPairings()}
+    onRetryPairings={() => void loadPairings()}
+    onRevokePairing={(selector) => void revokePairing(selector)}
+    onRenamePairing={(selector, nickname) => void renamePairing(selector, nickname)}
+    onForgetPairing={() => void forgetCurrentPairing()}
     onPlan={submitPlanning}
     onApproveCompletion={approveCompletionReview}
     onDismissCompletionReview={() => {

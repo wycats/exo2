@@ -1,6 +1,7 @@
 use super::{
-    MAX_REQUEST_BODY_BYTES, SESSION_COOKIE_PREFIX, TicketExchangeError, WorkbenchHostInner,
-    WorkbenchSession, assets,
+    MAX_REQUEST_BODY_BYTES, PAIRING_COOKIE_NAME, PairingExchangeError, PairingManagementError,
+    SESSION_COOKIE_PREFIX, TicketExchangeError, WorkbenchEntryBinding, WorkbenchHostInner,
+    WorkbenchLaunchMode, WorkbenchPairingMutationResult, WorkbenchSession, assets,
     planning::{self, BrowserPlanningOperation, BrowserPlanningRequest},
 };
 use crate::api::protocol::{
@@ -36,6 +37,39 @@ struct HttpState {
 #[derive(Debug, Deserialize)]
 struct SessionRequest {
     ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingEnrollmentRequest {
+    schema_version: u8,
+    ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingResumeRequest {
+    schema_version: u8,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingRevokeRequest {
+    schema_version: u8,
+    session_key: String,
+    selector: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingRenameRequest {
+    schema_version: u8,
+    session_key: String,
+    selector: String,
+    nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingForgetRequest {
+    schema_version: u8,
+    session_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,9 +114,31 @@ pub(super) async fn serve(
 ) -> std::io::Result<()> {
     let app = Router::new()
         .route("/api/session", post(create_session))
+        .route(
+            "/api/pairing/enroll",
+            post(enroll_pairing).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/pairing/resume",
+            post(resume_pairing).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route("/api/pairings", get(list_pairings))
+        .route(
+            "/api/pairing/revoke",
+            post(revoke_pairing).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/pairing/rename",
+            post(rename_pairing).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/pairing/forget",
+            post(forget_pairing).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route("/api/session/renew", post(renew_session))
         .route("/api/command", post(run_command))
         .route("/api/events", get(events))
+        .route("/api/health", get(health))
         .fallback(get(static_asset))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(HttpState { inner });
@@ -113,11 +169,14 @@ async fn create_session(
             "The workbench host is no longer available",
         );
     };
-    if !origin_matches(&inner, &headers) {
+    let Some(entry) = request_entry_binding(&inner, &headers) else {
+        return origin_mismatch_response();
+    };
+    if entry.launch_mode != WorkbenchLaunchMode::DirectLoopback {
         return error_response(
-            StatusCode::FORBIDDEN,
-            "workbench.origin_mismatch",
-            "The workbench request origin is not accepted",
+            StatusCode::BAD_REQUEST,
+            "workbench.invalid_request",
+            "Published workbench enrollment requires the pairing endpoint",
         );
     }
     let (session_id, result) = match inner.redeem_ticket(&request.ticket) {
@@ -127,9 +186,247 @@ async fn create_session(
     inner.touch_daemon_activity();
     let cookie_name = session_cookie_name(&result.session_key);
     let mut response = Json(result).into_response();
-    if let Ok(value) = session_cookie(&cookie_name, &session_id).parse() {
+    if let Ok(value) = session_cookie(&cookie_name, &session_id, false, 43_200).parse() {
         response.headers_mut().insert(SET_COOKIE, value);
     }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn enroll_pairing(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<PairingEnrollmentRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) if request.schema_version == 1 => request,
+        Ok(_) => return invalid_request_response(),
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let Some(entry) = request_entry_binding(&inner, &headers).filter(|entry| entry.is_published())
+    else {
+        return origin_mismatch_response();
+    };
+    let pairing = pairing_credential(&headers);
+    let result = match inner.enroll_pairing(
+        &request.ticket,
+        pairing
+            .as_ref()
+            .map(|(selector, secret)| (selector.as_str(), secret.as_str())),
+        &entry,
+    ) {
+        Ok(result) => result,
+        Err(error) => return pairing_exchange_error_response(error),
+    };
+    let cookie_name = session_cookie_name(&result.session.session_key);
+    let mut response = Json(result.session).into_response();
+    append_cookie(
+        &mut response,
+        session_cookie(&cookie_name, &result.session_secret, true, 43_200),
+    );
+    append_cookie(
+        &mut response,
+        pairing_cookie(&result.pairing_cookie, result.pairing_max_age),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn resume_pairing(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<PairingResumeRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) if request.schema_version == 1 => request,
+        Ok(_) => return invalid_request_response(),
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let Some(entry) = request_entry_binding(&inner, &headers).filter(|entry| entry.is_published())
+    else {
+        return origin_mismatch_response();
+    };
+    let Some((pairing_selector, pairing_secret)) = pairing_credential(&headers) else {
+        return pairing_exchange_error_response(PairingExchangeError::Invalid);
+    };
+    let result = match inner.resume_pairing(
+        &pairing_selector,
+        &pairing_secret,
+        &request.request_id,
+        &entry,
+    ) {
+        Ok(result) => result,
+        Err(error) => return pairing_exchange_error_response(error),
+    };
+    let cookie_name = session_cookie_name(&result.session.session_key);
+    let mut response = Json(result.session).into_response();
+    append_cookie(
+        &mut response,
+        session_cookie(&cookie_name, &result.session_secret, true, 43_200),
+    );
+    append_cookie(
+        &mut response,
+        pairing_cookie(&result.pairing_cookie, result.pairing_max_age),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn list_pairings(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> AxumResponse {
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let Some(session_key) = session_key_from_uri(&uri) else {
+        return invalid_request_response();
+    };
+    let session = match pairing_management_session(&inner, &headers, session_key) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let result = match inner.list_pairings(
+        session.pairing_selector.as_deref(),
+        Some(&session.workspace_key),
+        true,
+    ) {
+        Ok(result) => result,
+        Err(_) => return pairing_management_error_response(PairingManagementError::Unavailable),
+    };
+    inner.touch_daemon_activity();
+    let mut response = Json(result).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn revoke_pairing(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<PairingRevokeRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) if request.schema_version == 1 => request,
+        Ok(_) => return invalid_request_response(),
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let session = match pairing_management_session(&inner, &headers, &request.session_key) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let result = match inner.revoke_pairing(&request.selector, Some(&session.workspace_key)) {
+        Ok(result) => result,
+        Err(error) => return pairing_management_error_response(error),
+    };
+    inner.touch_daemon_activity();
+    let mut response = Json(result).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn rename_pairing(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<PairingRenameRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) if request.schema_version == 1 => request,
+        Ok(_) => return invalid_request_response(),
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let session = match pairing_management_session(&inner, &headers, &request.session_key) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let result = match inner.rename_pairing(
+        &request.selector,
+        &request.nickname,
+        Some(&session.workspace_key),
+    ) {
+        Ok(result) => result,
+        Err(error) => return pairing_management_error_response(error),
+    };
+    inner.touch_daemon_activity();
+    let mut response = Json(result).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn forget_pairing(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    payload: Result<Json<PairingForgetRequest>, JsonRejection>,
+) -> AxumResponse {
+    let Json(request) = match payload {
+        Ok(request) if request.schema_version == 1 => request,
+        Ok(_) => return invalid_request_response(),
+        Err(error) => return json_rejection_response(error),
+    };
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let session = match pairing_management_session(&inner, &headers, &request.session_key) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(selector) = session.pairing_selector.as_deref() else {
+        return pairing_management_error_response(PairingManagementError::NotFound);
+    };
+    let result = WorkbenchPairingMutationResult {
+        kind: "workbench.pairing.forget",
+        ok: true,
+        schema_version: 1,
+        selector: selector.to_string(),
+    };
+    inner.touch_daemon_activity();
+    let mut response = Json(result).into_response();
+    append_cookie(&mut response, pairing_cookie("", 0));
+    append_cookie(
+        &mut response,
+        session_cookie(&session_cookie_name(&request.session_key), "", true, 0),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn health(State(state): State<HttpState>, headers: HeaderMap) -> AxumResponse {
+    let Some(inner) = state.inner.upgrade() else {
+        return host_unavailable_response();
+    };
+    let Some(host) = header_text(&headers, HOST) else {
+        return origin_mismatch_response();
+    };
+    if inner.published_binding_for_host(host).is_none() {
+        return origin_mismatch_response();
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -152,13 +449,9 @@ async fn renew_session(
             "The workbench host is no longer available",
         );
     };
-    if !origin_matches(&inner, &headers) {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "workbench.origin_mismatch",
-            "The workbench request origin is not accepted",
-        );
-    }
+    let Some(entry) = request_entry_binding(&inner, &headers) else {
+        return origin_mismatch_response();
+    };
     if !valid_session_key(&request.session_key) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -174,6 +467,16 @@ async fn renew_session(
             "The workbench session is invalid",
         );
     };
+    let Some(current_session) = inner.session(&request.session_key, session_secret) else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "workbench.session_invalid",
+            "The workbench session is invalid",
+        );
+    };
+    if !inner.session_matches_entry(&current_session, &entry) {
+        return origin_mismatch_response();
+    }
     let result = match inner.renew_session(&request.session_key, session_secret) {
         Ok(Some(result)) => result,
         Ok(None) => {
@@ -193,7 +496,9 @@ async fn renew_session(
     };
     inner.touch_daemon_activity();
     let mut response = Json(result).into_response();
-    if let Ok(value) = session_cookie(&cookie_name, session_secret).parse() {
+    if let Ok(value) =
+        session_cookie(&cookie_name, session_secret, entry.is_published(), 43_200).parse()
+    {
         response.headers_mut().insert(SET_COOKIE, value);
     }
     response
@@ -689,17 +994,75 @@ fn authenticated_session(
     headers: &HeaderMap,
     session_key: &str,
 ) -> Option<WorkbenchSession> {
+    let entry = authenticated_request_entry(inner, headers)?;
     let cookie_name = session_cookie_name(session_key);
     let session_id = cookie_value(headers, &cookie_name)?;
-    inner.session(session_key, session_id)
+    let session = inner.session(session_key, session_id)?;
+    inner
+        .session_matches_entry(&session, &entry)
+        .then_some(session)
+}
+
+fn pairing_management_session(
+    inner: &WorkbenchHostInner,
+    headers: &HeaderMap,
+    session_key: &str,
+) -> Result<WorkbenchSession, AxumResponse> {
+    if !valid_session_key(session_key) {
+        return Err(invalid_request_response());
+    }
+    let Some(session) = authenticated_session(inner, headers, session_key) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "workbench.session_invalid",
+            "The workbench session is invalid",
+        ));
+    };
+    if !session.entry.is_published()
+        || !session.allows("workbench.pairing.manage")
+        || session.pairing_selector.is_none()
+    {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "workbench.capability_denied",
+            "The workbench session does not allow pairing management",
+        ));
+    }
+    Ok(session)
 }
 
 fn session_cookie_name(session_key: &str) -> String {
     format!("{SESSION_COOKIE_PREFIX}{session_key}")
 }
 
-fn session_cookie(name: &str, value: &str) -> String {
-    format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
+fn session_cookie(name: &str, value: &str, secure: bool, max_age: u64) -> String {
+    format!(
+        "{name}={value}; HttpOnly; {}SameSite=Strict; Path=/; Max-Age={max_age}",
+        if secure { "Secure; " } else { "" }
+    )
+}
+
+fn pairing_cookie(value: &str, max_age: u64) -> String {
+    session_cookie(PAIRING_COOKIE_NAME, value, true, max_age)
+}
+
+fn append_cookie(response: &mut AxumResponse, cookie: String) {
+    if let Ok(value) = cookie.parse() {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+}
+
+fn pairing_credential(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = cookie_value(headers, PAIRING_COOKIE_NAME)?;
+    let mut parts = value.split('.');
+    if parts.next() != Some("v1") {
+        return None;
+    }
+    let (Some(selector), Some(secret), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    (valid_session_key(selector) && valid_session_key(secret))
+        .then(|| (selector.to_string(), secret.to_string()))
 }
 
 fn session_key_from_uri(uri: &Uri) -> Option<&str> {
@@ -731,35 +1094,58 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .find_map(|(candidate, value)| (candidate == name).then_some(value))
 }
 
+fn request_entry_binding(
+    inner: &WorkbenchHostInner,
+    headers: &HeaderMap,
+) -> Option<WorkbenchEntryBinding> {
+    inner.entry_binding_for_request(header_text(headers, HOST)?, header_text(headers, ORIGIN)?)
+}
+
+fn authenticated_request_entry(
+    inner: &WorkbenchHostInner,
+    headers: &HeaderMap,
+) -> Option<WorkbenchEntryBinding> {
+    let host = header_text(headers, HOST)?;
+    match header_text(headers, ORIGIN) {
+        Some(origin) => inner.entry_binding_for_request(host, origin),
+        None => inner.entry_binding_for_host(host),
+    }
+}
+
 fn origin_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
-    host_matches(inner, headers)
-        && headers
-            .get(ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| inner.origin().as_deref() == Some(value))
+    request_entry_binding(inner, headers).is_some()
 }
 
 fn event_origin_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
-    host_matches(inner, headers)
-        && headers
-            .get(ORIGIN)
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .is_some_and(|value| inner.origin().as_deref() == Some(value))
-            })
-            .unwrap_or(true)
+    authenticated_request_entry(inner, headers).is_some()
 }
 
-fn host_matches(inner: &WorkbenchHostInner, headers: &HeaderMap) -> bool {
-    let Some(expected_host) = inner.expected_host() else {
-        return false;
-    };
-    headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == expected_host)
+fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
+    headers.get(name)?.to_str().ok()
+}
+
+fn host_unavailable_response() -> AxumResponse {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "workbench.host_unavailable",
+        "The workbench host is no longer available",
+    )
+}
+
+fn origin_mismatch_response() -> AxumResponse {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "workbench.origin_mismatch",
+        "The workbench request origin is not accepted",
+    )
+}
+
+fn invalid_request_response() -> AxumResponse {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "workbench.invalid_request",
+        "The workbench request is invalid",
+    )
 }
 
 fn invalidation_event(revision: u64) -> Event {
@@ -805,6 +1191,58 @@ fn ticket_exchange_error_response(error: TicketExchangeError) -> AxumResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             "workbench.busy",
             "The workbench session store is temporarily unavailable",
+        ),
+    };
+    error_response(status, kind, message)
+}
+
+fn pairing_exchange_error_response(error: PairingExchangeError) -> AxumResponse {
+    let (status, kind, message) = match error {
+        PairingExchangeError::Invalid => (
+            StatusCode::UNAUTHORIZED,
+            "workbench.pairing_invalid",
+            "This browser is not paired with the workbench",
+        ),
+        PairingExchangeError::Expired => (
+            StatusCode::UNAUTHORIZED,
+            "workbench.pairing_expired",
+            "This browser pairing has expired",
+        ),
+        PairingExchangeError::Limit => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "workbench.pairing_limit",
+            "The workbench pairing limit is reached",
+        ),
+        PairingExchangeError::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "workbench.pairing_busy",
+            "The workbench pairing service is busy",
+        ),
+        PairingExchangeError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.pairing_busy",
+            "The workbench pairing store is temporarily unavailable",
+        ),
+    };
+    error_response(status, kind, message)
+}
+
+fn pairing_management_error_response(error: PairingManagementError) -> AxumResponse {
+    let (status, kind, message) = match error {
+        PairingManagementError::Invalid => (
+            StatusCode::BAD_REQUEST,
+            "workbench.invalid_request",
+            "The workbench pairing request is invalid",
+        ),
+        PairingManagementError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "workbench.pairing_not_found",
+            "The workbench pairing was not found",
+        ),
+        PairingManagementError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workbench.pairing_busy",
+            "The workbench pairing store is temporarily unavailable",
         ),
     };
     error_response(status, kind, message)

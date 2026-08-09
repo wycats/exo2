@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::*;
-use crate::api::protocol::{Effect, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
+use crate::api::protocol::{Effect, ErrorCode, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
 use crate::context::{SqliteLoader, SqliteWriter};
 use serde_json::{Value as JsonValue, json};
 #[cfg(feature = "ui")]
@@ -29,6 +29,7 @@ struct Fixture {
 struct RawHttpResponse {
     status: u16,
     headers: HashMap<String, String>,
+    set_cookies: Vec<String>,
     body: Vec<u8>,
 }
 
@@ -88,8 +89,86 @@ fn run_git(root: &Path, args: &[&str]) {
     );
 }
 
+#[test]
+fn pairing_management_failures_preserve_stable_cli_classification() {
+    for (error, code, kind) in [
+        (
+            PairingManagementError::Invalid,
+            ErrorCode::InvalidInput,
+            "workbench.invalid_request",
+        ),
+        (
+            PairingManagementError::NotFound,
+            ErrorCode::NotFound,
+            "workbench.pairing_not_found",
+        ),
+        (
+            PairingManagementError::Unavailable,
+            ErrorCode::PreconditionFailed,
+            "workbench.pairing_busy",
+        ),
+    ] {
+        let failure = pairing_management_anyhow(error);
+        let failure = failure
+            .downcast_ref::<ExoFailure>()
+            .expect("pairing management failure is structured");
+        assert_eq!(failure.error.code, code);
+        assert_eq!(
+            failure.error.details.as_ref().expect("failure details")["kind"],
+            kind
+        );
+    }
+}
+
 fn test_manager(project: Arc<Project>) -> WorkbenchHostManager {
     test_manager_with_identity(project, "test-workbench-instance")
+}
+
+fn test_direct_entry() -> WorkbenchEntryBinding {
+    WorkbenchEntryBinding::direct("http://127.0.0.1:1".to_string())
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+    ) -> Result<WorkbenchEntryBinding> {
+        WorkbenchEntryBinding::published(
+            format!("https://workbench-{}.test.localhost", &workspace.key[..8]),
+            format!("locald-{}", &workspace.key[..12]),
+            workspace.key.clone(),
+        )
+    }
+}
+
+#[cfg(feature = "ui")]
+fn use_test_published_entries(manager: &WorkbenchHostManager) {
+    manager.set_entry_provider(Arc::new(TestPublishedEntryProvider));
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestMovedPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestMovedPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+    ) -> Result<WorkbenchEntryBinding> {
+        WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-stable-project-instance".to_string(),
+            workspace.key.clone(),
+        )
+    }
 }
 
 fn test_manager_with_identity(
@@ -147,6 +226,17 @@ fn launch_parts(launch: &WorkbenchLaunchResult) -> (&str, &str) {
 
 #[cfg(feature = "ui")]
 fn ticket_payload(ticket: &str) -> WorkbenchTicketV1 {
+    assert!(ticket.starts_with("v1."), "direct tickets use version 1");
+    let payload = ticket.split('.').nth(1).expect("ticket payload");
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("decode ticket payload");
+    serde_json::from_slice(&bytes).expect("parse ticket payload")
+}
+
+#[cfg(feature = "ui")]
+fn published_ticket_payload(ticket: &str) -> WorkbenchTicketV2 {
+    assert!(ticket.starts_with("v2."), "published tickets use version 2");
     let payload = ticket.split('.').nth(1).expect("ticket payload");
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
@@ -342,6 +432,8 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
                 workspace_key: legacy_sibling_key.clone(),
                 workspace_root: sibling_root.clone(),
                 capabilities: vec!["workbench.snapshot".to_string()],
+                entry: None,
+                pairing_selector: None,
                 created_at: now,
                 last_activity: now,
                 expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
@@ -557,6 +649,7 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
         "pending-capability".to_string(),
         PendingCapability {
             workspace_key: "workspace-000".to_string(),
+            entry: test_direct_entry(),
             expires_at: now.saturating_add(TICKET_LIFETIME.as_secs()),
         },
     );
@@ -569,6 +662,8 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             workspace_key: "workspace-001".to_string(),
             workspace_root: PathBuf::from("/tmp/exo-workbench-001"),
             capabilities: vec!["workbench.snapshot".to_string()],
+            entry: test_direct_entry(),
+            pairing_selector: None,
             created_at: now,
             last_activity: now,
             expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
@@ -584,6 +679,8 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             workspace_key: "workspace-002".to_string(),
             workspace_root: PathBuf::from("/tmp/exo-workbench-002"),
             capabilities: vec!["workbench.snapshot".to_string()],
+            entry: None,
+            pairing_selector: None,
             created_at: now,
             last_activity: now,
             expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
@@ -648,6 +745,8 @@ async fn unborn_workspace_is_a_live_project_workspace_observation() {
                 workspace_key: snapshot.workspace.key.clone(),
                 workspace_root: root.canonicalize().expect("canonical unborn workspace"),
                 capabilities: vec!["workbench.snapshot".to_string()],
+                entry: Some(test_direct_entry()),
+                pairing_selector: None,
                 created_at: now,
                 last_activity: now,
                 expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
@@ -893,7 +992,7 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
             .is_some(),
         "the redeemed session is authenticated by its independent cookie secret"
     );
-    let session_store = fs::read_to_string(&manager.inner.session_store_path)
+    let session_store = fs::read_to_string(&manager.inner.authorization_store_path)
         .expect("read workbench session store");
     assert!(!session_store.contains(&session_secret));
     assert!(session_store.contains(&session_credential_digest(&session_secret)));
@@ -918,6 +1017,932 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         !inactive_record.server_task_alive,
         "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_enrollment_and_resume_are_durable_exact_and_origin_bound() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (published_origin, ticket) = launch_parts(&launch);
+    assert!(published_origin.starts_with("https://workbench-"));
+    let published_ticket = published_ticket_payload(ticket);
+    assert_eq!(published_ticket.version, 2);
+    assert_eq!(published_ticket.entry_mode, WorkbenchLaunchMode::Published);
+    assert_eq!(published_ticket.canonical_origin, published_origin);
+    assert_eq!(published_ticket.workspace_key, launch.workspace.key);
+    assert!(published_ticket.project_instance_id.starts_with("locald-"));
+    let published_host = expected_host_from_origin(published_origin).expect("published host");
+    let private_origin = manager.host_status().expect("private host").origin;
+
+    let enrollment = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": ticket }).to_string()),
+        None,
+        Some(published_origin),
+    )
+    .await
+    .expect("enroll published browser");
+    assert_eq!(enrollment.status, 200, "{enrollment:?}");
+    let pairing_cookie = response_cookie(&enrollment, PAIRING_COOKIE_NAME)
+        .expect("pairing cookie")
+        .to_string();
+    assert!(
+        enrollment
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with(SESSION_COOKIE_PREFIX)),
+        "enrollment also creates the first active session"
+    );
+    let pairing_secret = pairing_cookie
+        .split('.')
+        .nth(2)
+        .expect("pairing cookie secret");
+    let persisted = fs::read_to_string(&manager.inner.authorization_store_path)
+        .expect("read authorization store");
+    let store: WorkbenchAuthorizationStoreV2 =
+        serde_json::from_str(&persisted).expect("decode authorization store");
+    assert_eq!(store.schema_version, 2);
+    assert_eq!(store.pairings.len(), 1);
+    assert_eq!(store.sessions.len(), 1);
+    assert!(!persisted.contains(pairing_secret));
+
+    let request_id = "r".repeat(43);
+    let resume = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": request_id }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume paired browser");
+    assert_eq!(resume.status, 200, "{resume:?}");
+    let resumed_session_cookie = response_cookie_prefix(&resume, SESSION_COOKIE_PREFIX)
+        .expect("resumed session cookie")
+        .to_string();
+
+    let replay = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": request_id }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("replay paired resume");
+    assert_eq!(replay.status, 200, "{replay:?}");
+    assert_eq!(
+        response_cookie_prefix(&replay, SESSION_COOKIE_PREFIX),
+        Some(resumed_session_cookie.as_str()),
+        "same pairing and request ID reproduce the exact session credential"
+    );
+
+    let health = raw_http_via(
+        &private_origin,
+        published_host,
+        "GET",
+        "/api/health",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("read published health");
+    assert_eq!(health.status, 204);
+    assert!(health.body.is_empty());
+
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path).expect("read replay store"),
+    )
+    .expect("decode replay store");
+    assert_eq!(store.pairings.len(), 1);
+    assert_eq!(store.resume_outcomes.len(), 1);
+    assert_eq!(
+        store
+            .sessions
+            .iter()
+            .filter(|session| session.pairing_selector.is_some())
+            .count(),
+        2,
+        "enrollment and one unique resume create two active sessions"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_reenrollment_revokes_a_capability_mismatched_pairing() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let first_launch = manager
+        .launch(&fixture.root)
+        .expect("launch first published enrollment");
+    let (published_origin, first_ticket) = launch_parts(&first_launch);
+    let published_host = expected_host_from_origin(published_origin).expect("published host");
+    let private_origin = manager.host_status().expect("private host").origin;
+    let first_enrollment = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": first_ticket }).to_string()),
+        None,
+        Some(published_origin),
+    )
+    .await
+    .expect("enroll first published browser");
+    assert_eq!(first_enrollment.status, 200, "{first_enrollment:?}");
+    let first_pairing_cookie = response_cookie(&first_enrollment, PAIRING_COOKIE_NAME)
+        .expect("first pairing cookie")
+        .to_string();
+    let first_selector = first_pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("first pairing selector")
+        .to_string();
+
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let pairing = state
+            .pairing_grants
+            .get_mut(&first_selector)
+            .expect("first pairing grant");
+        pairing
+            .capabilities
+            .retain(|capability| capability != "lane.focus");
+    }
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist capability-mismatched pairing");
+
+    let second_launch = manager
+        .launch(&fixture.root)
+        .expect("launch replacement published enrollment");
+    let (_, second_ticket) = launch_parts(&second_launch);
+    let replacement = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": second_ticket }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={first_pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("replace capability-mismatched pairing");
+    assert_eq!(replacement.status, 200, "{replacement:?}");
+    let replacement_cookie =
+        response_cookie(&replacement, PAIRING_COOKIE_NAME).expect("replacement pairing cookie");
+    let replacement_selector = replacement_cookie
+        .split('.')
+        .nth(1)
+        .expect("replacement pairing selector");
+    assert_ne!(replacement_selector, first_selector);
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(state.pairing_grants.len(), 2);
+    assert!(
+        state
+            .pairing_grants
+            .get(&first_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    assert!(state.pairing_grants.contains_key(replacement_selector));
+    assert!(
+        state.session_grants.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(first_selector.as_str())
+        })
+    );
+    assert!(
+        state
+            .resume_outcomes
+            .keys()
+            .all(|key| key.pairing_selector != first_selector)
+    );
+    drop(state);
+
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path).expect("read replacement store"),
+    )
+    .expect("decode replacement store");
+    assert_eq!(store.pairings.len(), 2);
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == first_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == replacement_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_none())
+    );
+    assert!(
+        store.sessions.iter().all(|session| {
+            session.pairing_selector.as_deref() != Some(first_selector.as_str())
+        })
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_pairing_management_is_scoped_path_free_and_revocable() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (published_origin, ticket) = launch_parts(&launch);
+    let published_host = expected_host_from_origin(published_origin).expect("published host");
+    let private_origin = manager.host_status().expect("private host").origin;
+    let enrollment = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": ticket }).to_string()),
+        None,
+        Some(published_origin),
+    )
+    .await
+    .expect("enroll published browser");
+    assert_eq!(enrollment.status, 200, "{enrollment:?}");
+    let pairing_cookie = response_cookie(&enrollment, PAIRING_COOKIE_NAME)
+        .expect("pairing cookie")
+        .to_string();
+    let pairing_selector = pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("pairing selector")
+        .to_string();
+    let session_cookie = response_cookie_prefix(&enrollment, SESSION_COOKIE_PREFIX)
+        .expect("session cookie")
+        .to_string();
+    let session_key = session_cookie
+        .split_once('=')
+        .and_then(|(name, _)| name.strip_prefix(SESSION_COOKIE_PREFIX))
+        .expect("session key")
+        .to_string();
+    let browser_cookies = format!("{session_cookie}; {PAIRING_COOKIE_NAME}={pairing_cookie}");
+
+    manager
+        .inner
+        .rename_pairing(&pairing_selector, "Daily planning browser", None)
+        .expect("rename pairing");
+    let cli_projection = manager
+        .inner
+        .list_pairings(None, None, false)
+        .expect("list CLI pairings");
+    assert_eq!(cli_projection.pairings.len(), 1);
+    assert_eq!(cli_projection.pairings[0].selector, pairing_selector);
+    assert_eq!(
+        cli_projection.pairings[0].nickname.as_deref(),
+        Some("Daily planning browser")
+    );
+
+    let browser_projection = raw_http_via(
+        &private_origin,
+        published_host,
+        "GET",
+        &format!("/api/pairings?session_key={session_key}"),
+        None,
+        Some(&browser_cookies),
+        Some(published_origin),
+    )
+    .await
+    .expect("list browser pairings");
+    assert_eq!(browser_projection.status, 200, "{browser_projection:?}");
+    let projection = browser_projection.json();
+    assert_eq!(projection["pairings"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        projection["pairings"][0]["selector"],
+        pairing_selector.chars().take(12).collect::<String>()
+    );
+    assert_eq!(projection["pairings"][0]["current"], true);
+    assert_eq!(
+        projection["pairings"][0]["nickname"],
+        "Daily planning browser"
+    );
+    let serialized_projection = serde_json::to_string(&projection).expect("serialize projection");
+    assert!(!serialized_projection.contains(&fixture.root.display().to_string()));
+
+    let browser_rename = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/rename",
+        Some(
+            json!({
+                "schema_version": 1,
+                "session_key": session_key,
+                "selector": pairing_selector.chars().take(12).collect::<String>(),
+                "nickname": "Cockpit browser"
+            })
+            .to_string(),
+        ),
+        Some(&browser_cookies),
+        Some(published_origin),
+    )
+    .await
+    .expect("rename browser pairing");
+    assert_eq!(browser_rename.status, 200, "{browser_rename:?}");
+    assert_eq!(browser_rename.json()["kind"], "workbench.pairing.rename");
+    assert_eq!(
+        manager
+            .inner
+            .list_pairings(None, None, false)
+            .expect("list renamed pairings")
+            .pairings[0]
+            .nickname
+            .as_deref(),
+        Some("Cockpit browser")
+    );
+    assert_eq!(
+        manager.inner.rename_pairing(
+            &pairing_selector,
+            "Wrong workspace",
+            Some("sibling-workspace")
+        ),
+        Err(PairingManagementError::NotFound)
+    );
+
+    let persisted_before_failure = fs::read(&manager.inner.authorization_store_path)
+        .expect("read authorization store before failed revocation");
+    let backup_path = manager
+        .inner
+        .authorization_store_path
+        .with_extension("json.before-revoke");
+    fs::rename(&manager.inner.authorization_store_path, &backup_path)
+        .expect("move authorization store aside");
+    fs::create_dir(&manager.inner.authorization_store_path)
+        .expect("block authorization-store replacement");
+    assert_eq!(
+        manager.inner.revoke_pairing(&pairing_selector, None),
+        Err(PairingManagementError::Unavailable)
+    );
+    let state_after_failure = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state_after_failure
+            .pairing_grants
+            .contains_key(&pairing_selector)
+    );
+    assert!(
+        state_after_failure
+            .session_grants
+            .values()
+            .any(|grant| grant.pairing_selector.as_deref() == Some(&pairing_selector))
+    );
+    drop(state_after_failure);
+    fs::remove_dir(&manager.inner.authorization_store_path)
+        .expect("remove blocked authorization-store destination");
+    fs::rename(&backup_path, &manager.inner.authorization_store_path)
+        .expect("restore authorization store after failed revocation");
+    assert_eq!(
+        fs::read(&manager.inner.authorization_store_path)
+            .expect("read restored authorization store"),
+        persisted_before_failure,
+        "failed revocation must leave durable authorization unchanged"
+    );
+
+    let revoke = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/revoke",
+        Some(
+            json!({
+                "schema_version": 1,
+                "session_key": session_key,
+                "selector": pairing_selector.chars().take(12).collect::<String>(),
+            })
+            .to_string(),
+        ),
+        Some(&browser_cookies),
+        Some(published_origin),
+    )
+    .await
+    .expect("revoke browser pairing");
+    assert_eq!(revoke.status, 200, "{revoke:?}");
+    let revoked_projection = manager
+        .inner
+        .list_pairings(None, None, false)
+        .expect("list revoked pairings");
+    assert_eq!(revoked_projection.pairings.len(), 1);
+    assert_eq!(
+        revoked_projection.pairings[0].status,
+        WorkbenchPairingStatus::Revoked
+    );
+    assert!(revoked_projection.pairings[0].revoked_at.is_some());
+    assert!(!revoked_projection.pairings[0].current);
+    let persisted_revocation: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store after revocation"),
+    )
+    .expect("decode authorization store after revocation");
+    assert_eq!(persisted_revocation.pairings.len(), 1);
+    assert!(persisted_revocation.pairings[0].revoked_at.is_some());
+    assert!(persisted_revocation.sessions.is_empty());
+    assert!(persisted_revocation.resume_outcomes.is_empty());
+    let restored_revocation = read_authorization_store(
+        &manager.inner.authorization_store_path,
+        fixture.project.id.as_str(),
+        unix_seconds(),
+    )
+    .expect("read retained revocation")
+    .expect("retained authorization state");
+    assert!(
+        restored_revocation
+            .pairings
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    let resume = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "z".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume revoked pairing");
+    assert_eq!(resume.status, 401);
+
+    let second_launch = manager
+        .launch(&fixture.root)
+        .expect("launch replacement enrollment");
+    let (_, second_ticket) = launch_parts(&second_launch);
+    let second_enrollment = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": second_ticket }).to_string()),
+        None,
+        Some(published_origin),
+    )
+    .await
+    .expect("enroll replacement browser");
+    let second_pairing_cookie =
+        response_cookie(&second_enrollment, PAIRING_COOKIE_NAME).expect("second pairing cookie");
+    let second_pairing_selector = second_pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("second pairing selector")
+        .to_string();
+    let second_session_cookie = response_cookie_prefix(&second_enrollment, SESSION_COOKIE_PREFIX)
+        .expect("second session cookie");
+    let second_session_key = second_session_cookie
+        .split_once('=')
+        .and_then(|(name, _)| name.strip_prefix(SESSION_COOKIE_PREFIX))
+        .expect("second session key");
+    let forget = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/forget",
+        Some(
+            json!({
+                "schema_version": 1,
+                "session_key": second_session_key,
+            })
+            .to_string(),
+        ),
+        Some(&format!(
+            "{second_session_cookie}; {PAIRING_COOKIE_NAME}={second_pairing_cookie}"
+        )),
+        Some(published_origin),
+    )
+    .await
+    .expect("forget current browser pairing");
+    assert_eq!(forget.status, 200, "{forget:?}");
+    assert_eq!(forget.json()["kind"], "workbench.pairing.forget");
+    assert_eq!(
+        forget
+            .set_cookies
+            .iter()
+            .filter(|cookie| cookie.contains("Max-Age=0"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        manager
+            .inner
+            .list_pairings(None, None, false)
+            .expect("list pairings after browser forget")
+            .pairings
+            .len(),
+        2,
+        "forgetting local browser state must not revoke durable authority"
+    );
+    let resume_after_browser_forget = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "y".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={second_pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume after browser-local forget");
+    assert_eq!(resume_after_browser_forget.status, 200);
+
+    manager
+        .inner
+        .forget_pairing(&pairing_selector, None)
+        .expect("forget retained revoked pairing");
+    let after_retained_forget = manager
+        .inner
+        .list_pairings(None, None, false)
+        .expect("list after retained pairing forget");
+    assert_eq!(after_retained_forget.pairings.len(), 1);
+    assert_eq!(
+        after_retained_forget.pairings[0].selector,
+        second_pairing_selector
+    );
+    assert_eq!(
+        after_retained_forget.pairings[0].status,
+        WorkbenchPairingStatus::Active
+    );
+
+    manager
+        .inner
+        .forget_pairing(&second_pairing_selector, None)
+        .expect("forget active pairing");
+    assert!(
+        manager
+            .inner
+            .list_pairings(None, None, false)
+            .expect("list after active pairing forget")
+            .pairings
+            .is_empty()
+    );
+    let resume_after_cli_forget = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "x".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={second_pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume after CLI pairing forget");
+    assert_eq!(resume_after_cli_forget.status, 401);
+    manager.shutdown().await;
+}
+
+#[test]
+fn retained_revoked_pairings_have_separate_project_and_workspace_bounds() {
+    let fixture = fixture();
+    let now = unix_seconds();
+    let mut pairings = HashMap::new();
+    let active_selector = "active-pairing-selector".to_string();
+    pairings.insert(
+        active_selector.clone(),
+        WorkbenchPairingGrantV1 {
+            selector: active_selector.clone(),
+            credential_digest: "a".repeat(64),
+            project_id: fixture.project.id.as_str().to_string(),
+            workspace_key: "workspace-a".to_string(),
+            workspace_root: fixture.root.clone(),
+            launch_mode: WorkbenchLaunchMode::Published,
+            project_instance_id: "project-instance".to_string(),
+            canonical_origin: "https://workbench.fixture.localhost".to_string(),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            created_at: now.saturating_sub(100),
+            last_used_at: now.saturating_sub(50),
+            idle_expires_at: now.saturating_add(100),
+            absolute_expires_at: now.saturating_add(200),
+            nickname: None,
+            revoked_at: None,
+        },
+    );
+    for index in 0..(MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE + 3) {
+        let selector = format!("revoked-pairing-{index:02}");
+        pairings.insert(
+            selector.clone(),
+            WorkbenchPairingGrantV1 {
+                selector,
+                credential_digest: format!("{index:064x}"),
+                project_id: fixture.project.id.as_str().to_string(),
+                workspace_key: "workspace-a".to_string(),
+                workspace_root: fixture.root.clone(),
+                launch_mode: WorkbenchLaunchMode::Published,
+                project_instance_id: "project-instance".to_string(),
+                canonical_origin: "https://workbench.fixture.localhost".to_string(),
+                capabilities: vec!["workbench.snapshot".to_string()],
+                created_at: now.saturating_sub(100),
+                last_used_at: now.saturating_sub(50),
+                idle_expires_at: now.saturating_add(100),
+                absolute_expires_at: now.saturating_add(200),
+                nickname: None,
+                revoked_at: Some(
+                    now.saturating_sub(
+                        u64::try_from(MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE + 3 - index)
+                            .expect("fixture index fits u64"),
+                    ),
+                ),
+            },
+        );
+    }
+
+    prune_retained_revoked_pairings(&mut pairings);
+
+    assert!(pairings.contains_key(&active_selector));
+    let retained = pairings
+        .values()
+        .filter(|pairing| pairing.revoked_at.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE);
+    assert!(pairings.contains_key("revoked-pairing-10"));
+    assert!(!pairings.contains_key("revoked-pairing-00"));
+
+    let revoked_template = retained[0].clone();
+    let active = pairings
+        .get(&active_selector)
+        .expect("active pairing")
+        .clone();
+    let mut project_pairings = HashMap::from([(active_selector.clone(), active)]);
+    for index in 0..(MAX_RETAINED_REVOKED_PAIRINGS + 3) {
+        let selector = format!("project-revoked-pairing-{index:02}");
+        let mut pairing = revoked_template.clone();
+        pairing.selector = selector.clone();
+        pairing.workspace_key = format!("workspace-{index:02}");
+        pairing.revoked_at = Some(
+            now.saturating_sub(
+                u64::try_from(MAX_RETAINED_REVOKED_PAIRINGS + 3 - index)
+                    .expect("fixture index fits u64"),
+            ),
+        );
+        project_pairings.insert(selector, pairing);
+    }
+
+    prune_retained_revoked_pairings(&mut project_pairings);
+
+    assert!(project_pairings.contains_key(&active_selector));
+    assert_eq!(
+        project_pairings
+            .values()
+            .filter(|pairing| pairing.revoked_at.is_some())
+            .count(),
+        MAX_RETAINED_REVOKED_PAIRINGS
+    );
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_pairing_is_scoped_to_the_exact_linked_worktree_origin() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("pairing-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-pairing-linked",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    let linked_root = linked.canonicalize().expect("canonical linked worktree");
+
+    let writer = SqliteWriter::open(fixture.project.db_path()).expect("open project writer");
+    let epoch = writer
+        .add_epoch("Pairing Isolation", None, &[])
+        .expect("add epoch");
+    let phase = writer
+        .add_phase(&epoch, "Pairing Phase", "regular", None, &[])
+        .expect("add phase");
+    writer
+        .update_phase_status(&phase, "in-progress")
+        .expect("start phase");
+    let primary_lane = writer
+        .add_workbench_lane("Primary", "Primary worktree lane", &phase)
+        .expect("add primary lane");
+    let linked_lane = writer
+        .add_workbench_lane("Linked", "Linked worktree lane", &phase)
+        .expect("add linked lane");
+    let primary_root = fixture
+        .root
+        .canonicalize()
+        .expect("canonical primary worktree");
+    writer
+        .focus_workbench_lane(&primary_root.to_string_lossy(), &primary_lane, &phase)
+        .expect("focus primary lane");
+    writer
+        .focus_workbench_lane(&linked_root.to_string_lossy(), &linked_lane, &phase)
+        .expect("focus linked lane");
+    drop(writer);
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let primary_launch = manager
+        .launch(&primary_root)
+        .expect("launch primary published workbench");
+    let linked_launch = manager
+        .launch(&linked_root)
+        .expect("launch linked published workbench");
+    let (primary_origin, primary_ticket) = launch_parts(&primary_launch);
+    let (linked_origin, _) = launch_parts(&linked_launch);
+    assert_ne!(primary_launch.workspace.key, linked_launch.workspace.key);
+    assert_ne!(primary_origin, linked_origin);
+    let primary_host = expected_host_from_origin(primary_origin).expect("primary host");
+    let linked_host = expected_host_from_origin(linked_origin).expect("linked host");
+    let private_origin = manager.host_status().expect("private host").origin;
+
+    let enrollment = raw_http_via(
+        &private_origin,
+        primary_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": primary_ticket }).to_string()),
+        None,
+        Some(primary_origin),
+    )
+    .await
+    .expect("enroll primary browser");
+    assert_eq!(enrollment.status, 200, "{enrollment:?}");
+    let pairing_cookie =
+        response_cookie(&enrollment, PAIRING_COOKIE_NAME).expect("primary pairing cookie");
+
+    let cross_workspace_resume = raw_http_via(
+        &private_origin,
+        linked_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "x".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(linked_origin),
+    )
+    .await
+    .expect("attempt cross-worktree resume");
+    assert_eq!(cross_workspace_resume.status, 401);
+    assert_eq!(
+        cross_workspace_resume.json()["kind"],
+        "workbench.pairing_invalid"
+    );
+
+    let mismatched_origin = raw_http_via(
+        &private_origin,
+        primary_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "y".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(linked_origin),
+    )
+    .await
+    .expect("attempt mismatched-origin resume");
+    assert_eq!(mismatched_origin.status, 403);
+
+    assert_eq!(
+        manager
+            .snapshot(&primary_root)
+            .expect("snapshot primary focus")
+            .focused_lane
+            .as_ref()
+            .map(|lane| lane.summary.id.as_str()),
+        Some(primary_lane.as_str())
+    );
+    assert_eq!(
+        manager
+            .snapshot(&linked_root)
+            .expect("snapshot linked focus")
+            .focused_lane
+            .as_ref()
+            .map(|lane| lane.summary.id.as_str()),
+        Some(linked_lane.as_str())
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
+    let fixture = fixture();
+    let original = fixture._temp.path().join("pairing-before-move");
+    let moved = fixture._temp.path().join("pairing-after-move");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-pairing-move",
+            original.to_str().expect("original linked path"),
+        ],
+    );
+    let original_root = original
+        .canonicalize()
+        .expect("canonical original worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let first_launch = manager
+        .launch(&original_root)
+        .expect("launch original published workbench");
+    let original_workspace_key = first_launch.workspace.key.clone();
+    let (published_origin, ticket) = launch_parts(&first_launch);
+    let published_host = expected_host_from_origin(published_origin).expect("published host");
+    let private_origin = manager.host_status().expect("private host").origin;
+    let enrollment = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "schema_version": 1, "ticket": ticket }).to_string()),
+        None,
+        Some(published_origin),
+    )
+    .await
+    .expect("enroll before move");
+    assert_eq!(enrollment.status, 200, "{enrollment:?}");
+    let pairing_cookie = response_cookie(&enrollment, PAIRING_COOKIE_NAME)
+        .expect("pairing cookie")
+        .to_string();
+    let first_resume = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "b".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume before move");
+    assert_eq!(first_resume.status, 200, "{first_resume:?}");
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().expect("original linked path"),
+            moved.to_str().expect("moved linked path"),
+        ],
+    );
+    let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    let moved_launch = manager
+        .launch(&moved_root)
+        .expect("authenticated launch after worktree move");
+    assert_eq!(launch_parts(&moved_launch).0, published_origin);
+    assert_ne!(moved_launch.workspace.key, original_workspace_key);
+    let moved_workspace_key = moved_launch.workspace.key.clone();
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path).expect("read moved authorization store"),
+    )
+    .expect("decode moved authorization store");
+    assert_eq!(store.pairings.len(), 1);
+    assert_eq!(store.pairings[0].workspace_key, moved_workspace_key);
+    assert_eq!(store.pairings[0].workspace_root, moved_root);
+    assert!(store.resume_outcomes.is_empty());
+    assert!(
+        store
+            .sessions
+            .iter()
+            .all(|session| session.pairing_selector.is_none()),
+        "moving the authenticated project instance invalidates derived sessions"
+    );
+
+    let resumed_after_move = raw_http_via(
+        &private_origin,
+        published_host,
+        "POST",
+        "/api/pairing/resume",
+        Some(json!({ "schema_version": 1, "request_id": "c".repeat(43) }).to_string()),
+        Some(&format!("{PAIRING_COOKIE_NAME}={pairing_cookie}")),
+        Some(published_origin),
+    )
+    .await
+    .expect("resume retained pairing after move");
+    assert_eq!(resumed_after_move.status, 200, "{resumed_after_move:?}");
+    assert_eq!(
+        resumed_after_move.json()["workspace_key"],
+        moved_workspace_key
+    );
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -964,7 +1989,7 @@ async fn ticket_persistence_failure_restores_the_one_time_capability() {
     let launch = manager.launch(&fixture.root).expect("launch workbench");
     let (_, ticket) = launch_parts(&launch);
     let payload = ticket_payload(ticket);
-    fs::create_dir(&manager.inner.session_store_path)
+    fs::create_dir(&manager.inner.authorization_store_path)
         .expect("block the session store with a directory");
 
     assert_eq!(
@@ -982,7 +2007,7 @@ async fn ticket_persistence_failure_restores_the_one_time_capability() {
         "a failed durable exchange must restore the one-time capability"
     );
 
-    fs::remove_dir(&manager.inner.session_store_path)
+    fs::remove_dir(&manager.inner.authorization_store_path)
         .expect("restore the session store destination");
     manager
         .inner
@@ -1035,7 +2060,7 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
         .inner
         .persist_session_store()
         .expect("persist short session");
-    let store_path = first_manager.inner.session_store_path.clone();
+    let store_path = first_manager.inner.authorization_store_path.clone();
     let persisted = fs::read_to_string(&store_path).expect("read durable session");
     assert!(!persisted.contains(&session_secret));
     assert!(persisted.contains(&digest));
@@ -1213,8 +2238,9 @@ async fn session_activity_survives_shutdown_inside_the_persistence_interval() {
         touched.last_activity,
         "the durable grant must track every authenticated activity touch"
     );
-    let before_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
-        &fs::read(&manager.inner.session_store_path).expect("read throttled session store"),
+    let before_shutdown: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read throttled authorization store"),
     )
     .expect("decode throttled session store");
     assert_eq!(
@@ -1229,8 +2255,9 @@ async fn session_activity_survives_shutdown_inside_the_persistence_interval() {
     );
 
     manager.shutdown().await;
-    let after_shutdown: WorkbenchSessionStoreV1 = serde_json::from_slice(
-        &fs::read(&manager.inner.session_store_path).expect("read shutdown session store"),
+    let after_shutdown: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read shutdown authorization store"),
     )
     .expect("decode shutdown session store");
     assert_eq!(
@@ -1243,6 +2270,78 @@ async fn session_activity_survives_shutdown_inside_the_persistence_interval() {
         touched.last_activity,
         "shutdown must persist the latest authenticated activity"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn version_one_sessions_migrate_to_the_rollback_safe_authorization_store() {
+    let fixture = fixture();
+    let runtime_dir = fixture.project.runtime_dir();
+    fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+    let legacy_path = runtime_dir.join("workbench.sessions.json");
+    let archive_path = runtime_dir.join("workbench.sessions.v1.json");
+    let authorization_path = runtime_dir.join("workbench.authorizations.json");
+    let now = unix_seconds();
+    let selector = "m".repeat(43);
+    let credential_digest = "a".repeat(64);
+    let legacy = WorkbenchSessionStoreV1 {
+        schema_version: 1,
+        project_id: fixture.project.id.to_string(),
+        sessions: vec![WorkbenchSessionGrantV1 {
+            credential_digest: credential_digest.clone(),
+            selector: selector.clone(),
+            project_id: fixture.project.id.to_string(),
+            workspace_key: "w".repeat(43),
+            workspace_root: fixture.root.canonicalize().expect("canonical workspace"),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            entry: Some(
+                WorkbenchEntryBinding::published(
+                    "https://legacy.test.localhost".to_string(),
+                    "legacy-project-instance".to_string(),
+                    "w".repeat(43),
+                )
+                .expect("legacy published-shaped entry"),
+            ),
+            pairing_selector: Some("p".repeat(43)),
+            created_at: now,
+            last_activity: now,
+            expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+        }],
+    };
+    fs::write(
+        &legacy_path,
+        serde_json::to_vec(&legacy).expect("serialize legacy store"),
+    )
+    .expect("write legacy session store");
+
+    let manager = test_manager(Arc::clone(&fixture.project));
+    assert_eq!(manager.inner.authorization_store_path, authorization_path);
+    assert!(authorization_path.is_file());
+    assert!(!legacy_path.exists());
+    assert!(archive_path.is_file());
+    let migrated: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&authorization_path).expect("read migrated authorization store"),
+    )
+    .expect("decode migrated authorization store");
+    assert_eq!(migrated.schema_version, 2);
+    assert!(migrated.pairings.is_empty());
+    assert!(migrated.resume_outcomes.is_empty());
+    assert_eq!(migrated.sessions.len(), 1);
+    assert_eq!(migrated.sessions[0].selector, selector);
+    assert!(migrated.sessions[0].entry.is_none());
+    assert!(migrated.sessions[0].pairing_selector.is_none());
+    assert_eq!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .session_grants
+            .get(&credential_digest)
+            .and_then(|grant| grant.entry.as_ref()),
+        None
+    );
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -1283,7 +2382,7 @@ async fn expired_durable_sessions_are_not_restored_by_a_replacement_host() {
         .persist_session_store()
         .expect("persist expired session fixture");
     assert!(
-        fs::read_to_string(&first_manager.inner.session_store_path)
+        fs::read_to_string(&first_manager.inner.authorization_store_path)
             .expect("read expired session fixture")
             .contains(&digest),
         "the replacement must reject the persisted grant rather than relying on its removal"
@@ -1436,6 +2535,8 @@ async fn expired_tickets_and_session_bounds_fail_closed_without_consuming_live_t
                 workspace_key: payload.workspace_key.clone(),
                 workspace_root: workspace_root.clone(),
                 capabilities: payload.capabilities.clone(),
+                entry: test_direct_entry(),
+                pairing_selector: None,
                 created_at: now,
                 last_activity: now,
                 expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
@@ -2142,6 +3243,8 @@ async fn planning_is_read_only_when_the_focused_phase_is_owned_elsewhere() {
             .iter()
             .map(ToString::to_string)
             .collect(),
+        entry: test_direct_entry(),
+        pairing_selector: None,
         created_at: now,
         last_activity: now,
         expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
@@ -2243,6 +3346,8 @@ async fn completion_reviews_are_non_mutating_replayable_and_session_bound() {
             .iter()
             .map(ToString::to_string)
             .collect(),
+        entry: test_direct_entry(),
+        pairing_selector: None,
         created_at: now,
         last_activity: now,
         expires_at: now + SESSION_RENEWAL_LIFETIME.as_secs(),
@@ -3336,10 +4441,35 @@ async fn raw_http(
     let authority = origin
         .strip_prefix("http://")
         .ok_or_else(|| io::Error::other("test origin is not HTTP"))?;
+    raw_http_via(
+        origin,
+        authority,
+        method,
+        path,
+        body,
+        cookie,
+        request_origin,
+    )
+    .await
+}
+
+#[cfg(feature = "ui")]
+async fn raw_http_via(
+    connect_origin: &str,
+    request_host: &str,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+    cookie: Option<&str>,
+    request_origin: Option<&str>,
+) -> io::Result<RawHttpResponse> {
+    let authority = connect_origin
+        .strip_prefix("http://")
+        .ok_or_else(|| io::Error::other("test connection origin is not HTTP"))?;
     let mut stream = tokio::net::TcpStream::connect(authority).await?;
     let body = body.unwrap_or_default();
     let mut request =
-        format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+        format!("{method} {path} HTTP/1.1\r\nHost: {request_host}\r\nConnection: close\r\n");
     if let Some(origin) = request_origin {
         request.push_str(&format!("Origin: {origin}\r\n"));
     }
@@ -3374,7 +4504,15 @@ fn parse_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
         .ok_or_else(|| io::Error::other("HTTP response has no status"))?;
-    let headers = lines
+    let header_lines = lines.collect::<Vec<_>>();
+    let set_cookies = header_lines
+        .iter()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, value)| value.trim().to_string())
+        .collect::<Vec<_>>();
+    let headers = header_lines
+        .into_iter()
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
         .collect::<HashMap<_, _>>();
@@ -3388,7 +4526,25 @@ fn parse_http_response(bytes: &[u8]) -> io::Result<RawHttpResponse> {
     Ok(RawHttpResponse {
         status,
         headers,
+        set_cookies,
         body,
+    })
+}
+
+#[cfg(feature = "ui")]
+fn response_cookie<'a>(response: &'a RawHttpResponse, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    response
+        .set_cookies
+        .iter()
+        .find_map(|cookie| cookie.split(';').next()?.strip_prefix(&prefix))
+}
+
+#[cfg(feature = "ui")]
+fn response_cookie_prefix<'a>(response: &'a RawHttpResponse, prefix: &str) -> Option<&'a str> {
+    response.set_cookies.iter().find_map(|cookie| {
+        let value = cookie.split(';').next()?;
+        value.strip_prefix(prefix).map(|_| value)
     })
 }
 
