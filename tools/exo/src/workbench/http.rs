@@ -397,6 +397,16 @@ async fn forget_pairing(
     let Some(selector) = session.pairing_selector.as_deref() else {
         return pairing_management_error_response(PairingManagementError::NotFound);
     };
+    let mut session_selectors = match inner.pairing_session_selectors(selector) {
+        Ok(selectors) => selectors,
+        Err(error) => return pairing_management_error_response(error),
+    };
+    if !session_selectors
+        .iter()
+        .any(|candidate| candidate == &request.session_key)
+    {
+        session_selectors.push(request.session_key.clone());
+    }
     let result = WorkbenchPairingMutationResult {
         kind: "workbench.pairing.forget",
         ok: true,
@@ -406,10 +416,12 @@ async fn forget_pairing(
     inner.touch_daemon_activity();
     let mut response = Json(result).into_response();
     append_cookie(&mut response, pairing_cookie("", 0));
-    append_cookie(
-        &mut response,
-        session_cookie(&session_cookie_name(&request.session_key), "", true, 0),
-    );
+    for session_selector in session_selectors {
+        append_cookie(
+            &mut response,
+            session_cookie(&session_cookie_name(&session_selector), "", true, 0),
+        );
+    }
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));

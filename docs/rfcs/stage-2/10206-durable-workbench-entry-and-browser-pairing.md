@@ -152,9 +152,10 @@ A worktree move can preserve that identity, but a browser request cannot claim
 the move. After the move, an authenticated Exo launch or ensure operation must
 resolve the moved workspace, prove the same locald `ProjectInstanceId`, and
 atomically replace the retained workspace root and key. That replacement
-invalidates sessions and retained resume outcomes derived from the former
-workspace binding. A bare request to the old or new origin never relocates
-authority.
+invalidates sessions and successful resume outcomes derived from the former
+workspace binding. A terminal request outcome already returned to a browser
+remains replay-stable for its short retention window. A bare request to the old
+or new origin never relocates authority.
 
 Locald aliases are redirect-only. Exo authorizes, pairs, and sets cookies only
 for the canonical primary origin returned by the publisher protocol.
@@ -335,10 +336,11 @@ minting a second session.
 
 Resume outcomes are keyed by `(pairing_selector, request_id)`. A successful
 outcome is retained until the resulting session expires and never longer than
-24 hours. Terminal authentication failures are retained for five minutes.
-There are at most 32 retained outcomes per pairing and 256 per project. Exo
-prunes expired outcomes before enforcing the bounds; if no safe slot is
-available, it returns `workbench.pairing_busy` before mutation.
+24 hours. Terminal resume failures are retained for five minutes and
+replay the same failure even if an authenticated launch subsequently reconciles
+the worktree binding. There are at most 32 retained outcomes per pairing and 256
+per project. Exo prunes expired outcomes before enforcing the bounds; if no safe
+slot is available, it returns `workbench.pairing_busy` before mutation.
 
 The Exo resume request ID is application authority. It is never a locald
 acquisition attempt, lease handle, binding revision, or publisher replay key.
@@ -370,19 +372,22 @@ exo workbench pairing forget <selector>
 The cockpit uses an authenticated `GET /api/pairings` projection plus
 `POST /api/pairing/rename` and `POST /api/pairing/revoke` commands under the
 `workbench.pairing.manage` capability. `POST /api/pairing/forget` remains a
-current-browser action: it discards that browser's pairing and session cookies
-without revoking durable authority or deleting the retained record. Browser
-projections include only a path-free workspace label, abbreviated selector,
-creation time, last-used time, expiry, optional nickname, active or revoked
-status, optional revocation time, and whether the row is the current browser.
-They omit filesystem paths, credential digests, locald handles, and secrets.
+current-browser action: it discards that browser's pairing cookie and every
+active session cookie derived from the pairing without revoking durable
+authority or deleting the retained record. Browser projections include only a
+path-free workspace label, abbreviated selector, creation time, last-used time,
+expiry, optional nickname, active or revoked status, optional revocation time,
+and whether the row is the current browser. They omit filesystem paths,
+credential digests, locald handles, and secrets.
 
 Revocation marks the pairing record with `revoked_at` and invalidates its
-retained resume outcomes and active sessions in one authorization-store commit.
-The retained record remains available for management and audit identity but can
-never mint or replay authority. CLI `pairing forget` removes the selected
-record; when the record is still active, the same atomic commit first invalidates
-its sessions and outcomes. An expired active record is pruned.
+successful resume outcomes and active sessions in one authorization-store
+commit. Short-lived terminal request outcomes remain replay-stable but can
+never mint authority. The retained record remains available for management and
+audit identity. CLI `pairing forget` removes the selected record and every
+remaining outcome; when the record is still active, the same atomic commit first
+invalidates its sessions and successful outcomes. An expired active record is
+pruned.
 
 ### Origin and HTTP rules
 

@@ -1209,6 +1209,126 @@ describe("cockpit page", () => {
     });
   });
 
+  it("clears stale pairing mutation state when a fresh enrollment replaces the client", async () => {
+    vi.stubGlobal("location", {
+      hash: "",
+      href: "https://workbench.example.test/",
+      pathname: "/",
+      protocol: "https:",
+      reload: vi.fn(),
+      search: "",
+    });
+    const revoke = deferred<Response>();
+    let pairingReads = 0;
+    const pairing = (selector: string, current: boolean) => ({
+      selector,
+      workspace_label: "exo2: durable entry",
+      created_at: "2026-08-08T01:00:00Z",
+      last_used_at: "2026-08-08T02:00:00Z",
+      expires_at: "2026-09-07T02:00:00Z",
+      nickname: current ? "Fresh browser" : "Other browser",
+      status: "active",
+      revoked_at: null,
+      current,
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/pairing/enroll") {
+          return sessionResponse("fresh-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        if (String(path).startsWith("/api/pairings?")) {
+          pairingReads += 1;
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.pairing.list",
+              ok: true,
+              schema_version: 1,
+              pairings: [
+                pairing(
+                  pairingReads === 1 ? "other-pairin" : "fresh-pairin",
+                  pairingReads > 1,
+                ),
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (path === "/api/pairing/revoke") {
+          return revoke.promise;
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    const pairingPopover = screen.getByRole("complementary", {
+      name: "Browser access",
+    });
+    pairingPopover.showPopover = vi.fn();
+    pairingPopover.hidePopover = vi.fn();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Manage browser access" }),
+    );
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Revoke browser pairing other-pairin",
+      }),
+    );
+
+    location.hash = "#ticket=v2.fresh-ticket";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    await waitFor(() => {
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "fresh-session",
+      );
+    });
+    revoke.resolve(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.pairing.revoke",
+          ok: true,
+          schema_version: 1,
+          selector: "other-pairin",
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const freshPairingPopover = screen.getByRole("complementary", {
+      name: "Browser access",
+    });
+    freshPairingPopover.showPopover = vi.fn();
+    freshPairingPopover.hidePopover = vi.fn();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Manage browser access" }),
+    );
+    const freshForget = await screen.findByRole("button", {
+      name: "Forget this browser",
+    });
+    expect((freshForget as HTMLButtonElement).disabled).toBe(false);
+    expect(pairingReads).toBe(2);
+  });
+
   it("does not offer an inert retry for a rejected ticket exchange", async () => {
     history.replaceState({}, "", "/#ticket=v1.rejected-ticket");
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(

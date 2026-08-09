@@ -446,6 +446,10 @@
       planningEditorRebindToken = 0;
       planningEditorRebindPending = false;
       completionReview = null;
+      pairings = null;
+      pairingsLoading = false;
+      pairingFailure = null;
+      pendingPairingSelector = null;
       recoveryAttempt = 0;
       sessionRecovery = "connected";
       sessionRecoveryMessage = null;
@@ -1313,7 +1317,7 @@
         pairingFailure = messageFrom(error);
       }
     } finally {
-      if (pendingPairingSelector === selector) {
+      if (client === activeClient && pendingPairingSelector === selector) {
         pendingPairingSelector = null;
       }
     }
@@ -1348,7 +1352,10 @@
         pairingFailure = messageFrom(error);
       }
     } finally {
-      if (pendingPairingSelector === currentSelector) {
+      if (
+        client === activeClient &&
+        pendingPairingSelector === currentSelector
+      ) {
         pendingPairingSelector = null;
       }
     }

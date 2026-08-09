@@ -38,6 +38,7 @@ const WORKSPACE_STORE_PERSIST_INTERVAL: Duration = Duration::from_mins(1);
 const PAIRING_IDLE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const PAIRING_ABSOLUTE_LIFETIME: Duration = Duration::from_secs(180 * 24 * 60 * 60);
 const RESUME_OUTCOME_LIFETIME: Duration = Duration::from_hours(24);
+const TERMINAL_RESUME_OUTCOME_LIFETIME: Duration = Duration::from_mins(5);
 const MAX_SESSIONS: usize = 64;
 const MAX_ACTIVE_PAIRINGS: usize = 64;
 const MAX_ACTIVE_PAIRINGS_PER_WORKSPACE: usize = 8;
@@ -502,11 +503,30 @@ struct WorkbenchResumeOutcomeKey {
 struct WorkbenchResumeOutcomeV1 {
     pairing_selector: String,
     request_id: String,
-    session_selector: String,
-    session_credential_digest: String,
     created_at: u64,
-    session_expires_at: u64,
     retained_until: u64,
+    #[serde(flatten)]
+    result: WorkbenchResumeOutcomeResultV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum WorkbenchResumeOutcomeResultV1 {
+    Session {
+        session_selector: String,
+        session_credential_digest: String,
+        session_expires_at: u64,
+    },
+    Terminal {
+        terminal_error: WorkbenchResumeTerminalErrorV1,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkbenchResumeTerminalErrorV1 {
+    Invalid,
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2027,7 +2047,9 @@ impl WorkbenchHostInner {
                 .as_ref()
                 .is_none_or(|selector| !moved_pairings.contains(selector))
         });
-        candidate_outcomes.retain(|key, _| !moved_pairings.contains(&key.pairing_selector));
+        candidate_outcomes.retain(|key, outcome| {
+            !moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal()
+        });
         let store = authorization_store_from_collections(
             self.project.id.as_str(),
             &candidate_sessions,
@@ -2097,6 +2119,9 @@ impl WorkbenchHostInner {
             .get(&payload.workspace_key)
             .cloned()
             .ok_or(PairingExchangeError::Invalid)?;
+        let workspace_root = self
+            .validate_session_workspace(&workspace.root)
+            .map_err(|_| PairingExchangeError::Expired)?;
         let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
 
         let presented_pairing = presented_pairing.and_then(|(selector, secret)| {
@@ -2149,7 +2174,7 @@ impl WorkbenchHostInner {
                     credential_digest: session_credential_digest(&new_pairing_secret),
                     project_id: payload.project_id.clone(),
                     workspace_key: payload.workspace_key.clone(),
-                    workspace_root: workspace.root.clone(),
+                    workspace_root: workspace_root.clone(),
                     launch_mode: WorkbenchLaunchMode::Published,
                     project_instance_id: payload
                         .entry
@@ -2179,7 +2204,7 @@ impl WorkbenchHostInner {
             selector: session_selector.clone(),
             project_id: payload.project_id.clone(),
             workspace_key: payload.workspace_key.clone(),
-            workspace_root: workspace.root,
+            workspace_root,
             capabilities,
             entry: payload.entry,
             pairing_selector: Some(pairing.selector.clone()),
@@ -2199,11 +2224,14 @@ impl WorkbenchHostInner {
                 .get_mut(replaced_selector)
                 .expect("replaced pairing exists")
                 .revoked_at = Some(now);
-            candidate_outcomes.retain(|key, _| key.pairing_selector.as_str() != replaced_selector);
+            candidate_outcomes.retain(|key, outcome| {
+                key.pairing_selector.as_str() != replaced_selector || outcome.is_terminal()
+            });
         }
         candidate_sessions.insert(session.id.clone(), WorkbenchSessionGrantV1::from(&session));
         candidate_pairings.insert(pairing.selector.clone(), pairing.clone());
         prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
         let store = authorization_store_from_collections(
             self.project.id.as_str(),
             &candidate_sessions,
@@ -2264,30 +2292,71 @@ impl WorkbenchHostInner {
             .authorization_store_gate
             .lock()
             .map_err(|_| PairingExchangeError::Unavailable)?;
+        let key = WorkbenchResumeOutcomeKey {
+            pairing_selector: pairing_selector.to_string(),
+            request_id: request_id.to_string(),
+        };
         let pairing = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| PairingExchangeError::Unavailable)?;
             retain_live_authorizations(&mut state, now);
-            state
+            let pairing = state
                 .pairing_grants
                 .get(pairing_selector)
-                .filter(|pairing| pairing.is_live(now))
                 .cloned()
-        }
-        .ok_or(PairingExchangeError::Expired)?;
-        if pairing.credential_digest != session_credential_digest(pairing_secret)
-            || pairing.entry() != *request_entry
-        {
+                .ok_or(PairingExchangeError::Expired)?;
+            if pairing.credential_digest != session_credential_digest(pairing_secret) {
+                return Err(PairingExchangeError::Invalid);
+            }
+            if let Some(error) = state
+                .resume_outcomes
+                .get(&key)
+                .and_then(WorkbenchResumeOutcomeV1::terminal_error)
+            {
+                return Err(error);
+            }
+            if !pairing.is_live(now) {
+                return Err(PairingExchangeError::Expired);
+            }
+            pairing
+        };
+        if pairing.entry() != *request_entry {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| PairingExchangeError::Unavailable)?;
+            retain_live_authorizations(&mut state, now);
+            self.persist_terminal_resume_outcome_locked(
+                &mut state,
+                key.clone(),
+                WorkbenchResumeTerminalErrorV1::Invalid,
+                now,
+            )?;
             return Err(PairingExchangeError::Invalid);
         }
-        let workspace_root = self
-            .validate_workspace(&pairing.workspace_root)
-            .map_err(|_| PairingExchangeError::Expired)?;
-        if workspace_root != pairing.workspace_root {
-            return Err(PairingExchangeError::Expired);
-        }
+        let workspace_root = match self.validate_session_workspace(&pairing.workspace_root) {
+            Ok(root) => root,
+            Err(_) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| PairingExchangeError::Unavailable)?;
+                retain_live_authorizations(&mut state, now);
+                ensure_resume_outcome_capacity(&state, &key)?;
+                let terminal =
+                    terminal_resume_outcome(&key, WorkbenchResumeTerminalErrorV1::Expired, now);
+                self.persist_pairing_revocation_locked(
+                    &mut state,
+                    pairing_selector,
+                    now,
+                    Some((key, terminal)),
+                )
+                .map_err(|_| PairingExchangeError::Unavailable)?;
+                return Err(PairingExchangeError::Expired);
+            }
+        };
 
         let session_secret = derive_pairing_token(
             pairing_secret,
@@ -2300,10 +2369,6 @@ impl WorkbenchHostInner {
             b"exo.workbench.resume.session.selector.v1",
         )?;
         let session_id = session_credential_digest(&session_secret);
-        let key = WorkbenchResumeOutcomeKey {
-            pairing_selector: pairing_selector.to_string(),
-            request_id: request_id.to_string(),
-        };
         let mut state = self
             .state
             .lock()
@@ -2318,23 +2383,27 @@ impl WorkbenchHostInner {
             return Err(PairingExchangeError::Expired);
         }
         let replay = state.resume_outcomes.get(&key).cloned();
-        if let Some(outcome) = replay.as_ref()
-            && (outcome.session_selector != session_selector
-                || outcome.session_credential_digest != session_id)
+        if let Some(error) = replay
+            .as_ref()
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error)
+        {
+            return Err(error);
+        }
+        if let Some(WorkbenchResumeOutcomeV1 {
+            result:
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_selector: replay_selector,
+                    session_credential_digest: replay_digest,
+                    ..
+                },
+            ..
+        }) = replay.as_ref()
+            && (replay_selector != &session_selector || replay_digest != &session_id)
         {
             return Err(PairingExchangeError::Invalid);
         }
         if replay.is_none() {
-            let pairing_outcomes = state
-                .resume_outcomes
-                .keys()
-                .filter(|candidate| candidate.pairing_selector == pairing_selector)
-                .count();
-            if state.resume_outcomes.len() >= MAX_RESUME_OUTCOMES
-                || pairing_outcomes >= MAX_RESUME_OUTCOMES_PER_PAIRING
-            {
-                return Err(PairingExchangeError::Busy);
-            }
+            ensure_resume_outcome_capacity(&state, &key)?;
             if state.session_grants.len() >= MAX_SESSIONS {
                 return Err(PairingExchangeError::Busy);
             }
@@ -2347,10 +2416,13 @@ impl WorkbenchHostInner {
             .min(updated_pairing.absolute_expires_at);
         let session_expires_at = replay
             .as_ref()
-            .map_or_else(
-                || now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
-                |outcome| outcome.session_expires_at,
-            )
+            .and_then(|outcome| match &outcome.result {
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_expires_at, ..
+                } => Some(*session_expires_at),
+                WorkbenchResumeOutcomeResultV1::Terminal { .. } => None,
+            })
+            .unwrap_or_else(|| now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()))
             .max(now.saturating_add(1));
         let session = WorkbenchSession {
             id: session_id.clone(),
@@ -2369,12 +2441,14 @@ impl WorkbenchHostInner {
         let outcome = WorkbenchResumeOutcomeV1 {
             pairing_selector: pairing.selector.clone(),
             request_id: request_id.to_string(),
-            session_selector: session_selector.clone(),
-            session_credential_digest: session_id.clone(),
             created_at: session.created_at,
-            session_expires_at,
             retained_until: session_expires_at
                 .min(now.saturating_add(RESUME_OUTCOME_LIFETIME.as_secs())),
+            result: WorkbenchResumeOutcomeResultV1::Session {
+                session_selector: session_selector.clone(),
+                session_credential_digest: session_id.clone(),
+                session_expires_at,
+            },
         };
         let mut candidate_sessions = state.session_grants.clone();
         let mut candidate_pairings = state.pairing_grants.clone();
@@ -2413,6 +2487,72 @@ impl WorkbenchHostInner {
                 expires_at: timestamp_for_unix_seconds(session_expires_at),
             },
         })
+    }
+
+    fn persist_terminal_resume_outcome_locked(
+        &self,
+        state: &mut WorkbenchState,
+        key: WorkbenchResumeOutcomeKey,
+        error: WorkbenchResumeTerminalErrorV1,
+        now: u64,
+    ) -> Result<(), PairingExchangeError> {
+        if state.resume_outcomes.contains_key(&key) {
+            return Ok(());
+        }
+        ensure_resume_outcome_capacity(state, &key)?;
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_outcomes.insert(key.clone(), terminal_resume_outcome(&key, error, now));
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        state.resume_outcomes = candidate_outcomes;
+        Ok(())
+    }
+
+    fn persist_pairing_revocation_locked(
+        &self,
+        state: &mut WorkbenchState,
+        selector: &str,
+        now: u64,
+        terminal_outcome: Option<(WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1)>,
+    ) -> Result<()> {
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_pairings
+            .get_mut(selector)
+            .ok_or_else(|| anyhow::anyhow!("workbench pairing is unavailable"))?
+            .revoked_at
+            .get_or_insert(now);
+        candidate_sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
+        candidate_outcomes
+            .retain(|key, outcome| key.pairing_selector != selector || outcome.is_terminal());
+        if let Some((key, outcome)) = terminal_outcome {
+            candidate_outcomes.insert(key, outcome);
+        }
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state
+            .sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
+        retain_live_sessions(state, now);
+        Ok(())
     }
 
     pub(crate) fn list_pairings(
@@ -2501,33 +2641,8 @@ impl WorkbenchHostInner {
         retain_live_authorizations(&mut state, now);
         let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
             .ok_or(PairingManagementError::NotFound)?;
-        let mut candidate_sessions = state.session_grants.clone();
-        let mut candidate_pairings = state.pairing_grants.clone();
-        let mut candidate_outcomes = state.resume_outcomes.clone();
-        candidate_pairings
-            .get_mut(&selector)
-            .expect("resolved pairing exists")
-            .revoked_at
-            .get_or_insert(now);
-        candidate_sessions
-            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector.as_str()));
-        candidate_outcomes.retain(|key, _| key.pairing_selector != selector);
-        prune_retained_revoked_pairings(&mut candidate_pairings);
-        let store = authorization_store_from_collections(
-            self.project.id.as_str(),
-            &candidate_sessions,
-            &candidate_pairings,
-            &candidate_outcomes,
-        );
-        write_authorization_store(&self.authorization_store_path, &store)
+        self.persist_pairing_revocation_locked(&mut state, &selector, now, None)
             .map_err(|_| PairingManagementError::Unavailable)?;
-        state.session_grants = candidate_sessions;
-        state.pairing_grants = candidate_pairings;
-        state.resume_outcomes = candidate_outcomes;
-        state
-            .sessions
-            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector.as_str()));
-        retain_live_sessions(&mut state, now);
         Ok(WorkbenchPairingMutationResult {
             kind: "workbench.pairing.revoke",
             ok: true,
@@ -2631,6 +2746,36 @@ impl WorkbenchHostInner {
             schema_version: 1,
             selector,
         })
+    }
+
+    pub(crate) fn pairing_session_selectors(
+        &self,
+        pairing_selector: &str,
+    ) -> std::result::Result<Vec<String>, PairingManagementError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        retain_live_authorizations(&mut state, unix_seconds());
+        if !state.pairing_grants.contains_key(pairing_selector) {
+            return Err(PairingManagementError::NotFound);
+        }
+        let mut selectors = state
+            .session_grants
+            .values()
+            .filter(|session| session.pairing_selector.as_deref() == Some(pairing_selector))
+            .map(|session| session.selector.clone())
+            .collect::<HashSet<_>>();
+        selectors.extend(
+            state
+                .sessions
+                .values()
+                .filter(|session| session.pairing_selector.as_deref() == Some(pairing_selector))
+                .map(|session| session.selector.clone()),
+        );
+        let mut selectors = selectors.into_iter().collect::<Vec<_>>();
+        selectors.sort();
+        Ok(selectors)
     }
 
     pub(crate) fn session(
@@ -3106,6 +3251,44 @@ impl WorkbenchPairingGrantV1 {
     }
 }
 
+impl WorkbenchResumeOutcomeV1 {
+    fn terminal_error(&self) -> Option<PairingExchangeError> {
+        match &self.result {
+            WorkbenchResumeOutcomeResultV1::Terminal {
+                terminal_error: WorkbenchResumeTerminalErrorV1::Invalid,
+            } => Some(PairingExchangeError::Invalid),
+            WorkbenchResumeOutcomeResultV1::Terminal {
+                terminal_error: WorkbenchResumeTerminalErrorV1::Expired,
+            } => Some(PairingExchangeError::Expired),
+            WorkbenchResumeOutcomeResultV1::Session { .. } => None,
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        matches!(
+            &self.result,
+            WorkbenchResumeOutcomeResultV1::Terminal { .. }
+        )
+    }
+
+    fn valid(&self) -> bool {
+        valid_public_token(&self.pairing_selector)
+            && valid_public_token(&self.request_id)
+            && match &self.result {
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_selector,
+                    session_credential_digest,
+                    session_expires_at,
+                } => {
+                    valid_public_token(session_selector)
+                        && valid_credential_digest(session_credential_digest)
+                        && *session_expires_at >= self.created_at
+                }
+                WorkbenchResumeOutcomeResultV1::Terminal { .. } => true,
+            }
+    }
+}
+
 impl From<&WorkbenchSession> for WorkbenchSessionGrantV1 {
     fn from(session: &WorkbenchSession) -> Self {
         Self {
@@ -3144,15 +3327,13 @@ fn retain_live_authorizations(state: &mut WorkbenchState, now: u64) {
         .pairing_grants
         .retain(|_, pairing| pairing.is_retained(now));
     prune_retained_revoked_pairings(&mut state.pairing_grants);
+    retain_candidate_resume_outcomes(&mut state.resume_outcomes, &state.pairing_grants, now);
     let live_pairings = state
         .pairing_grants
         .values()
         .filter(|pairing| pairing.is_live(now))
         .map(|pairing| pairing.selector.clone())
         .collect::<HashSet<_>>();
-    state.resume_outcomes.retain(|key, outcome| {
-        live_pairings.contains(&key.pairing_selector) && outcome.retained_until > now
-    });
     state.session_grants.retain(|_, session| {
         session
             .pairing_selector
@@ -3165,6 +3346,55 @@ fn retain_live_authorizations(state: &mut WorkbenchState, now: u64) {
             .as_ref()
             .is_none_or(|selector| live_pairings.contains(selector))
     });
+}
+
+fn retain_candidate_resume_outcomes(
+    outcomes: &mut HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
+    pairings: &HashMap<String, WorkbenchPairingGrantV1>,
+    now: u64,
+) {
+    outcomes.retain(|key, outcome| {
+        outcome.retained_until > now
+            && pairings
+                .get(&key.pairing_selector)
+                .is_some_and(|pairing| outcome.is_terminal() || pairing.is_live(now))
+    });
+}
+
+fn ensure_resume_outcome_capacity(
+    state: &WorkbenchState,
+    key: &WorkbenchResumeOutcomeKey,
+) -> Result<(), PairingExchangeError> {
+    if state.resume_outcomes.contains_key(key) {
+        return Ok(());
+    }
+    let pairing_outcomes = state
+        .resume_outcomes
+        .keys()
+        .filter(|candidate| candidate.pairing_selector == key.pairing_selector)
+        .count();
+    if state.resume_outcomes.len() >= MAX_RESUME_OUTCOMES
+        || pairing_outcomes >= MAX_RESUME_OUTCOMES_PER_PAIRING
+    {
+        return Err(PairingExchangeError::Busy);
+    }
+    Ok(())
+}
+
+fn terminal_resume_outcome(
+    key: &WorkbenchResumeOutcomeKey,
+    error: WorkbenchResumeTerminalErrorV1,
+    now: u64,
+) -> WorkbenchResumeOutcomeV1 {
+    WorkbenchResumeOutcomeV1 {
+        pairing_selector: key.pairing_selector.clone(),
+        request_id: key.request_id.clone(),
+        created_at: now,
+        retained_until: now.saturating_add(TERMINAL_RESUME_OUTCOME_LIFETIME.as_secs()),
+        result: WorkbenchResumeOutcomeResultV1::Terminal {
+            terminal_error: error,
+        },
+    }
 }
 
 fn prune_retained_revoked_pairings(pairings: &mut HashMap<String, WorkbenchPairingGrantV1>) {
@@ -3473,10 +3703,7 @@ fn read_authorization_store(
                 .into_iter()
                 .filter(|outcome| {
                     outcome.retained_until > now
-                        && valid_public_token(&outcome.pairing_selector)
-                        && valid_public_token(&outcome.request_id)
-                        && valid_public_token(&outcome.session_selector)
-                        && valid_credential_digest(&outcome.session_credential_digest)
+                        && outcome.valid()
                         && restored.pairings.contains_key(&outcome.pairing_selector)
                 })
                 .map(|outcome| {
