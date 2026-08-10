@@ -31,15 +31,28 @@ const TICKET_LIFETIME: Duration = Duration::from_hours(1);
 const SESSION_RENEWAL_LIFETIME: Duration = Duration::from_hours(12);
 const SESSION_IDLE_LIFETIME: Duration = Duration::from_mins(30);
 const SESSION_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
-const SESSION_STORE_SCHEMA_VERSION: u8 = 1;
+const AUTHORIZATION_STORE_SCHEMA_VERSION: u8 = 2;
 const WORKSPACE_STORE_SCHEMA_VERSION: u8 = 1;
 const WORKSPACE_OBSERVATION_FRESH_LIFETIME: Duration = Duration::from_mins(5);
 const WORKSPACE_STORE_PERSIST_INTERVAL: Duration = Duration::from_mins(1);
+const PAIRING_IDLE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const PAIRING_ABSOLUTE_LIFETIME: Duration = Duration::from_secs(180 * 24 * 60 * 60);
+const RESUME_OUTCOME_LIFETIME: Duration = Duration::from_hours(24);
+const TERMINAL_RESUME_OUTCOME_LIFETIME: Duration = Duration::from_mins(5);
 const MAX_SESSIONS: usize = 64;
+const MAX_ACTIVE_PAIRINGS: usize = 64;
+const MAX_ACTIVE_PAIRINGS_PER_WORKSPACE: usize = 8;
+const MAX_RETAINED_REVOKED_PAIRINGS: usize = 64;
+const MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE: usize = 8;
+const MAX_RESUME_OUTCOMES: usize = 256;
+const MAX_RESUME_OUTCOMES_PER_PAIRING: usize = 32;
+const MAX_PAIRING_NICKNAME_CHARS: usize = 80;
+const PAIRING_SELECTOR_DISPLAY_CHARS: usize = 12;
 const MAX_PROJECT_WORKSPACES: usize = 128;
 const MAX_EVENT_STREAMS: usize = 32;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_COOKIE_PREFIX: &str = "exo_workbench_session_";
+pub(crate) const PAIRING_COOKIE_NAME: &str = "exo_workbench_pairing";
 
 type DispatchFuture = Pin<Box<dyn Future<Output = ResponseEnvelope> + Send>>;
 type DispatchFn = dyn Fn(RequestEnvelope) -> DispatchFuture + Send + Sync;
@@ -169,6 +182,35 @@ impl DaemonRuntimeServices {
         self.host.inspect(workspace_root, lane_id)
     }
 
+    pub fn pairings(&self) -> Result<WorkbenchPairingListResult> {
+        self.host.inner.list_pairings(None, None, false)
+    }
+
+    pub fn revoke_pairing(&self, selector: &str) -> Result<WorkbenchPairingMutationResult> {
+        self.host
+            .inner
+            .revoke_pairing(selector, None)
+            .map_err(pairing_management_anyhow)
+    }
+
+    pub fn forget_pairing(&self, selector: &str) -> Result<WorkbenchPairingMutationResult> {
+        self.host
+            .inner
+            .forget_pairing(selector, None)
+            .map_err(pairing_management_anyhow)
+    }
+
+    pub fn rename_pairing(
+        &self,
+        selector: &str,
+        nickname: &str,
+    ) -> Result<WorkbenchPairingMutationResult> {
+        self.host
+            .inner
+            .rename_pairing(selector, nickname, None)
+            .map_err(pairing_management_anyhow)
+    }
+
     pub fn observe_workspace(&self, workspace_root: &Path) -> Result<()> {
         self.host.observe_workspace(workspace_root)
     }
@@ -240,15 +282,16 @@ struct WorkbenchHostInner {
     process_start_id: Arc<str>,
     runtime: Handle,
     host_record_path: PathBuf,
-    session_store_path: PathBuf,
+    authorization_store_path: PathBuf,
     workspace_store_path: PathBuf,
-    session_store_gate: Mutex<()>,
+    authorization_store_gate: Mutex<()>,
     workspace_store_gate: Mutex<()>,
     last_activity: Arc<AtomicU64>,
     revision: AtomicU64,
     project_state_gate: Mutex<()>,
     write_tx: broadcast::Sender<u64>,
     dispatcher: OnceLock<DaemonRequestDispatcher>,
+    entry_provider: Mutex<Arc<dyn WorkbenchEntryProvider>>,
     state: Mutex<WorkbenchState>,
     event_admission: Arc<Semaphore>,
     completion_review_admission: Arc<Semaphore>,
@@ -257,12 +300,15 @@ struct WorkbenchHostInner {
 #[derive(Default)]
 struct WorkbenchState {
     host: Option<BoundHost>,
+    origin_bindings: HashMap<String, WorkbenchEntryBinding>,
     preferred_port: Option<u16>,
     workspaces_by_root: HashMap<PathBuf, String>,
     workspaces_by_key: HashMap<String, WorkspaceRegistration>,
     pending_capabilities: HashMap<String, PendingCapability>,
     session_grants: HashMap<String, WorkbenchSessionGrantV1>,
     sessions: HashMap<String, WorkbenchSession>,
+    pairing_grants: HashMap<String, WorkbenchPairingGrantV1>,
+    resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
     completion_review_requests:
         HashMap<planning::CompletionReviewRequestKey, planning::CompletionReviewRequestRecord>,
     completion_reviews: HashMap<String, planning::CompletionReviewRecord>,
@@ -282,6 +328,82 @@ struct BoundHost {
     last_error: Option<String>,
     shutdown: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+}
+
+trait WorkbenchEntryProvider: Send + Sync {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+    ) -> Result<WorkbenchEntryBinding>;
+}
+
+#[derive(Debug)]
+struct DirectWorkbenchEntryProvider;
+
+impl WorkbenchEntryProvider for DirectWorkbenchEntryProvider {
+    fn resolve(
+        &self,
+        _workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+    ) -> Result<WorkbenchEntryBinding> {
+        Ok(WorkbenchEntryBinding::direct(direct_origin.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkbenchLaunchMode {
+    #[default]
+    DirectLoopback,
+    Published,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchEntryBinding {
+    launch_mode: WorkbenchLaunchMode,
+    canonical_origin: String,
+    project_instance_id: Option<String>,
+    workspace_key: Option<String>,
+}
+
+impl WorkbenchEntryBinding {
+    fn direct(canonical_origin: String) -> Self {
+        Self {
+            launch_mode: WorkbenchLaunchMode::DirectLoopback,
+            canonical_origin,
+            project_instance_id: None,
+            workspace_key: None,
+        }
+    }
+
+    fn published(
+        canonical_origin: String,
+        project_instance_id: String,
+        workspace_key: String,
+    ) -> Result<Self> {
+        if !canonical_origin.starts_with("https://")
+            || expected_host_from_origin(&canonical_origin).is_none()
+            || project_instance_id.is_empty()
+            || workspace_key.is_empty()
+        {
+            return Err(anyhow::anyhow!("invalid published workbench entry binding"));
+        }
+        Ok(Self {
+            launch_mode: WorkbenchLaunchMode::Published,
+            canonical_origin,
+            project_instance_id: Some(project_instance_id),
+            workspace_key: Some(workspace_key),
+        })
+    }
+
+    fn expected_host(&self) -> Option<&str> {
+        expected_host_from_origin(&self.canonical_origin)
+    }
+
+    const fn is_published(&self) -> bool {
+        matches!(self.launch_mode, WorkbenchLaunchMode::Published)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +428,7 @@ pub(super) struct WorkspaceProjection {
 #[derive(Debug, Clone)]
 struct PendingCapability {
     workspace_key: String,
+    entry: WorkbenchEntryBinding,
     expires_at: u64,
 }
 
@@ -318,6 +441,8 @@ pub(crate) struct WorkbenchSession {
     pub(crate) workspace_key: String,
     pub(crate) workspace_root: PathBuf,
     pub(crate) capabilities: Vec<String>,
+    entry: WorkbenchEntryBinding,
+    pairing_selector: Option<String>,
     pub(crate) created_at: u64,
     pub(crate) last_activity: u64,
     pub(crate) expires_at: u64,
@@ -332,6 +457,10 @@ struct WorkbenchSessionGrantV1 {
     workspace_key: String,
     workspace_root: PathBuf,
     capabilities: Vec<String>,
+    #[serde(default)]
+    entry: Option<WorkbenchEntryBinding>,
+    #[serde(default)]
+    pairing_selector: Option<String>,
     created_at: u64,
     last_activity: u64,
     expires_at: u64,
@@ -342,6 +471,78 @@ struct WorkbenchSessionStoreV1 {
     schema_version: u8,
     project_id: String,
     sessions: Vec<WorkbenchSessionGrantV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchPairingGrantV1 {
+    selector: String,
+    credential_digest: String,
+    project_id: String,
+    workspace_key: String,
+    workspace_root: PathBuf,
+    launch_mode: WorkbenchLaunchMode,
+    project_instance_id: String,
+    canonical_origin: String,
+    capabilities: Vec<String>,
+    created_at: u64,
+    last_used_at: u64,
+    idle_expires_at: u64,
+    absolute_expires_at: u64,
+    nickname: Option<String>,
+    #[serde(default)]
+    revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct WorkbenchResumeOutcomeKey {
+    pairing_selector: String,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchResumeOutcomeV1 {
+    pairing_selector: String,
+    request_id: String,
+    created_at: u64,
+    retained_until: u64,
+    #[serde(flatten)]
+    result: WorkbenchResumeOutcomeResultV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum WorkbenchResumeOutcomeResultV1 {
+    Session {
+        session_selector: String,
+        session_credential_digest: String,
+        session_expires_at: u64,
+    },
+    Terminal {
+        terminal_error: WorkbenchResumeTerminalErrorV1,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkbenchResumeTerminalErrorV1 {
+    Invalid,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkbenchAuthorizationStoreV2 {
+    schema_version: u8,
+    project_id: String,
+    sessions: Vec<WorkbenchSessionGrantV1>,
+    pairings: Vec<WorkbenchPairingGrantV1>,
+    resume_outcomes: Vec<WorkbenchResumeOutcomeV1>,
+}
+
+#[derive(Default)]
+struct RestoredAuthorizationState {
+    sessions: HashMap<String, WorkbenchSessionGrantV1>,
+    pairings: HashMap<String, WorkbenchPairingGrantV1>,
+    resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -402,6 +603,31 @@ struct WorkbenchTicketV1 {
     workspace_key: String,
     capabilities: Vec<String>,
     issued_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkbenchTicketV2 {
+    version: u8,
+    capability_id: String,
+    instance_id: String,
+    project_id: String,
+    workspace_key: String,
+    entry_mode: WorkbenchLaunchMode,
+    project_instance_id: String,
+    canonical_origin: String,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedWorkbenchTicket {
+    capability_id: String,
+    project_id: String,
+    workspace_key: String,
+    entry: WorkbenchEntryBinding,
+    capabilities: Vec<String>,
     expires_at: u64,
 }
 
@@ -668,6 +894,74 @@ pub(crate) enum TicketExchangeError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingExchangeError {
+    Invalid,
+    Expired,
+    Limit,
+    Busy,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PairingEnrollmentResult {
+    pub(crate) pairing_cookie: String,
+    pub(crate) pairing_max_age: u64,
+    pub(crate) session_secret: String,
+    pub(crate) session: WorkbenchSessionResult,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PairingResumeResult {
+    pub(crate) pairing_cookie: String,
+    pub(crate) pairing_max_age: u64,
+    pub(crate) session_secret: String,
+    pub(crate) session: WorkbenchSessionResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchPairingStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchPairingSummary {
+    pub selector: String,
+    pub workspace_label: String,
+    pub created_at: String,
+    pub last_used_at: String,
+    pub expires_at: String,
+    pub nickname: Option<String>,
+    pub status: WorkbenchPairingStatus,
+    pub revoked_at: Option<String>,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchPairingListResult {
+    pub kind: &'static str,
+    pub ok: bool,
+    pub schema_version: u8,
+    pub pairings: Vec<WorkbenchPairingSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkbenchPairingMutationResult {
+    pub kind: &'static str,
+    pub ok: bool,
+    pub schema_version: u8,
+    pub selector: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingManagementError {
+    Invalid,
+    NotFound,
+    Unavailable,
+}
+
 impl WorkbenchHostManager {
     pub fn new(
         project: Arc<Project>,
@@ -679,16 +973,26 @@ impl WorkbenchHostManager {
     ) -> Self {
         let (write_tx, _) = broadcast::channel(16);
         let host_record_path = runtime_dir.join("workbench.host.json");
-        let session_store_path = runtime_dir.join("workbench.sessions.json");
+        let authorization_store_path = runtime_dir.join("workbench.authorizations.json");
+        let legacy_session_store_path = runtime_dir.join("workbench.sessions.json");
         let workspace_store_path = runtime_dir.join("workbench.workspaces.json");
         let now = unix_seconds();
         let mut state = WorkbenchState::default();
-        match read_session_store(&session_store_path, project.id.as_str(), now) {
-            Ok(grants) => state.session_grants = grants,
+        match load_authorization_state(
+            &authorization_store_path,
+            &legacy_session_store_path,
+            project.id.as_str(),
+            now,
+        ) {
+            Ok(restored) => {
+                state.session_grants = restored.sessions;
+                state.pairing_grants = restored.pairings;
+                state.resume_outcomes = restored.resume_outcomes;
+            }
             Err(error) => {
                 eprintln!(
-                    "exo daemon: failed to read workbench session store at {}: {error}",
-                    session_store_path.display()
+                    "exo daemon: failed to read workbench authorization store at {}: {error}",
+                    authorization_store_path.display()
                 );
             }
         }
@@ -721,15 +1025,16 @@ impl WorkbenchHostManager {
                 process_start_id,
                 runtime,
                 host_record_path,
-                session_store_path,
+                authorization_store_path,
                 workspace_store_path,
-                session_store_gate: Mutex::new(()),
+                authorization_store_gate: Mutex::new(()),
                 workspace_store_gate: Mutex::new(()),
                 last_activity,
                 revision: AtomicU64::new(0),
                 project_state_gate: Mutex::new(()),
                 write_tx,
                 dispatcher: OnceLock::new(),
+                entry_provider: Mutex::new(Arc::new(DirectWorkbenchEntryProvider)),
                 state: Mutex::new(state),
                 event_admission: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
                 completion_review_admission: Arc::new(Semaphore::new(
@@ -755,6 +1060,15 @@ impl WorkbenchHostManager {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn set_entry_provider(&self, provider: Arc<dyn WorkbenchEntryProvider>) {
+        *self
+            .inner
+            .entry_provider
+            .lock()
+            .expect("workbench entry provider") = provider;
+    }
+
     pub fn launch(&self, workspace_root: &Path) -> Result<WorkbenchLaunchResult> {
         if !assets::available() {
             return Err(anyhow::Error::new(workbench_failure(
@@ -764,26 +1078,70 @@ impl WorkbenchHostManager {
         }
 
         let workspace = self.register_workspace(workspace_root)?;
-        let (origin, reused_host, secret) = self.ensure_host()?;
+        let (direct_origin, reused_host, secret) = self.ensure_host()?;
+        let entry = self
+            .inner
+            .entry_provider
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench entry provider is unavailable"))?
+            .resolve(&workspace, &direct_origin)?;
+        if entry.is_published() {
+            self.inner
+                .reconcile_published_workspace_move(&workspace, &entry)?;
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            state
+                .origin_bindings
+                .insert(entry.canonical_origin.clone(), entry.clone());
+        }
         let issued_at = unix_seconds();
         let expires_at = issued_at.saturating_add(TICKET_LIFETIME.as_secs());
         let capability_id = random_token()?;
-        let payload = WorkbenchTicketV1 {
-            version: 1,
-            capability_id: capability_id.clone(),
-            instance_id: self.inner.instance_id.to_string(),
-            project_id: self.inner.project.id.to_string(),
-            workspace_key: workspace.key.clone(),
-            capabilities: std::iter::once("workbench.snapshot")
-                .chain(std::iter::once("workbench.inspect"))
-                .chain(std::iter::once("lane.focus"))
-                .chain(planning::PLANNING_CAPABILITIES)
-                .map(str::to_string)
-                .collect(),
-            issued_at,
-            expires_at,
+        let capabilities = std::iter::once("workbench.snapshot")
+            .chain(std::iter::once("workbench.inspect"))
+            .chain(std::iter::once("lane.focus"))
+            .chain(entry.is_published().then_some("workbench.pairing.manage"))
+            .chain(planning::PLANNING_CAPABILITIES)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let ticket = if entry.is_published() {
+            sign_ticket(
+                &secret,
+                &WorkbenchTicketV2 {
+                    version: 2,
+                    capability_id: capability_id.clone(),
+                    instance_id: self.inner.instance_id.to_string(),
+                    project_id: self.inner.project.id.to_string(),
+                    workspace_key: workspace.key.clone(),
+                    entry_mode: entry.launch_mode,
+                    project_instance_id: entry
+                        .project_instance_id
+                        .clone()
+                        .expect("published entry has a project instance"),
+                    canonical_origin: entry.canonical_origin.clone(),
+                    capabilities: capabilities.clone(),
+                    issued_at,
+                    expires_at,
+                },
+            )?
+        } else {
+            sign_ticket(
+                &secret,
+                &WorkbenchTicketV1 {
+                    version: 1,
+                    capability_id: capability_id.clone(),
+                    instance_id: self.inner.instance_id.to_string(),
+                    project_id: self.inner.project.id.to_string(),
+                    workspace_key: workspace.key.clone(),
+                    capabilities: capabilities.clone(),
+                    issued_at,
+                    expires_at,
+                },
+            )?
         };
-        let ticket = sign_ticket(&secret, &payload)?;
 
         let mut state = self
             .inner
@@ -797,6 +1155,7 @@ impl WorkbenchHostManager {
             capability_id,
             PendingCapability {
                 workspace_key: workspace.key.clone(),
+                entry: entry.clone(),
                 expires_at,
             },
         );
@@ -806,7 +1165,7 @@ impl WorkbenchHostManager {
             kind: "workbench.launch",
             ok: true,
             schema_version: 1,
-            url: format!("{origin}/#ticket={ticket}"),
+            url: format!("{}/#ticket={ticket}", entry.canonical_origin),
             expires_at: timestamp_for_unix_seconds(expires_at),
             expires_in_seconds: TICKET_LIFETIME.as_secs(),
             reused_host,
@@ -1384,18 +1743,63 @@ impl WorkbenchHostInner {
         self.dispatcher.get()
     }
 
-    pub(crate) fn expected_host(&self) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| state.host.as_ref().map(|host| host.expected_host.clone()))
+    pub(crate) fn entry_binding_for_request(
+        &self,
+        host: &str,
+        origin: &str,
+    ) -> Option<WorkbenchEntryBinding> {
+        let state = self.state.lock().ok()?;
+        if let Some(bound) = state.host.as_ref()
+            && bound.expected_host == host
+            && bound.origin == origin
+        {
+            return Some(WorkbenchEntryBinding::direct(bound.origin.clone()));
+        }
+        state
+            .origin_bindings
+            .get(origin)
+            .filter(|binding| binding.expected_host() == Some(host))
+            .cloned()
     }
 
-    pub(crate) fn origin(&self) -> Option<String> {
+    pub(crate) fn published_binding_for_host(&self, host: &str) -> Option<WorkbenchEntryBinding> {
         self.state
             .lock()
-            .ok()
-            .and_then(|state| state.host.as_ref().map(|host| host.origin.clone()))
+            .ok()?
+            .origin_bindings
+            .values()
+            .find(|binding| binding.is_published() && binding.expected_host() == Some(host))
+            .cloned()
+    }
+
+    pub(crate) fn entry_binding_for_host(&self, host: &str) -> Option<WorkbenchEntryBinding> {
+        let state = self.state.lock().ok()?;
+        if let Some(bound) = state.host.as_ref()
+            && bound.expected_host == host
+        {
+            return Some(WorkbenchEntryBinding::direct(bound.origin.clone()));
+        }
+        state
+            .origin_bindings
+            .values()
+            .find(|binding| binding.expected_host() == Some(host))
+            .cloned()
+    }
+
+    pub(crate) fn session_matches_entry(
+        &self,
+        session: &WorkbenchSession,
+        entry: &WorkbenchEntryBinding,
+    ) -> bool {
+        if session.entry.launch_mode != entry.launch_mode {
+            return false;
+        }
+        match entry.launch_mode {
+            WorkbenchLaunchMode::DirectLoopback => {
+                session.entry.canonical_origin == entry.canonical_origin
+            }
+            WorkbenchLaunchMode::Published => session.entry == *entry,
+        }
     }
 
     pub(crate) fn current_revision(&self) -> u64 {
@@ -1418,14 +1822,13 @@ impl WorkbenchHostInner {
         self.last_activity.store(unix_seconds(), Ordering::Relaxed);
     }
 
-    pub(crate) fn redeem_ticket(
-        &self,
-        ticket: &str,
-    ) -> Result<(String, WorkbenchSessionResult), TicketExchangeError> {
+    fn verify_ticket(&self, ticket: &str) -> Result<VerifiedWorkbenchTicket, TicketExchangeError> {
         let mut parts = ticket.split('.');
-        if parts.next() != Some("v1") {
-            return Err(TicketExchangeError::Invalid);
-        }
+        let envelope_version = match parts.next() {
+            Some("v1") => 1,
+            Some("v2") => 2,
+            _ => return Err(TicketExchangeError::Invalid),
+        };
         let (Some(payload_part), Some(signature_part), None) =
             (parts.next(), parts.next(), parts.next())
         else {
@@ -1437,32 +1840,82 @@ impl WorkbenchHostInner {
         let signature = URL_SAFE_NO_PAD
             .decode(signature_part)
             .map_err(|_| TicketExchangeError::Invalid)?;
-        let secret = self
-            .state
-            .lock()
-            .map_err(|_| TicketExchangeError::Invalid)?
-            .host
-            .as_ref()
-            .map(|host| host.secret)
-            .ok_or(TicketExchangeError::Invalid)?;
+        let (secret, direct_origin) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| TicketExchangeError::Invalid)?;
+            let host = state.host.as_ref().ok_or(TicketExchangeError::Invalid)?;
+            (host.secret, host.origin.clone())
+        };
         let mut verifier =
             HmacSha256::new_from_slice(&secret).map_err(|_| TicketExchangeError::Invalid)?;
         verifier.update(&payload_bytes);
         verifier
             .verify_slice(&signature)
             .map_err(|_| TicketExchangeError::Invalid)?;
-        let payload: WorkbenchTicketV1 =
-            serde_json::from_slice(&payload_bytes).map_err(|_| TicketExchangeError::Invalid)?;
         let now = unix_seconds();
-        if payload.version != 1
-            || payload.instance_id != self.instance_id.as_ref()
-            || payload.project_id != self.project.id.as_str()
-            || payload.expires_at <= now
-            || payload.issued_at > now
-        {
+        match envelope_version {
+            1 => {
+                let payload: WorkbenchTicketV1 = serde_json::from_slice(&payload_bytes)
+                    .map_err(|_| TicketExchangeError::Invalid)?;
+                if payload.version != 1
+                    || payload.instance_id != self.instance_id.as_ref()
+                    || payload.project_id != self.project.id.as_str()
+                    || payload.expires_at <= now
+                    || payload.issued_at > now
+                {
+                    return Err(TicketExchangeError::Invalid);
+                }
+                Ok(VerifiedWorkbenchTicket {
+                    capability_id: payload.capability_id,
+                    project_id: payload.project_id,
+                    workspace_key: payload.workspace_key,
+                    entry: WorkbenchEntryBinding::direct(direct_origin),
+                    capabilities: payload.capabilities,
+                    expires_at: payload.expires_at,
+                })
+            }
+            2 => {
+                let payload: WorkbenchTicketV2 = serde_json::from_slice(&payload_bytes)
+                    .map_err(|_| TicketExchangeError::Invalid)?;
+                if payload.version != 2
+                    || payload.instance_id != self.instance_id.as_ref()
+                    || payload.project_id != self.project.id.as_str()
+                    || payload.expires_at <= now
+                    || payload.issued_at > now
+                    || payload.entry_mode != WorkbenchLaunchMode::Published
+                {
+                    return Err(TicketExchangeError::Invalid);
+                }
+                let entry = WorkbenchEntryBinding::published(
+                    payload.canonical_origin,
+                    payload.project_instance_id,
+                    payload.workspace_key.clone(),
+                )
+                .map_err(|_| TicketExchangeError::Invalid)?;
+                Ok(VerifiedWorkbenchTicket {
+                    capability_id: payload.capability_id,
+                    project_id: payload.project_id,
+                    workspace_key: payload.workspace_key,
+                    entry,
+                    capabilities: payload.capabilities,
+                    expires_at: payload.expires_at,
+                })
+            }
+            _ => Err(TicketExchangeError::Invalid),
+        }
+    }
+
+    pub(crate) fn redeem_ticket(
+        &self,
+        ticket: &str,
+    ) -> Result<(String, WorkbenchSessionResult), TicketExchangeError> {
+        let payload = self.verify_ticket(ticket)?;
+        if payload.entry.launch_mode != WorkbenchLaunchMode::DirectLoopback {
             return Err(TicketExchangeError::Invalid);
         }
-
+        let now = unix_seconds();
         let mut state = self
             .state
             .lock()
@@ -1479,6 +1932,7 @@ impl WorkbenchHostInner {
             .remove(&payload.capability_id)
             .ok_or(TicketExchangeError::Invalid)?;
         if pending.workspace_key != payload.workspace_key
+            || pending.entry != payload.entry
             || pending.expires_at != payload.expires_at
         {
             return Err(TicketExchangeError::Invalid);
@@ -1499,6 +1953,8 @@ impl WorkbenchHostInner {
             workspace_key: payload.workspace_key.clone(),
             workspace_root: workspace.root,
             capabilities: upgraded_session_capabilities(payload.capabilities),
+            entry: payload.entry,
+            pairing_selector: None,
             created_at: now,
             last_activity: now,
             expires_at: session_expires_at,
@@ -1536,6 +1992,792 @@ impl WorkbenchHostInner {
         Ok(result)
     }
 
+    fn reconcile_published_workspace_move(
+        &self,
+        workspace: &WorkspaceRegistration,
+        entry: &WorkbenchEntryBinding,
+    ) -> Result<()> {
+        if !entry.is_published() {
+            return Ok(());
+        }
+        let project_instance_id = entry
+            .project_instance_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("published workbench entry has no project instance"))?;
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let now = unix_seconds();
+        retain_live_authorizations(&mut state, now);
+        let moved_pairings = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| {
+                pairing.project_id == self.project.id.as_str()
+                    && pairing.project_instance_id == project_instance_id
+                    && (pairing.workspace_key != workspace.key
+                        || pairing.workspace_root != workspace.root
+                        || pairing.canonical_origin != entry.canonical_origin)
+            })
+            .map(|pairing| pairing.selector.clone())
+            .collect::<HashSet<_>>();
+        if moved_pairings.is_empty() {
+            return Ok(());
+        }
+
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        for selector in &moved_pairings {
+            let pairing = candidate_pairings
+                .get_mut(selector)
+                .expect("selected pairing exists");
+            pairing.workspace_key = workspace.key.clone();
+            pairing.workspace_root = workspace.root.clone();
+            pairing.canonical_origin = entry.canonical_origin.clone();
+        }
+        candidate_sessions.retain(|_, session| {
+            session
+                .pairing_selector
+                .as_ref()
+                .is_none_or(|selector| !moved_pairings.contains(selector))
+        });
+        candidate_outcomes.retain(|key, outcome| {
+            !moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal()
+        });
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .context("persist moved workbench pairing authority")?;
+
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state.sessions.retain(|_, session| {
+            session
+                .pairing_selector
+                .as_ref()
+                .is_none_or(|selector| !moved_pairings.contains(selector))
+        });
+        state.origin_bindings.retain(|_, binding| {
+            binding.project_instance_id.as_deref() != Some(project_instance_id)
+                || binding.canonical_origin == entry.canonical_origin
+        });
+        Ok(())
+    }
+
+    pub(crate) fn enroll_pairing(
+        &self,
+        ticket: &str,
+        presented_pairing: Option<(&str, &str)>,
+        request_entry: &WorkbenchEntryBinding,
+    ) -> Result<PairingEnrollmentResult, PairingExchangeError> {
+        let payload = self
+            .verify_ticket(ticket)
+            .map_err(pairing_error_from_ticket)?;
+        if !payload.entry.is_published() || payload.entry != *request_entry {
+            return Err(PairingExchangeError::Invalid);
+        }
+        let now = unix_seconds();
+        let new_pairing_secret = random_token().map_err(|_| PairingExchangeError::Unavailable)?;
+        let new_pairing_selector = random_token().map_err(|_| PairingExchangeError::Unavailable)?;
+        let session_secret = random_token().map_err(|_| PairingExchangeError::Unavailable)?;
+        let session_selector = random_token().map_err(|_| PairingExchangeError::Unavailable)?;
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        retain_live_authorizations(&mut state, now);
+        if state.session_grants.len() >= MAX_SESSIONS {
+            return Err(PairingExchangeError::Busy);
+        }
+        let pending = state
+            .pending_capabilities
+            .get(&payload.capability_id)
+            .filter(|pending| {
+                pending.workspace_key == payload.workspace_key
+                    && pending.entry == payload.entry
+                    && pending.expires_at == payload.expires_at
+            })
+            .cloned()
+            .ok_or(PairingExchangeError::Invalid)?;
+        let workspace = state
+            .workspaces_by_key
+            .get(&payload.workspace_key)
+            .cloned()
+            .ok_or(PairingExchangeError::Invalid)?;
+        let workspace_root = self
+            .validate_session_workspace(&workspace.root)
+            .map_err(|_| PairingExchangeError::Expired)?;
+        let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+
+        let presented_pairing = presented_pairing.and_then(|(selector, secret)| {
+            state
+                .pairing_grants
+                .get(selector)
+                .filter(|pairing| {
+                    pairing.is_live(now)
+                        && pairing.credential_digest == session_credential_digest(secret)
+                        && pairing.entry() == payload.entry
+                })
+                .map(|pairing| (pairing.clone(), secret.to_string()))
+        });
+        let replaced_pairing_selector = presented_pairing
+            .as_ref()
+            .filter(|(pairing, _)| pairing.capabilities != capabilities)
+            .map(|(pairing, _)| pairing.selector.clone());
+        let reusable_pairing =
+            presented_pairing.filter(|(pairing, _)| pairing.capabilities == capabilities);
+        let creating_pairing = reusable_pairing.is_none();
+        if creating_pairing {
+            let project_pairings = state
+                .pairing_grants
+                .values()
+                .filter(|pairing| pairing.is_live(now))
+                .count()
+                .saturating_sub(usize::from(replaced_pairing_selector.is_some()));
+            let workspace_pairings = state
+                .pairing_grants
+                .values()
+                .filter(|pairing| {
+                    pairing.workspace_key == payload.workspace_key && pairing.is_live(now)
+                })
+                .filter(|pairing| {
+                    replaced_pairing_selector.as_deref() != Some(pairing.selector.as_str())
+                })
+                .count();
+            if project_pairings >= MAX_ACTIVE_PAIRINGS
+                || workspace_pairings >= MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+            {
+                return Err(PairingExchangeError::Limit);
+            }
+        }
+
+        let (mut pairing, pairing_secret) = reusable_pairing.unwrap_or_else(|| {
+            let absolute_expires_at = now.saturating_add(PAIRING_ABSOLUTE_LIFETIME.as_secs());
+            (
+                WorkbenchPairingGrantV1 {
+                    selector: new_pairing_selector,
+                    credential_digest: session_credential_digest(&new_pairing_secret),
+                    project_id: payload.project_id.clone(),
+                    workspace_key: payload.workspace_key.clone(),
+                    workspace_root: workspace_root.clone(),
+                    launch_mode: WorkbenchLaunchMode::Published,
+                    project_instance_id: payload
+                        .entry
+                        .project_instance_id
+                        .clone()
+                        .expect("published entry has project instance"),
+                    canonical_origin: payload.entry.canonical_origin.clone(),
+                    capabilities: capabilities.clone(),
+                    created_at: now,
+                    last_used_at: now,
+                    idle_expires_at: now.saturating_add(PAIRING_IDLE_LIFETIME.as_secs()),
+                    absolute_expires_at,
+                    nickname: None,
+                    revoked_at: None,
+                },
+                new_pairing_secret,
+            )
+        });
+        pairing.last_used_at = now;
+        pairing.idle_expires_at = now
+            .saturating_add(PAIRING_IDLE_LIFETIME.as_secs())
+            .min(pairing.absolute_expires_at);
+
+        let session_expires_at = now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs());
+        let session = WorkbenchSession {
+            id: session_credential_digest(&session_secret),
+            selector: session_selector.clone(),
+            project_id: payload.project_id.clone(),
+            workspace_key: payload.workspace_key.clone(),
+            workspace_root,
+            capabilities,
+            entry: payload.entry,
+            pairing_selector: Some(pairing.selector.clone()),
+            created_at: now,
+            last_activity: now,
+            expires_at: session_expires_at,
+            last_persisted_at: now,
+        };
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        if let Some(replaced_selector) = replaced_pairing_selector.as_deref() {
+            candidate_sessions.retain(|_, session| {
+                session.pairing_selector.as_deref() != Some(replaced_selector)
+            });
+            candidate_pairings
+                .get_mut(replaced_selector)
+                .expect("replaced pairing exists")
+                .revoked_at = Some(now);
+            candidate_outcomes.retain(|key, outcome| {
+                key.pairing_selector.as_str() != replaced_selector || outcome.is_terminal()
+            });
+        }
+        candidate_sessions.insert(session.id.clone(), WorkbenchSessionGrantV1::from(&session));
+        candidate_pairings.insert(pairing.selector.clone(), pairing.clone());
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+
+        state.pending_capabilities.remove(&payload.capability_id);
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        if let Some(replaced_selector) = replaced_pairing_selector.as_deref() {
+            state.sessions.retain(|_, session| {
+                session.pairing_selector.as_deref() != Some(replaced_selector)
+            });
+        }
+        state.sessions.insert(session.id.clone(), session);
+        drop(state);
+        self.touch_daemon_activity();
+        let pairing_max_age = pairing
+            .idle_expires_at
+            .min(pairing.absolute_expires_at)
+            .saturating_sub(now);
+        Ok(PairingEnrollmentResult {
+            pairing_cookie: pairing_cookie_value(&pairing.selector, &pairing_secret),
+            pairing_max_age,
+            session_secret,
+            session: WorkbenchSessionResult {
+                kind: "workbench.session",
+                ok: true,
+                schema_version: 1,
+                session_key: session_selector,
+                project_id: payload.project_id,
+                workspace_key: pending.workspace_key,
+                expires_at: timestamp_for_unix_seconds(session_expires_at),
+            },
+        })
+    }
+
+    pub(crate) fn resume_pairing(
+        &self,
+        pairing_selector: &str,
+        pairing_secret: &str,
+        request_id: &str,
+        request_entry: &WorkbenchEntryBinding,
+    ) -> Result<PairingResumeResult, PairingExchangeError> {
+        if !valid_public_token(pairing_selector)
+            || !valid_public_token(pairing_secret)
+            || !valid_public_token(request_id)
+            || !request_entry.is_published()
+        {
+            return Err(PairingExchangeError::Invalid);
+        }
+        let now = unix_seconds();
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        let key = WorkbenchResumeOutcomeKey {
+            pairing_selector: pairing_selector.to_string(),
+            request_id: request_id.to_string(),
+        };
+        let pairing = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| PairingExchangeError::Unavailable)?;
+            retain_live_authorizations(&mut state, now);
+            let pairing = state
+                .pairing_grants
+                .get(pairing_selector)
+                .cloned()
+                .ok_or(PairingExchangeError::Expired)?;
+            if pairing.credential_digest != session_credential_digest(pairing_secret) {
+                return Err(PairingExchangeError::Invalid);
+            }
+            if let Some(error) = state
+                .resume_outcomes
+                .get(&key)
+                .and_then(WorkbenchResumeOutcomeV1::terminal_error)
+            {
+                return Err(error);
+            }
+            if !pairing.is_live(now) {
+                return Err(PairingExchangeError::Expired);
+            }
+            pairing
+        };
+        if pairing.entry() != *request_entry {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| PairingExchangeError::Unavailable)?;
+            retain_live_authorizations(&mut state, now);
+            self.persist_terminal_resume_outcome_locked(
+                &mut state,
+                key.clone(),
+                WorkbenchResumeTerminalErrorV1::Invalid,
+                now,
+            )?;
+            return Err(PairingExchangeError::Invalid);
+        }
+        let workspace_root = match self.validate_session_workspace(&pairing.workspace_root) {
+            Ok(root) => root,
+            Err(_) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| PairingExchangeError::Unavailable)?;
+                retain_live_authorizations(&mut state, now);
+                ensure_resume_outcome_capacity(&state, &key)?;
+                let terminal =
+                    terminal_resume_outcome(&key, WorkbenchResumeTerminalErrorV1::Expired, now);
+                self.persist_pairing_revocation_locked(
+                    &mut state,
+                    pairing_selector,
+                    now,
+                    Some((key, terminal)),
+                )
+                .map_err(|_| PairingExchangeError::Unavailable)?;
+                return Err(PairingExchangeError::Expired);
+            }
+        };
+
+        let session_secret = derive_pairing_token(
+            pairing_secret,
+            request_id,
+            b"exo.workbench.resume.session.secret.v1",
+        )?;
+        let session_selector = derive_pairing_token(
+            pairing_secret,
+            request_id,
+            b"exo.workbench.resume.session.selector.v1",
+        )?;
+        let session_id = session_credential_digest(&session_secret);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        retain_live_authorizations(&mut state, now);
+        if state
+            .pairing_grants
+            .get(pairing_selector)
+            .filter(|pairing| pairing.is_live(now))
+            != Some(&pairing)
+        {
+            return Err(PairingExchangeError::Expired);
+        }
+        let replay = state.resume_outcomes.get(&key).cloned();
+        if let Some(error) = replay
+            .as_ref()
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error)
+        {
+            return Err(error);
+        }
+        if let Some(WorkbenchResumeOutcomeV1 {
+            result:
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_selector: replay_selector,
+                    session_credential_digest: replay_digest,
+                    ..
+                },
+            ..
+        }) = replay.as_ref()
+            && (replay_selector != &session_selector || replay_digest != &session_id)
+        {
+            return Err(PairingExchangeError::Invalid);
+        }
+        if replay.is_none() {
+            ensure_resume_outcome_capacity(&state, &key)?;
+            if state.session_grants.len() >= MAX_SESSIONS {
+                return Err(PairingExchangeError::Busy);
+            }
+        }
+
+        let mut updated_pairing = pairing.clone();
+        updated_pairing.last_used_at = now;
+        updated_pairing.idle_expires_at = now
+            .saturating_add(PAIRING_IDLE_LIFETIME.as_secs())
+            .min(updated_pairing.absolute_expires_at);
+        let session_expires_at = replay
+            .as_ref()
+            .and_then(|outcome| match &outcome.result {
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_expires_at, ..
+                } => Some(*session_expires_at),
+                WorkbenchResumeOutcomeResultV1::Terminal { .. } => None,
+            })
+            .unwrap_or_else(|| now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()))
+            .max(now.saturating_add(1));
+        let session = WorkbenchSession {
+            id: session_id.clone(),
+            selector: session_selector.clone(),
+            project_id: pairing.project_id.clone(),
+            workspace_key: pairing.workspace_key.clone(),
+            workspace_root,
+            capabilities: pairing.capabilities.clone(),
+            entry: pairing.entry(),
+            pairing_selector: Some(pairing.selector.clone()),
+            created_at: replay.as_ref().map_or(now, |outcome| outcome.created_at),
+            last_activity: now,
+            expires_at: session_expires_at,
+            last_persisted_at: now,
+        };
+        let outcome = WorkbenchResumeOutcomeV1 {
+            pairing_selector: pairing.selector.clone(),
+            request_id: request_id.to_string(),
+            created_at: session.created_at,
+            retained_until: session_expires_at
+                .min(now.saturating_add(RESUME_OUTCOME_LIFETIME.as_secs())),
+            result: WorkbenchResumeOutcomeResultV1::Session {
+                session_selector: session_selector.clone(),
+                session_credential_digest: session_id.clone(),
+                session_expires_at,
+            },
+        };
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_sessions.insert(session_id.clone(), WorkbenchSessionGrantV1::from(&session));
+        candidate_pairings.insert(pairing.selector.clone(), updated_pairing.clone());
+        candidate_outcomes.insert(key, outcome);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state.sessions.insert(session_id, session);
+        drop(state);
+        self.touch_daemon_activity();
+        Ok(PairingResumeResult {
+            pairing_cookie: pairing_cookie_value(pairing_selector, pairing_secret),
+            pairing_max_age: updated_pairing
+                .idle_expires_at
+                .min(updated_pairing.absolute_expires_at)
+                .saturating_sub(now),
+            session_secret,
+            session: WorkbenchSessionResult {
+                kind: "workbench.session",
+                ok: true,
+                schema_version: 1,
+                session_key: session_selector,
+                project_id: pairing.project_id,
+                workspace_key: pairing.workspace_key,
+                expires_at: timestamp_for_unix_seconds(session_expires_at),
+            },
+        })
+    }
+
+    fn persist_terminal_resume_outcome_locked(
+        &self,
+        state: &mut WorkbenchState,
+        key: WorkbenchResumeOutcomeKey,
+        error: WorkbenchResumeTerminalErrorV1,
+        now: u64,
+    ) -> Result<(), PairingExchangeError> {
+        if state.resume_outcomes.contains_key(&key) {
+            return Ok(());
+        }
+        ensure_resume_outcome_capacity(state, &key)?;
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_outcomes.insert(key.clone(), terminal_resume_outcome(&key, error, now));
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingExchangeError::Unavailable)?;
+        state.resume_outcomes = candidate_outcomes;
+        Ok(())
+    }
+
+    fn persist_pairing_revocation_locked(
+        &self,
+        state: &mut WorkbenchState,
+        selector: &str,
+        now: u64,
+        terminal_outcome: Option<(WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1)>,
+    ) -> Result<()> {
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_pairings
+            .get_mut(selector)
+            .ok_or_else(|| anyhow::anyhow!("workbench pairing is unavailable"))?
+            .revoked_at
+            .get_or_insert(now);
+        candidate_sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
+        candidate_outcomes
+            .retain(|key, outcome| key.pairing_selector != selector || outcome.is_terminal());
+        if let Some((key, outcome)) = terminal_outcome {
+            candidate_outcomes.insert(key, outcome);
+        }
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state
+            .sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
+        retain_live_sessions(state, now);
+        Ok(())
+    }
+
+    pub(crate) fn list_pairings(
+        &self,
+        current_selector: Option<&str>,
+        workspace_key: Option<&str>,
+        abbreviated_selectors: bool,
+    ) -> Result<WorkbenchPairingListResult> {
+        let now = unix_seconds();
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let mut pairings = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| {
+                pairing.is_retained(now)
+                    && workspace_key.is_none_or(|key| pairing.workspace_key == key)
+            })
+            .map(|pairing| {
+                let selector = if abbreviated_selectors {
+                    pairing
+                        .selector
+                        .chars()
+                        .take(PAIRING_SELECTOR_DISPLAY_CHARS)
+                        .collect()
+                } else {
+                    pairing.selector.clone()
+                };
+                WorkbenchPairingSummary {
+                    selector,
+                    workspace_label: state
+                        .workspaces_by_key
+                        .get(&pairing.workspace_key)
+                        .map(|workspace| workspace.label.clone())
+                        .unwrap_or_else(|| workspace_label(None, None, &pairing.workspace_key)),
+                    created_at: timestamp_for_unix_seconds(pairing.created_at),
+                    last_used_at: timestamp_for_unix_seconds(pairing.last_used_at),
+                    expires_at: timestamp_for_unix_seconds(
+                        pairing.idle_expires_at.min(pairing.absolute_expires_at),
+                    ),
+                    nickname: pairing.nickname.clone(),
+                    status: if pairing.revoked_at.is_some() {
+                        WorkbenchPairingStatus::Revoked
+                    } else {
+                        WorkbenchPairingStatus::Active
+                    },
+                    revoked_at: pairing.revoked_at.map(timestamp_for_unix_seconds),
+                    current: pairing.is_live(now)
+                        && current_selector == Some(pairing.selector.as_str()),
+                }
+            })
+            .collect::<Vec<_>>();
+        pairings.sort_by(|left, right| {
+            matches!(left.status, WorkbenchPairingStatus::Revoked)
+                .cmp(&matches!(right.status, WorkbenchPairingStatus::Revoked))
+                .then_with(|| right.last_used_at.cmp(&left.last_used_at))
+                .then_with(|| left.selector.cmp(&right.selector))
+        });
+        Ok(WorkbenchPairingListResult {
+            kind: "workbench.pairing.list",
+            ok: true,
+            schema_version: 1,
+            pairings,
+        })
+    }
+
+    pub(crate) fn revoke_pairing(
+        &self,
+        selector_reference: &str,
+        workspace_key: Option<&str>,
+    ) -> std::result::Result<WorkbenchPairingMutationResult, PairingManagementError> {
+        if !valid_pairing_selector_reference(selector_reference) {
+            return Err(PairingManagementError::Invalid);
+        }
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let now = unix_seconds();
+        retain_live_authorizations(&mut state, now);
+        let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
+            .ok_or(PairingManagementError::NotFound)?;
+        self.persist_pairing_revocation_locked(&mut state, &selector, now, None)
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        Ok(WorkbenchPairingMutationResult {
+            kind: "workbench.pairing.revoke",
+            ok: true,
+            schema_version: 1,
+            selector,
+        })
+    }
+
+    pub(crate) fn forget_pairing(
+        &self,
+        selector_reference: &str,
+        workspace_key: Option<&str>,
+    ) -> std::result::Result<WorkbenchPairingMutationResult, PairingManagementError> {
+        if !valid_pairing_selector_reference(selector_reference) {
+            return Err(PairingManagementError::Invalid);
+        }
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let now = unix_seconds();
+        retain_live_authorizations(&mut state, now);
+        let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
+            .ok_or(PairingManagementError::NotFound)?;
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_pairings.remove(&selector);
+        candidate_sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector.as_str()));
+        candidate_outcomes.retain(|key, _| key.pairing_selector != selector);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state
+            .sessions
+            .retain(|_, session| session.pairing_selector.as_deref() != Some(selector.as_str()));
+        retain_live_sessions(&mut state, now);
+        Ok(WorkbenchPairingMutationResult {
+            kind: "workbench.pairing.forget",
+            ok: true,
+            schema_version: 1,
+            selector,
+        })
+    }
+
+    pub(crate) fn rename_pairing(
+        &self,
+        selector_reference: &str,
+        nickname: &str,
+        workspace_key: Option<&str>,
+    ) -> std::result::Result<WorkbenchPairingMutationResult, PairingManagementError> {
+        let nickname = nickname.trim();
+        if !valid_pairing_selector_reference(selector_reference)
+            || nickname.is_empty()
+            || nickname.chars().count() > MAX_PAIRING_NICKNAME_CHARS
+        {
+            return Err(PairingManagementError::Invalid);
+        }
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        let now = unix_seconds();
+        retain_live_authorizations(&mut state, now);
+        let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
+            .ok_or(PairingManagementError::NotFound)?;
+        let mut candidate_pairings = state.pairing_grants.clone();
+        candidate_pairings
+            .get_mut(&selector)
+            .expect("resolved pairing exists")
+            .nickname = Some(nickname.to_string());
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &state.session_grants,
+            &candidate_pairings,
+            &state.resume_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        state.pairing_grants = candidate_pairings;
+        Ok(WorkbenchPairingMutationResult {
+            kind: "workbench.pairing.rename",
+            ok: true,
+            schema_version: 1,
+            selector,
+        })
+    }
+
+    pub(crate) fn pairing_session_selectors(
+        &self,
+        pairing_selector: &str,
+    ) -> std::result::Result<Vec<String>, PairingManagementError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
+        retain_live_authorizations(&mut state, unix_seconds());
+        if !state.pairing_grants.contains_key(pairing_selector) {
+            return Err(PairingManagementError::NotFound);
+        }
+        let mut selectors = state
+            .session_grants
+            .values()
+            .filter(|session| session.pairing_selector.as_deref() == Some(pairing_selector))
+            .map(|session| session.selector.clone())
+            .collect::<HashSet<_>>();
+        selectors.extend(
+            state
+                .sessions
+                .values()
+                .filter(|session| session.pairing_selector.as_deref() == Some(pairing_selector))
+                .map(|session| session.selector.clone()),
+        );
+        let mut selectors = selectors.into_iter().collect::<Vec<_>>();
+        selectors.sort();
+        Ok(selectors)
+    }
+
     pub(crate) fn session(
         &self,
         session_key: &str,
@@ -1554,7 +2796,7 @@ impl WorkbenchHostInner {
         }
         let now = unix_seconds();
         let mut state = self.state.lock().ok()?;
-        retain_live_sessions(&mut state, now);
+        retain_live_authorizations(&mut state, now);
         let session_is_bound = state
             .sessions
             .get(credential_digest)
@@ -1689,6 +2931,16 @@ impl WorkbenchHostInner {
             return false;
         }
         let previous = state.workspaces_by_key.get(&grant.workspace_key).cloned();
+        let entry = grant.entry.clone().unwrap_or_else(|| {
+            state
+                .host
+                .as_ref()
+                .map(|host| WorkbenchEntryBinding::direct(host.origin.clone()))
+                .unwrap_or_else(|| WorkbenchEntryBinding::direct(String::new()))
+        });
+        if entry.canonical_origin.is_empty() {
+            return false;
+        }
         let branch = if observed_git {
             git.branch
         } else {
@@ -1741,6 +2993,8 @@ impl WorkbenchHostInner {
                 workspace_key: grant.workspace_key,
                 workspace_root: grant.workspace_root,
                 capabilities: grant.capabilities,
+                entry,
+                pairing_selector: grant.pairing_selector,
                 created_at: grant.created_at,
                 last_activity: grant.last_activity,
                 expires_at: grant.expires_at,
@@ -1801,7 +3055,7 @@ impl WorkbenchHostInner {
 
     fn persist_session_store(&self) -> Result<()> {
         let _gate = self
-            .session_store_gate
+            .authorization_store_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench session store is unavailable"))?;
         let store = {
@@ -1809,20 +3063,10 @@ impl WorkbenchHostInner {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
-            let mut sessions = state.session_grants.values().cloned().collect::<Vec<_>>();
-            sessions.sort_by(|left, right| {
-                left.selector
-                    .cmp(&right.selector)
-                    .then_with(|| left.credential_digest.cmp(&right.credential_digest))
-            });
-            WorkbenchSessionStoreV1 {
-                schema_version: SESSION_STORE_SCHEMA_VERSION,
-                project_id: self.project.id.to_string(),
-                sessions,
-            }
+            authorization_store_from_state(&state, self.project.id.as_str())
         };
-        write_session_store(&self.session_store_path, &store)
-            .with_context(|| format!("write {}", self.session_store_path.display()))
+        write_authorization_store(&self.authorization_store_path, &store)
+            .with_context(|| format!("write {}", self.authorization_store_path.display()))
     }
 
     fn persist_workspace_store_if_due(&self, force: bool) -> Result<()> {
@@ -1976,6 +3220,75 @@ impl WorkbenchSessionGrantV1 {
     }
 }
 
+impl WorkbenchPairingGrantV1 {
+    const fn is_live(&self, now: u64) -> bool {
+        matches!(self.launch_mode, WorkbenchLaunchMode::Published)
+            && self.revoked_at.is_none()
+            && self.created_at <= now
+            && self.last_used_at <= now
+            && self.idle_expires_at > now
+            && self.absolute_expires_at > now
+    }
+
+    const fn is_retained(&self, now: u64) -> bool {
+        if let Some(revoked_at) = self.revoked_at {
+            matches!(self.launch_mode, WorkbenchLaunchMode::Published)
+                && self.created_at <= self.last_used_at
+                && self.last_used_at <= revoked_at
+                && revoked_at <= now
+        } else {
+            self.is_live(now)
+        }
+    }
+
+    fn entry(&self) -> WorkbenchEntryBinding {
+        WorkbenchEntryBinding {
+            launch_mode: WorkbenchLaunchMode::Published,
+            canonical_origin: self.canonical_origin.clone(),
+            project_instance_id: Some(self.project_instance_id.clone()),
+            workspace_key: Some(self.workspace_key.clone()),
+        }
+    }
+}
+
+impl WorkbenchResumeOutcomeV1 {
+    fn terminal_error(&self) -> Option<PairingExchangeError> {
+        match &self.result {
+            WorkbenchResumeOutcomeResultV1::Terminal {
+                terminal_error: WorkbenchResumeTerminalErrorV1::Invalid,
+            } => Some(PairingExchangeError::Invalid),
+            WorkbenchResumeOutcomeResultV1::Terminal {
+                terminal_error: WorkbenchResumeTerminalErrorV1::Expired,
+            } => Some(PairingExchangeError::Expired),
+            WorkbenchResumeOutcomeResultV1::Session { .. } => None,
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        matches!(
+            &self.result,
+            WorkbenchResumeOutcomeResultV1::Terminal { .. }
+        )
+    }
+
+    fn valid(&self) -> bool {
+        valid_public_token(&self.pairing_selector)
+            && valid_public_token(&self.request_id)
+            && match &self.result {
+                WorkbenchResumeOutcomeResultV1::Session {
+                    session_selector,
+                    session_credential_digest,
+                    session_expires_at,
+                } => {
+                    valid_public_token(session_selector)
+                        && valid_credential_digest(session_credential_digest)
+                        && *session_expires_at >= self.created_at
+                }
+                WorkbenchResumeOutcomeResultV1::Terminal { .. } => true,
+            }
+    }
+}
+
 impl From<&WorkbenchSession> for WorkbenchSessionGrantV1 {
     fn from(session: &WorkbenchSession) -> Self {
         Self {
@@ -1985,6 +3298,8 @@ impl From<&WorkbenchSession> for WorkbenchSessionGrantV1 {
             workspace_key: session.workspace_key.clone(),
             workspace_root: session.workspace_root.clone(),
             capabilities: session.capabilities.clone(),
+            entry: Some(session.entry.clone()),
+            pairing_selector: session.pairing_selector.clone(),
             created_at: session.created_at,
             last_activity: session.last_activity,
             expires_at: session.expires_at,
@@ -2004,6 +3319,162 @@ fn retain_live_sessions(state: &mut WorkbenchState, now: u64) {
     state
         .completion_review_requests
         .retain(|key, _| live_sessions.contains(&key.session_id));
+}
+
+fn retain_live_authorizations(state: &mut WorkbenchState, now: u64) {
+    retain_live_sessions(state, now);
+    state
+        .pairing_grants
+        .retain(|_, pairing| pairing.is_retained(now));
+    prune_retained_revoked_pairings(&mut state.pairing_grants);
+    retain_candidate_resume_outcomes(&mut state.resume_outcomes, &state.pairing_grants, now);
+    let live_pairings = state
+        .pairing_grants
+        .values()
+        .filter(|pairing| pairing.is_live(now))
+        .map(|pairing| pairing.selector.clone())
+        .collect::<HashSet<_>>();
+    state.session_grants.retain(|_, session| {
+        session
+            .pairing_selector
+            .as_ref()
+            .is_none_or(|selector| live_pairings.contains(selector))
+    });
+    state.sessions.retain(|_, session| {
+        session
+            .pairing_selector
+            .as_ref()
+            .is_none_or(|selector| live_pairings.contains(selector))
+    });
+}
+
+fn retain_candidate_resume_outcomes(
+    outcomes: &mut HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
+    pairings: &HashMap<String, WorkbenchPairingGrantV1>,
+    now: u64,
+) {
+    outcomes.retain(|key, outcome| {
+        outcome.retained_until > now
+            && pairings
+                .get(&key.pairing_selector)
+                .is_some_and(|pairing| outcome.is_terminal() || pairing.is_live(now))
+    });
+}
+
+fn ensure_resume_outcome_capacity(
+    state: &WorkbenchState,
+    key: &WorkbenchResumeOutcomeKey,
+) -> Result<(), PairingExchangeError> {
+    if state.resume_outcomes.contains_key(key) {
+        return Ok(());
+    }
+    let pairing_outcomes = state
+        .resume_outcomes
+        .keys()
+        .filter(|candidate| candidate.pairing_selector == key.pairing_selector)
+        .count();
+    if state.resume_outcomes.len() >= MAX_RESUME_OUTCOMES
+        || pairing_outcomes >= MAX_RESUME_OUTCOMES_PER_PAIRING
+    {
+        return Err(PairingExchangeError::Busy);
+    }
+    Ok(())
+}
+
+fn terminal_resume_outcome(
+    key: &WorkbenchResumeOutcomeKey,
+    error: WorkbenchResumeTerminalErrorV1,
+    now: u64,
+) -> WorkbenchResumeOutcomeV1 {
+    WorkbenchResumeOutcomeV1 {
+        pairing_selector: key.pairing_selector.clone(),
+        request_id: key.request_id.clone(),
+        created_at: now,
+        retained_until: now.saturating_add(TERMINAL_RESUME_OUTCOME_LIFETIME.as_secs()),
+        result: WorkbenchResumeOutcomeResultV1::Terminal {
+            terminal_error: error,
+        },
+    }
+}
+
+fn prune_retained_revoked_pairings(pairings: &mut HashMap<String, WorkbenchPairingGrantV1>) {
+    let mut revoked = pairings
+        .values()
+        .filter_map(|pairing| {
+            pairing.revoked_at.map(|revoked_at| {
+                (
+                    revoked_at,
+                    pairing.selector.clone(),
+                    pairing.workspace_key.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    revoked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
+    let mut kept = 0_usize;
+    let mut kept_by_workspace = HashMap::<String, usize>::new();
+    let mut remove = HashSet::new();
+    for (_, selector, workspace_key) in revoked {
+        let workspace_kept = kept_by_workspace.entry(workspace_key).or_default();
+        if kept < MAX_RETAINED_REVOKED_PAIRINGS
+            && *workspace_kept < MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE
+        {
+            kept += 1;
+            *workspace_kept += 1;
+        } else {
+            remove.insert(selector);
+        }
+    }
+    pairings.retain(|selector, _| !remove.contains(selector));
+}
+
+fn valid_pairing_selector_reference(value: &str) -> bool {
+    (8..=43).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn resolve_pairing_selector(
+    state: &WorkbenchState,
+    selector_reference: &str,
+    workspace_key: Option<&str>,
+) -> Option<String> {
+    let mut matches = state
+        .pairing_grants
+        .values()
+        .filter(|pairing| {
+            pairing.selector.starts_with(selector_reference)
+                && workspace_key.is_none_or(|key| pairing.workspace_key == key)
+        })
+        .map(|pairing| pairing.selector.clone());
+    let selector = matches.next()?;
+    matches.next().is_none().then_some(selector)
+}
+
+fn pairing_management_anyhow(error: PairingManagementError) -> anyhow::Error {
+    let (code, kind, message) = match error {
+        PairingManagementError::Invalid => (
+            crate::api::protocol::ErrorCode::InvalidInput,
+            "workbench.invalid_request",
+            "The workbench pairing request is invalid",
+        ),
+        PairingManagementError::NotFound => (
+            crate::api::protocol::ErrorCode::NotFound,
+            "workbench.pairing_not_found",
+            "The workbench pairing was not found",
+        ),
+        PairingManagementError::Unavailable => (
+            crate::api::protocol::ErrorCode::PreconditionFailed,
+            "workbench.pairing_busy",
+            "The workbench pairing store is temporarily unavailable",
+        ),
+    };
+    anyhow::Error::new(
+        ExoFailure::new(code, message, ExoFailure::orienting_steering(vec![]))
+            .with_details(serde_json::json!({ "kind": kind })),
+    )
 }
 
 pub fn daemon_required_failure() -> ExoFailure {
@@ -2043,13 +3514,18 @@ fn random_bytes() -> Result<[u8; 32]> {
     Ok(bytes)
 }
 
-fn sign_ticket(secret: &[u8; 32], payload: &WorkbenchTicketV1) -> Result<String> {
+fn sign_ticket<T: Serialize>(secret: &[u8; 32], payload: &T) -> Result<String> {
     let payload_bytes = serde_json::to_vec(payload)?;
+    let version = serde_json::to_value(payload)?
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| matches!(version, 1 | 2))
+        .ok_or_else(|| anyhow::anyhow!("workbench ticket version is invalid"))?;
     let mut signer =
         HmacSha256::new_from_slice(secret).context("initialize workbench ticket signer")?;
     signer.update(&payload_bytes);
     Ok(format!(
-        "v1.{}.{}",
+        "v{version}.{}.{}",
         URL_SAFE_NO_PAD.encode(&payload_bytes),
         URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes())
     ))
@@ -2061,6 +3537,64 @@ fn random_token() -> Result<String> {
 
 fn session_credential_digest(session_secret: &str) -> String {
     blake3::hash(session_secret.as_bytes()).to_hex().to_string()
+}
+
+fn pairing_cookie_value(selector: &str, secret: &str) -> String {
+    format!("v1.{selector}.{secret}")
+}
+
+fn derive_pairing_token(
+    pairing_secret: &str,
+    request_id: &str,
+    domain: &[u8],
+) -> Result<String, PairingExchangeError> {
+    let secret = URL_SAFE_NO_PAD
+        .decode(pairing_secret)
+        .map_err(|_| PairingExchangeError::Invalid)?;
+    if secret.len() != 32 {
+        return Err(PairingExchangeError::Invalid);
+    }
+    let mut derivation =
+        HmacSha256::new_from_slice(&secret).map_err(|_| PairingExchangeError::Invalid)?;
+    derivation.update(domain);
+    derivation.update(&[0]);
+    derivation.update(request_id.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(derivation.finalize().into_bytes()))
+}
+
+const fn pairing_error_from_ticket(error: TicketExchangeError) -> PairingExchangeError {
+    match error {
+        TicketExchangeError::Invalid => PairingExchangeError::Invalid,
+        TicketExchangeError::Busy => PairingExchangeError::Busy,
+        TicketExchangeError::Unavailable => PairingExchangeError::Unavailable,
+    }
+}
+
+fn valid_credential_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn expected_host_from_origin(origin: &str) -> Option<&str> {
+    let authority = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))?;
+    (!authority.is_empty()
+        && !authority.contains(['/', '?', '#', '@'])
+        && authority.bytes().all(|byte| !byte.is_ascii_whitespace()))
+    .then_some(authority)
+}
+
+fn valid_pairing_grant(pairing: &WorkbenchPairingGrantV1, project_id: &str, now: u64) -> bool {
+    pairing.project_id == project_id
+        && pairing.workspace_root.is_absolute()
+        && pairing.is_retained(now)
+        && pairing.idle_expires_at >= pairing.created_at
+        && pairing.absolute_expires_at >= pairing.created_at
+        && valid_public_token(&pairing.selector)
+        && valid_credential_digest(&pairing.credential_digest)
+        && !pairing.project_instance_id.is_empty()
+        && pairing.canonical_origin.starts_with("https://")
+        && expected_host_from_origin(&pairing.canonical_origin).is_some()
 }
 
 fn unix_seconds() -> u64 {
@@ -2097,50 +3631,215 @@ fn write_host_record(path: &Path, record: &WorkbenchHostRecord) -> std::io::Resu
         .map_err(|error| error.error)
 }
 
-fn read_session_store(
+fn load_authorization_state(
+    authorization_path: &Path,
+    legacy_session_path: &Path,
+    project_id: &str,
+    now: u64,
+) -> Result<RestoredAuthorizationState> {
+    if let Some(restored) = read_authorization_store(authorization_path, project_id, now)? {
+        return Ok(restored);
+    }
+    let Some(sessions) = read_legacy_session_store(legacy_session_path, project_id, now)? else {
+        return Ok(RestoredAuthorizationState::default());
+    };
+    let restored = RestoredAuthorizationState {
+        sessions,
+        ..RestoredAuthorizationState::default()
+    };
+    let store = authorization_store_from_collections(
+        project_id,
+        &restored.sessions,
+        &restored.pairings,
+        &restored.resume_outcomes,
+    );
+    write_authorization_store(authorization_path, &store)
+        .context("migrate version-1 workbench sessions")?;
+    if let Err(error) = archive_legacy_session_store(legacy_session_path, now) {
+        eprintln!(
+            "exo daemon: preserved migrated workbench sessions at {} because the legacy store could not be archived: {error}",
+            legacy_session_path.display()
+        );
+    }
+    Ok(restored)
+}
+
+fn read_authorization_store(
     path: &Path,
     project_id: &str,
     now: u64,
-) -> Result<HashMap<String, WorkbenchSessionGrantV1>> {
+) -> Result<Option<RestoredAuthorizationState>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
-    let store: WorkbenchSessionStoreV1 =
-        serde_json::from_slice(&bytes).context("decode workbench session store")?;
-    if store.schema_version != SESSION_STORE_SCHEMA_VERSION || store.project_id != project_id {
-        return Ok(HashMap::new());
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("decode workbench authorization store")?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
+    let mut restored = RestoredAuthorizationState::default();
+    match schema_version {
+        Some(AUTHORIZATION_STORE_SCHEMA_VERSION) => {
+            let store: WorkbenchAuthorizationStoreV2 = serde_json::from_value(value)
+                .context("decode version-2 workbench authorization store")?;
+            if store.project_id != project_id {
+                return Ok(Some(restored));
+            }
+            restored.sessions = restore_session_grants(store.sessions, project_id, now);
+            restored.pairings = store
+                .pairings
+                .into_iter()
+                .filter(|pairing| valid_pairing_grant(pairing, project_id, now))
+                .map(|pairing| (pairing.selector.clone(), pairing))
+                .collect();
+            prune_retained_revoked_pairings(&mut restored.pairings);
+            restored.resume_outcomes = store
+                .resume_outcomes
+                .into_iter()
+                .filter(|outcome| {
+                    outcome.retained_until > now
+                        && outcome.valid()
+                        && restored.pairings.contains_key(&outcome.pairing_selector)
+                })
+                .map(|outcome| {
+                    (
+                        WorkbenchResumeOutcomeKey {
+                            pairing_selector: outcome.pairing_selector.clone(),
+                            request_id: outcome.request_id.clone(),
+                        },
+                        outcome,
+                    )
+                })
+                .collect();
+        }
+        _ => {}
     }
-    Ok(store
-        .sessions
+    Ok(Some(restored))
+}
+
+fn read_legacy_session_store(
+    path: &Path,
+    project_id: &str,
+    now: u64,
+) -> Result<Option<HashMap<String, WorkbenchSessionGrantV1>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut store: WorkbenchSessionStoreV1 =
+        serde_json::from_slice(&bytes).context("decode version-1 workbench session store")?;
+    if store.schema_version != 1 || store.project_id != project_id {
+        return Ok(Some(HashMap::new()));
+    }
+    for grant in &mut store.sessions {
+        grant.entry = None;
+        grant.pairing_selector = None;
+    }
+    Ok(Some(restore_session_grants(
+        store.sessions,
+        project_id,
+        now,
+    )))
+}
+
+fn archive_legacy_session_store(path: &Path, now: u64) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("legacy workbench session store has no parent"))?;
+    let preferred = parent.join("workbench.sessions.v1.json");
+    let archive = if !preferred.exists() {
+        preferred
+    } else {
+        (0_u16..=u16::MAX)
+            .map(|attempt| parent.join(format!("workbench.sessions.v1.{now}.{attempt}.json")))
+            .find(|candidate| !candidate.exists())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no legacy workbench session archive name is available")
+            })?
+    };
+    std::fs::rename(path, archive).context("archive version-1 workbench session store")?;
+    Ok(())
+}
+
+fn restore_session_grants(
+    grants: Vec<WorkbenchSessionGrantV1>,
+    project_id: &str,
+    now: u64,
+) -> HashMap<String, WorkbenchSessionGrantV1> {
+    grants
         .into_iter()
         .filter(|grant| {
             grant.project_id == project_id
                 && grant.workspace_root.is_absolute()
                 && grant.is_live(now)
                 && valid_public_token(&grant.selector)
-                && grant.credential_digest.len() == 64
-                && grant
-                    .credential_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+                && valid_credential_digest(&grant.credential_digest)
         })
         .map(|mut grant| {
             grant.capabilities = upgraded_session_capabilities(grant.capabilities);
             (grant.credential_digest.clone(), grant)
         })
-        .collect())
+        .collect()
 }
 
-fn write_session_store(path: &Path, store: &WorkbenchSessionStoreV1) -> Result<()> {
+fn authorization_store_from_state(
+    state: &WorkbenchState,
+    project_id: &str,
+) -> WorkbenchAuthorizationStoreV2 {
+    authorization_store_from_collections(
+        project_id,
+        &state.session_grants,
+        &state.pairing_grants,
+        &state.resume_outcomes,
+    )
+}
+
+fn authorization_store_from_collections(
+    project_id: &str,
+    session_grants: &HashMap<String, WorkbenchSessionGrantV1>,
+    pairing_grants: &HashMap<String, WorkbenchPairingGrantV1>,
+    outcomes: &HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
+) -> WorkbenchAuthorizationStoreV2 {
+    let mut sessions = session_grants.values().cloned().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        left.selector
+            .cmp(&right.selector)
+            .then_with(|| left.credential_digest.cmp(&right.credential_digest))
+    });
+    let mut pairings = pairing_grants.values().cloned().collect::<Vec<_>>();
+    pairings.sort_by(|left, right| left.selector.cmp(&right.selector));
+    let mut resume_outcomes = outcomes.values().cloned().collect::<Vec<_>>();
+    resume_outcomes.sort_by(|left, right| {
+        left.pairing_selector
+            .cmp(&right.pairing_selector)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    WorkbenchAuthorizationStoreV2 {
+        schema_version: AUTHORIZATION_STORE_SCHEMA_VERSION,
+        project_id: project_id.to_string(),
+        sessions,
+        pairings,
+        resume_outcomes,
+    }
+}
+
+fn write_authorization_store(path: &Path, store: &WorkbenchAuthorizationStoreV2) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("workbench session store path has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let content = serde_json::to_vec(store)?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".workbench.sessions.json.exo-tmp.")
+        .prefix(".workbench.authorizations.json.exo-tmp.")
         .tempfile_in(parent)?;
     use std::io::Write as _;
     temporary.write_all(&content)?;

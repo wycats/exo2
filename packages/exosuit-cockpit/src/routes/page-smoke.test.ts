@@ -9,7 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import snapshotFixture from "$lib/workbench-snapshot.v3.json";
 import type { WorkbenchPlanningRequest } from "$lib/workbench";
-import { workbenchHistoryState } from "$lib/workbench-client";
+import {
+  pairingResumeRequestIdFromHistory,
+  workbenchHistoryState,
+} from "$lib/workbench-client";
 
 vi.mock("$app/navigation", () => {
   const metadata = (state: Record<string, unknown>, historyIndex: number) => ({
@@ -1049,6 +1052,281 @@ describe("cockpit page", () => {
     expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
       "session-selector",
     );
+  });
+
+  it("retries published pairing resume with the same request identity", async () => {
+    vi.stubGlobal("location", {
+      hash: "",
+      href: "https://workbench.example.test/",
+      pathname: "/",
+      protocol: "https:",
+      reload: vi.fn(),
+      search: "",
+    });
+    const submittedRequestIds: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          const request = JSON.parse(String(init?.body));
+          submittedRequestIds.push(request.request_id);
+          if (submittedRequestIds.length === 1) {
+            throw new TypeError("connection reset");
+          }
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Exo is not responding" }),
+    ).toBeTruthy();
+    const pendingRequestId = pairingResumeRequestIdFromHistory(history.state);
+    expect(pendingRequestId).toHaveLength(43);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(submittedRequestIds).toEqual([pendingRequestId, pendingRequestId]);
+    expect(pairingResumeRequestIdFromHistory(history.state)).toBeNull();
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "published-session",
+    );
+  });
+
+  it("refreshes the retained pairing record after revoking another browser", async () => {
+    vi.stubGlobal("location", {
+      hash: "",
+      href: "https://workbench.example.test/",
+      pathname: "/",
+      protocol: "https:",
+      reload: vi.fn(),
+      search: "",
+    });
+    let pairingReads = 0;
+    const pairing = (status: "active" | "revoked") => ({
+      selector: "other-pairin",
+      workspace_label: "exo2: durable entry",
+      created_at: "2026-08-08T01:00:00Z",
+      last_used_at: "2026-08-08T02:00:00Z",
+      expires_at: "2026-09-07T02:00:00Z",
+      nickname: "Chrome",
+      status,
+      revoked_at: status === "revoked" ? "2026-08-08T03:00:00Z" : null,
+      current: false,
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        if (String(path).startsWith("/api/pairings?")) {
+          pairingReads += 1;
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.pairing.list",
+              ok: true,
+              schema_version: 1,
+              pairings: [pairing(pairingReads === 1 ? "active" : "revoked")],
+            }),
+            { status: 200 },
+          );
+        }
+        if (path === "/api/pairing/revoke") {
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.pairing.revoke",
+              ok: true,
+              schema_version: 1,
+              selector: "other-pairin",
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    const pairingPopover = screen.getByRole("complementary", {
+      name: "Browser access",
+    });
+    pairingPopover.showPopover = vi.fn();
+    pairingPopover.hidePopover = vi.fn();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Manage browser access" }),
+    );
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Revoke browser pairing other-pairin",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(pairingReads).toBe(2);
+      expect(screen.getByText("Chrome")).toBeTruthy();
+      expect(
+        screen.queryByRole("button", {
+          name: "Revoke browser pairing other-pairin",
+        }),
+      ).toBeNull();
+    });
+  });
+
+  it("clears stale pairing mutation state when a fresh enrollment replaces the client", async () => {
+    vi.stubGlobal("location", {
+      hash: "",
+      href: "https://workbench.example.test/",
+      pathname: "/",
+      protocol: "https:",
+      reload: vi.fn(),
+      search: "",
+    });
+    const revoke = deferred<Response>();
+    let pairingReads = 0;
+    const pairing = (selector: string, current: boolean) => ({
+      selector,
+      workspace_label: "exo2: durable entry",
+      created_at: "2026-08-08T01:00:00Z",
+      last_used_at: "2026-08-08T02:00:00Z",
+      expires_at: "2026-09-07T02:00:00Z",
+      nickname: current ? "Fresh browser" : "Other browser",
+      status: "active",
+      revoked_at: null,
+      current,
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/pairing/enroll") {
+          return sessionResponse("fresh-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("published-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        if (String(path).startsWith("/api/pairings?")) {
+          pairingReads += 1;
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.pairing.list",
+              ok: true,
+              schema_version: 1,
+              pairings: [
+                pairing(
+                  pairingReads === 1 ? "other-pairin" : "fresh-pairin",
+                  pairingReads > 1,
+                ),
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (path === "/api/pairing/revoke") {
+          return revoke.promise;
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    const pairingPopover = screen.getByRole("complementary", {
+      name: "Browser access",
+    });
+    pairingPopover.showPopover = vi.fn();
+    pairingPopover.hidePopover = vi.fn();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Manage browser access" }),
+    );
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Revoke browser pairing other-pairin",
+      }),
+    );
+
+    location.hash = "#ticket=v2.fresh-ticket";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    await waitFor(() => {
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "fresh-session",
+      );
+    });
+    revoke.resolve(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.pairing.revoke",
+          ok: true,
+          schema_version: 1,
+          selector: "other-pairin",
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const freshPairingPopover = screen.getByRole("complementary", {
+      name: "Browser access",
+    });
+    freshPairingPopover.showPopover = vi.fn();
+    freshPairingPopover.hidePopover = vi.fn();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Manage browser access" }),
+    );
+    const freshForget = await screen.findByRole("button", {
+      name: "Forget this browser",
+    });
+    expect((freshForget as HTMLButtonElement).disabled).toBe(false);
+    expect(pairingReads).toBe(2);
   });
 
   it("does not offer an inert retry for a rejected ticket exchange", async () => {

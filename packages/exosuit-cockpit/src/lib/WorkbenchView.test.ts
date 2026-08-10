@@ -105,6 +105,105 @@ describe("focus-only lane workbench", () => {
     expect(navigator.id).toBe("lane-navigation");
   });
 
+  it("keeps published browser access in a compact management popover", async () => {
+    const onOpenPairings = vi.fn();
+    const onRevokePairing = vi.fn();
+    const onRenamePairing = vi.fn();
+    const onForgetPairing = vi.fn();
+    render(WorkbenchView, {
+      snapshot: fixture(),
+      pairingAvailable: true,
+      pairings: [
+        {
+          selector: "current-pair",
+          workspace_label: "exo2: durable entry",
+          created_at: "2026-08-08T01:00:00Z",
+          last_used_at: "2026-08-08T02:00:00Z",
+          expires_at: "2026-09-07T02:00:00Z",
+          nickname: "Codex",
+          status: "active",
+          revoked_at: null,
+          current: true,
+        },
+        {
+          selector: "other-pairin",
+          workspace_label: "exo2: durable entry",
+          created_at: "2026-08-07T01:00:00Z",
+          last_used_at: "2026-08-07T02:00:00Z",
+          expires_at: "2026-09-06T02:00:00Z",
+          nickname: "Chrome",
+          status: "active",
+          revoked_at: null,
+          current: false,
+        },
+        {
+          selector: "revoked-pair",
+          workspace_label: "exo2: durable entry",
+          created_at: "2026-08-06T01:00:00Z",
+          last_used_at: "2026-08-06T02:00:00Z",
+          expires_at: "2026-09-05T02:00:00Z",
+          nickname: "Old browser",
+          status: "revoked",
+          revoked_at: "2026-08-07T03:00:00Z",
+          current: false,
+        },
+      ],
+      onOpenPairings,
+      onRevokePairing,
+      onRenamePairing,
+      onForgetPairing,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const invoker = screen.getByRole("button", {
+      name: "Manage browser access",
+    });
+    expect(invoker.getAttribute("commandfor")).toBe("pairing-management");
+    expect(invoker.getAttribute("command")).toBe("toggle-popover");
+    expect(
+      screen.getByRole("complementary", { name: "Browser access" }),
+    ).toBeTruthy();
+
+    await fireEvent.click(invoker);
+    expect(onOpenPairings).toHaveBeenCalledOnce();
+    expect(screen.getByText("This browser")).toBeTruthy();
+    expect(screen.getByText("Chrome")).toBeTruthy();
+    expect(screen.getByText("Old browser")).toBeTruthy();
+    expect(screen.getByText("Revoked")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", {
+        name: "Revoke browser pairing revoked-pair",
+      }),
+    ).toBeNull();
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Name this browser" }),
+    );
+    const nickname = screen.getByRole("textbox", {
+      name: "Browser pairing name",
+    });
+    await fireEvent.input(nickname, { target: { value: "Planning laptop" } });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save browser name" }),
+    );
+    expect(onRenamePairing).toHaveBeenCalledWith(
+      "current-pair",
+      "Planning laptop",
+    );
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Forget this browser" }),
+    );
+    expect(onForgetPairing).toHaveBeenCalledOnce();
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Revoke browser pairing other-pairin",
+      }),
+    );
+    expect(onRevokePairing).toHaveBeenCalledWith("other-pairin");
+  });
+
   it("keeps the compact lane invoker toggleable with the command fallback", async () => {
     vi.stubGlobal(
       "matchMedia",

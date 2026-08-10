@@ -29,7 +29,9 @@
     RefreshCw,
     Route,
     Send,
+    ShieldCheck,
     Target,
+    Trash2,
     Wifi,
     WifiOff,
     X,
@@ -50,6 +52,7 @@
     type WorkbenchTask,
     type WorkbenchTaskCompletionReview,
   } from "./workbench";
+  import type { WorkbenchPairingSummary } from "./workbench-client";
 
   interface Props {
     snapshot: WorkbenchSnapshot;
@@ -65,6 +68,11 @@
       | "needs_launch"
       | "reload_required";
     sessionRecoveryMessage?: string | null;
+    pairingAvailable?: boolean;
+    pairings?: WorkbenchPairingSummary[] | null;
+    pairingsLoading?: boolean;
+    pairingFailure?: string | null;
+    pendingPairingSelector?: string | null;
     pendingLaneId?: string | null;
     focusFailure?: string | null;
     refreshFailure?: string | null;
@@ -86,6 +94,11 @@
     onRetryFocus?: (() => void) | null;
     onRetryPlanning?: (() => void) | null;
     onRetrySession?: (() => void) | null;
+    onOpenPairings?: () => void;
+    onRetryPairings?: () => void;
+    onRevokePairing?: (selector: string) => void;
+    onRenamePairing?: (selector: string, nickname: string) => void;
+    onForgetPairing?: () => void;
     onRefresh: () => void;
     onPlan?: (
       operation: WorkbenchPlanningOperation,
@@ -105,6 +118,11 @@
     streamConnected = false,
     sessionRecovery = "connected",
     sessionRecoveryMessage = null,
+    pairingAvailable = false,
+    pairings = null,
+    pairingsLoading = false,
+    pairingFailure = null,
+    pendingPairingSelector = null,
     pendingLaneId = null,
     focusFailure = null,
     refreshFailure = null,
@@ -123,6 +141,11 @@
     onRetryFocus = null,
     onRetryPlanning = null,
     onRetrySession = null,
+    onOpenPairings = () => {},
+    onRetryPairings = () => {},
+    onRevokePairing = () => {},
+    onRenamePairing = () => {},
+    onForgetPairing = () => {},
     onRefresh,
     onPlan = async () => false,
     onApproveCompletion = async () => false,
@@ -140,6 +163,9 @@
   const utf8Encoder = new TextEncoder();
 
   let laneRail: HTMLElement | undefined = $state();
+  let pairingPopover: HTMLElement | undefined = $state();
+  let pairingRenameSelector: string | null = $state(null);
+  let pairingRenameValue = $state("");
   let completionReviewCard: HTMLElement | undefined = $state();
   let compactNavigation = $state(false);
   let planningEditor = $state<PlanningEditor | null>(null);
@@ -588,6 +614,54 @@
     }
   }
 
+  function togglePairingFallback(): void {
+    onOpenPairings();
+    if (supportsCommandInvoker()) {
+      return;
+    }
+    const wasOpen = pairingPopover?.matches(":popover-open") ?? false;
+    requestAnimationFrame(() => {
+      if (!pairingPopover?.isConnected) {
+        return;
+      }
+      const isOpen = pairingPopover.matches(":popover-open");
+      if (wasOpen && isOpen) {
+        pairingPopover.hidePopover();
+      } else if (!wasOpen && !isOpen) {
+        pairingPopover.showPopover();
+      }
+    });
+  }
+
+  function closePairingFallback(): void {
+    if (supportsCommandInvoker()) {
+      return;
+    }
+    if (pairingPopover?.matches(":popover-open")) {
+      pairingPopover.hidePopover();
+    }
+  }
+
+  function beginPairingRename(pairing: WorkbenchPairingSummary): void {
+    pairingRenameSelector = pairing.selector;
+    pairingRenameValue = pairing.nickname ?? "";
+  }
+
+  function cancelPairingRename(): void {
+    pairingRenameSelector = null;
+    pairingRenameValue = "";
+  }
+
+  function submitPairingRename(event: SubmitEvent, selector: string): void {
+    event.preventDefault();
+    const nickname = pairingRenameValue.trim();
+    if (!nickname || pendingPairingSelector !== null) {
+      return;
+    }
+    onRenamePairing(selector, nickname);
+    cancelPairingRename();
+  }
+
   function openEditor(editor: PlanningEditor, initialValue = ""): void {
     const binding = workbenchPlanningBinding(snapshot);
     if (!binding) {
@@ -782,6 +856,19 @@
       >
         <PanelLeft size={17} aria-hidden="true" />
       </button>
+      {#if pairingAvailable}
+        <button
+          class="icon-button pairing-invoker"
+          type="button"
+          title="Manage browser access"
+          aria-label="Manage browser access"
+          commandfor="pairing-management"
+          command="toggle-popover"
+          onclick={togglePairingFallback}
+        >
+          <ShieldCheck size={17} aria-hidden="true" />
+        </button>
+      {/if}
       <button
         class="icon-button"
         type="button"
@@ -794,6 +881,142 @@
       </button>
     </div>
   </header>
+
+  {#if pairingAvailable}
+    <aside
+      bind:this={pairingPopover}
+      class="pairing-popover"
+      id="pairing-management"
+      aria-label="Browser access"
+      popover="auto"
+    >
+      <div class="pairing-heading">
+        <div>
+          <span class="section-kicker">This workspace</span>
+          <h2>Browser access</h2>
+        </div>
+        <button
+          class="icon-button"
+          type="button"
+          title="Close browser access"
+          aria-label="Close browser access"
+          commandfor="pairing-management"
+          command="hide-popover"
+          onclick={closePairingFallback}
+        >
+          <X size={16} aria-hidden="true" />
+        </button>
+      </div>
+      <p class="pairing-intro">
+        Paired browsers can return to this worktree without another launch link.
+      </p>
+
+      {#if pairingFailure}
+        <div class="pairing-failure" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>{pairingFailure}</span>
+          <button type="button" onclick={onRetryPairings}>Retry</button>
+        </div>
+      {:else if pairingsLoading || pairings === null}
+        <div class="pairing-loading" role="status">
+          <LoaderCircle class="spin" size={16} aria-hidden="true" />
+          Loading browser access
+        </div>
+      {:else if pairings.length === 0}
+        <p class="pairing-empty">No browser pairing records for this workspace.</p>
+      {:else}
+        <ul class="pairing-list">
+          {#each pairings as pairing (pairing.selector)}
+            <li class:current={pairing.current} class:revoked={pairing.status === "revoked"}>
+              <div class="pairing-copy">
+                <strong>{pairing.current
+                  ? "This browser"
+                  : pairing.nickname ?? (pairing.status === "revoked" ? "Revoked browser" : "Paired browser")}</strong>
+                {#if pairing.status === "active" && pairingRenameSelector === pairing.selector}
+                  <form
+                    class="pairing-rename-form"
+                    onsubmit={(event) => submitPairingRename(event, pairing.selector)}
+                  >
+                    <label class="sr-only" for={`pairing-name-${pairing.selector}`}>
+                      Browser pairing name
+                    </label>
+                    <input
+                      id={`pairing-name-${pairing.selector}`}
+                      bind:value={pairingRenameValue}
+                      maxlength="80"
+                      placeholder="Browser name"
+                      required
+                    />
+                    <button
+                      type="submit"
+                      title="Save browser name"
+                      aria-label="Save browser name"
+                      disabled={!pairingRenameValue.trim() || pendingPairingSelector !== null}
+                    >
+                      <Check size={14} aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      title="Cancel browser rename"
+                      aria-label="Cancel browser rename"
+                      onclick={cancelPairingRename}
+                    >
+                      <X size={14} aria-hidden="true" />
+                    </button>
+                  </form>
+                {:else if pairing.current && pairing.nickname}
+                  <span>{pairing.nickname}</span>
+                {/if}
+                {#if pairing.status === "revoked"}
+                  <span>Revoked {observedTime(pairing.revoked_at ?? pairing.last_used_at, true)}</span>
+                {:else}
+                  <span>Used {observedTime(pairing.last_used_at, true)}</span>
+                {/if}
+                <code>{pairing.selector}</code>
+              </div>
+              <div class="pairing-actions">
+                {#if pairing.status === "revoked"}
+                  <span class="pairing-status"><XCircle size={14} aria-hidden="true" /> Revoked</span>
+                {:else}
+                  <button
+                    class="pairing-rename"
+                    type="button"
+                    title={pairing.current ? "Name this browser" : "Rename browser pairing"}
+                    aria-label={pairing.current
+                      ? "Name this browser"
+                      : `Rename browser pairing ${pairing.selector}`}
+                    disabled={interactionDisabled || pendingPairingSelector !== null}
+                    onclick={() => beginPairingRename(pairing)}
+                  >
+                    <Pencil size={14} aria-hidden="true" />
+                  </button>
+                  <button
+                    class="pairing-revoke"
+                    type="button"
+                    disabled={interactionDisabled || pendingPairingSelector !== null}
+                    aria-label={pairing.current
+                      ? "Forget this browser"
+                      : `Revoke browser pairing ${pairing.selector}`}
+                    onclick={() => pairing.current
+                      ? onForgetPairing()
+                      : onRevokePairing(pairing.selector)}
+                  >
+                    {#if pendingPairingSelector === pairing.selector ||
+                      (pairing.current && pendingPairingSelector === "current")}
+                      <LoaderCircle class="spin" size={15} aria-hidden="true" />
+                    {:else}
+                      <Trash2 size={15} aria-hidden="true" />
+                    {/if}
+                    {pairing.current ? "Forget" : "Revoke"}
+                  </button>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </aside>
+  {/if}
 
   {#if sessionRecovery === "reconnecting"}
     <div class="recovery-banner" role="status">
@@ -2074,6 +2297,228 @@
   .lane-invoker {
     display: none;
     anchor-name: --lane-navigation-trigger;
+  }
+
+  .pairing-invoker {
+    anchor-name: --pairing-management-trigger;
+  }
+
+  .pairing-popover {
+    width: min(360px, calc(100vw - 24px));
+    max-height: min(620px, calc(100vh - 80px));
+    overflow: auto;
+    position: fixed;
+    top: 64px;
+    right: 16px;
+    margin: 0;
+    padding: 18px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    box-shadow: 0 16px 42px rgba(23, 32, 31, 0.2);
+  }
+
+  .pairing-popover::backdrop {
+    background: transparent;
+  }
+
+  @supports (position-area: block-end span-inline-end) {
+    .pairing-popover {
+      position-anchor: --pairing-management-trigger;
+      position-area: block-end span-inline-end;
+      inset: auto;
+      margin-top: 8px;
+    }
+  }
+
+  .pairing-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .pairing-heading h2 {
+    margin-top: 2px;
+    font-size: 1rem;
+  }
+
+  .pairing-intro,
+  .pairing-empty {
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.45;
+    text-wrap: pretty;
+  }
+
+  .pairing-loading,
+  .pairing-failure {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 56px;
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+
+  .pairing-failure {
+    align-items: flex-start;
+    padding: 10px;
+    border: 1px solid #e0b6b9;
+    border-radius: 6px;
+    background: var(--red-soft);
+    color: #812c33;
+  }
+
+  .pairing-failure span {
+    flex: 1;
+    line-height: 1.4;
+  }
+
+  .pairing-failure button,
+  .pairing-rename,
+  .pairing-revoke {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .pairing-list {
+    margin: 16px 0 0;
+    padding: 0;
+    border-top: 1px solid var(--line);
+    list-style: none;
+  }
+
+  .pairing-list li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .pairing-list li.current {
+    color: var(--teal);
+  }
+
+  .pairing-list li.revoked .pairing-copy {
+    opacity: 0.72;
+  }
+
+  .pairing-copy {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+  }
+
+  .pairing-copy strong {
+    color: var(--ink);
+    font-size: 0.8rem;
+  }
+
+  .pairing-copy span {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 0.68rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pairing-copy code {
+    width: fit-content;
+    margin-top: 3px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    background: var(--surface-soft);
+    color: var(--muted);
+    font-size: 0.6rem;
+  }
+
+  .pairing-rename-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 4px;
+    margin: 3px 0;
+  }
+
+  .pairing-rename-form input {
+    min-width: 0;
+    height: 28px;
+    padding: 0 7px;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.72rem;
+  }
+
+  .pairing-rename-form button,
+  .pairing-rename {
+    width: 28px;
+    height: 28px;
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .pairing-rename-form button:hover:not(:disabled),
+  .pairing-rename:hover:not(:disabled) {
+    background: var(--surface-soft);
+    color: var(--ink);
+  }
+
+  .pairing-rename-form button:disabled,
+  .pairing-rename:disabled {
+    cursor: wait;
+    opacity: 0.55;
+  }
+
+  .pairing-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .pairing-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+  }
+
+  .pairing-revoke {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px;
+    border-radius: 4px;
+    color: var(--red);
+    font-size: 0.7rem;
+  }
+
+  .pairing-revoke:hover:not(:disabled) {
+    background: var(--red-soft);
+  }
+
+  .pairing-revoke:disabled {
+    cursor: wait;
+    opacity: 0.55;
   }
 
   .recovery-banner {

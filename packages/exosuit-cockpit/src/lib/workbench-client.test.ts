@@ -4,10 +4,15 @@ import inspectionFixture from "./workbench-lane-inspection.v1.json";
 import snapshotFixture from "./workbench-snapshot.v3.json";
 import type { WorkbenchPlanningRequest } from "./workbench";
 import {
+  clearPairingResumeRequestId,
+  createWorkbenchPairingResumeRequestId,
   createWorkbenchRequestId,
   exchangeWorkbenchTicket,
   launchTicketFromHash,
+  pairingResumeRequestIdFromHistory,
   prepareWorkbenchTicketExchange,
+  resumeWorkbenchPairing,
+  retainPairingResumeRequestId,
   retainSessionSelector,
   sessionKeyFromHistory,
   WorkbenchClient,
@@ -51,6 +56,157 @@ describe("workbench browser client", () => {
         method: "POST",
         credentials: "same-origin",
         body: JSON.stringify({ ticket: "v1.ticket" }),
+      }),
+    );
+  });
+
+  it("enrolls a published origin through the pairing endpoint", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({
+        kind: "workbench.session",
+        ok: true,
+        schema_version: 1,
+        session_key: "published-session",
+        project_id: "project-fixture",
+        workspace_key: "workspace-fixture",
+        expires_at: "2026-07-29T22:00:00Z",
+      }),
+    );
+
+    await exchangeWorkbenchTicket("v1.ticket", fetcher, true);
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/pairing/enroll",
+      expect.objectContaining({
+        body: JSON.stringify({ schema_version: 1, ticket: "v1.ticket" }),
+      }),
+    );
+  });
+
+  it("preserves a 256-bit pairing resume identity until success", async () => {
+    const requestId = createWorkbenchPairingResumeRequestId();
+    expect(requestId).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const pending = retainPairingResumeRequestId({ unrelated: "kept" }, requestId);
+    expect(pairingResumeRequestIdFromHistory(pending)).toBe(requestId);
+    expect(clearPairingResumeRequestId(pending)).toEqual({ unrelated: "kept" });
+
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({
+        kind: "workbench.session",
+        ok: true,
+        schema_version: 1,
+        session_key: "resumed-session",
+        project_id: "project-fixture",
+        workspace_key: "workspace-fixture",
+        expires_at: "2026-07-29T22:00:00Z",
+      }),
+    );
+    await resumeWorkbenchPairing(requestId, fetcher);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/pairing/resume",
+      expect.objectContaining({
+        body: JSON.stringify({ schema_version: 1, request_id: requestId }),
+      }),
+    );
+  });
+
+  it("lists and revokes path-free published browser pairings", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          kind: "workbench.pairing.list",
+          ok: true,
+          schema_version: 1,
+          pairings: [
+            {
+              selector: "pairing-sele",
+              workspace_label: "exo2: durable entry",
+              created_at: "2026-08-08T01:00:00Z",
+              last_used_at: "2026-08-08T02:00:00Z",
+              expires_at: "2026-09-07T02:00:00Z",
+              nickname: "Codex",
+              status: "active",
+              revoked_at: null,
+              current: true,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          kind: "workbench.pairing.revoke",
+          ok: true,
+          schema_version: 1,
+          selector: "other-pairing-selector",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          kind: "workbench.pairing.rename",
+          ok: true,
+          schema_version: 1,
+          selector: "other-pairing-selector",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          kind: "workbench.pairing.forget",
+          ok: true,
+          schema_version: 1,
+          selector: "current-pairing-selector",
+        }),
+      );
+    const client = new WorkbenchClient("session-selector", fetcher);
+
+    const list = await client.pairings();
+    expect(list.pairings[0]).toMatchObject({
+      selector: "pairing-sele",
+      nickname: "Codex",
+      current: true,
+    });
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/pairings?session_key=session-selector",
+      expect.objectContaining({ method: "GET", credentials: "same-origin" }),
+    );
+
+    await client.revokePairing("other-pairing-selector");
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/pairing/revoke",
+      expect.objectContaining({
+        body: JSON.stringify({
+          schema_version: 1,
+          session_key: "session-selector",
+          selector: "other-pairing-selector",
+        }),
+      }),
+    );
+
+    await client.renamePairing("other-pairing-selector", "Review browser");
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/pairing/rename",
+      expect.objectContaining({
+        body: JSON.stringify({
+          schema_version: 1,
+          session_key: "session-selector",
+          selector: "other-pairing-selector",
+          nickname: "Review browser",
+        }),
+      }),
+    );
+
+    await client.forgetPairing();
+    expect(fetcher).toHaveBeenNthCalledWith(
+      4,
+      "/api/pairing/forget",
+      expect.objectContaining({
+        body: JSON.stringify({
+          schema_version: 1,
+          session_key: "session-selector",
+        }),
       }),
     );
   });
