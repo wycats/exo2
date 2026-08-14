@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use crate::process_spawn::CommandSpawnExt as _;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
