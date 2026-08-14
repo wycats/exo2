@@ -8,6 +8,11 @@ use locald_publisher_client::{
     InstalledPublisher, Lease, LeaseState, PublisherClient, SandboxPublisherContext, WaitOutcome,
     probe_installation, probe_sandbox_publisher,
 };
+#[cfg(test)]
+use locald_publisher_client::{
+    SystemSuspendAwareClock, UnixCommandSocketDiscovery, UnixPublisherTransport, WakeError,
+    WakeMonitor, WakeRegistration, WakeSink,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
@@ -40,6 +45,27 @@ pub(super) struct LocaldWorkbenchEntryProvider {
     publications: Mutex<HashMap<PublicationKey, Arc<ManagedPublication>>>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TestNoHostSuspendWakeMonitor;
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestNoHostSuspendWakeRegistration;
+
+#[cfg(test)]
+impl WakeRegistration for TestNoHostSuspendWakeRegistration {}
+
+#[cfg(test)]
+impl WakeMonitor for TestNoHostSuspendWakeMonitor {
+    fn register(
+        &self,
+        _sink: Arc<dyn WakeSink>,
+    ) -> std::result::Result<Box<dyn WakeRegistration>, WakeError> {
+        Ok(Box::new(TestNoHostSuspendWakeRegistration))
+    }
+}
+
 impl std::fmt::Debug for LocaldWorkbenchEntryProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -65,7 +91,12 @@ impl LocaldWorkbenchEntryProvider {
     )]
     pub(super) fn with_sandbox(sandbox: SandboxPublisherContext) -> Self {
         Self {
-            client: PublisherClient::production(),
+            client: PublisherClient::with_wake_monitor(
+                Arc::new(UnixCommandSocketDiscovery),
+                Arc::new(UnixPublisherTransport),
+                Arc::new(SystemSuspendAwareClock),
+                Arc::new(TestNoHostSuspendWakeMonitor),
+            ),
             sandbox: Some(sandbox),
             publications: Mutex::new(HashMap::new()),
         }

@@ -513,8 +513,7 @@ async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restar
             };
             assert!(
                 std::time::Instant::now() < deadline,
-                "published workbench did not recover: {}",
-                error
+                "published workbench did not recover: {error:#}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
