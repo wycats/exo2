@@ -333,6 +333,17 @@ impl TestLocaldSandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().expect("clone locald log")))
             .stderr(Stdio::from(log));
+        #[cfg(target_os = "linux")]
+        // Exercise the explicit sandbox fallback without depending on the CI host's logind state.
+        command.env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!(
+                "unix:path={}",
+                self.command_socket
+                    .with_file_name("missing-system-bus.sock")
+                    .display()
+            ),
+        );
         TestLocaldDaemon {
             child: command.spawn_guarded().expect("spawn locald sandbox"),
         }
@@ -341,18 +352,20 @@ impl TestLocaldSandbox {
     fn wait_until_active(&self, daemon: &mut TestLocaldDaemon) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if locald_publisher_client::probe_sandbox_publisher(&self.context()).is_ok() {
-                return;
-            }
+            let probe_error =
+                match locald_publisher_client::probe_sandbox_publisher(&self.context()) {
+                    Ok(_) => return,
+                    Err(error) => error,
+                };
             if let Some(status) = daemon.child.try_wait().expect("inspect locald sandbox") {
                 panic!(
-                    "locald sandbox exited before publication became active ({status}): {}",
+                    "locald sandbox exited before publication became active ({status}); last probe error: {probe_error}: {}",
                     fs::read_to_string(&self.log_path).unwrap_or_default()
                 );
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "locald sandbox did not activate publication: {}",
+                "locald sandbox did not activate publication; last probe error: {probe_error}: {}",
                 fs::read_to_string(&self.log_path).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(50));
