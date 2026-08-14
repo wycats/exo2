@@ -2392,7 +2392,18 @@ impl WorkbenchHostInner {
             })
             .map(|pairing| pairing.selector.clone())
             .collect::<HashSet<_>>();
-        if moved_pairings.is_empty() {
+        let replaced_pairings = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| {
+                pairing.project_id == self.project.id.as_str()
+                    && pairing.workspace_key == workspace.key
+                    && pairing.project_instance_id != project_instance_id
+                    && pairing.revoked_at.is_none()
+            })
+            .map(|pairing| pairing.selector.clone())
+            .collect::<HashSet<_>>();
+        if moved_pairings.is_empty() && replaced_pairings.is_empty() {
             return Ok(());
         }
 
@@ -2407,15 +2418,24 @@ impl WorkbenchHostInner {
             pairing.workspace_root = workspace.root.clone();
             pairing.canonical_origin = entry.canonical_origin.clone();
         }
+        for selector in &replaced_pairings {
+            candidate_pairings
+                .get_mut(selector)
+                .expect("replaced pairing exists")
+                .revoked_at
+                .get_or_insert(now);
+        }
         candidate_sessions.retain(|_, session| {
-            session
-                .pairing_selector
-                .as_ref()
-                .is_none_or(|selector| !moved_pairings.contains(selector))
+            session.pairing_selector.as_ref().is_none_or(|selector| {
+                !moved_pairings.contains(selector) && !replaced_pairings.contains(selector)
+            })
         });
         candidate_outcomes.retain(|key, outcome| {
-            !moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal()
+            (!moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal())
+                && !replaced_pairings.contains(&key.pairing_selector)
         });
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
         let store = authorization_store_from_collections(
             self.project.id.as_str(),
             &candidate_sessions,
@@ -2429,10 +2449,9 @@ impl WorkbenchHostInner {
         state.pairing_grants = candidate_pairings;
         state.resume_outcomes = candidate_outcomes;
         state.sessions.retain(|_, session| {
-            session
-                .pairing_selector
-                .as_ref()
-                .is_none_or(|selector| !moved_pairings.contains(selector))
+            session.pairing_selector.as_ref().is_none_or(|selector| {
+                !moved_pairings.contains(selector) && !replaced_pairings.contains(selector)
+            })
         });
         state.origin_bindings.retain(|_, binding| {
             binding.project_instance_id.as_deref() != Some(project_instance_id)

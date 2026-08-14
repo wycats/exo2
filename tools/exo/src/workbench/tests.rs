@@ -459,6 +459,32 @@ impl WorkbenchEntryProvider for TestFailingMovedPublishedEntryProvider {
     }
 }
 
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestReplacementPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestReplacementPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-replacement-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+}
+
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restart() {
@@ -2841,6 +2867,97 @@ async fn failed_moved_worktree_publication_restores_the_previous_origin_binding(
         1
     );
     drop(state);
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_project_instance_revokes_stale_workspace_pairing_authority() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch original published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let original_entry = WorkbenchEntryBinding::published(
+        "https://workbench-moved.test.localhost".to_string(),
+        "locald-stable-project-instance".to_string(),
+        launch.workspace.key.clone(),
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll original pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"r".repeat(43),
+            &original_entry,
+        )
+        .expect("record original resume outcome");
+
+    manager.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    manager
+        .launch(&fixture.root)
+        .expect("launch replacement project instance");
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some()),
+        "the replaced pairing remains as revoked audit identity"
+    );
+    assert!(
+        state.session_grants.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert!(
+        state.sessions.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert!(
+        state
+            .resume_outcomes
+            .keys()
+            .all(|key| key.pairing_selector != pairing_selector)
+    );
+    drop(state);
+
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read replacement authorization store"),
+    )
+    .expect("decode replacement authorization store");
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    assert!(
+        store.sessions.iter().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert!(
+        store
+            .resume_outcomes
+            .iter()
+            .all(|outcome| outcome.pairing_selector != pairing_selector)
+    );
     manager.shutdown().await;
 }
 
