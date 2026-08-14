@@ -253,7 +253,13 @@ impl TestLocaldSandbox {
         let sandbox_root = home.join(".local/share/locald/sandboxes").join("b37");
         let data_home = sandbox_root.join("data");
         fs::create_dir_all(&data_home).expect("create locald sandbox data home");
-        fs::create_dir_all(sandbox_root.join("config")).expect("create locald sandbox config home");
+        let config_home = sandbox_root.join("config");
+        fs::create_dir_all(config_home.join("locald")).expect("create locald sandbox config home");
+        fs::write(
+            config_home.join("locald/config.toml"),
+            "[server]\nsandbox = true\n",
+        )
+        .expect("write locald sandbox config");
         fs::create_dir_all(sandbox_root.join("state")).expect("create locald sandbox state home");
         let http_port = TcpListener::bind("127.0.0.1:0")
             .expect("reserve sandbox HTTP port")

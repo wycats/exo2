@@ -1,6 +1,10 @@
 mod assets;
 mod http;
 pub(crate) mod planning;
+#[cfg(unix)]
+mod publication;
+#[cfg(not(unix))]
+#[path = "publication_unavailable.rs"]
 mod publication;
 mod snapshot;
 

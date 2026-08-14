@@ -1,5 +1,6 @@
-//! Process-global child creation coordinated with locald publisher descriptor acquisition.
+//! Process creation coordinated with locald publisher descriptor acquisition where available.
 
+#[cfg(unix)]
 use locald_publisher_client::ProcessSpawnBarrier;
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -22,7 +23,14 @@ pub trait CommandSpawnExt {
 
 impl CommandSpawnExt for Command {
     fn spawn_guarded(&mut self) -> io::Result<Child> {
-        ProcessSpawnBarrier::global().spawn_std_command(self)
+        #[cfg(unix)]
+        {
+            ProcessSpawnBarrier::global().spawn_std_command(self)
+        }
+        #[cfg(not(unix))]
+        {
+            self.spawn()
+        }
     }
 
     fn output_guarded(&mut self) -> io::Result<Output> {
@@ -53,7 +61,14 @@ pub trait TokioCommandSpawnExt {
 
 impl TokioCommandSpawnExt for tokio::process::Command {
     fn spawn_guarded(&mut self) -> io::Result<tokio::process::Child> {
-        ProcessSpawnBarrier::global().spawn_tokio_command(self)
+        #[cfg(unix)]
+        {
+            ProcessSpawnBarrier::global().spawn_tokio_command(self)
+        }
+        #[cfg(not(unix))]
+        {
+            self.spawn()
+        }
     }
 }
 
