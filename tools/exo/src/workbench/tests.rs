@@ -3,14 +3,19 @@
 use super::*;
 use crate::api::protocol::{Effect, ErrorCode, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
 use crate::context::{SqliteLoader, SqliteWriter};
+use crate::process_spawn::CommandSpawnExt as _;
 use serde_json::{Value as JsonValue, json};
 #[cfg(feature = "ui")]
 use std::collections::HashMap;
 use std::fs;
 #[cfg(feature = "ui")]
 use std::io;
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+use std::io::Read as _;
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 #[cfg(feature = "ui")]
 use std::sync::Mutex;
@@ -76,10 +81,12 @@ fn fixture() -> Fixture {
 }
 
 fn run_git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    clear_repository_local_git_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(root)
-        .output()
+        .output_guarded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -87,6 +94,28 @@ fn run_git(root: &Path, args: &[&str]) {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn clear_repository_local_git_environment(command: &mut Command) {
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(name);
+    }
 }
 
 #[test]
@@ -138,18 +167,239 @@ impl WorkbenchEntryProvider for TestPublishedEntryProvider {
         &self,
         workspace: &WorkspaceRegistration,
         _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
-        WorkbenchEntryBinding::published(
+        let entry = WorkbenchEntryBinding::published(
             format!("https://workbench-{}.test.localhost", &workspace.key[..8]),
             format!("locald-{}", &workspace.key[..12]),
             workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct RebindTrackingPublishedEntryProvider {
+    rebinds: AtomicU64,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
         )
+    }
+
+    fn rebind_all(&self, _listener: &TcpListener, _listener_generation: u64) -> Result<()> {
+        self.rebinds.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 }
 
 #[cfg(feature = "ui")]
 fn use_test_published_entries(manager: &WorkbenchHostManager) {
     manager.set_entry_provider(Arc::new(TestPublishedEntryProvider));
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct TestLocaldSandbox {
+    home: PathBuf,
+    data_dir: PathBuf,
+    command_socket: PathBuf,
+    log_path: PathBuf,
+    http_port: u16,
+    https_port: u16,
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct TestLocaldDaemon {
+    child: std::process::Child,
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+impl Drop for TestLocaldDaemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            drop(self.child.kill());
+            drop(self.child.wait());
+        }
+    }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+impl TestLocaldSandbox {
+    fn new(root: &Path) -> Self {
+        let home = root.join("home");
+        let sandbox_root = home.join(".local/share/locald/sandboxes").join("b37");
+        let data_home = sandbox_root.join("data");
+        fs::create_dir_all(&data_home).expect("create locald sandbox data home");
+        fs::create_dir_all(sandbox_root.join("config")).expect("create locald sandbox config home");
+        fs::create_dir_all(sandbox_root.join("state")).expect("create locald sandbox state home");
+        let http_port = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve sandbox HTTP port")
+            .local_addr()
+            .expect("sandbox HTTP address")
+            .port();
+        let https_port = loop {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .expect("reserve sandbox HTTPS port")
+                .local_addr()
+                .expect("sandbox HTTPS address")
+                .port();
+            if port != http_port {
+                break port;
+            }
+        };
+        Self {
+            home,
+            data_dir: data_home.join("locald"),
+            command_socket: sandbox_root.join("locald.sock"),
+            log_path: root.join("locald-sandbox.log"),
+            http_port,
+            https_port,
+        }
+    }
+
+    fn context(&self) -> locald_publisher_client::SandboxPublisherContext {
+        locald_publisher_client::SandboxPublisherContext::new(
+            locald_publisher_client::protocol::AbsolutePath::try_from(self.data_dir.clone())
+                .expect("absolute sandbox data directory"),
+            locald_publisher_client::protocol::AbsolutePath::try_from(self.command_socket.clone())
+                .expect("absolute sandbox command socket"),
+        )
+        .expect("sandbox publisher context")
+        .with_no_host_suspend_guarantee()
+    }
+
+    fn spawn(&self) -> TestLocaldDaemon {
+        let log = fs::File::create(&self.log_path).expect("create locald sandbox log");
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        clear_repository_local_git_environment(&mut command);
+        command
+            .arg("b37_locald_sandbox_daemon_helper")
+            .arg("--nocapture")
+            .env("EXO_B37_LOCALD_DAEMON_HELPER", "1")
+            .env("HOME", &self.home)
+            .env(
+                "XDG_DATA_HOME",
+                self.data_dir.parent().expect("sandbox data home"),
+            )
+            .env(
+                "XDG_CONFIG_HOME",
+                self.command_socket
+                    .parent()
+                    .expect("sandbox root")
+                    .join("config"),
+            )
+            .env(
+                "XDG_STATE_HOME",
+                self.command_socket
+                    .parent()
+                    .expect("sandbox root")
+                    .join("state"),
+            )
+            .env("LOCALD_SOCKET", &self.command_socket)
+            .env("LOCALD_SANDBOX_ACTIVE", "1")
+            .env("LOCALD_SANDBOX_NAME", "b37")
+            .env("LOCALD_SANDBOX_NO_HOST_SUSPEND", "1")
+            .env("LOCALD_HTTP_PORT", self.http_port.to_string())
+            .env("LOCALD_HTTPS_PORT", self.https_port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().expect("clone locald log")))
+            .stderr(Stdio::from(log));
+        TestLocaldDaemon {
+            child: command.spawn_guarded().expect("spawn locald sandbox"),
+        }
+    }
+
+    fn wait_until_active(&self, daemon: &mut TestLocaldDaemon) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if locald_publisher_client::probe_sandbox_publisher(&self.context()).is_ok() {
+                return;
+            }
+            if let Some(status) = daemon.child.try_wait().expect("inspect locald sandbox") {
+                panic!(
+                    "locald sandbox exited before publication became active ({status}): {}",
+                    fs::read_to_string(&self.log_path).unwrap_or_default()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "locald sandbox did not activate publication: {}",
+                fs::read_to_string(&self.log_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn stop(&self, daemon: &mut TestLocaldDaemon) {
+        let mut stream = UnixStream::connect(&self.command_socket)
+            .expect("connect to locald sandbox for shutdown");
+        serde_json::to_writer(&mut stream, &locald_core::IpcRequest::Shutdown)
+            .expect("send locald sandbox shutdown");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish locald sandbox shutdown request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read locald sandbox shutdown response");
+        assert_eq!(
+            serde_json::from_slice::<locald_core::IpcResponse>(&response)
+                .expect("decode locald sandbox shutdown response"),
+            locald_core::IpcResponse::Ok
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if daemon
+                .child
+                .try_wait()
+                .expect("wait for locald sandbox")
+                .is_some()
+            {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                daemon.child.kill().expect("kill stalled locald sandbox");
+                daemon.child.wait().expect("reap stalled locald sandbox");
+                panic!(
+                    "locald sandbox did not stop cleanly: {}",
+                    fs::read_to_string(&self.log_path).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn b37_locald_sandbox_daemon_helper() {
+    if std::env::var_os("EXO_B37_LOCALD_DAEMON_HELPER").is_none() {
+        return;
+    }
+    locald_server::run(true, "exo-b37-proof".to_owned()).expect("run locald sandbox daemon");
 }
 
 #[cfg(feature = "ui")]
@@ -162,13 +412,177 @@ impl WorkbenchEntryProvider for TestMovedPublishedEntryProvider {
         &self,
         workspace: &WorkspaceRegistration,
         _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
-        WorkbenchEntryBinding::published(
+        let entry = WorkbenchEntryBinding::published(
             "https://workbench-moved.test.localhost".to_string(),
             "locald-stable-project-instance".to_string(),
             workspace.key.clone(),
-        )
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
     }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restart() {
+    async fn launch_eventually(
+        manager: &WorkbenchHostManager,
+        workspace: &Path,
+    ) -> WorkbenchLaunchResult {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let error = match manager.launch(workspace) {
+                Ok(launch) => return launch,
+                Err(error) => error,
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "published workbench did not recover: {}",
+                error
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn canonical_origin(launch: &WorkbenchLaunchResult) -> &str {
+        launch
+            .url
+            .split_once("/#ticket=")
+            .map_or(launch.url.as_str(), |(origin, _)| origin)
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("e")
+        .tempdir_in("/tmp")
+        .expect("create short b.3.7 proof root");
+    let primary = temp.path().join("primary");
+    let linked = temp.path().join("linked");
+    fs::create_dir(&primary).expect("create primary worktree");
+    run_git(&primary, &["init", "-b", "main"]);
+    fs::write(primary.join("README.md"), "# Exo b.3.7 proof\n").expect("write proof readme");
+    run_git(&primary, &["add", "."]);
+    run_git(
+        &primary,
+        &[
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo@example.invalid",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    run_git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "b37-linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+    let config = r#"[project]
+name = "exo-b37-proof"
+
+[services.workbench]
+type = "published"
+
+[services.workbench.health_check]
+type = "http"
+path = "/api/health"
+interval = 1
+timeout = 1
+"#;
+    fs::write(primary.join("locald.toml"), config).expect("write primary locald config");
+    fs::write(linked.join("locald.toml"), config).expect("write linked locald config");
+
+    let sandbox = TestLocaldSandbox::new(temp.path());
+    let mut daemon = sandbox.spawn();
+    sandbox.wait_until_active(&mut daemon);
+
+    let project = Arc::new(Project::resolve(&primary).expect("resolve proof project"));
+    fs::create_dir_all(
+        project
+            .db_path()
+            .parent()
+            .expect("proof database has a parent"),
+    )
+    .expect("create proof project state root");
+    drop(SqliteWriter::open(project.db_path()).expect("initialize proof project database"));
+    let manager = test_manager_with_identity(project, "b37-publication-proof");
+    let provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
+        sandbox.context(),
+    ));
+    manager.set_entry_provider(provider.clone());
+
+    let first = launch_eventually(&manager, &primary).await;
+    let second = launch_eventually(&manager, &linked).await;
+    assert_eq!(first.launch_mode, WorkbenchLaunchMode::Published);
+    assert_eq!(second.launch_mode, WorkbenchLaunchMode::Published);
+    assert!(!first.reused_host);
+    assert!(second.reused_host);
+    let first_origin = canonical_origin(&first).to_owned();
+    let second_origin = canonical_origin(&second).to_owned();
+    assert_ne!(first_origin, second_origin);
+    for origin in [&first_origin, &second_origin] {
+        assert!(origin.starts_with("https://workbench"));
+        assert!(origin.contains(".localhost"));
+        assert!(
+            !origin.contains("127.0.0.1"),
+            "published workbench origin must not expose the private listener: {origin}"
+        );
+    }
+    let (listener_generation, first_project_instance, second_project_instance) = {
+        let state = manager.inner.state.lock().expect("workbench state");
+        let listener_generation = state.host.as_ref().expect("shared host").generation;
+        let first_binding = state
+            .origin_bindings
+            .get(&first_origin)
+            .expect("first published binding");
+        let second_binding = state
+            .origin_bindings
+            .get(&second_origin)
+            .expect("second published binding");
+        (
+            listener_generation,
+            first_binding
+                .project_instance_id
+                .clone()
+                .expect("first project instance"),
+            second_binding
+                .project_instance_id
+                .clone()
+                .expect("second project instance"),
+        )
+    };
+    assert_ne!(first_project_instance, second_project_instance);
+    assert_eq!(provider.publication_count(), 2);
+    assert!(provider.all_on_listener_generation(listener_generation));
+
+    sandbox.stop(&mut daemon);
+    daemon = sandbox.spawn();
+    sandbox.wait_until_active(&mut daemon);
+
+    let recovered_first = launch_eventually(&manager, &primary).await;
+    let recovered_second = launch_eventually(&manager, &linked).await;
+    assert_eq!(canonical_origin(&recovered_first), first_origin);
+    assert_eq!(canonical_origin(&recovered_second), second_origin);
+    assert!(recovered_first.reused_host);
+    assert!(recovered_second.reused_host);
+    assert_eq!(provider.publication_count(), 2);
+    assert!(provider.all_on_listener_generation(listener_generation));
+
+    manager.shutdown().await;
+    assert_eq!(provider.publication_count(), 0);
+    sandbox.stop(&mut daemon);
 }
 
 fn test_manager_with_identity(
@@ -687,7 +1101,7 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
         },
     );
 
-    assert!(retain_project_workspace_limit(&mut state, &current_key));
+    assert!(!retain_project_workspace_limit(&mut state, &current_key).is_empty());
     assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
     assert_eq!(state.workspaces_by_root.len(), MAX_PROJECT_WORKSPACES);
     assert!(state.workspaces_by_key.contains_key(&current_key));
@@ -950,6 +1364,8 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     let manager = test_manager(Arc::clone(&fixture.project));
     let first = manager.launch(&fixture.root).expect("launch workbench");
     let (origin, ticket) = launch_parts(&first);
+    assert_eq!(first.schema_version, 2);
+    assert_eq!(first.launch_mode, WorkbenchLaunchMode::DirectLoopback);
     assert_eq!(first.expires_in_seconds, 3_600);
     let payload = ticket_payload(ticket);
     assert_eq!(payload.expires_at - payload.issued_at, 3_600);
@@ -1017,6 +1433,49 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         !inactive_record.server_task_alive,
         "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn unexpected_host_stop_reuses_listener_and_rebinds_publications() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let first = manager
+        .launch(&fixture.root)
+        .expect("launch initial published workbench");
+    let private_origin = manager.host_status().expect("initial host status").origin;
+    let (generation, task) = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let host = state.host.as_mut().expect("bound workbench host");
+        (
+            host.generation,
+            host.task.take().expect("running workbench server task"),
+        )
+    };
+    task.abort();
+    let _ = task.await;
+    manager
+        .inner
+        .server_stopped(generation, Some("injected server stop".to_string()));
+
+    let restarted = manager
+        .launch(&fixture.root)
+        .expect("restart published workbench on retained listener");
+    assert_eq!(launch_parts(&restarted).0, launch_parts(&first).0);
+    assert_eq!(
+        manager.host_status().expect("restarted host status").origin,
+        private_origin,
+        "an unexpected stop must retain the exact private listener origin"
+    );
+    assert!(
+        provider.rebinds.load(Ordering::Acquire) >= 2,
+        "initial start and restart must both rebind the published authority"
+    );
+
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]

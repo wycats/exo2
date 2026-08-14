@@ -1,4 +1,5 @@
 use crate::api::protocol::{Reminder, ReminderSeverity};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::rfc;
 use anyhow::Context;
 use gray_matter::{Matter, engine::YAML};
@@ -214,7 +215,7 @@ fn git_untracked_paths(root: &Path) -> anyhow::Result<Vec<String>> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .context("Failed to run git status --porcelain")?;
 
     if !output.status.success() {

@@ -1,4 +1,5 @@
 use crate::github::remote::ParsedGithubRemote;
+use crate::process_spawn::CommandSpawnExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
 
@@ -679,7 +680,7 @@ struct StdGhProcess;
 
 impl GhProcess for StdGhProcess {
     fn output(&self, args: &[&str]) -> std::io::Result<Output> {
-        ProcessCommand::new("gh").args(args).output()
+        ProcessCommand::new("gh").args(args).output_guarded()
     }
 }
 

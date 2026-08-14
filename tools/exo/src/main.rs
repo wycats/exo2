@@ -26,6 +26,7 @@ use exo::api::protocol::{
 use exo::command::run::TASK_DIRECT_MODE_ENV;
 use exo::command::transport::{CliTransport, ticket_for_exec_call};
 use exo::failure::ExoFailure;
+use exo::process_spawn::CommandSpawnExt as _;
 use exo::project::Project;
 use exo::{command, context::AgentContext};
 use serde::Deserialize;
@@ -2293,7 +2294,7 @@ fn run_exohook_validate(
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
-    let status = cmd.status()?;
+    let status = cmd.status_guarded()?;
     if status.success() {
         Ok(RunOutcome::Human)
     } else {

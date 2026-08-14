@@ -1,3 +1,4 @@
+use crate::process_spawn::CommandSpawnExt as _;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -93,7 +94,7 @@ fn git_merge_file(current: &Path, base: &Path, other: &Path) -> Result<String> {
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("other path was not utf8"))?,
         ])
-        .output()
+        .output_guarded()
         .context("Failed to execute git merge-file")?;
 
     // git merge-file returns:

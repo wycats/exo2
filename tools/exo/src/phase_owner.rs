@@ -8,6 +8,7 @@ use crate::api::protocol::ErrorCode;
 use crate::context::sqlite_loader::PhaseOwnerData;
 use crate::context::{SqliteLoader, SqliteWriter};
 use crate::failure::ExoFailure;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::Project;
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::{Context, Result};
@@ -487,7 +488,7 @@ fn worktree_index(repo_root: &Path) -> Option<HashMap<PathBuf, bool>> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -526,7 +527,7 @@ fn local_branch_names(repo_root: &Path) -> Option<HashSet<String>> {
     let output = Command::new("git")
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
         .current_dir(repo_root)
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return Some(HashSet::new());
@@ -570,7 +571,7 @@ fn current_branch(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;

@@ -15,6 +15,7 @@ use crate::api::protocol::{Effect, ErrorCode};
 use crate::context::SqliteLoader;
 use crate::daemon_transport::DaemonEndpoint;
 use crate::failure::ExoFailure;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{
     Project, ProjectCatalog, ProjectCatalogDiagnostic, ProjectCatalogEntry,
     ProjectPolicyRepairApply, ProjectPolicyRepairPlan, ProjectResolver,
@@ -580,7 +581,7 @@ fn workspace_belongs_to_project(
     let is_git_checkout = ProcessCommand::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .ok()
         .is_some_and(|output| output.status.success());
     if !is_git_checkout {
@@ -645,7 +646,7 @@ fn workspace_git_dirty(root: &Path) -> bool {
     ProcessCommand::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .ok()
         .filter(|output| output.status.success())
         .is_some_and(|output| !output.stdout.is_empty())
@@ -1996,7 +1997,7 @@ fn process_is_defunct(pid: u32) -> bool {
 fn process_is_defunct(pid: u32) -> bool {
     let Ok(output) = ProcessCommand::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
+        .output_guarded()
     else {
         return false;
     };
@@ -2045,7 +2046,7 @@ fn process_liveness(pid: u32) -> MoveRootProcessLiveness {
         let filter = format!("PID eq {pid}");
         let output = match ProcessCommand::new("tasklist")
             .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-            .output()
+            .output_guarded()
         {
             Ok(output) => output,
             Err(_) => return MoveRootProcessLiveness::Unknown,

@@ -8,6 +8,7 @@
 use super::traits::{Command, CommandBox, CommandContext, CommandOutput, OutputFormat};
 use crate::api::protocol::Effect;
 use crate::context::{AgentContext, SqliteLoader};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, StatePolicy};
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::{Context as _, Result as ExoResult};
@@ -132,7 +133,7 @@ impl Command for ContextRestore {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&agent_ctx.root)
-                .output()
+                .output_guarded()
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         };

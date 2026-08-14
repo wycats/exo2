@@ -1,4 +1,5 @@
 use crate::ExoResult;
+use crate::process_spawn::CommandSpawnExt as _;
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1383,7 +1384,7 @@ fn ensure_sidecar_root_git_repo(root: &Path) -> ExoResult<bool> {
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to run git init in {}", root.display()))?;
     if !output.status.success() {
         return Err(git_command_error(root, "git init", &output));
@@ -1804,7 +1805,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> ExoResult<Output> {
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to run git in {}", cwd.display()))
 }
 
@@ -1835,7 +1836,7 @@ mod tests {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .output_guarded()
             .unwrap();
 
         assert!(
@@ -1873,7 +1874,7 @@ mod tests {
         let output = Command::new("git")
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(cwd)
-            .output()
+            .output_guarded()
             .unwrap();
         assert!(output.status.success());
         PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())

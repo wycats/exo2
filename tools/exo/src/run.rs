@@ -1,3 +1,4 @@
+use crate::process_spawn::CommandSpawnExt as _;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -90,7 +91,7 @@ pub fn run_task(root: &Path, task_name: &str) -> Result<()> {
         .arg("-c")
         .arg(&task.cmd)
         .current_dir(cwd)
-        .status()
+        .status_guarded()
         .with_context(|| format!("Failed to execute command: {}", task.cmd))?;
 
     if !status.success() {

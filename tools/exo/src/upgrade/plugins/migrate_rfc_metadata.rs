@@ -8,6 +8,7 @@
 
 use crate::ExoResult;
 use crate::context::{AgentContext, SqliteWriter};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::rfc::{
     backfill_rfc_lifecycle_metadata_content, extract_anchor_ulid, extract_h1_title,
     extract_rfc_relationships, has_anchor, parse_rfc_number, parse_slug, parse_stage, parse_status,
@@ -175,7 +176,7 @@ fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
             Command::new("git")
                 .args(["rev-parse", "--verify", "--quiet", history_ref])
                 .current_dir(root)
-                .output()
+                .output_guarded()
                 .is_ok_and(|output| output.status.success())
         })
         .collect::<Vec<_>>();
@@ -192,7 +193,7 @@ fn historical_retired_stages(root: &Path) -> HashMap<String, u8> {
         "--",
         RFCS_DIR,
     ]);
-    let Ok(output) = command.current_dir(root).output() else {
+    let Ok(output) = command.current_dir(root).output_guarded() else {
         return HashMap::new();
     };
     if !output.status.success() {
@@ -267,7 +268,7 @@ fn git_worktree_mode(root: &Path) -> GitWorktreeMode {
     let Ok(worktree_probe) = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
-        .output()
+        .output_guarded()
     else {
         return GitWorktreeMode::Unavailable;
     };
@@ -300,7 +301,7 @@ fn document_matches_canonical(
     let tracked = Command::new("git")
         .args(["cat-file", "-e", &canonical_path])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .is_ok_and(|output| output.status.success());
     if !tracked {
         return false;
@@ -309,7 +310,7 @@ fn document_matches_canonical(
     Command::new("git")
         .args(["diff", "--quiet", canonical_oid, "--", &relative_path])
         .current_dir(root)
-        .status()
+        .status_guarded()
         .is_ok_and(|status| status.success())
 }
 
@@ -810,7 +811,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -821,7 +822,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -861,7 +862,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -878,7 +879,7 @@ mod tests {
             Command::new("git")
                 .args(["commit", "-qam", "branch RFC"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -899,7 +900,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--bare", "-q"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1040,7 +1041,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1101,7 +1102,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1175,7 +1176,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1250,7 +1251,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1296,7 +1297,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1305,7 +1306,7 @@ mod tests {
             Command::new("git")
                 .args(["update-ref", "refs/remotes/private-history/HEAD", "HEAD"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1317,7 +1318,7 @@ mod tests {
                     "docs/rfcs/withdrawn/00001-retired-before-rename.md",
                 ])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1326,7 +1327,7 @@ mod tests {
             Command::new("git")
                 .args(["commit", "-qm", "withdraw RFC"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1338,7 +1339,7 @@ mod tests {
                     "docs/rfcs/withdrawn/00001-retired.md",
                 ])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1346,7 +1347,7 @@ mod tests {
             Command::new("git")
                 .args(["commit", "-qm", "rename retired RFC"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1354,7 +1355,7 @@ mod tests {
             Command::new("git")
                 .args(["update-ref", "refs/remotes/origin/HEAD", "HEAD"])
                 .current_dir(root)
-                .status()
+                .status_guarded()
                 .unwrap()
                 .success()
         );
@@ -1484,7 +1485,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1496,7 +1497,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );
@@ -1590,7 +1591,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(root)
-                    .status()
+                    .status_guarded()
                     .unwrap()
                     .success()
             );

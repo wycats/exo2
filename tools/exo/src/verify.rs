@@ -3,6 +3,7 @@ use crate::api::protocol::ErrorCode;
 use crate::cli_quote::shell_quote_arg;
 use crate::command_reference::ExoCommandReference;
 use crate::failure::ExoFailure;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::Context;
 use serde::Serialize;
@@ -139,7 +140,7 @@ pub fn run_verify(root: &Path, json_mode: bool) -> ExoResult<VerifyReport> {
         let mut cmd = runner.command(root);
 
         let output = cmd
-            .output()
+            .output_guarded()
             .context(format!("Failed to execute {}", runner.name))?;
 
         if !output.status.success() {
@@ -155,7 +156,7 @@ pub fn run_verify(root: &Path, json_mode: bool) -> ExoResult<VerifyReport> {
     let mut cmd = runner.command(root);
 
     let status = cmd
-        .status()
+        .status_guarded()
         .context(format!("Failed to execute {}", runner.name))?;
 
     if !status.success() {
@@ -284,7 +285,7 @@ fn command_succeeds(root: &Path, program: &str, args: &[&str]) -> bool {
         .current_dir(root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_guarded()
         .is_ok_and(|s| s.success())
 }
 

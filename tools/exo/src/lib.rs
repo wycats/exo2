@@ -88,6 +88,8 @@ pub(crate) mod phase_owner;
 pub(crate) mod plan;
 pub mod post_write;
 pub mod preload_guidance;
+#[doc(hidden)]
+pub mod process_spawn;
 pub mod project;
 pub mod rfc;
 pub mod router;

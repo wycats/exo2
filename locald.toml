@@ -1,0 +1,9 @@
+[project]
+name = "exo2"
+
+[services.workbench]
+type = "published"
+
+[services.workbench.health_check]
+type = "http"
+path = "/api/health"

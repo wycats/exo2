@@ -234,13 +234,14 @@ fn sidecar_runtime_lock_path(project: &Project) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_spawn::CommandSpawnExt as _;
     use crate::project::{ProjectId, SidecarAutoPushPolicy};
 
     fn git_init(root: &Path) {
         let output = std::process::Command::new("git")
             .args(["init"])
             .current_dir(root)
-            .output()
+            .output_guarded()
             .expect("run git init");
         assert!(
             output.status.success(),
@@ -253,7 +254,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
             .current_dir(root)
-            .output()
+            .output_guarded()
             .expect("run git status");
         assert!(
             output.status.success(),

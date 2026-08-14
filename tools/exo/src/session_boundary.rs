@@ -14,6 +14,7 @@
 //! - Session → plan-aware reorientation ("where were we?")
 //! - Compaction → minimal reorientation ("hold the plan, keep going")
 
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::world_state::WorldState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -193,7 +194,7 @@ fn has_recent_git_commit(root: &Path, minutes: u64) -> bool {
     let output = Command::new("git")
         .args(["log", "-1", "--format=%ct"])
         .current_dir(root)
-        .output();
+        .output_guarded();
 
     let Ok(output) = output else {
         return false;

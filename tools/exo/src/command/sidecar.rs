@@ -23,6 +23,7 @@ use crate::github::registry::{
     SidecarRegistryProposal, SidecarRegistryResolution, resolve_sidecar_registry,
 };
 use crate::github::remote::{ParsedGithubRemote, parse_github_remote};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{
     Project, ProjectResolver, SidecarAutoPushPolicy, SidecarLinkOptions, StatePolicy,
     init_sidecar_with_resolver, link_sidecar_with_options_and_resolver,
@@ -603,7 +604,7 @@ fn clone_discovered_sidecar_remote(sidecar_root: &Path, discovered_remote: &str)
         .arg(sidecar_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .output_guarded()
         .with_context(|| {
             format!("Failed to run git clone for discovered sidecar remote '{discovered_remote}'")
         })?;
@@ -2261,14 +2262,14 @@ fn create_github_repo_if_missing(owner: &str, repo: &str) -> ExoResult<()> {
     let repo_ref = format!("{owner}/{repo}");
     let view = ProcessCommand::new("gh")
         .args(["repo", "view", &repo_ref])
-        .output()?;
+        .output_guarded()?;
     if view.status.success() {
         return Ok(());
     }
 
     let create = ProcessCommand::new("gh")
         .args(["repo", "create", &repo_ref, "--private", "--confirm"])
-        .output()?;
+        .output_guarded()?;
     if create.status.success() {
         return Ok(());
     }
@@ -2285,7 +2286,7 @@ fn upsert_github_profile_registry(profile_owner: &str, registry_entry: &str) -> 
             "api",
             &format!("repos/{repo_ref}/contents/.exosuit/sidecars.toml"),
         ])
-        .output()?;
+        .output_guarded()?;
 
     let (mut registry, sha) = if content.status.success() {
         let metadata: serde_json::Value = serde_json::from_slice(&content.stdout)?;
@@ -2296,7 +2297,7 @@ fn upsert_github_profile_registry(profile_owner: &str, registry_entry: &str) -> 
                 "Accept: application/vnd.github.raw",
                 &format!("repos/{repo_ref}/contents/.exosuit/sidecars.toml"),
             ])
-            .output()?;
+            .output_guarded()?;
         if !download.status.success() {
             anyhow::bail!(
                 "failed to read existing GitHub profile sidecar registry: {}",
@@ -2346,7 +2347,7 @@ fn upsert_github_profile_registry(profile_owner: &str, registry_entry: &str) -> 
             "--input",
             &temp.to_string_lossy(),
         ])
-        .output()?;
+        .output_guarded()?;
     let _ = std::fs::remove_file(&temp);
     if put.status.success() {
         return Ok(true);
@@ -5734,7 +5735,7 @@ fn process_is_defunct(pid: u32) -> bool {
 fn process_is_defunct(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
+        .output_guarded()
     else {
         return false;
     };
@@ -5785,7 +5786,7 @@ fn process_start_identity(pid: u32) -> ExoResult<String> {
     }
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
+        .output_guarded()
         .with_context(|| {
             format!(
                 "failed to resolve process start identity for sidecar write owner process {pid}"
@@ -5847,7 +5848,7 @@ fn process_liveness(pid: u32) -> ProcessLiveness {
     }
     let output = match ProcessCommand::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
+        .output_guarded()
     {
         Ok(output) => output,
         Err(_) => return ProcessLiveness::Unknown,
@@ -6155,7 +6156,7 @@ fn run_git(root: &Path, args: &[&str]) -> ExoResult<Output> {
     ProcessCommand::new("git")
         .args(args)
         .current_dir(root)
-        .output()
+        .output_guarded()
         .map_err(Into::into)
 }
 
@@ -6247,7 +6248,7 @@ mod tests {
     fn process_liveness_treats_unreaped_child_as_dead() {
         let mut child = ProcessCommand::new("sh")
             .args(["-c", "exit 0"])
-            .spawn()
+            .spawn_guarded()
             .expect("spawn exiting child");
         let pid = child.id();
 
@@ -6526,7 +6527,7 @@ mod remote_order_tests {
         let output = ProcessCommand::new("git")
             .args(args)
             .current_dir(root)
-            .output()
+            .output_guarded()
             .expect("run git");
         assert!(
             output.status.success(),

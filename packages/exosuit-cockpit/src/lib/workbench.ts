@@ -1,7 +1,8 @@
 export interface WorkbenchLaunchResult {
   kind: "workbench.launch";
   ok: true;
-  schema_version: 1;
+  schema_version: 2;
+  launch_mode: "direct_loopback" | "published";
   url: string;
   expires_at: string;
   expires_in_seconds: 3600;

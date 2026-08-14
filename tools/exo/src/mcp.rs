@@ -1,3 +1,4 @@
+use crate::process_spawn::CommandSpawnExt as _;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -248,14 +249,12 @@ fn response_for_line(
 
 #[cfg(unix)]
 fn reexec_mcp_with_replay(line: &str) -> Result<std::convert::Infallible, std::io::Error> {
-    use std::os::unix::process::CommandExt;
-
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let error = std::process::Command::new(exe)
         .args(args)
         .env("EXO_MCP_REPLAY_LINE", line)
-        .exec();
+        .exec_guarded();
     Err(error)
 }
 

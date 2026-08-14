@@ -1599,6 +1599,7 @@ pub(crate) fn import_sql_dumps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_spawn::CommandSpawnExt as _;
     use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::process::{Child, Command, Stdio};
@@ -1624,7 +1625,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
+                .spawn_guarded()
                 .expect("spawn lock-order helper process");
             Self(Some(child))
         }

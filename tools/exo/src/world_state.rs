@@ -2,6 +2,7 @@ use crate::ExoResult;
 use crate::command::sidecar::SidecarRepoSyncStatus;
 use crate::context::rfc::{self, RfcIndexEntry};
 use crate::context::{ActivePhaseData, AgentContext, Goal};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::task;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -375,7 +376,7 @@ fn git_status_porcelain(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
-        .output()
+        .output_guarded()
         .ok()?;
 
     if !output.status.success() {
