@@ -659,8 +659,9 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         .arg(root)
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output_guarded()
+        .output_with_configured_stdio_guarded()
         .ok()?;
     output
         .status

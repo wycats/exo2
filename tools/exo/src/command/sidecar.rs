@@ -604,7 +604,7 @@ fn clone_discovered_sidecar_remote(sidecar_root: &Path, discovered_remote: &str)
         .arg(sidecar_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output_guarded()
+        .output_with_configured_stdio_guarded()
         .with_context(|| {
             format!("Failed to run git clone for discovered sidecar remote '{discovered_remote}'")
         })?;

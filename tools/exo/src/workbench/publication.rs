@@ -26,6 +26,14 @@ struct PublicationKey {
     project_instance_id: String,
 }
 
+impl PublicationKey {
+    fn conflicts_with(&self, replacement: &Self) -> bool {
+        self != replacement
+            && (self.workspace_key == replacement.workspace_key
+                || self.project_instance_id == replacement.project_instance_id)
+    }
+}
+
 pub(super) struct LocaldWorkbenchEntryProvider {
     client: PublisherClient,
     sandbox: Option<SandboxPublisherContext>,
@@ -110,15 +118,13 @@ impl LocaldWorkbenchEntryProvider {
         })
     }
 
-    fn remove_other_workspace_instances(&self, key: &PublicationKey) {
+    fn remove_conflicting_publications(&self, key: &PublicationKey) {
         let removed = {
             let Ok(mut publications) = self.publications.lock() else {
                 return;
             };
             publications
-                .extract_if(|candidate, _| {
-                    candidate.workspace_key == key.workspace_key && candidate != key
-                })
+                .extract_if(|candidate, _| candidate.conflicts_with(key))
                 .map(|(_, publication)| publication)
                 .collect::<Vec<_>>()
         };
@@ -207,7 +213,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             ensure_started()?;
             publication.ensure_listener(listener, listener_generation)?;
             publication.wait_ready()?;
-            self.remove_other_workspace_instances(&key);
+            self.remove_conflicting_publications(&key);
             return Ok(entry);
         }
 
@@ -272,7 +278,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             publication.stop_and_release();
             return Err(error);
         }
-        self.remove_other_workspace_instances(&publication.key);
+        self.remove_conflicting_publications(&publication.key);
         Ok(entry)
     }
 
@@ -338,8 +344,11 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             .lock()
             .map(|mut publications| publications.drain().map(|(_, value)| value).collect())
             .unwrap_or_default();
+        for publication in &publications {
+            publication.begin_stop();
+        }
         for publication in publications {
-            publication.stop_and_release();
+            publication.join_and_release();
         }
     }
 }
@@ -679,8 +688,11 @@ impl ManagedPublication {
         }
     }
 
-    fn stop_and_release(&self) {
+    fn begin_stop(&self) {
         self.lifecycle.begin_stop();
+    }
+
+    fn join_and_release(&self) {
         if let Ok(mut monitor) = self.monitor.lock()
             && let Some(handle) = monitor.take()
         {
@@ -695,6 +707,11 @@ impl ManagedPublication {
         if let Some(lease) = lease {
             drop(lease.release());
         }
+    }
+
+    fn stop_and_release(&self) {
+        self.begin_stop();
+        self.join_and_release();
     }
 }
 
@@ -780,6 +797,31 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use tempfile::TempDir;
+
+    fn publication_key(workspace_key: &str, project_instance_id: &str) -> PublicationKey {
+        PublicationKey {
+            workspace_key: workspace_key.to_string(),
+            project_instance_id: project_instance_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn publication_identity_conflicts_cover_workspace_replacement_and_worktree_moves() {
+        let original = publication_key("workspace-before-move", "stable-project-instance");
+        assert!(original.conflicts_with(&publication_key(
+            "workspace-after-move",
+            "stable-project-instance"
+        )));
+        assert!(original.conflicts_with(&publication_key(
+            "workspace-before-move",
+            "replacement-project-instance"
+        )));
+        assert!(!original.conflicts_with(&publication_key(
+            "sibling-workspace",
+            "sibling-project-instance"
+        )));
+        assert!(!original.conflicts_with(&original));
+    }
 
     #[test]
     fn publication_lifecycle_serializes_authority_changes_and_rechecks_stop() {

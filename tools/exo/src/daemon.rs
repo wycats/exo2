@@ -1450,7 +1450,7 @@ fn process_alive(pid: u32) -> bool {
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output_guarded()
+        .output_with_configured_stdio_guarded()
         .is_ok_and(|output| {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))

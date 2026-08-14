@@ -13,6 +13,9 @@ pub trait CommandSpawnExt {
     /// Run to completion with the same I/O behavior as [`Command::output`].
     fn output_guarded(&mut self) -> io::Result<Output>;
 
+    /// Run to completion while preserving the caller's configured stdout and stderr.
+    fn output_with_configured_stdio_guarded(&mut self) -> io::Result<Output>;
+
     /// Run to completion with the same I/O behavior as [`Command::status`].
     fn status_guarded(&mut self) -> io::Result<ExitStatus>;
 
@@ -37,6 +40,11 @@ impl CommandSpawnExt for Command {
         self.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.spawn_guarded()?.wait_with_output()
+    }
+
+    fn output_with_configured_stdio_guarded(&mut self) -> io::Result<Output> {
+        self.stdin(Stdio::null());
         self.spawn_guarded()?.wait_with_output()
     }
 
@@ -85,5 +93,19 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_output_preserves_explicit_stderr_configuration() {
+        let output = Command::new("sh")
+            .args(["-c", "printf stdout; printf stderr >&2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output_with_configured_stdio_guarded()
+            .expect("guarded output with configured stdio");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout");
+        assert!(output.stderr.is_empty());
     }
 }

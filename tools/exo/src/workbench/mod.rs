@@ -478,6 +478,21 @@ impl WorkbenchEntryBinding {
     const fn is_published(&self) -> bool {
         matches!(self.launch_mode, WorkbenchLaunchMode::Published)
     }
+
+    fn conflicts_with_transition(
+        &self,
+        workspace_key: &str,
+        replacement: &WorkbenchEntryBinding,
+    ) -> bool {
+        self.workspace_key.as_deref() == Some(workspace_key)
+            || self.canonical_origin == replacement.canonical_origin
+            || replacement
+                .project_instance_id
+                .as_ref()
+                .is_some_and(|project_instance_id| {
+                    self.project_instance_id.as_ref() == Some(project_instance_id)
+                })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1181,23 +1196,23 @@ impl WorkbenchHostManager {
             .listener()?
             .try_clone()
             .context("retain workbench publication listener")?;
-        let previous_workspace_bindings = {
-            let state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
-            state
-                .origin_bindings
-                .iter()
-                .filter(|(_, binding)| {
-                    binding.workspace_key.as_deref() == Some(workspace.key.as_str())
-                })
-                .map(|(origin, binding)| (origin.clone(), binding.clone()))
-                .collect::<Vec<_>>()
-        };
+        let mut entry_transition = None;
         let rebind_provider = Arc::clone(&entry_provider);
         let mut authorize = |entry: &WorkbenchEntryBinding| {
+            if entry_transition.is_none() {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+                let previous_bindings = state
+                    .origin_bindings
+                    .iter()
+                    .filter(|(_, binding)| binding.conflicts_with_transition(&workspace.key, entry))
+                    .map(|(origin, binding)| (origin.clone(), binding.clone()))
+                    .collect::<Vec<_>>();
+                entry_transition = Some((entry.clone(), previous_bindings));
+            }
             self.inner
                 .reconcile_published_workspace_move(&workspace, &entry)?;
             let mut state = self
@@ -1205,9 +1220,9 @@ impl WorkbenchHostManager {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
-            state.origin_bindings.retain(|_, existing| {
-                existing.workspace_key.as_deref() != Some(workspace.key.as_str())
-            });
+            state
+                .origin_bindings
+                .retain(|_, existing| !existing.conflicts_with_transition(&workspace.key, entry));
             state
                 .origin_bindings
                 .insert(entry.canonical_origin.clone(), entry.clone());
@@ -1231,11 +1246,13 @@ impl WorkbenchHostManager {
         ) {
             Ok(entry) => entry,
             Err(error) => {
-                if let Ok(mut state) = self.inner.state.lock() {
+                if let Some((replacement, previous_entry_bindings)) = entry_transition
+                    && let Ok(mut state) = self.inner.state.lock()
+                {
                     state.origin_bindings.retain(|_, existing| {
-                        existing.workspace_key.as_deref() != Some(workspace.key.as_str())
+                        !existing.conflicts_with_transition(&workspace.key, &replacement)
                     });
-                    state.origin_bindings.extend(previous_workspace_bindings);
+                    state.origin_bindings.extend(previous_entry_bindings);
                 }
                 return Err(error);
             }

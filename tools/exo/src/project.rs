@@ -1384,7 +1384,7 @@ fn ensure_sidecar_root_git_repo(root: &Path) -> ExoResult<bool> {
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output_guarded()
+        .output_with_configured_stdio_guarded()
         .with_context(|| format!("Failed to run git init in {}", root.display()))?;
     if !output.status.success() {
         return Err(git_command_error(root, "git init", &output));
@@ -1805,7 +1805,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> ExoResult<Output> {
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output_guarded()
+        .output_with_configured_stdio_guarded()
         .with_context(|| format!("Failed to run git in {}", cwd.display()))
 }
 
@@ -1836,7 +1836,7 @@ mod tests {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output_guarded()
+            .output_with_configured_stdio_guarded()
             .unwrap();
 
         assert!(

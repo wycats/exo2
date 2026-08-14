@@ -434,6 +434,31 @@ impl WorkbenchEntryProvider for TestMovedPublishedEntryProvider {
     }
 }
 
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestFailingMovedPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestFailingMovedPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        _ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-stable-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        anyhow::bail!("injected moved-worktree publication failure")
+    }
+}
+
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restart() {
@@ -2746,6 +2771,76 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
         resumed_after_move.json()["workspace_key"],
         moved_workspace_key
     );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_moved_worktree_publication_restores_the_previous_origin_binding() {
+    let fixture = fixture();
+    let original = fixture._temp.path().join("binding-before-move");
+    let moved = fixture._temp.path().join("binding-after-move");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-binding-move",
+            original.to_str().expect("original linked path"),
+        ],
+    );
+    let original_root = original
+        .canonicalize()
+        .expect("canonical original worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let original_launch = manager
+        .launch(&original_root)
+        .expect("launch original published workbench");
+    let original_workspace_key = original_launch.workspace.key.clone();
+    let published_origin = launch_parts(&original_launch).0.to_string();
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().expect("original linked path"),
+            moved.to_str().expect("moved linked path"),
+        ],
+    );
+    let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    manager.set_entry_provider(Arc::new(TestFailingMovedPublishedEntryProvider));
+    let error = manager
+        .launch(&moved_root)
+        .expect_err("moved publication fails after temporary authorization");
+    assert!(
+        error
+            .to_string()
+            .contains("injected moved-worktree publication failure")
+    );
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    let restored = state
+        .origin_bindings
+        .get(&published_origin)
+        .expect("previous origin binding restored");
+    assert_eq!(
+        restored.workspace_key.as_deref(),
+        Some(original_workspace_key.as_str())
+    );
+    assert_eq!(
+        state
+            .origin_bindings
+            .values()
+            .filter(|binding| {
+                binding.project_instance_id.as_deref() == Some("locald-stable-project-instance")
+            })
+            .count(),
+        1
+    );
+    drop(state);
     manager.shutdown().await;
 }
 
