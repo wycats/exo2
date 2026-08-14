@@ -573,6 +573,15 @@ timeout = 1
     assert_eq!(provider.publication_count(), 2);
     assert!(provider.all_on_listener_generation(listener_generation));
 
+    provider.mark_publications_terminal_for_test();
+    assert_eq!(provider.failed_publication_count(), 2);
+    let reacquired_first = launch_eventually(&manager, &primary).await;
+    let reacquired_second = launch_eventually(&manager, &linked).await;
+    assert_eq!(canonical_origin(&reacquired_first), first_origin);
+    assert_eq!(canonical_origin(&reacquired_second), second_origin);
+    assert_eq!(provider.failed_publication_count(), 0);
+    assert_eq!(provider.publication_count(), 2);
+
     sandbox.stop(&mut daemon);
     daemon = sandbox.spawn();
     sandbox.wait_until_active(&mut daemon);

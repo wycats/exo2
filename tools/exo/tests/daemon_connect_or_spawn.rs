@@ -2554,6 +2554,13 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
         serde_json::json!({}),
     )
     .await;
+    let primary_launch_retry = send_machine_operation(
+        &primary,
+        "workbench-primary-launch",
+        &["workbench", "launch"],
+        serde_json::json!({}),
+    )
+    .await;
     let linked_launch = send_machine_operation(
         &linked,
         "workbench-linked-launch",
@@ -2608,8 +2615,14 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             .expect("workbench URL has fragment ticket")
     };
     let (origin, primary_ticket) = launch_parts(&primary_launch);
+    let (retry_origin, retry_ticket) = launch_parts(&primary_launch_retry);
     let (linked_origin, linked_ticket) = launch_parts(&linked_launch);
     assert_eq!(origin, linked_origin);
+    assert_eq!(origin, retry_origin);
+    assert_ne!(
+        primary_ticket, retry_ticket,
+        "a same-ID launch retry must regenerate daemon-local enrollment authority"
+    );
 
     let exchange = |ticket: String| {
         let origin = origin.clone();

@@ -14,7 +14,7 @@ fn mutable_command_unreachable(name: &str) -> ! {
 #[derive(Debug, Clone, exospec::ExoSpec)]
 #[exo(namespace = "workbench", description = "Local lane workbench commands")]
 pub enum WorkbenchCommands {
-    #[exo(effect = "write", description = "Launch the local lane workbench")]
+    #[exo(effect = "pure", description = "Launch the local lane workbench")]
     Launch,
 
     #[exo(
@@ -75,7 +75,7 @@ pub enum WorkbenchCommands {
 impl WorkbenchCommands {
     pub fn to_command_box(self, _root: &std::path::Path) -> anyhow::Result<CommandBox> {
         Ok(match self {
-            Self::Launch => CommandBox::mutable(WorkbenchLaunch),
+            Self::Launch => CommandBox::pure(WorkbenchLaunch),
             Self::Snapshot => CommandBox::pure(WorkbenchSnapshot),
             Self::Inspect { id } => CommandBox::pure(WorkbenchInspect::new(id)),
             Self::PairingList => CommandBox::pure(WorkbenchPairingList),
@@ -300,21 +300,7 @@ impl Command for WorkbenchLaunch {
         "launch"
     }
 
-    fn effect(&self) -> Effect {
-        Effect::Write
-    }
-
-    fn execute(&self, _ctx: &CommandContext<'_>) -> ExoResult<CommandOutput> {
-        mutable_command_unreachable("WorkbenchLaunch")
-    }
-
-    fn description(&self) -> &'static str {
-        "Launch the local lane workbench"
-    }
-}
-
-impl MutableCommand for WorkbenchLaunch {
-    fn execute_mut(&self, ctx: &mut MutableCommandContext<'_>) -> ExoResult<CommandOutput> {
+    fn execute(&self, ctx: &CommandContext<'_>) -> ExoResult<CommandOutput> {
         let services = ctx
             .runtime_services
             .ok_or_else(|| anyhow::Error::new(daemon_required_failure()))?;
@@ -328,6 +314,10 @@ impl MutableCommand for WorkbenchLaunch {
             result.workspace.label, result.url,
         );
         Ok(CommandOutput::new(result, message))
+    }
+
+    fn description(&self) -> &'static str {
+        "Launch the local lane workbench"
     }
 }
 
@@ -390,13 +380,13 @@ mod tests {
     }
 
     #[test]
-    fn launch_is_an_external_at_most_once_write() {
+    fn launch_is_a_replayable_runtime_operation() {
         let spec = CommandSpec::from_registry(&default_registry());
         let operation = spec
             .operation("workbench", "launch")
             .expect("registered workbench launch");
-        assert_eq!(operation.effect, Effect::Write);
-        assert_eq!(operation.recovery_class, RecoveryClass::ExternalAtMostOnce);
+        assert_eq!(operation.effect, Effect::Pure);
+        assert_eq!(operation.recovery_class, RecoveryClass::ReplayableRead);
     }
 
     #[test]
@@ -433,17 +423,8 @@ mod tests {
                 "workbench.daemon_required"
             );
         }
-        let mut mutable_context = MutableCommandContext {
-            root: Path::new("."),
-            project: None,
-            format: OutputFormat::Json,
-            agent_id: None,
-            workflow_confirmation: None,
-            input_content: None,
-            runtime_services: None,
-        };
         let error = WorkbenchLaunch
-            .execute_mut(&mut mutable_context)
+            .execute(&direct_context())
             .expect_err("direct launch must fail");
         let failure = error
             .downcast_ref::<ExoFailure>()

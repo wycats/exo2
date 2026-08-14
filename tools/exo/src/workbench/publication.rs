@@ -70,6 +70,27 @@ impl LocaldWorkbenchEntryProvider {
             .map_or(0, |publications| publications.len())
     }
 
+    #[cfg(test)]
+    pub(super) fn failed_publication_count(&self) -> usize {
+        self.publications.lock().map_or(0, |publications| {
+            publications
+                .values()
+                .filter(|publication| publication.requires_replacement().unwrap_or(true))
+                .count()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_publications_terminal_for_test(&self) {
+        if let Ok(publications) = self.publications.lock() {
+            for publication in publications.values() {
+                if let Ok(mut state) = publication.state.lock() {
+                    state.last_error = Some("injected terminal lease state".to_string());
+                }
+            }
+        }
+    }
+
     fn resolve_installation(&self) -> Result<Option<InstalledPublisher>> {
         if let Some(sandbox) = &self.sandbox {
             return probe_sandbox_publisher(sandbox).map(Some).map_err(|error| {
@@ -106,8 +127,25 @@ impl LocaldWorkbenchEntryProvider {
         }
     }
 
-    fn current_publication(&self, key: &PublicationKey) -> Option<Arc<ManagedPublication>> {
-        self.publications.lock().ok()?.get(key).map(Arc::clone)
+    fn current_publication(&self, key: &PublicationKey) -> Result<Option<Arc<ManagedPublication>>> {
+        let removed = {
+            let mut publications = self
+                .publications
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench publication registry is unavailable"))?;
+            let Some(publication) = publications.get(key) else {
+                return Ok(None);
+            };
+            if publication.requires_replacement()? {
+                publications.remove(key)
+            } else {
+                return Ok(Some(Arc::clone(publication)));
+            }
+        };
+        if let Some(publication) = removed {
+            publication.stop_and_release();
+        }
+        Ok(None)
     }
 
     fn insert_publication(&self, publication: Arc<ManagedPublication>) -> Result<()> {
@@ -163,7 +201,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             workspace_key: workspace.key.clone(),
             project_instance_id: project_instance_id.clone(),
         };
-        if let Some(publication) = self.current_publication(&key) {
+        if let Some(publication) = self.current_publication(&key)? {
             let entry = publication.entry()?;
             authorize(&entry)?;
             ensure_started()?;
@@ -398,6 +436,17 @@ impl ManagedPublication {
         }
         drop(state);
         Ok(self.entry.clone())
+    }
+
+    fn requires_replacement(&self) -> Result<bool> {
+        if self.lifecycle.is_stopping() {
+            return Ok(true);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench publication state is unavailable"))?;
+        Ok(state.lease.is_none() || state.last_error.is_some())
     }
 
     fn start_monitor(self: &Arc<Self>) -> Result<()> {
