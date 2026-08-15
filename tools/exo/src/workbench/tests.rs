@@ -1178,6 +1178,26 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
         },
     );
+    state.pairing_grants.insert(
+        "live-pairing".to_string(),
+        WorkbenchPairingGrantV1 {
+            selector: "live-pairing".to_string(),
+            credential_digest: session_credential_digest("pairing-secret"),
+            project_id: "project-fixture".to_string(),
+            workspace_key: "workspace-003".to_string(),
+            workspace_root: PathBuf::from("/tmp/exo-workbench-003"),
+            launch_mode: WorkbenchLaunchMode::Published,
+            project_instance_id: "project-instance".to_string(),
+            canonical_origin: "https://workbench.test.localhost".to_string(),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            created_at: now,
+            last_used_at: now,
+            idle_expires_at: now.saturating_add(PAIRING_IDLE_LIFETIME.as_secs()),
+            absolute_expires_at: now.saturating_add(PAIRING_ABSOLUTE_LIFETIME.as_secs()),
+            nickname: None,
+            revoked_at: None,
+        },
+    );
 
     assert!(!retain_project_workspace_limit(&mut state, &current_key).is_empty());
     assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
@@ -1186,8 +1206,9 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
     assert!(state.workspaces_by_key.contains_key("workspace-000"));
     assert!(state.workspaces_by_key.contains_key("workspace-001"));
     assert!(state.workspaces_by_key.contains_key("workspace-002"));
+    assert!(state.workspaces_by_key.contains_key("workspace-003"));
     assert!(state.workspaces_by_key.contains_key("workspace-127"));
-    assert!(!state.workspaces_by_key.contains_key("workspace-003"));
+    assert!(!state.workspaces_by_key.contains_key("workspace-004"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2837,7 +2858,36 @@ async fn failed_moved_worktree_publication_restores_the_previous_origin_binding(
         .launch(&original_root)
         .expect("launch original published workbench");
     let original_workspace_key = original_launch.workspace.key.clone();
-    let published_origin = launch_parts(&original_launch).0.to_string();
+    let (published_origin, ticket) = launch_parts(&original_launch);
+    let published_origin = published_origin.to_string();
+    let original_entry = WorkbenchEntryBinding::published(
+        published_origin.clone(),
+        "locald-stable-project-instance".to_string(),
+        original_workspace_key.clone(),
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll pairing before failed move");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"f".repeat(43),
+            &original_entry,
+        )
+        .expect("record pairing session before failed move");
+    let authorization_before_move: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store before failed move"),
+    )
+    .expect("decode authorization store before failed move");
 
     run_git(
         &fixture.root,
@@ -2879,6 +2929,12 @@ async fn failed_moved_worktree_publication_restores_the_previous_origin_binding(
         1
     );
     drop(state);
+    let authorization_after_failure: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store after failed move"),
+    )
+    .expect("decode authorization store after failed move");
+    assert_eq!(authorization_after_failure, authorization_before_move);
     manager.shutdown().await;
 }
 
@@ -2915,6 +2971,25 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
             &original_entry,
         )
         .expect("record original resume outcome");
+    let terminal_request_id = "t".repeat(43);
+    let mismatched_entry = WorkbenchEntryBinding::published(
+        "https://replacement-mismatch.test.localhost".to_string(),
+        "locald-stable-project-instance".to_string(),
+        launch.workspace.key.clone(),
+    )
+    .expect("mismatched published entry");
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &terminal_request_id,
+                &mismatched_entry,
+            )
+            .expect_err("record terminal resume outcome"),
+        PairingExchangeError::Invalid
+    );
 
     manager.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
     manager
@@ -2939,13 +3014,42 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
             session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
         })
     );
-    assert!(
+    assert_eq!(state.resume_outcomes.len(), 1);
+    assert_eq!(
         state
             .resume_outcomes
-            .keys()
-            .all(|key| key.pairing_selector != pairing_selector)
+            .get(&WorkbenchResumeOutcomeKey {
+                pairing_selector: pairing_selector.clone(),
+                request_id: terminal_request_id.clone(),
+            })
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
     );
     drop(state);
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &terminal_request_id,
+                &original_entry,
+            )
+            .expect_err("replacement replays terminal resume result"),
+        PairingExchangeError::Invalid
+    );
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &"u".repeat(43),
+                &original_entry,
+            )
+            .expect_err("replacement pairing rejects a new resume request"),
+        PairingExchangeError::Expired
+    );
 
     let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
         &fs::read(&manager.inner.authorization_store_path)
@@ -2964,11 +3068,12 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
             session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
         })
     );
-    assert!(
-        store
-            .resume_outcomes
-            .iter()
-            .all(|outcome| outcome.pairing_selector != pairing_selector)
+    assert_eq!(store.resume_outcomes.len(), 1);
+    assert_eq!(store.resume_outcomes[0].pairing_selector, pairing_selector);
+    assert_eq!(store.resume_outcomes[0].request_id, terminal_request_id);
+    assert_eq!(
+        store.resume_outcomes[0].terminal_error(),
+        Some(PairingExchangeError::Invalid)
     );
     manager.shutdown().await;
 }

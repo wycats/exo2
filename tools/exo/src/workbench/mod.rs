@@ -634,6 +634,13 @@ struct RestoredAuthorizationState {
     resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
 }
 
+struct WorkbenchAuthorizationRollback {
+    session_grants: HashMap<String, WorkbenchSessionGrantV1>,
+    sessions: HashMap<String, WorkbenchSession>,
+    pairing_grants: HashMap<String, WorkbenchPairingGrantV1>,
+    resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkbenchWorkspaceStoreEntryV1 {
     key: String,
@@ -1180,6 +1187,11 @@ impl WorkbenchHostManager {
             .host_launch_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let workspace = self.register_workspace(workspace_root)?;
         let entry_provider = self
             .inner
@@ -1211,10 +1223,16 @@ impl WorkbenchHostManager {
                     .filter(|(_, binding)| binding.conflicts_with_transition(&workspace.key, entry))
                     .map(|(origin, binding)| (origin.clone(), binding.clone()))
                     .collect::<Vec<_>>();
-                entry_transition = Some((entry.clone(), previous_bindings));
+                entry_transition = Some((entry.clone(), previous_bindings, None));
             }
-            self.inner
-                .reconcile_published_workspace_move(&workspace, &entry)?;
+            let rollback = self
+                .inner
+                .reconcile_published_workspace_move_locked(&workspace, entry)?;
+            if let Some((_, _, transition_rollback)) = entry_transition.as_mut()
+                && transition_rollback.is_none()
+            {
+                *transition_rollback = rollback;
+            }
             let mut state = self
                 .inner
                 .state
@@ -1246,13 +1264,24 @@ impl WorkbenchHostManager {
         ) {
             Ok(entry) => entry,
             Err(error) => {
-                if let Some((replacement, previous_entry_bindings)) = entry_transition
-                    && let Ok(mut state) = self.inner.state.lock()
+                if let Some((replacement, previous_entry_bindings, authorization_rollback)) =
+                    entry_transition
                 {
-                    state.origin_bindings.retain(|_, existing| {
-                        !existing.conflicts_with_transition(&workspace.key, &replacement)
-                    });
-                    state.origin_bindings.extend(previous_entry_bindings);
+                    if let Some(authorization_rollback) = authorization_rollback
+                        && let Err(rollback_error) = self
+                            .inner
+                            .restore_published_workspace_move_locked(authorization_rollback)
+                    {
+                        return Err(error.context(format!(
+                            "failed to restore prior workbench pairing authority: {rollback_error:#}"
+                        )));
+                    }
+                    if let Ok(mut state) = self.inner.state.lock() {
+                        state.origin_bindings.retain(|_, existing| {
+                            !existing.conflicts_with_transition(&workspace.key, &replacement)
+                        });
+                        state.origin_bindings.extend(previous_entry_bindings);
+                    }
                 }
                 return Err(error);
             }
@@ -2065,6 +2094,13 @@ fn retain_project_workspace_limit(
             .filter(|grant| grant.is_live(now))
             .map(|grant| grant.workspace_key.clone()),
     );
+    protected.extend(
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .map(|pairing| pairing.workspace_key.clone()),
+    );
     protected.retain(|key| state.workspaces_by_key.contains_key(key));
 
     let mut registrations = state
@@ -2358,22 +2394,18 @@ impl WorkbenchHostInner {
         Ok(result)
     }
 
-    fn reconcile_published_workspace_move(
+    fn reconcile_published_workspace_move_locked(
         &self,
         workspace: &WorkspaceRegistration,
         entry: &WorkbenchEntryBinding,
-    ) -> Result<()> {
+    ) -> Result<Option<WorkbenchAuthorizationRollback>> {
         if !entry.is_published() {
-            return Ok(());
+            return Ok(None);
         }
         let project_instance_id = entry
             .project_instance_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("published workbench entry has no project instance"))?;
-        let _gate = self
-            .authorization_store_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .state
             .lock()
@@ -2404,9 +2436,15 @@ impl WorkbenchHostInner {
             .map(|pairing| pairing.selector.clone())
             .collect::<HashSet<_>>();
         if moved_pairings.is_empty() && replaced_pairings.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
+        let rollback = WorkbenchAuthorizationRollback {
+            session_grants: state.session_grants.clone(),
+            sessions: state.sessions.clone(),
+            pairing_grants: state.pairing_grants.clone(),
+            resume_outcomes: state.resume_outcomes.clone(),
+        };
         let mut candidate_sessions = state.session_grants.clone();
         let mut candidate_pairings = state.pairing_grants.clone();
         let mut candidate_outcomes = state.resume_outcomes.clone();
@@ -2432,7 +2470,7 @@ impl WorkbenchHostInner {
         });
         candidate_outcomes.retain(|key, outcome| {
             (!moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal())
-                && !replaced_pairings.contains(&key.pairing_selector)
+                && (!replaced_pairings.contains(&key.pairing_selector) || outcome.is_terminal())
         });
         prune_retained_revoked_pairings(&mut candidate_pairings);
         retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
@@ -2457,6 +2495,29 @@ impl WorkbenchHostInner {
             binding.project_instance_id.as_deref() != Some(project_instance_id)
                 || binding.canonical_origin == entry.canonical_origin
         });
+        Ok(Some(rollback))
+    }
+
+    fn restore_published_workspace_move_locked(
+        &self,
+        rollback: WorkbenchAuthorizationRollback,
+    ) -> Result<()> {
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &rollback.session_grants,
+            &rollback.pairing_grants,
+            &rollback.resume_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .context("restore prior workbench pairing authority")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        state.session_grants = rollback.session_grants;
+        state.sessions = rollback.sessions;
+        state.pairing_grants = rollback.pairing_grants;
+        state.resume_outcomes = rollback.resume_outcomes;
         Ok(())
     }
 
