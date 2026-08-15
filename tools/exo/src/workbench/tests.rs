@@ -986,6 +986,35 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
         Some(phase.as_str())
     );
     let sibling_key = sibling.key.clone();
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let published_launch = manager
+        .launch(&sibling_root)
+        .expect("launch published sibling workbench");
+    assert_eq!(published_launch.workspace.key, sibling_key);
+    let (published_origin, published_ticket) = launch_parts(&published_launch);
+    let published_entry = WorkbenchEntryBinding::published(
+        published_origin.to_string(),
+        "locald-stable-project-instance".to_string(),
+        sibling_key.clone(),
+    )
+    .expect("published sibling entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(published_ticket, None, &published_entry)
+        .expect("enroll sibling pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"p".repeat(43),
+            &published_entry,
+        )
+        .expect("create pairing-derived sibling session");
     let serialized = serde_json::to_string(&snapshot).expect("serialize project snapshot");
     assert!(!serialized.contains(&current_root.display().to_string()));
     assert!(!serialized.contains(&sibling_root.display().to_string()));
@@ -1054,6 +1083,45 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
             .iter()
             .all(|workspace| workspace.key != sibling_key),
         "Git worktree removal ends workspace retention"
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some()),
+        "Git worktree removal revokes retained pairing authority"
+    );
+    assert!(
+        state
+            .session_grants
+            .values()
+            .all(|session| session.workspace_key != sibling_key)
+    );
+    assert!(
+        state
+            .sessions
+            .values()
+            .all(|session| session.workspace_key != sibling_key)
+    );
+    drop(state);
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read removed workspace authorization store"),
+    )
+    .expect("decode removed workspace authorization store");
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    assert!(
+        store
+            .sessions
+            .iter()
+            .all(|session| session.workspace_key != sibling_key)
     );
     manager.shutdown().await;
 }
@@ -1532,6 +1600,52 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         !inactive_record.server_task_alive,
         "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_ticket_redemption_waits_for_authorization_transition() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch direct workbench");
+    let ticket = launch_parts(&launch).1.to_string();
+    let gate = manager
+        .inner
+        .authorization_store_gate
+        .lock()
+        .expect("hold authorization transition");
+    let redeeming_manager = manager.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("report redemption start");
+        tx.send(redeeming_manager.inner.redeem_ticket(&ticket))
+            .expect("report ticket redemption");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("redemption worker starts");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "direct redemption must wait for the authorization transition"
+    );
+    drop(gate);
+    let (session_secret, session) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("ticket redemption resumes")
+        .expect("redeem direct ticket");
+    worker.join().expect("join ticket redemption worker");
+    assert!(
+        manager
+            .inner
+            .session(&session.session_key, &session_secret)
+            .is_some(),
+        "the serialized direct session remains usable"
+    );
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]

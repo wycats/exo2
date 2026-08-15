@@ -1735,6 +1735,11 @@ impl WorkbenchHostManager {
             }
         }
 
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .inner
             .state
@@ -1752,6 +1757,16 @@ impl WorkbenchHostManager {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            let missing_workspace_keys = removed
+                .iter()
+                .filter_map(|root| state.workspaces_by_root.get(root).cloned())
+                .collect::<Vec<_>>();
+            self.inner
+                .invalidate_removed_workspace_authorizations_locked(
+                    &mut state,
+                    &missing_workspace_keys,
+                    now,
+                )?;
             for root in removed {
                 if let Some(key) = state.workspaces_by_root.remove(&root) {
                     state.workspaces_by_key.remove(&key);
@@ -2318,6 +2333,10 @@ impl WorkbenchHostInner {
             return Err(TicketExchangeError::Invalid);
         }
         let now = unix_seconds();
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| TicketExchangeError::Unavailable)?;
         let mut state = self
             .state
             .lock()
@@ -2381,7 +2400,7 @@ impl WorkbenchHostInner {
             },
         );
         drop(state);
-        if self.persist_session_store().is_err() {
+        if self.persist_session_store_locked().is_err() {
             if let Ok(mut state) = self.state.lock() {
                 state.sessions.remove(&credential_digest);
                 state.session_grants.remove(&credential_digest);
@@ -3237,6 +3256,7 @@ impl WorkbenchHostInner {
         session_key: &str,
         credential_digest: &str,
     ) -> Option<WorkbenchSession> {
+        let _gate = self.authorization_store_gate.lock().ok()?;
         if !self.restore_session(session_key, credential_digest) {
             return None;
         }
@@ -3271,7 +3291,7 @@ impl WorkbenchHostInner {
             grant.last_activity = now;
         }
         drop(state);
-        if persist_activity && let Err(error) = self.persist_session_store() {
+        if persist_activity && let Err(error) = self.persist_session_store_locked() {
             eprintln!("exo daemon: failed to persist workbench session activity: {error}");
         }
         Some(session)
@@ -3294,6 +3314,10 @@ impl WorkbenchHostInner {
         }
         let now = unix_seconds();
         let expires_at = now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs());
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .state
             .lock()
@@ -3315,7 +3339,7 @@ impl WorkbenchHostInner {
             .session_grants
             .insert(session.id.clone(), WorkbenchSessionGrantV1::from(&renewed));
         drop(state);
-        self.persist_session_store()
+        self.persist_session_store_locked()
             .context("persist renewed workbench session")?;
         Ok(Some(WorkbenchSessionResult {
             kind: "workbench.session",
@@ -3515,6 +3539,10 @@ impl WorkbenchHostInner {
             .authorization_store_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench session store is unavailable"))?;
+        self.persist_session_store_locked()
+    }
+
+    fn persist_session_store_locked(&self) -> Result<()> {
         let store = {
             let state = self
                 .state
@@ -3524,6 +3552,75 @@ impl WorkbenchHostInner {
         };
         write_authorization_store(&self.authorization_store_path, &store)
             .with_context(|| format!("write {}", self.authorization_store_path.display()))
+    }
+
+    fn invalidate_removed_workspace_authorizations_locked(
+        &self,
+        state: &mut WorkbenchState,
+        workspace_keys: &[String],
+        now: u64,
+    ) -> Result<()> {
+        if workspace_keys.is_empty() {
+            return Ok(());
+        }
+        let removed = workspace_keys.iter().cloned().collect::<HashSet<_>>();
+        let pairing_selectors = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| removed.contains(&pairing.workspace_key))
+            .map(|pairing| pairing.selector.clone())
+            .collect::<HashSet<_>>();
+        let has_sessions = state
+            .session_grants
+            .values()
+            .any(|session| removed.contains(&session.workspace_key));
+        let has_live_pairings = pairing_selectors.iter().any(|selector| {
+            state
+                .pairing_grants
+                .get(selector)
+                .is_some_and(|pairing| pairing.revoked_at.is_none())
+        });
+        let has_nonterminal_outcomes = state.resume_outcomes.iter().any(|(key, outcome)| {
+            pairing_selectors.contains(&key.pairing_selector) && !outcome.is_terminal()
+        });
+        if !has_sessions && !has_live_pairings && !has_nonterminal_outcomes {
+            state
+                .sessions
+                .retain(|_, session| !removed.contains(&session.workspace_key));
+            return Ok(());
+        }
+
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_sessions.retain(|_, session| !removed.contains(&session.workspace_key));
+        for selector in &pairing_selectors {
+            candidate_pairings
+                .get_mut(selector)
+                .expect("removed workspace pairing exists")
+                .revoked_at
+                .get_or_insert(now);
+        }
+        candidate_outcomes.retain(|key, outcome| {
+            !pairing_selectors.contains(&key.pairing_selector) || outcome.is_terminal()
+        });
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .context("persist removed worktree authorization invalidation")?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state
+            .sessions
+            .retain(|_, session| !removed.contains(&session.workspace_key));
+        Ok(())
     }
 
     fn persist_workspace_store_if_due(&self, force: bool) -> Result<()> {
