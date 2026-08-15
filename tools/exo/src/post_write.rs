@@ -11,8 +11,22 @@ use anyhow::Result as ExoResult;
 use fs2::FileExt;
 use serde::Serialize;
 
+// These remain ledgered writes, but they mutate machine-local authorization
+// rather than project state.
+fn is_machine_local_authorization_mutation(namespace: &str, operation: &str) -> bool {
+    namespace == "workbench"
+        && matches!(
+            operation,
+            "pairing.revoke" | "pairing.forget" | "pairing.rename"
+        )
+}
+
 pub fn should_write_sql_dump(namespace: &str, operation: &str, effect: Effect) -> bool {
     if effect == Effect::Pure {
+        return false;
+    }
+
+    if is_machine_local_authorization_mutation(namespace, operation) {
         return false;
     }
 
@@ -66,8 +80,11 @@ pub fn should_auto_persist_after_command_event(
     event_logged && should_auto_persist_after_success(effect, namespace, operation, project)
 }
 
-pub fn should_log_command_event(namespace: &str, _operation: &str) -> bool {
-    namespace != "sidecar" && namespace != "dogfood" && namespace != "storage"
+pub fn should_log_command_event(namespace: &str, operation: &str) -> bool {
+    !is_machine_local_authorization_mutation(namespace, operation)
+        && namespace != "sidecar"
+        && namespace != "dogfood"
+        && namespace != "storage"
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,6 +417,64 @@ mod tests {
             Some(&project)
         ));
         assert!(!should_log_command_event("storage", "maintain"));
+    }
+
+    #[test]
+    fn pairing_management_skips_canonical_project_post_write_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let sidecar_root = temp.path().join("sidecar");
+        let project = sidecar_project(workspace, sidecar_root);
+
+        for operation in ["pairing.revoke", "pairing.forget", "pairing.rename"] {
+            assert!(!should_write_sql_dump(
+                "workbench",
+                operation,
+                Effect::Write
+            ));
+            assert!(!should_auto_persist_after_success(
+                Effect::Write,
+                "workbench",
+                operation,
+                Some(&project)
+            ));
+            assert!(!should_persist_after_success(
+                Some(&project),
+                "workbench",
+                operation,
+                Effect::Write
+            ));
+            assert!(!should_log_command_event("workbench", operation));
+            preflight_sidecar_post_write(Some(&project), "workbench", operation, Effect::Write)
+                .expect("machine-local pairing mutation skips sidecar ownership");
+        }
+    }
+
+    #[test]
+    fn other_workbench_writes_retain_canonical_project_post_write_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let sidecar_root = temp.path().join("sidecar");
+        let project = sidecar_project(workspace, sidecar_root);
+
+        assert!(should_write_sql_dump(
+            "workbench",
+            "task.update",
+            Effect::Write
+        ));
+        assert!(should_auto_persist_after_success(
+            Effect::Write,
+            "workbench",
+            "task.update",
+            Some(&project)
+        ));
+        assert!(should_persist_after_success(
+            Some(&project),
+            "workbench",
+            "task.update",
+            Effect::Write
+        ));
+        assert!(should_log_command_event("workbench", "task.update"));
     }
 
     #[test]
