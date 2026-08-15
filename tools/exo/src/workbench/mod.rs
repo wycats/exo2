@@ -1747,6 +1747,11 @@ impl WorkbenchHostManager {
             .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
         let mut changed = false;
         let mut removed_workspace_keys = Vec::new();
+        for workspace in discovered {
+            if insert_discovered_workspace(&mut state, workspace) {
+                changed = true;
+            }
+        }
         if let Some(index) = worktree_index.as_ref() {
             let removed = state
                 .workspaces_by_root
@@ -1756,6 +1761,15 @@ impl WorkbenchHostManager {
                         && !index.contains_key(*root)
                 })
                 .cloned()
+                .filter(|root| {
+                    state
+                        .workspaces_by_root
+                        .get(root)
+                        .and_then(|key| state.workspaces_by_key.get(key))
+                        .is_none_or(|workspace| {
+                            !workspace_has_plausible_move_successor(&state, index, workspace, now)
+                        })
+                })
                 .collect::<Vec<_>>();
             let missing_workspace_keys = removed
                 .iter()
@@ -1773,11 +1787,6 @@ impl WorkbenchHostManager {
                     removed_workspace_keys.push(key);
                     changed = true;
                 }
-            }
-        }
-        for workspace in discovered {
-            if insert_discovered_workspace(&mut state, workspace) {
-                changed = true;
             }
         }
         let evicted = retain_project_workspace_limit(&mut state, current_workspace_key);
@@ -2076,6 +2085,35 @@ fn insert_discovered_workspace(
         .workspaces_by_key
         .insert(workspace.key.clone(), workspace);
     true
+}
+
+fn workspace_has_plausible_move_successor(
+    state: &WorkbenchState,
+    worktree_index: &HashMap<PathBuf, bool>,
+    missing: &WorkspaceRegistration,
+    now: u64,
+) -> bool {
+    let has_live_pairing = state
+        .pairing_grants
+        .values()
+        .any(|pairing| pairing.workspace_key == missing.key && pairing.is_live(now));
+    has_live_pairing
+        && state.workspaces_by_key.values().any(|candidate| {
+            candidate.key != missing.key
+                && worktree_index.get(&candidate.root) == Some(&false)
+                && workspace_registrations_share_git_identity(missing, candidate)
+        })
+}
+
+fn workspace_registrations_share_git_identity(
+    previous: &WorkspaceRegistration,
+    candidate: &WorkspaceRegistration,
+) -> bool {
+    match (&previous.branch, &candidate.branch) {
+        (Some(previous), Some(candidate)) => previous == candidate,
+        (None, None) => previous.head.is_some() && previous.head == candidate.head,
+        _ => false,
+    }
 }
 
 fn retain_project_workspace_limit(

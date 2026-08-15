@@ -2883,6 +2883,11 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     let pairing_cookie = response_cookie(&enrollment, PAIRING_COOKIE_NAME)
         .expect("pairing cookie")
         .to_string();
+    let pairing_selector = pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("pairing selector")
+        .to_string();
     let first_resume = raw_http_via(
         &private_origin,
         published_host,
@@ -2906,6 +2911,33 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
         ],
     );
     let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    manager
+        .snapshot(&fixture.root)
+        .expect("sibling snapshot observes the moved worktree");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state after sibling snapshot")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_none()),
+        "Git move evidence must preserve pairing authority until authenticated launch"
+    );
+    let retained_store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store after sibling snapshot"),
+    )
+    .expect("decode authorization store after sibling snapshot");
+    assert!(
+        retained_store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_none()),
+        "move observation must not persist premature revocation"
+    );
     let moved_launch = manager
         .launch(&moved_root)
         .expect("authenticated launch after worktree move");
