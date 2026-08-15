@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 #[cfg(feature = "ui")]
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(feature = "ui")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -495,6 +495,60 @@ impl WorkbenchEntryProvider for TestReplacementPublishedEntryProvider {
         authorize(&entry)?;
         ensure_started()?;
         Ok(entry)
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct TestPublishedThenDirectEntryProvider {
+    direct: AtomicBool,
+    released_workspace_keys: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "ui")]
+impl TestPublishedThenDirectEntryProvider {
+    fn use_direct_entry(&self) {
+        self.direct.store(true, Ordering::Release);
+    }
+
+    fn released_workspace_keys(&self) -> Vec<String> {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .clone()
+    }
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestPublishedThenDirectEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        if self.direct.load(Ordering::Acquire) {
+            ensure_started()?;
+            return Ok(WorkbenchEntryBinding::direct(direct_origin.to_string()));
+        }
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-stable-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+
+    fn release_workspace(&self, workspace_key: &str) {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .push(workspace_key.to_string());
     }
 }
 
@@ -1115,7 +1169,11 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
             .pairings
             .iter()
             .find(|pairing| pairing.selector == pairing_selector)
-            .is_some_and(|pairing| pairing.revoked_at.is_some())
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
     );
     assert!(
         store
@@ -1264,6 +1322,7 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             absolute_expires_at: now.saturating_add(PAIRING_ABSOLUTE_LIFETIME.as_secs()),
             nickname: None,
             revoked_at: None,
+            revocation_cause: None,
         },
     );
 
@@ -2639,6 +2698,7 @@ fn retained_revoked_pairings_have_separate_project_and_workspace_bounds() {
             absolute_expires_at: now.saturating_add(200),
             nickname: None,
             revoked_at: None,
+            revocation_cause: None,
         },
     );
     for index in 0..(MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE + 3) {
@@ -2666,6 +2726,7 @@ fn retained_revoked_pairings_have_separate_project_and_workspace_bounds() {
                             .expect("fixture index fits u64"),
                     ),
                 ),
+                revocation_cause: Some(WorkbenchPairingRevocationCause::Explicit),
             },
         );
     }
@@ -2922,21 +2983,29 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
             .expect("workbench state after sibling snapshot")
             .pairing_grants
             .get(&pairing_selector)
-            .is_some_and(|pairing| pairing.revoked_at.is_none()),
-        "Git move evidence must preserve pairing authority until authenticated launch"
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            }),
+        "Git move evidence alone must not preserve pairing authority"
     );
-    let retained_store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+    let revoked_store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
         &fs::read(&manager.inner.authorization_store_path)
             .expect("read authorization store after sibling snapshot"),
     )
     .expect("decode authorization store after sibling snapshot");
     assert!(
-        retained_store
+        revoked_store
             .pairings
             .iter()
             .find(|pairing| pairing.selector == pairing_selector)
-            .is_some_and(|pairing| pairing.revoked_at.is_none()),
-        "move observation must not persist premature revocation"
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            }),
+        "missing workspace authority remains revoked until exact published-instance proof"
     );
     let moved_launch = manager
         .launch(&moved_root)
@@ -2951,6 +3020,8 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     assert_eq!(store.pairings.len(), 1);
     assert_eq!(store.pairings[0].workspace_key, moved_workspace_key);
     assert_eq!(store.pairings[0].workspace_root, moved_root);
+    assert!(store.pairings[0].revoked_at.is_none());
+    assert!(store.pairings[0].revocation_cause.is_none());
     assert!(store.resume_outcomes.is_empty());
     assert!(
         store
@@ -2975,6 +3046,272 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     assert_eq!(
         resumed_after_move.json()["workspace_key"],
         moved_workspace_key
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_launch_after_worktree_move_releases_stale_publication_authority() {
+    let fixture = fixture();
+    let original = fixture._temp.path().join("direct-before-move");
+    let moved = fixture._temp.path().join("direct-after-move");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-direct-move",
+            original.to_str().expect("original linked path"),
+        ],
+    );
+    let original_root = original
+        .canonicalize()
+        .expect("canonical original worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(TestPublishedThenDirectEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+    let published_launch = manager
+        .launch(&original_root)
+        .expect("launch original published workbench");
+    let original_workspace_key = published_launch.workspace.key.clone();
+    let (_, ticket) = launch_parts(&published_launch);
+    let payload = published_ticket_payload(ticket);
+    let published_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("published request entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &published_entry)
+        .expect("enroll original pairing");
+    let pairing_selector = enrollment
+        .pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("pairing selector")
+        .to_string();
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().expect("original linked path"),
+            moved.to_str().expect("moved linked path"),
+        ],
+    );
+    let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    provider.use_direct_entry();
+    let direct_launch = manager
+        .launch(&moved_root)
+        .expect("launch moved worktree through direct fallback");
+    assert_eq!(
+        direct_launch.launch_mode,
+        WorkbenchLaunchMode::DirectLoopback
+    );
+    assert_ne!(direct_launch.workspace.key, original_workspace_key);
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![original_workspace_key.clone()],
+        "direct fallback must release the stale published workspace"
+    );
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        !state
+            .workspaces_by_key
+            .contains_key(&original_workspace_key)
+    );
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .all(|binding| binding.workspace_key.as_deref() != Some(&original_workspace_key))
+    );
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
+    );
+    drop(state);
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_projection_samples_membership_after_authorization_coordination() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("projection-race-linked");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(TestPublishedThenDirectEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+    let current = manager
+        .register_workspace(&fixture.root)
+        .expect("register current workspace");
+    let linked_workspace_key = Mutex::new(None::<String>);
+
+    let projections = manager
+        .project_workspace_projections_with_before_authorization_gate(&current.key, || {
+            run_git(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "workbench-projection-race",
+                    linked.to_str().expect("linked worktree path"),
+                ],
+            );
+            let linked_root = linked.canonicalize().expect("canonical linked worktree");
+            let launch = manager
+                .launch(&linked_root)
+                .expect("publish linked worktree during projection coordination");
+            *linked_workspace_key.lock().expect("linked workspace key") =
+                Some(launch.workspace.key);
+        })
+        .expect("project workspaces after concurrent registration");
+    let linked_workspace_key = linked_workspace_key
+        .into_inner()
+        .expect("linked workspace key mutex")
+        .expect("linked workspace key recorded");
+
+    assert!(
+        projections
+            .iter()
+            .any(|workspace| workspace.registration.key == linked_workspace_key)
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(state.workspaces_by_key.contains_key(&linked_workspace_key));
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(&linked_workspace_key))
+    );
+    drop(state);
+    assert!(provider.released_workspace_keys().is_empty());
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_project_instance_cannot_leave_a_restorable_missing_workspace_pairing() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("replacement-after-removal");
+    let branch = "workbench-replacement-after-removal";
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            linked.to_str().expect("linked worktree path"),
+        ],
+    );
+    let linked_root = linked.canonicalize().expect("canonical linked worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let original_launch = manager
+        .launch(&linked_root)
+        .expect("launch original published workbench");
+    let (_, ticket) = launch_parts(&original_launch);
+    let payload = published_ticket_payload(ticket);
+    let original_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll original pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            linked.to_str().expect("linked worktree path"),
+        ],
+    );
+    manager
+        .snapshot(&fixture.root)
+        .expect("observe removed worktree");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revocation_cause == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
+    );
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("linked worktree path"),
+            branch,
+        ],
+    );
+    let replacement_root = linked
+        .canonicalize()
+        .expect("canonical replacement worktree");
+    manager.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    manager
+        .launch(&replacement_root)
+        .expect("launch replacement project instance");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause == Some(WorkbenchPairingRevocationCause::Replaced)
+            }),
+        "a different project instance makes the old pairing permanently replaced"
+    );
+
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    manager
+        .launch(&replacement_root)
+        .expect("relaunch original project instance identity");
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &"z".repeat(43),
+                &original_entry,
+            )
+            .expect_err("replaced pairing remains revoked"),
+        PairingExchangeError::Expired
     );
     manager.shutdown().await;
 }

@@ -580,6 +580,16 @@ struct WorkbenchPairingGrantV1 {
     nickname: Option<String>,
     #[serde(default)]
     revoked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation_cause: Option<WorkbenchPairingRevocationCause>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkbenchPairingRevocationCause {
+    Explicit,
+    Replaced,
+    WorkspaceMissing,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1290,6 +1300,7 @@ impl WorkbenchHostManager {
             self.retire_replaced_hosts();
         }
         if !entry.is_published() {
+            let removed_workspace_keys = self.reconcile_direct_workspace_move_locked(&workspace)?;
             let mut state = self
                 .inner
                 .state
@@ -1298,6 +1309,8 @@ impl WorkbenchHostManager {
             state.origin_bindings.retain(|_, existing| {
                 existing.workspace_key.as_deref() != Some(workspace.key.as_str())
             });
+            drop(state);
+            self.release_workspace_publications(&removed_workspace_keys);
         }
         let issued_at = unix_seconds();
         let expires_at = issued_at.saturating_add(TICKET_LIFETIME.as_secs());
@@ -1563,6 +1576,60 @@ impl WorkbenchHostManager {
         }
     }
 
+    fn reconcile_direct_workspace_move_locked(
+        &self,
+        workspace: &WorkspaceRegistration,
+    ) -> Result<Vec<String>> {
+        let Some(worktree_index) = self.inner.project.worktree_index() else {
+            return Ok(Vec::new());
+        };
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let removed_roots = state
+            .workspaces_by_key
+            .values()
+            .filter(|candidate| {
+                candidate.key != workspace.key
+                    && !worktree_index.contains_key(&candidate.root)
+                    && workspace_registrations_share_git_identity(candidate, workspace)
+            })
+            .map(|candidate| candidate.root.clone())
+            .collect::<Vec<_>>();
+        let removed_workspace_keys = removed_roots
+            .iter()
+            .filter_map(|root| state.workspaces_by_root.get(root).cloned())
+            .collect::<Vec<_>>();
+        self.inner
+            .invalidate_removed_workspace_authorizations_locked(
+                &mut state,
+                &removed_workspace_keys,
+                unix_seconds(),
+            )?;
+        for root in removed_roots {
+            if let Some(key) = state.workspaces_by_root.remove(&root) {
+                state.workspaces_by_key.remove(&key);
+            }
+        }
+        state.origin_bindings.retain(|_, binding| {
+            binding
+                .workspace_key
+                .as_ref()
+                .is_none_or(|key| !removed_workspace_keys.contains(key))
+        });
+        state.workspace_store_dirty |= !removed_workspace_keys.is_empty();
+        drop(state);
+        if let Err(error) = self
+            .inner
+            .persist_workspace_store_if_due(!removed_workspace_keys.is_empty())
+        {
+            eprintln!("exo daemon: failed to persist direct worktree move: {error}");
+        }
+        Ok(removed_workspace_keys)
+    }
+
     fn register_workspace_with_git(
         &self,
         workspace_root: &Path,
@@ -1663,7 +1730,24 @@ impl WorkbenchHostManager {
         &self,
         current_workspace_key: &str,
     ) -> Result<Vec<WorkspaceProjection>> {
+        self.project_workspace_projections_with_before_authorization_gate(
+            current_workspace_key,
+            || {},
+        )
+    }
+
+    fn project_workspace_projections_with_before_authorization_gate(
+        &self,
+        current_workspace_key: &str,
+        before_authorization_gate: impl FnOnce(),
+    ) -> Result<Vec<WorkspaceProjection>> {
         let now = unix_seconds();
+        before_authorization_gate();
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let worktree_index = self.inner.project.worktree_index();
         let (known_roots, current_root, live_grant_keys_by_root) = {
             let state = self
@@ -1735,11 +1819,6 @@ impl WorkbenchHostManager {
             }
         }
 
-        let _authorization_gate = self
-            .inner
-            .authorization_store_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .inner
             .state
@@ -1761,15 +1840,6 @@ impl WorkbenchHostManager {
                         && !index.contains_key(*root)
                 })
                 .cloned()
-                .filter(|root| {
-                    state
-                        .workspaces_by_root
-                        .get(root)
-                        .and_then(|key| state.workspaces_by_key.get(key))
-                        .is_none_or(|workspace| {
-                            !workspace_has_plausible_move_successor(&state, index, workspace, now)
-                        })
-                })
                 .collect::<Vec<_>>();
             let missing_workspace_keys = removed
                 .iter()
@@ -2085,24 +2155,6 @@ fn insert_discovered_workspace(
         .workspaces_by_key
         .insert(workspace.key.clone(), workspace);
     true
-}
-
-fn workspace_has_plausible_move_successor(
-    state: &WorkbenchState,
-    worktree_index: &HashMap<PathBuf, bool>,
-    missing: &WorkspaceRegistration,
-    now: u64,
-) -> bool {
-    let has_live_pairing = state
-        .pairing_grants
-        .values()
-        .any(|pairing| pairing.workspace_key == missing.key && pairing.is_live(now));
-    has_live_pairing
-        && state.workspaces_by_key.values().any(|candidate| {
-            candidate.key != missing.key
-                && worktree_index.get(&candidate.root) == Some(&false)
-                && workspace_registrations_share_git_identity(missing, candidate)
-        })
 }
 
 fn workspace_registrations_share_git_identity(
@@ -2475,6 +2527,9 @@ impl WorkbenchHostInner {
             .filter(|pairing| {
                 pairing.project_id == self.project.id.as_str()
                     && pairing.project_instance_id == project_instance_id
+                    && (pairing.revoked_at.is_none()
+                        || pairing.revocation_cause
+                            == Some(WorkbenchPairingRevocationCause::WorkspaceMissing))
                     && (pairing.workspace_key != workspace.key
                         || pairing.workspace_root != workspace.root
                         || pairing.canonical_origin != entry.canonical_origin)
@@ -2488,7 +2543,7 @@ impl WorkbenchHostInner {
                 pairing.project_id == self.project.id.as_str()
                     && pairing.workspace_key == workspace.key
                     && pairing.project_instance_id != project_instance_id
-                    && pairing.revoked_at.is_none()
+                    && pairing.revocation_cause != Some(WorkbenchPairingRevocationCause::Replaced)
             })
             .map(|pairing| pairing.selector.clone())
             .collect::<HashSet<_>>();
@@ -2512,13 +2567,13 @@ impl WorkbenchHostInner {
             pairing.workspace_key = workspace.key.clone();
             pairing.workspace_root = workspace.root.clone();
             pairing.canonical_origin = entry.canonical_origin.clone();
+            pairing.restore_missing_workspace_move();
         }
         for selector in &replaced_pairings {
             candidate_pairings
                 .get_mut(selector)
                 .expect("replaced pairing exists")
-                .revoked_at
-                .get_or_insert(now);
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
         }
         candidate_sessions.retain(|_, session| {
             session.pairing_selector.as_ref().is_none_or(|selector| {
@@ -2692,6 +2747,7 @@ impl WorkbenchHostInner {
                     absolute_expires_at,
                     nickname: None,
                     revoked_at: None,
+                    revocation_cause: None,
                 },
                 new_pairing_secret,
             )
@@ -2726,7 +2782,7 @@ impl WorkbenchHostInner {
             candidate_pairings
                 .get_mut(replaced_selector)
                 .expect("replaced pairing exists")
-                .revoked_at = Some(now);
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
             candidate_outcomes.retain(|key, outcome| {
                 key.pairing_selector.as_str() != replaced_selector || outcome.is_terminal()
             });
@@ -3030,8 +3086,7 @@ impl WorkbenchHostInner {
         candidate_pairings
             .get_mut(selector)
             .ok_or_else(|| anyhow::anyhow!("workbench pairing is unavailable"))?
-            .revoked_at
-            .get_or_insert(now);
+            .revoke(now, WorkbenchPairingRevocationCause::Explicit);
         candidate_sessions
             .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
         candidate_outcomes
@@ -3636,8 +3691,7 @@ impl WorkbenchHostInner {
             candidate_pairings
                 .get_mut(selector)
                 .expect("removed workspace pairing exists")
-                .revoked_at
-                .get_or_insert(now);
+                .revoke(now, WorkbenchPairingRevocationCause::WorkspaceMissing);
         }
         candidate_outcomes.retain(|key, outcome| {
             !pairing_selectors.contains(&key.pairing_selector) || outcome.is_terminal()
@@ -3832,6 +3886,28 @@ impl WorkbenchPairingGrantV1 {
                 && revoked_at <= now
         } else {
             self.is_live(now)
+        }
+    }
+
+    fn revoke(&mut self, now: u64, cause: WorkbenchPairingRevocationCause) {
+        self.revoked_at.get_or_insert(now);
+        match cause {
+            WorkbenchPairingRevocationCause::WorkspaceMissing => {
+                if self.revocation_cause.is_none() {
+                    self.revocation_cause = Some(cause);
+                }
+            }
+            WorkbenchPairingRevocationCause::Explicit
+            | WorkbenchPairingRevocationCause::Replaced => {
+                self.revocation_cause = Some(cause);
+            }
+        }
+    }
+
+    fn restore_missing_workspace_move(&mut self) {
+        if self.revocation_cause == Some(WorkbenchPairingRevocationCause::WorkspaceMissing) {
+            self.revoked_at = None;
+            self.revocation_cause = None;
         }
     }
 
@@ -4189,6 +4265,9 @@ fn valid_pairing_grant(pairing: &WorkbenchPairingGrantV1, project_id: &str, now:
         && !pairing.project_instance_id.is_empty()
         && pairing.canonical_origin.starts_with("https://")
         && expected_host_from_origin(&pairing.canonical_origin).is_some()
+        && pairing
+            .revocation_cause
+            .is_none_or(|_| pairing.revoked_at.is_some())
 }
 
 fn unix_seconds() -> u64 {
