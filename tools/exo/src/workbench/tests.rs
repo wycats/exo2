@@ -3,18 +3,23 @@
 use super::*;
 use crate::api::protocol::{Effect, ErrorCode, Op, PROTOCOL_VERSION, ResponseEnvelope, Status};
 use crate::context::{SqliteLoader, SqliteWriter};
+use crate::process_spawn::CommandSpawnExt as _;
 use serde_json::{Value as JsonValue, json};
 #[cfg(feature = "ui")]
 use std::collections::HashMap;
 use std::fs;
 #[cfg(feature = "ui")]
 use std::io;
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+use std::io::Read as _;
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 #[cfg(feature = "ui")]
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(feature = "ui")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -76,10 +81,12 @@ fn fixture() -> Fixture {
 }
 
 fn run_git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    clear_repository_local_git_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(root)
-        .output()
+        .output_guarded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -87,6 +94,28 @@ fn run_git(root: &Path, args: &[&str]) {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn clear_repository_local_git_environment(command: &mut Command) {
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(name);
+    }
 }
 
 #[test]
@@ -138,18 +167,258 @@ impl WorkbenchEntryProvider for TestPublishedEntryProvider {
         &self,
         workspace: &WorkspaceRegistration,
         _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
-        WorkbenchEntryBinding::published(
+        let entry = WorkbenchEntryBinding::published(
             format!("https://workbench-{}.test.localhost", &workspace.key[..8]),
             format!("locald-{}", &workspace.key[..12]),
             workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct RebindTrackingPublishedEntryProvider {
+    rebinds: AtomicU64,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
         )
+    }
+
+    fn rebind_all(&self, _listener: &TcpListener, _listener_generation: u64) -> Result<()> {
+        self.rebinds.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 }
 
 #[cfg(feature = "ui")]
 fn use_test_published_entries(manager: &WorkbenchHostManager) {
     manager.set_entry_provider(Arc::new(TestPublishedEntryProvider));
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct TestLocaldSandbox {
+    home: PathBuf,
+    data_dir: PathBuf,
+    command_socket: PathBuf,
+    log_path: PathBuf,
+    http_port: u16,
+    https_port: u16,
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct TestLocaldDaemon {
+    child: std::process::Child,
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+impl Drop for TestLocaldDaemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            drop(self.child.kill());
+            drop(self.child.wait());
+        }
+    }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+impl TestLocaldSandbox {
+    fn new(root: &Path) -> Self {
+        let home = root.join("home");
+        let sandbox_root = home.join(".local/share/locald/sandboxes").join("b37");
+        let data_home = sandbox_root.join("data");
+        fs::create_dir_all(&data_home).expect("create locald sandbox data home");
+        let config_home = sandbox_root.join("config");
+        fs::create_dir_all(config_home.join("locald")).expect("create locald sandbox config home");
+        fs::write(
+            config_home.join("locald/config.toml"),
+            "[server]\nsandbox = true\n",
+        )
+        .expect("write locald sandbox config");
+        fs::create_dir_all(sandbox_root.join("state")).expect("create locald sandbox state home");
+        let http_port = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve sandbox HTTP port")
+            .local_addr()
+            .expect("sandbox HTTP address")
+            .port();
+        let https_port = loop {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .expect("reserve sandbox HTTPS port")
+                .local_addr()
+                .expect("sandbox HTTPS address")
+                .port();
+            if port != http_port {
+                break port;
+            }
+        };
+        Self {
+            home,
+            data_dir: data_home.join("locald"),
+            command_socket: sandbox_root.join("locald.sock"),
+            log_path: root.join("locald-sandbox.log"),
+            http_port,
+            https_port,
+        }
+    }
+
+    fn context(&self) -> locald_publisher_client::SandboxPublisherContext {
+        locald_publisher_client::SandboxPublisherContext::new(
+            locald_publisher_client::protocol::AbsolutePath::try_from(self.data_dir.clone())
+                .expect("absolute sandbox data directory"),
+            locald_publisher_client::protocol::AbsolutePath::try_from(self.command_socket.clone())
+                .expect("absolute sandbox command socket"),
+        )
+        .expect("sandbox publisher context")
+        .with_no_host_suspend_guarantee()
+    }
+
+    fn spawn(&self) -> TestLocaldDaemon {
+        let log = fs::File::create(&self.log_path).expect("create locald sandbox log");
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        clear_repository_local_git_environment(&mut command);
+        command
+            .arg("b37_locald_sandbox_daemon_helper")
+            .arg("--nocapture")
+            .env("EXO_B37_LOCALD_DAEMON_HELPER", "1")
+            .env("HOME", &self.home)
+            .env(
+                "XDG_DATA_HOME",
+                self.data_dir.parent().expect("sandbox data home"),
+            )
+            .env(
+                "XDG_CONFIG_HOME",
+                self.command_socket
+                    .parent()
+                    .expect("sandbox root")
+                    .join("config"),
+            )
+            .env(
+                "XDG_STATE_HOME",
+                self.command_socket
+                    .parent()
+                    .expect("sandbox root")
+                    .join("state"),
+            )
+            .env("LOCALD_SOCKET", &self.command_socket)
+            .env("LOCALD_SANDBOX_ACTIVE", "1")
+            .env("LOCALD_SANDBOX_NAME", "b37")
+            .env("LOCALD_SANDBOX_NO_HOST_SUSPEND", "1")
+            .env("LOCALD_HTTP_PORT", self.http_port.to_string())
+            .env("LOCALD_HTTPS_PORT", self.https_port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().expect("clone locald log")))
+            .stderr(Stdio::from(log));
+        #[cfg(target_os = "linux")]
+        // Exercise the explicit sandbox fallback without depending on the CI host's logind state.
+        command.env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!(
+                "unix:path={}",
+                self.command_socket
+                    .with_file_name("missing-system-bus.sock")
+                    .display()
+            ),
+        );
+        TestLocaldDaemon {
+            child: command.spawn_guarded().expect("spawn locald sandbox"),
+        }
+    }
+
+    fn wait_until_active(&self, daemon: &mut TestLocaldDaemon) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let probe_error =
+                match locald_publisher_client::probe_sandbox_publisher(&self.context()) {
+                    Ok(_) => return,
+                    Err(error) => error,
+                };
+            if let Some(status) = daemon.child.try_wait().expect("inspect locald sandbox") {
+                panic!(
+                    "locald sandbox exited before publication became active ({status}); last probe error: {probe_error}: {}",
+                    fs::read_to_string(&self.log_path).unwrap_or_default()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "locald sandbox did not activate publication; last probe error: {probe_error}: {}",
+                fs::read_to_string(&self.log_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn stop(&self, daemon: &mut TestLocaldDaemon) {
+        let mut stream = UnixStream::connect(&self.command_socket)
+            .expect("connect to locald sandbox for shutdown");
+        serde_json::to_writer(&mut stream, &locald_core::IpcRequest::Shutdown)
+            .expect("send locald sandbox shutdown");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish locald sandbox shutdown request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read locald sandbox shutdown response");
+        assert_eq!(
+            serde_json::from_slice::<locald_core::IpcResponse>(&response)
+                .expect("decode locald sandbox shutdown response"),
+            locald_core::IpcResponse::Ok
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if daemon
+                .child
+                .try_wait()
+                .expect("wait for locald sandbox")
+                .is_some()
+            {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                daemon.child.kill().expect("kill stalled locald sandbox");
+                daemon.child.wait().expect("reap stalled locald sandbox");
+                panic!(
+                    "locald sandbox did not stop cleanly: {}",
+                    fs::read_to_string(&self.log_path).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn b37_locald_sandbox_daemon_helper() {
+    if std::env::var_os("EXO_B37_LOCALD_DAEMON_HELPER").is_none() {
+        return;
+    }
+    locald_server::run(true, "exo-b37-proof".to_owned()).expect("run locald sandbox daemon");
 }
 
 #[cfg(feature = "ui")]
@@ -162,13 +431,290 @@ impl WorkbenchEntryProvider for TestMovedPublishedEntryProvider {
         &self,
         workspace: &WorkspaceRegistration,
         _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
-        WorkbenchEntryBinding::published(
+        let entry = WorkbenchEntryBinding::published(
             "https://workbench-moved.test.localhost".to_string(),
             "locald-stable-project-instance".to_string(),
             workspace.key.clone(),
-        )
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
     }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestFailingMovedPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestFailingMovedPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        _ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-stable-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        anyhow::bail!("injected moved-worktree publication failure")
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct TestReplacementPublishedEntryProvider;
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestReplacementPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        _direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-replacement-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct TestPublishedThenDirectEntryProvider {
+    direct: AtomicBool,
+    released_workspace_keys: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "ui")]
+impl TestPublishedThenDirectEntryProvider {
+    fn use_direct_entry(&self) {
+        self.direct.store(true, Ordering::Release);
+    }
+
+    fn released_workspace_keys(&self) -> Vec<String> {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .clone()
+    }
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for TestPublishedThenDirectEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        _listener: &TcpListener,
+        _listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        if self.direct.load(Ordering::Acquire) {
+            ensure_started()?;
+            return Ok(WorkbenchEntryBinding::direct(direct_origin.to_string()));
+        }
+        let entry = WorkbenchEntryBinding::published(
+            "https://workbench-moved.test.localhost".to_string(),
+            "locald-stable-project-instance".to_string(),
+            workspace.key.clone(),
+        )?;
+        authorize(&entry)?;
+        ensure_started()?;
+        Ok(entry)
+    }
+
+    fn release_workspace(&self, workspace_key: &str) {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .push(workspace_key.to_string());
+    }
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restart() {
+    async fn launch_eventually(
+        manager: &WorkbenchHostManager,
+        workspace: &Path,
+    ) -> WorkbenchLaunchResult {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let error = match manager.launch(workspace) {
+                Ok(launch) => return launch,
+                Err(error) => error,
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "published workbench did not recover: {error:#}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn canonical_origin(launch: &WorkbenchLaunchResult) -> &str {
+        launch
+            .url
+            .split_once("/#ticket=")
+            .map_or(launch.url.as_str(), |(origin, _)| origin)
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("e")
+        .tempdir_in("/tmp")
+        .expect("create short b.3.7 proof root");
+    let primary = temp.path().join("primary");
+    let linked = temp.path().join("linked");
+    fs::create_dir(&primary).expect("create primary worktree");
+    run_git(&primary, &["init", "-b", "main"]);
+    fs::write(primary.join("README.md"), "# Exo b.3.7 proof\n").expect("write proof readme");
+    run_git(&primary, &["add", "."]);
+    run_git(
+        &primary,
+        &[
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo@example.invalid",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    run_git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "b37-linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+    let config = r#"[project]
+name = "exo-b37-proof"
+
+[services.workbench]
+type = "published"
+
+[services.workbench.health_check]
+type = "http"
+path = "/api/health"
+interval = 1
+timeout = 1
+"#;
+    fs::write(primary.join("locald.toml"), config).expect("write primary locald config");
+    fs::write(linked.join("locald.toml"), config).expect("write linked locald config");
+
+    let sandbox = TestLocaldSandbox::new(temp.path());
+    let mut daemon = sandbox.spawn();
+    sandbox.wait_until_active(&mut daemon);
+
+    let project = Arc::new(Project::resolve(&primary).expect("resolve proof project"));
+    fs::create_dir_all(
+        project
+            .db_path()
+            .parent()
+            .expect("proof database has a parent"),
+    )
+    .expect("create proof project state root");
+    drop(SqliteWriter::open(project.db_path()).expect("initialize proof project database"));
+    let manager = test_manager_with_identity(project, "b37-publication-proof");
+    let provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
+        sandbox.context(),
+    ));
+    manager.set_entry_provider(provider.clone());
+
+    let first = launch_eventually(&manager, &primary).await;
+    let second = launch_eventually(&manager, &linked).await;
+    assert_eq!(first.launch_mode, WorkbenchLaunchMode::Published);
+    assert_eq!(second.launch_mode, WorkbenchLaunchMode::Published);
+    assert!(!first.reused_host);
+    assert!(second.reused_host);
+    let first_origin = canonical_origin(&first).to_owned();
+    let second_origin = canonical_origin(&second).to_owned();
+    assert_ne!(first_origin, second_origin);
+    for origin in [&first_origin, &second_origin] {
+        assert!(origin.starts_with("https://workbench"));
+        assert!(origin.contains(".localhost"));
+        assert!(
+            !origin.contains("127.0.0.1"),
+            "published workbench origin must not expose the private listener: {origin}"
+        );
+    }
+    let (listener_generation, first_project_instance, second_project_instance) = {
+        let state = manager.inner.state.lock().expect("workbench state");
+        let listener_generation = state.host.as_ref().expect("shared host").generation;
+        let first_binding = state
+            .origin_bindings
+            .get(&first_origin)
+            .expect("first published binding");
+        let second_binding = state
+            .origin_bindings
+            .get(&second_origin)
+            .expect("second published binding");
+        (
+            listener_generation,
+            first_binding
+                .project_instance_id
+                .clone()
+                .expect("first project instance"),
+            second_binding
+                .project_instance_id
+                .clone()
+                .expect("second project instance"),
+        )
+    };
+    assert_ne!(first_project_instance, second_project_instance);
+    assert_eq!(provider.publication_count(), 2);
+    assert!(provider.all_on_listener_generation(listener_generation));
+
+    provider.mark_publications_terminal_for_test();
+    assert_eq!(provider.failed_publication_count(), 2);
+    let reacquired_first = launch_eventually(&manager, &primary).await;
+    let reacquired_second = launch_eventually(&manager, &linked).await;
+    assert_eq!(canonical_origin(&reacquired_first), first_origin);
+    assert_eq!(canonical_origin(&reacquired_second), second_origin);
+    assert_eq!(provider.failed_publication_count(), 0);
+    assert_eq!(provider.publication_count(), 2);
+
+    sandbox.stop(&mut daemon);
+    daemon = sandbox.spawn();
+    sandbox.wait_until_active(&mut daemon);
+
+    let recovered_first = launch_eventually(&manager, &primary).await;
+    let recovered_second = launch_eventually(&manager, &linked).await;
+    assert_eq!(canonical_origin(&recovered_first), first_origin);
+    assert_eq!(canonical_origin(&recovered_second), second_origin);
+    assert!(recovered_first.reused_host);
+    assert!(recovered_second.reused_host);
+    assert_eq!(provider.publication_count(), 2);
+    assert!(provider.all_on_listener_generation(listener_generation));
+
+    manager.shutdown().await;
+    assert_eq!(provider.publication_count(), 0);
+    sandbox.stop(&mut daemon);
 }
 
 fn test_manager_with_identity(
@@ -494,6 +1040,35 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
         Some(phase.as_str())
     );
     let sibling_key = sibling.key.clone();
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let published_launch = manager
+        .launch(&sibling_root)
+        .expect("launch published sibling workbench");
+    assert_eq!(published_launch.workspace.key, sibling_key);
+    let (published_origin, published_ticket) = launch_parts(&published_launch);
+    let published_entry = WorkbenchEntryBinding::published(
+        published_origin.to_string(),
+        "locald-stable-project-instance".to_string(),
+        sibling_key.clone(),
+    )
+    .expect("published sibling entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(published_ticket, None, &published_entry)
+        .expect("enroll sibling pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"p".repeat(43),
+            &published_entry,
+        )
+        .expect("create pairing-derived sibling session");
     let serialized = serde_json::to_string(&snapshot).expect("serialize project snapshot");
     assert!(!serialized.contains(&current_root.display().to_string()));
     assert!(!serialized.contains(&sibling_root.display().to_string()));
@@ -562,6 +1137,49 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
             .iter()
             .all(|workspace| workspace.key != sibling_key),
         "Git worktree removal ends workspace retention"
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some()),
+        "Git worktree removal revokes retained pairing authority"
+    );
+    assert!(
+        state
+            .session_grants
+            .values()
+            .all(|session| session.workspace_key != sibling_key)
+    );
+    assert!(
+        state
+            .sessions
+            .values()
+            .all(|session| session.workspace_key != sibling_key)
+    );
+    drop(state);
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read removed workspace authorization store"),
+    )
+    .expect("decode removed workspace authorization store");
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
+    );
+    assert!(
+        store
+            .sessions
+            .iter()
+            .all(|session| session.workspace_key != sibling_key)
     );
     manager.shutdown().await;
 }
@@ -686,16 +1304,38 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
             expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
         },
     );
+    state.pairing_grants.insert(
+        "live-pairing".to_string(),
+        WorkbenchPairingGrantV1 {
+            selector: "live-pairing".to_string(),
+            credential_digest: session_credential_digest("pairing-secret"),
+            project_id: "project-fixture".to_string(),
+            workspace_key: "workspace-003".to_string(),
+            workspace_root: PathBuf::from("/tmp/exo-workbench-003"),
+            launch_mode: WorkbenchLaunchMode::Published,
+            project_instance_id: "project-instance".to_string(),
+            canonical_origin: "https://workbench.test.localhost".to_string(),
+            capabilities: vec!["workbench.snapshot".to_string()],
+            created_at: now,
+            last_used_at: now,
+            idle_expires_at: now.saturating_add(PAIRING_IDLE_LIFETIME.as_secs()),
+            absolute_expires_at: now.saturating_add(PAIRING_ABSOLUTE_LIFETIME.as_secs()),
+            nickname: None,
+            revoked_at: None,
+            revocation_cause: None,
+        },
+    );
 
-    assert!(retain_project_workspace_limit(&mut state, &current_key));
+    assert!(!retain_project_workspace_limit(&mut state, &current_key).is_empty());
     assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
     assert_eq!(state.workspaces_by_root.len(), MAX_PROJECT_WORKSPACES);
     assert!(state.workspaces_by_key.contains_key(&current_key));
     assert!(state.workspaces_by_key.contains_key("workspace-000"));
     assert!(state.workspaces_by_key.contains_key("workspace-001"));
     assert!(state.workspaces_by_key.contains_key("workspace-002"));
+    assert!(state.workspaces_by_key.contains_key("workspace-003"));
     assert!(state.workspaces_by_key.contains_key("workspace-127"));
-    assert!(!state.workspaces_by_key.contains_key("workspace-003"));
+    assert!(!state.workspaces_by_key.contains_key("workspace-004"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -950,6 +1590,8 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
     let manager = test_manager(Arc::clone(&fixture.project));
     let first = manager.launch(&fixture.root).expect("launch workbench");
     let (origin, ticket) = launch_parts(&first);
+    assert_eq!(first.schema_version, 2);
+    assert_eq!(first.launch_mode, WorkbenchLaunchMode::DirectLoopback);
     assert_eq!(first.expires_in_seconds, 3_600);
     let payload = ticket_payload(ticket);
     assert_eq!(payload.expires_at - payload.issued_at, 3_600);
@@ -1017,6 +1659,95 @@ async fn launch_tickets_are_signed_one_time_and_runtime_local() {
         !inactive_record.server_task_alive,
         "shutdown retains the compatible origin without claiming a live host"
     );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_ticket_redemption_waits_for_authorization_transition() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch direct workbench");
+    let ticket = launch_parts(&launch).1.to_string();
+    let gate = manager
+        .inner
+        .authorization_store_gate
+        .lock()
+        .expect("hold authorization transition");
+    let redeeming_manager = manager.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("report redemption start");
+        tx.send(redeeming_manager.inner.redeem_ticket(&ticket))
+            .expect("report ticket redemption");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("redemption worker starts");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "direct redemption must wait for the authorization transition"
+    );
+    drop(gate);
+    let (session_secret, session) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("ticket redemption resumes")
+        .expect("redeem direct ticket");
+    worker.join().expect("join ticket redemption worker");
+    assert!(
+        manager
+            .inner
+            .session(&session.session_key, &session_secret)
+            .is_some(),
+        "the serialized direct session remains usable"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn unexpected_host_stop_reuses_listener_and_rebinds_publications() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let first = manager
+        .launch(&fixture.root)
+        .expect("launch initial published workbench");
+    let private_origin = manager.host_status().expect("initial host status").origin;
+    let (generation, task) = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let host = state.host.as_mut().expect("bound workbench host");
+        (
+            host.generation,
+            host.task.take().expect("running workbench server task"),
+        )
+    };
+    task.abort();
+    let _ = task.await;
+    manager
+        .inner
+        .server_stopped(generation, Some("injected server stop".to_string()));
+
+    let restarted = manager
+        .launch(&fixture.root)
+        .expect("restart published workbench on retained listener");
+    assert_eq!(launch_parts(&restarted).0, launch_parts(&first).0);
+    assert_eq!(
+        manager.host_status().expect("restarted host status").origin,
+        private_origin,
+        "an unexpected stop must retain the exact private listener origin"
+    );
+    assert!(
+        provider.rebinds.load(Ordering::Acquire) >= 2,
+        "initial start and restart must both rebind the published authority"
+    );
+
+    manager.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -1967,6 +2698,7 @@ fn retained_revoked_pairings_have_separate_project_and_workspace_bounds() {
             absolute_expires_at: now.saturating_add(200),
             nickname: None,
             revoked_at: None,
+            revocation_cause: None,
         },
     );
     for index in 0..(MAX_RETAINED_REVOKED_PAIRINGS_PER_WORKSPACE + 3) {
@@ -1994,6 +2726,7 @@ fn retained_revoked_pairings_have_separate_project_and_workspace_bounds() {
                             .expect("fixture index fits u64"),
                     ),
                 ),
+                revocation_cause: Some(WorkbenchPairingRevocationCause::Explicit),
             },
         );
     }
@@ -2211,6 +2944,11 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     let pairing_cookie = response_cookie(&enrollment, PAIRING_COOKIE_NAME)
         .expect("pairing cookie")
         .to_string();
+    let pairing_selector = pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("pairing selector")
+        .to_string();
     let first_resume = raw_http_via(
         &private_origin,
         published_host,
@@ -2234,6 +2972,41 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
         ],
     );
     let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    manager
+        .snapshot(&fixture.root)
+        .expect("sibling snapshot observes the moved worktree");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state after sibling snapshot")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            }),
+        "Git move evidence alone must not preserve pairing authority"
+    );
+    let revoked_store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store after sibling snapshot"),
+    )
+    .expect("decode authorization store after sibling snapshot");
+    assert!(
+        revoked_store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            }),
+        "missing workspace authority remains revoked until exact published-instance proof"
+    );
     let moved_launch = manager
         .launch(&moved_root)
         .expect("authenticated launch after worktree move");
@@ -2247,6 +3020,8 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     assert_eq!(store.pairings.len(), 1);
     assert_eq!(store.pairings[0].workspace_key, moved_workspace_key);
     assert_eq!(store.pairings[0].workspace_root, moved_root);
+    assert!(store.pairings[0].revoked_at.is_none());
+    assert!(store.pairings[0].revocation_cause.is_none());
     assert!(store.resume_outcomes.is_empty());
     assert!(
         store
@@ -2271,6 +3046,517 @@ async fn authenticated_published_launch_rebinds_a_moved_worktree_pairing() {
     assert_eq!(
         resumed_after_move.json()["workspace_key"],
         moved_workspace_key
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_launch_after_worktree_move_releases_stale_publication_authority() {
+    let fixture = fixture();
+    let original = fixture._temp.path().join("direct-before-move");
+    let moved = fixture._temp.path().join("direct-after-move");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-direct-move",
+            original.to_str().expect("original linked path"),
+        ],
+    );
+    let original_root = original
+        .canonicalize()
+        .expect("canonical original worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(TestPublishedThenDirectEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+    let published_launch = manager
+        .launch(&original_root)
+        .expect("launch original published workbench");
+    let original_workspace_key = published_launch.workspace.key.clone();
+    let (_, ticket) = launch_parts(&published_launch);
+    let payload = published_ticket_payload(ticket);
+    let published_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("published request entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &published_entry)
+        .expect("enroll original pairing");
+    let pairing_selector = enrollment
+        .pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("pairing selector")
+        .to_string();
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().expect("original linked path"),
+            moved.to_str().expect("moved linked path"),
+        ],
+    );
+    let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    provider.use_direct_entry();
+    let direct_launch = manager
+        .launch(&moved_root)
+        .expect("launch moved worktree through direct fallback");
+    assert_eq!(
+        direct_launch.launch_mode,
+        WorkbenchLaunchMode::DirectLoopback
+    );
+    assert_ne!(direct_launch.workspace.key, original_workspace_key);
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![original_workspace_key.clone()],
+        "direct fallback must release the stale published workspace"
+    );
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        !state
+            .workspaces_by_key
+            .contains_key(&original_workspace_key)
+    );
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .all(|binding| binding.workspace_key.as_deref() != Some(&original_workspace_key))
+    );
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause
+                        == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
+    );
+    drop(state);
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_projection_samples_membership_after_authorization_coordination() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("projection-race-linked");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(TestPublishedThenDirectEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+    let current = manager
+        .register_workspace(&fixture.root)
+        .expect("register current workspace");
+    let linked_workspace_key = Mutex::new(None::<String>);
+
+    let projections = manager
+        .project_workspace_projections_with_before_authorization_gate(&current.key, || {
+            run_git(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "workbench-projection-race",
+                    linked.to_str().expect("linked worktree path"),
+                ],
+            );
+            let linked_root = linked.canonicalize().expect("canonical linked worktree");
+            let launch = manager
+                .launch(&linked_root)
+                .expect("publish linked worktree during projection coordination");
+            *linked_workspace_key.lock().expect("linked workspace key") =
+                Some(launch.workspace.key);
+        })
+        .expect("project workspaces after concurrent registration");
+    let linked_workspace_key = linked_workspace_key
+        .into_inner()
+        .expect("linked workspace key mutex")
+        .expect("linked workspace key recorded");
+
+    assert!(
+        projections
+            .iter()
+            .any(|workspace| workspace.registration.key == linked_workspace_key)
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(state.workspaces_by_key.contains_key(&linked_workspace_key));
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(&linked_workspace_key))
+    );
+    drop(state);
+    assert!(provider.released_workspace_keys().is_empty());
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_project_instance_cannot_leave_a_restorable_missing_workspace_pairing() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("replacement-after-removal");
+    let branch = "workbench-replacement-after-removal";
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            linked.to_str().expect("linked worktree path"),
+        ],
+    );
+    let linked_root = linked.canonicalize().expect("canonical linked worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let original_launch = manager
+        .launch(&linked_root)
+        .expect("launch original published workbench");
+    let (_, ticket) = launch_parts(&original_launch);
+    let payload = published_ticket_payload(ticket);
+    let original_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll original pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            linked.to_str().expect("linked worktree path"),
+        ],
+    );
+    manager
+        .snapshot(&fixture.root)
+        .expect("observe removed worktree");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revocation_cause == Some(WorkbenchPairingRevocationCause::WorkspaceMissing)
+            })
+    );
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("linked worktree path"),
+            branch,
+        ],
+    );
+    let replacement_root = linked
+        .canonicalize()
+        .expect("canonical replacement worktree");
+    manager.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    manager
+        .launch(&replacement_root)
+        .expect("launch replacement project instance");
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| {
+                pairing.revoked_at.is_some()
+                    && pairing.revocation_cause == Some(WorkbenchPairingRevocationCause::Replaced)
+            }),
+        "a different project instance makes the old pairing permanently replaced"
+    );
+
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    manager
+        .launch(&replacement_root)
+        .expect("relaunch original project instance identity");
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &"z".repeat(43),
+                &original_entry,
+            )
+            .expect_err("replaced pairing remains revoked"),
+        PairingExchangeError::Expired
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_moved_worktree_publication_restores_the_previous_origin_binding() {
+    let fixture = fixture();
+    let original = fixture._temp.path().join("binding-before-move");
+    let moved = fixture._temp.path().join("binding-after-move");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-binding-move",
+            original.to_str().expect("original linked path"),
+        ],
+    );
+    let original_root = original
+        .canonicalize()
+        .expect("canonical original worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let original_launch = manager
+        .launch(&original_root)
+        .expect("launch original published workbench");
+    let original_workspace_key = original_launch.workspace.key.clone();
+    let (published_origin, ticket) = launch_parts(&original_launch);
+    let published_origin = published_origin.to_string();
+    let original_entry = WorkbenchEntryBinding::published(
+        published_origin.clone(),
+        "locald-stable-project-instance".to_string(),
+        original_workspace_key.clone(),
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll pairing before failed move");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"f".repeat(43),
+            &original_entry,
+        )
+        .expect("record pairing session before failed move");
+    let authorization_before_move: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store before failed move"),
+    )
+    .expect("decode authorization store before failed move");
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().expect("original linked path"),
+            moved.to_str().expect("moved linked path"),
+        ],
+    );
+    let moved_root = moved.canonicalize().expect("canonical moved worktree");
+    manager.set_entry_provider(Arc::new(TestFailingMovedPublishedEntryProvider));
+    let error = manager
+        .launch(&moved_root)
+        .expect_err("moved publication fails after temporary authorization");
+    assert!(
+        error
+            .to_string()
+            .contains("injected moved-worktree publication failure")
+    );
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    let restored = state
+        .origin_bindings
+        .get(&published_origin)
+        .expect("previous origin binding restored");
+    assert_eq!(
+        restored.workspace_key.as_deref(),
+        Some(original_workspace_key.as_str())
+    );
+    assert_eq!(
+        state
+            .origin_bindings
+            .values()
+            .filter(|binding| {
+                binding.project_instance_id.as_deref() == Some("locald-stable-project-instance")
+            })
+            .count(),
+        1
+    );
+    drop(state);
+    let authorization_after_failure: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read authorization store after failed move"),
+    )
+    .expect("decode authorization store after failed move");
+    assert_eq!(authorization_after_failure, authorization_before_move);
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_project_instance_revokes_stale_workspace_pairing_authority() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    manager.set_entry_provider(Arc::new(TestMovedPublishedEntryProvider));
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch original published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let original_entry = WorkbenchEntryBinding::published(
+        "https://workbench-moved.test.localhost".to_string(),
+        "locald-stable-project-instance".to_string(),
+        launch.workspace.key.clone(),
+    )
+    .expect("original published entry");
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &original_entry)
+        .expect("enroll original pairing");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    let pairing_selector = pairing_parts.next().expect("pairing selector").to_string();
+    let pairing_secret = pairing_parts.next().expect("pairing secret").to_string();
+    manager
+        .inner
+        .resume_pairing(
+            &pairing_selector,
+            &pairing_secret,
+            &"r".repeat(43),
+            &original_entry,
+        )
+        .expect("record original resume outcome");
+    let terminal_request_id = "t".repeat(43);
+    let mismatched_entry = WorkbenchEntryBinding::published(
+        "https://replacement-mismatch.test.localhost".to_string(),
+        "locald-stable-project-instance".to_string(),
+        launch.workspace.key.clone(),
+    )
+    .expect("mismatched published entry");
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &terminal_request_id,
+                &mismatched_entry,
+            )
+            .expect_err("record terminal resume outcome"),
+        PairingExchangeError::Invalid
+    );
+
+    manager.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    manager
+        .launch(&fixture.root)
+        .expect("launch replacement project instance");
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .pairing_grants
+            .get(&pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some()),
+        "the replaced pairing remains as revoked audit identity"
+    );
+    assert!(
+        state.session_grants.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert!(
+        state.sessions.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert_eq!(state.resume_outcomes.len(), 1);
+    assert_eq!(
+        state
+            .resume_outcomes
+            .get(&WorkbenchResumeOutcomeKey {
+                pairing_selector: pairing_selector.clone(),
+                request_id: terminal_request_id.clone(),
+            })
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
+    );
+    drop(state);
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &terminal_request_id,
+                &original_entry,
+            )
+            .expect_err("replacement replays terminal resume result"),
+        PairingExchangeError::Invalid
+    );
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &pairing_selector,
+                &pairing_secret,
+                &"u".repeat(43),
+                &original_entry,
+            )
+            .expect_err("replacement pairing rejects a new resume request"),
+        PairingExchangeError::Expired
+    );
+
+    let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path)
+            .expect("read replacement authorization store"),
+    )
+    .expect("decode replacement authorization store");
+    assert!(
+        store
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == pairing_selector)
+            .is_some_and(|pairing| pairing.revoked_at.is_some())
+    );
+    assert!(
+        store.sessions.iter().all(|session| {
+            session.pairing_selector.as_deref() != Some(pairing_selector.as_str())
+        })
+    );
+    assert_eq!(store.resume_outcomes.len(), 1);
+    assert_eq!(store.resume_outcomes[0].pairing_selector, pairing_selector);
+    assert_eq!(store.resume_outcomes[0].request_id, terminal_request_id);
+    assert_eq!(
+        store.resume_outcomes[0].terminal_error(),
+        Some(PairingExchangeError::Invalid)
     );
     manager.shutdown().await;
 }

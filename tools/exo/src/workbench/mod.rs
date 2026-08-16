@@ -1,6 +1,11 @@
 mod assets;
 mod http;
 pub(crate) mod planning;
+#[cfg(unix)]
+mod publication;
+#[cfg(not(unix))]
+#[path = "publication_unavailable.rs"]
+mod publication;
 mod snapshot;
 
 use crate::api::protocol::{RequestEnvelope, ResponseEnvelope};
@@ -22,6 +27,8 @@ use std::pin::Pin;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, broadcast, watch};
@@ -292,6 +299,8 @@ struct WorkbenchHostInner {
     write_tx: broadcast::Sender<u64>,
     dispatcher: OnceLock<DaemonRequestDispatcher>,
     entry_provider: Mutex<Arc<dyn WorkbenchEntryProvider>>,
+    host_launch_gate: Mutex<()>,
+    host_generation: AtomicU64,
     state: Mutex<WorkbenchState>,
     event_admission: Arc<Semaphore>,
     completion_review_admission: Arc<Semaphore>,
@@ -300,6 +309,7 @@ struct WorkbenchHostInner {
 #[derive(Default)]
 struct WorkbenchState {
     host: Option<BoundHost>,
+    retiring_hosts: Vec<BoundHost>,
     origin_bindings: HashMap<String, WorkbenchEntryBinding>,
     preferred_port: Option<u16>,
     workspaces_by_root: HashMap<PathBuf, String>,
@@ -318,8 +328,10 @@ struct WorkbenchState {
 }
 
 struct BoundHost {
+    generation: u64,
     origin: String,
     expected_host: String,
+    publication_listener: Option<TcpListener>,
     secret: [u8; 32],
     assets_hash: String,
     started_at: String,
@@ -335,25 +347,87 @@ trait WorkbenchEntryProvider: Send + Sync {
         &self,
         workspace: &WorkspaceRegistration,
         direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding>;
+
+    fn release_workspace(&self, _workspace_key: &str) {}
+
+    fn rebind_all(&self, _listener: &TcpListener, _listener_generation: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn all_on_listener_generation(&self, _listener_generation: u64) -> bool {
+        true
+    }
+
+    fn shutdown(&self) {}
 }
 
-#[derive(Debug)]
-struct DirectWorkbenchEntryProvider;
+enum HostLaunchPlan {
+    Existing {
+        generation: u64,
+        origin: String,
+        listener: TcpListener,
+        secret: [u8; 32],
+    },
+    Candidate(PendingHost),
+}
 
-impl WorkbenchEntryProvider for DirectWorkbenchEntryProvider {
-    fn resolve(
-        &self,
-        _workspace: &WorkspaceRegistration,
-        direct_origin: &str,
-    ) -> Result<WorkbenchEntryBinding> {
-        Ok(WorkbenchEntryBinding::direct(direct_origin.to_string()))
+struct PendingHost {
+    generation: u64,
+    origin: String,
+    expected_host: String,
+    listener: Option<TcpListener>,
+    secret: [u8; 32],
+}
+
+impl HostLaunchPlan {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Existing { generation, .. } => *generation,
+            Self::Candidate(host) => host.generation,
+        }
+    }
+
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "String-to-str coercion is not const on the supported Rust toolchain"
+    )]
+    fn origin(&self) -> &str {
+        match self {
+            Self::Existing { origin, .. } => origin,
+            Self::Candidate(host) => &host.origin,
+        }
+    }
+
+    const fn secret(&self) -> [u8; 32] {
+        match self {
+            Self::Existing { secret, .. } => *secret,
+            Self::Candidate(host) => host.secret,
+        }
+    }
+
+    const fn reused(&self) -> bool {
+        matches!(self, Self::Existing { .. })
+    }
+
+    fn listener(&self) -> Result<&TcpListener> {
+        match self {
+            Self::Existing { listener, .. } => Ok(listener),
+            Self::Candidate(host) => host
+                .listener
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pending workbench listener is unavailable")),
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum WorkbenchLaunchMode {
+pub enum WorkbenchLaunchMode {
     #[default]
     DirectLoopback,
     Published,
@@ -403,6 +477,21 @@ impl WorkbenchEntryBinding {
 
     const fn is_published(&self) -> bool {
         matches!(self.launch_mode, WorkbenchLaunchMode::Published)
+    }
+
+    fn conflicts_with_transition(
+        &self,
+        workspace_key: &str,
+        replacement: &WorkbenchEntryBinding,
+    ) -> bool {
+        self.workspace_key.as_deref() == Some(workspace_key)
+            || self.canonical_origin == replacement.canonical_origin
+            || replacement
+                .project_instance_id
+                .as_ref()
+                .is_some_and(|project_instance_id| {
+                    self.project_instance_id.as_ref() == Some(project_instance_id)
+                })
     }
 }
 
@@ -491,6 +580,16 @@ struct WorkbenchPairingGrantV1 {
     nickname: Option<String>,
     #[serde(default)]
     revoked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation_cause: Option<WorkbenchPairingRevocationCause>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkbenchPairingRevocationCause {
+    Explicit,
+    Replaced,
+    WorkspaceMissing,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -542,6 +641,13 @@ struct WorkbenchAuthorizationStoreV2 {
 struct RestoredAuthorizationState {
     sessions: HashMap<String, WorkbenchSessionGrantV1>,
     pairings: HashMap<String, WorkbenchPairingGrantV1>,
+    resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
+}
+
+struct WorkbenchAuthorizationRollback {
+    session_grants: HashMap<String, WorkbenchSessionGrantV1>,
+    sessions: HashMap<String, WorkbenchSession>,
+    pairing_grants: HashMap<String, WorkbenchPairingGrantV1>,
     resume_outcomes: HashMap<WorkbenchResumeOutcomeKey, WorkbenchResumeOutcomeV1>,
 }
 
@@ -636,6 +742,7 @@ pub struct WorkbenchLaunchResult {
     pub kind: &'static str,
     pub ok: bool,
     pub schema_version: u8,
+    pub launch_mode: WorkbenchLaunchMode,
     pub url: String,
     pub expires_at: String,
     pub expires_in_seconds: u64,
@@ -1034,7 +1141,11 @@ impl WorkbenchHostManager {
                 project_state_gate: Mutex::new(()),
                 write_tx,
                 dispatcher: OnceLock::new(),
-                entry_provider: Mutex::new(Arc::new(DirectWorkbenchEntryProvider)),
+                entry_provider: Mutex::new(Arc::new(
+                    publication::LocaldWorkbenchEntryProvider::production(),
+                )),
+                host_launch_gate: Mutex::new(()),
+                host_generation: AtomicU64::new(0),
                 state: Mutex::new(state),
                 event_admission: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
                 completion_review_admission: Arc::new(Semaphore::new(
@@ -1061,6 +1172,10 @@ impl WorkbenchHostManager {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "published-entry fixtures compile only when the UI test feature is enabled"
+    )]
     fn set_entry_provider(&self, provider: Arc<dyn WorkbenchEntryProvider>) {
         *self
             .inner
@@ -1077,17 +1192,57 @@ impl WorkbenchHostManager {
             )));
         }
 
+        let _launch_gate = self
+            .inner
+            .host_launch_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let workspace = self.register_workspace(workspace_root)?;
-        let (direct_origin, reused_host, secret) = self.ensure_host()?;
-        let entry = self
+        let entry_provider = self
             .inner
             .entry_provider
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench entry provider is unavailable"))?
-            .resolve(&workspace, &direct_origin)?;
-        if entry.is_published() {
-            self.inner
-                .reconcile_published_workspace_move(&workspace, &entry)?;
+            .clone();
+        let mut host_plan = self.prepare_host()?;
+        let direct_origin = host_plan.origin().to_string();
+        let listener_generation = host_plan.generation();
+        let reused_host = host_plan.reused();
+        let secret = host_plan.secret();
+        let publication_listener = host_plan
+            .listener()?
+            .try_clone()
+            .context("retain workbench publication listener")?;
+        let mut entry_transition = None;
+        let rebind_provider = Arc::clone(&entry_provider);
+        let mut authorize = |entry: &WorkbenchEntryBinding| {
+            if entry_transition.is_none() {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+                let previous_bindings = state
+                    .origin_bindings
+                    .iter()
+                    .filter(|(_, binding)| binding.conflicts_with_transition(&workspace.key, entry))
+                    .map(|(origin, binding)| (origin.clone(), binding.clone()))
+                    .collect::<Vec<_>>();
+                entry_transition = Some((entry.clone(), previous_bindings, None));
+            }
+            let rollback = self
+                .inner
+                .reconcile_published_workspace_move_locked(&workspace, entry)?;
+            if let Some((_, _, transition_rollback)) = entry_transition.as_mut()
+                && transition_rollback.is_none()
+            {
+                *transition_rollback = rollback;
+            }
             let mut state = self
                 .inner
                 .state
@@ -1095,7 +1250,67 @@ impl WorkbenchHostManager {
                 .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
             state
                 .origin_bindings
+                .retain(|_, existing| !existing.conflicts_with_transition(&workspace.key, entry));
+            state
+                .origin_bindings
                 .insert(entry.canonical_origin.clone(), entry.clone());
+            drop(state);
+            Ok(())
+        };
+        let mut ensure_started = || {
+            if self.start_host_plan(&mut host_plan)? {
+                rebind_provider.rebind_all(&publication_listener, listener_generation)?;
+                self.retire_replaced_hosts();
+            }
+            Ok(())
+        };
+        let entry = match entry_provider.resolve(
+            &workspace,
+            &direct_origin,
+            &publication_listener,
+            listener_generation,
+            &mut authorize,
+            &mut ensure_started,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if let Some((replacement, previous_entry_bindings, authorization_rollback)) =
+                    entry_transition
+                {
+                    if let Some(authorization_rollback) = authorization_rollback
+                        && let Err(rollback_error) = self
+                            .inner
+                            .restore_published_workspace_move_locked(authorization_rollback)
+                    {
+                        return Err(error.context(format!(
+                            "failed to restore prior workbench pairing authority: {rollback_error:#}"
+                        )));
+                    }
+                    if let Ok(mut state) = self.inner.state.lock() {
+                        state.origin_bindings.retain(|_, existing| {
+                            !existing.conflicts_with_transition(&workspace.key, &replacement)
+                        });
+                        state.origin_bindings.extend(previous_entry_bindings);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if entry_provider.all_on_listener_generation(listener_generation) {
+            self.retire_replaced_hosts();
+        }
+        if !entry.is_published() {
+            let removed_workspace_keys = self.reconcile_direct_workspace_move_locked(&workspace)?;
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+            state.origin_bindings.retain(|_, existing| {
+                existing.workspace_key.as_deref() != Some(workspace.key.as_str())
+            });
+            drop(state);
+            self.release_workspace_publications(&removed_workspace_keys);
         }
         let issued_at = unix_seconds();
         let expires_at = issued_at.saturating_add(TICKET_LIFETIME.as_secs());
@@ -1108,6 +1323,9 @@ impl WorkbenchHostManager {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let ticket = if entry.is_published() {
+            let project_instance_id = entry.project_instance_id.clone().ok_or_else(|| {
+                anyhow::anyhow!("published workbench entry has no project instance")
+            })?;
             sign_ticket(
                 &secret,
                 &WorkbenchTicketV2 {
@@ -1117,12 +1335,9 @@ impl WorkbenchHostManager {
                     project_id: self.inner.project.id.to_string(),
                     workspace_key: workspace.key.clone(),
                     entry_mode: entry.launch_mode,
-                    project_instance_id: entry
-                        .project_instance_id
-                        .clone()
-                        .expect("published entry has a project instance"),
+                    project_instance_id,
                     canonical_origin: entry.canonical_origin.clone(),
-                    capabilities: capabilities.clone(),
+                    capabilities,
                     issued_at,
                     expires_at,
                 },
@@ -1136,7 +1351,7 @@ impl WorkbenchHostManager {
                     instance_id: self.inner.instance_id.to_string(),
                     project_id: self.inner.project.id.to_string(),
                     workspace_key: workspace.key.clone(),
-                    capabilities: capabilities.clone(),
+                    capabilities,
                     issued_at,
                     expires_at,
                 },
@@ -1164,7 +1379,8 @@ impl WorkbenchHostManager {
         Ok(WorkbenchLaunchResult {
             kind: "workbench.launch",
             ok: true,
-            schema_version: 1,
+            schema_version: 2,
+            launch_mode: entry.launch_mode,
             url: format!("{}/#ticket={ticket}", entry.canonical_origin),
             expires_at: timestamp_for_unix_seconds(expires_at),
             expires_in_seconds: TICKET_LIFETIME.as_secs(),
@@ -1286,22 +1502,45 @@ impl WorkbenchHostManager {
     }
 
     pub async fn shutdown(&self) {
-        let task = {
+        let entry_provider = self
+            .inner
+            .entry_provider
+            .lock()
+            .map(|provider| Arc::clone(&provider))
+            .ok();
+        if let Some(entry_provider) = entry_provider {
+            let _ = tokio::task::spawn_blocking(move || entry_provider.shutdown()).await;
+        }
+
+        let tasks = {
             let Ok(mut state) = self.inner.state.lock() else {
                 return;
             };
-            state.host.as_mut().and_then(|host| {
+            let mut tasks = Vec::new();
+            if let Some(host) = state.host.as_mut() {
                 let _ = host.shutdown.send(true);
-                host.task.take()
-            })
+                tasks.extend(host.task.take());
+            }
+            for host in &mut state.retiring_hosts {
+                let _ = host.shutdown.send(true);
+                tasks.extend(host.task.take());
+            }
+            if let Some(host) = state.host.as_mut() {
+                host.publication_listener = None;
+            }
+            for host in &mut state.retiring_hosts {
+                host.publication_listener = None;
+            }
+            tasks
         };
-        if let Some(mut task) = task
-            && tokio::time::timeout(Duration::from_secs(2), &mut task)
+        for mut task in tasks {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
                 .await
                 .is_err()
-        {
-            task.abort();
-            let _ = task.await;
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
         if let Err(error) = self.inner.persist_workspace_store_if_due(true) {
             eprintln!(
@@ -1321,6 +1560,74 @@ impl WorkbenchHostManager {
 
     pub fn observe_workspace(&self, workspace_root: &Path) -> Result<()> {
         self.register_workspace(workspace_root).map(drop)
+    }
+
+    fn release_workspace_publications(&self, workspace_keys: &[String]) {
+        let Ok(provider) = self
+            .inner
+            .entry_provider
+            .lock()
+            .map(|provider| provider.clone())
+        else {
+            return;
+        };
+        for workspace_key in workspace_keys {
+            provider.release_workspace(workspace_key);
+        }
+    }
+
+    fn reconcile_direct_workspace_move_locked(
+        &self,
+        workspace: &WorkspaceRegistration,
+    ) -> Result<Vec<String>> {
+        let Some(worktree_index) = self.inner.project.worktree_index() else {
+            return Ok(Vec::new());
+        };
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let removed_roots = state
+            .workspaces_by_key
+            .values()
+            .filter(|candidate| {
+                candidate.key != workspace.key
+                    && !worktree_index.contains_key(&candidate.root)
+                    && workspace_registrations_share_git_identity(candidate, workspace)
+            })
+            .map(|candidate| candidate.root.clone())
+            .collect::<Vec<_>>();
+        let removed_workspace_keys = removed_roots
+            .iter()
+            .filter_map(|root| state.workspaces_by_root.get(root).cloned())
+            .collect::<Vec<_>>();
+        self.inner
+            .invalidate_removed_workspace_authorizations_locked(
+                &mut state,
+                &removed_workspace_keys,
+                unix_seconds(),
+            )?;
+        for root in removed_roots {
+            if let Some(key) = state.workspaces_by_root.remove(&root) {
+                state.workspaces_by_key.remove(&key);
+            }
+        }
+        state.origin_bindings.retain(|_, binding| {
+            binding
+                .workspace_key
+                .as_ref()
+                .is_none_or(|key| !removed_workspace_keys.contains(key))
+        });
+        state.workspace_store_dirty |= !removed_workspace_keys.is_empty();
+        drop(state);
+        if let Err(error) = self
+            .inner
+            .persist_workspace_store_if_due(!removed_workspace_keys.is_empty())
+        {
+            eprintln!("exo daemon: failed to persist direct worktree move: {error}");
+        }
+        Ok(removed_workspace_keys)
     }
 
     fn register_workspace_with_git(
@@ -1399,9 +1706,17 @@ impl WorkbenchHostManager {
         state
             .workspaces_by_key
             .insert(key.clone(), workspace.clone());
-        let registry_trimmed = retain_project_workspace_limit(&mut state, &key);
+        let evicted = retain_project_workspace_limit(&mut state, &key);
+        let registry_trimmed = !evicted.is_empty();
+        state.origin_bindings.retain(|_, binding| {
+            binding
+                .workspace_key
+                .as_ref()
+                .is_none_or(|workspace_key| !evicted.contains(workspace_key))
+        });
         state.workspace_store_dirty |= changed || registry_trimmed;
         drop(state);
+        self.release_workspace_publications(&evicted);
         if let Err(error) = self
             .inner
             .persist_workspace_store_if_due(new_registration || registry_trimmed)
@@ -1415,7 +1730,24 @@ impl WorkbenchHostManager {
         &self,
         current_workspace_key: &str,
     ) -> Result<Vec<WorkspaceProjection>> {
+        self.project_workspace_projections_with_before_authorization_gate(
+            current_workspace_key,
+            || {},
+        )
+    }
+
+    fn project_workspace_projections_with_before_authorization_gate(
+        &self,
+        current_workspace_key: &str,
+        before_authorization_gate: impl FnOnce(),
+    ) -> Result<Vec<WorkspaceProjection>> {
         let now = unix_seconds();
+        before_authorization_gate();
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let worktree_index = self.inner.project.worktree_index();
         let (known_roots, current_root, live_grant_keys_by_root) = {
             let state = self
@@ -1493,38 +1825,61 @@ impl WorkbenchHostManager {
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
         let mut changed = false;
-        if let Some(index) = worktree_index.as_ref() {
-            let removed = state
-                .workspaces_by_root
-                .keys()
-                .filter(|root| {
-                    !current_root
-                        .as_ref()
-                        .is_some_and(|current| current == *root)
-                        && !index.contains_key(*root)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            for root in removed {
-                if let Some(key) = state.workspaces_by_root.remove(&root) {
-                    state.workspaces_by_key.remove(&key);
-                    changed = true;
-                }
-            }
-        }
+        let mut removed_workspace_keys = Vec::new();
         for workspace in discovered {
             if insert_discovered_workspace(&mut state, workspace) {
                 changed = true;
             }
         }
-        changed |= retain_project_workspace_limit(&mut state, current_workspace_key);
+        if let Some(index) = worktree_index.as_ref() {
+            let removed = state
+                .workspaces_by_root
+                .keys()
+                .filter(|root| {
+                    current_root.as_ref().is_none_or(|current| current != *root)
+                        && !index.contains_key(*root)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let missing_workspace_keys = removed
+                .iter()
+                .filter_map(|root| state.workspaces_by_root.get(root).cloned())
+                .collect::<Vec<_>>();
+            self.inner
+                .invalidate_removed_workspace_authorizations_locked(
+                    &mut state,
+                    &missing_workspace_keys,
+                    now,
+                )?;
+            for root in removed {
+                if let Some(key) = state.workspaces_by_root.remove(&root) {
+                    state.workspaces_by_key.remove(&key);
+                    removed_workspace_keys.push(key);
+                    changed = true;
+                }
+            }
+        }
+        let evicted = retain_project_workspace_limit(&mut state, current_workspace_key);
+        changed |= !evicted.is_empty();
+        removed_workspace_keys.extend(evicted);
+        state.origin_bindings.retain(|_, binding| {
+            binding
+                .workspace_key
+                .as_ref()
+                .is_none_or(|workspace_key| !removed_workspace_keys.contains(workspace_key))
+        });
         state.workspace_store_dirty |= changed;
+        #[allow(
+            clippy::needless_collect,
+            reason = "workspace registrations must outlive the state lock before publication release"
+        )]
         let registrations = state
             .workspaces_by_key
             .values()
             .cloned()
             .collect::<Vec<_>>();
         drop(state);
+        self.release_workspace_publications(&removed_workspace_keys);
 
         if let Err(error) = self.inner.persist_workspace_store_if_due(changed) {
             eprintln!("exo daemon: failed to persist workspace registrations: {error}");
@@ -1572,7 +1927,35 @@ impl WorkbenchHostManager {
     }
 
     fn ensure_host(&self) -> Result<(String, bool, [u8; 32])> {
-        let mut state = self
+        let _launch_gate = self
+            .inner
+            .host_launch_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
+        let provider = self
+            .inner
+            .entry_provider
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench entry provider is unavailable"))?
+            .clone();
+        let mut plan = self.prepare_host()?;
+        let origin = plan.origin().to_string();
+        let reused = plan.reused();
+        let secret = plan.secret();
+        let generation = plan.generation();
+        let listener = plan
+            .listener()?
+            .try_clone()
+            .context("retain workbench publication listener")?;
+        if self.start_host_plan(&mut plan)? {
+            provider.rebind_all(&listener, generation)?;
+            self.retire_replaced_hosts();
+        }
+        Ok((origin, reused, secret))
+    }
+
+    fn prepare_host(&self) -> Result<HostLaunchPlan> {
+        let state = self
             .inner
             .state
             .lock()
@@ -1580,7 +1963,37 @@ impl WorkbenchHostManager {
         if let Some(host) = state.host.as_ref()
             && host.server_task_alive
         {
-            return Ok((host.origin.clone(), true, host.secret));
+            return Ok(HostLaunchPlan::Existing {
+                generation: host.generation,
+                origin: host.origin.clone(),
+                listener: host
+                    .publication_listener
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("live workbench listener is unavailable"))?
+                    .try_clone()
+                    .context("retain live workbench listener")?,
+                secret: host.secret,
+            });
+        }
+        if let Some(host) = state.host.as_ref()
+            && let Some(listener) = host.publication_listener.as_ref()
+        {
+            let generation = self
+                .inner
+                .host_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            return Ok(HostLaunchPlan::Candidate(PendingHost {
+                generation,
+                origin: host.origin.clone(),
+                expected_host: host.expected_host.clone(),
+                listener: Some(
+                    listener
+                        .try_clone()
+                        .context("retain stopped workbench listener")?,
+                ),
+                secret: host.secret,
+            }));
         }
         if self.inner.dispatcher.get().is_none() {
             return Err(anyhow::Error::new(workbench_failure(
@@ -1588,25 +2001,22 @@ impl WorkbenchHostManager {
                 "The daemon workbench dispatcher is not ready",
             )));
         }
+        let preferred_port = state.preferred_port;
+        let retained_secret = state.host.as_ref().map(|host| host.secret);
+        drop(state);
 
-        let listener = if let Some(port) = state.preferred_port {
-            match TcpListener::bind(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port,
-            )) {
+        let listener = if let Some(port) = preferred_port {
+            match bind_workbench_listener(port) {
                 Ok(listener) => Ok(listener),
                 Err(preferred_error) => {
                     eprintln!(
                         "exo daemon: prior workbench port {port} is unavailable; binding a new loopback port: {preferred_error}"
                     );
-                    TcpListener::bind(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::LOCALHOST),
-                        0,
-                    ))
+                    bind_workbench_listener(0)
                 }
             }
         } else {
-            TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            bind_workbench_listener(0)
         }
         .map_err(|error| {
             anyhow::Error::new(
@@ -1624,27 +2034,61 @@ impl WorkbenchHostManager {
             .set_nonblocking(true)
             .context("configure workbench listener")?;
         let address = listener.local_addr().context("read workbench address")?;
-        state.preferred_port = Some(address.port());
         let expected_host = address.to_string();
         let origin = format!("http://{expected_host}");
-        let secret = random_bytes()?;
+        let generation = self
+            .inner
+            .host_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        Ok(HostLaunchPlan::Candidate(PendingHost {
+            generation,
+            origin,
+            expected_host,
+            listener: Some(listener),
+            secret: retained_secret.map_or_else(random_bytes, Ok)?,
+        }))
+    }
+
+    fn start_host_plan(&self, plan: &mut HostLaunchPlan) -> Result<bool> {
+        let HostLaunchPlan::Candidate(candidate) = plan else {
+            return Ok(false);
+        };
+        let listener = candidate
+            .listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("workbench candidate listener was already consumed"))?;
+        let publication_listener = listener
+            .try_clone()
+            .context("retain workbench publication listener")?;
+        let host_publication_listener = publication_listener
+            .try_clone()
+            .context("clone workbench publication listener")?;
         let started_at = timestamp_now();
         let assets_hash = assets::hash();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let tokio_listener =
             tokio::net::TcpListener::from_std(listener).context("adopt workbench listener")?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
         let weak = Arc::downgrade(&self.inner);
+        let host_generation = candidate.generation;
         let task = self.inner.runtime.spawn(async move {
             let result = http::serve(tokio_listener, Weak::clone(&weak), shutdown_rx).await;
             if let Some(inner) = weak.upgrade() {
-                inner.server_stopped(result.err().map(|error| error.to_string()));
+                inner.server_stopped(host_generation, result.err().map(|error| error.to_string()));
             }
         });
         let updated_at = timestamp_now();
-        state.host = Some(BoundHost {
-            origin: origin.clone(),
-            expected_host,
-            secret,
+        let host = BoundHost {
+            generation: candidate.generation,
+            origin: candidate.origin.clone(),
+            expected_host: candidate.expected_host.clone(),
+            publication_listener: Some(host_publication_listener),
+            secret: candidate.secret,
             assets_hash,
             started_at,
             server_task_alive: true,
@@ -1652,11 +2096,47 @@ impl WorkbenchHostManager {
             last_error: None,
             shutdown,
             task: Some(task),
-        });
+        };
+        state.preferred_port = publication_listener
+            .local_addr()
+            .ok()
+            .map(|address| address.port());
+        if let Some(replaced) = state.host.replace(host) {
+            state.retiring_hosts.push(replaced);
+        }
+        *plan = HostLaunchPlan::Existing {
+            generation: candidate.generation,
+            origin: candidate.origin.clone(),
+            listener: publication_listener,
+            secret: candidate.secret,
+        };
         drop(state);
         self.inner.persist_host_record();
-        Ok((origin, false, secret))
+        Ok(true)
     }
+
+    fn retire_replaced_hosts(&self) {
+        let retired = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
+            std::mem::take(&mut state.retiring_hosts)
+        };
+        for mut host in retired {
+            let _ = host.shutdown.send(true);
+            if let Some(task) = host.task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+fn bind_workbench_listener(port: u16) -> std::io::Result<TcpListener> {
+    #[cfg(target_os = "macos")]
+    let _descriptor_guard = locald_publisher_client::ProcessSpawnBarrier::global()
+        .enter_descriptor_acquisition_before(Instant::now() + Duration::from_secs(5))
+        .map_err(std::io::Error::other)?;
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 fn insert_discovered_workspace(
@@ -1677,9 +2157,23 @@ fn insert_discovered_workspace(
     true
 }
 
-fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_key: &str) -> bool {
+fn workspace_registrations_share_git_identity(
+    previous: &WorkspaceRegistration,
+    candidate: &WorkspaceRegistration,
+) -> bool {
+    match (&previous.branch, &candidate.branch) {
+        (Some(previous), Some(candidate)) => previous == candidate,
+        (None, None) => previous.head.is_some() && previous.head == candidate.head,
+        _ => false,
+    }
+}
+
+fn retain_project_workspace_limit(
+    state: &mut WorkbenchState,
+    current_workspace_key: &str,
+) -> Vec<String> {
     if state.workspaces_by_key.len() <= MAX_PROJECT_WORKSPACES {
-        return false;
+        return Vec::new();
     }
 
     let now = unix_seconds();
@@ -1705,6 +2199,13 @@ fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_
             .filter(|grant| grant.is_live(now))
             .map(|grant| grant.workspace_key.clone()),
     );
+    protected.extend(
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .map(|pairing| pairing.workspace_key.clone()),
+    );
     protected.retain(|key| state.workspaces_by_key.contains_key(key));
 
     let mut registrations = state
@@ -1729,13 +2230,19 @@ fn retain_project_workspace_limit(state: &mut WorkbenchState, current_workspace_
         .take(MAX_PROJECT_WORKSPACES.max(protected.len()))
         .map(|workspace| workspace.key)
         .collect::<HashSet<_>>();
+    let removed = state
+        .workspaces_by_key
+        .keys()
+        .filter(|key| !retained.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>();
     state
         .workspaces_by_key
         .retain(|key, _| retained.contains(key));
     state
         .workspaces_by_root
         .retain(|_, key| retained.contains(key));
-    true
+    removed
 }
 
 impl WorkbenchHostInner {
@@ -1916,6 +2423,10 @@ impl WorkbenchHostInner {
             return Err(TicketExchangeError::Invalid);
         }
         let now = unix_seconds();
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| TicketExchangeError::Unavailable)?;
         let mut state = self
             .state
             .lock()
@@ -1979,7 +2490,7 @@ impl WorkbenchHostInner {
             },
         );
         drop(state);
-        if self.persist_session_store().is_err() {
+        if self.persist_session_store_locked().is_err() {
             if let Ok(mut state) = self.state.lock() {
                 state.sessions.remove(&credential_digest);
                 state.session_grants.remove(&credential_digest);
@@ -1992,22 +2503,18 @@ impl WorkbenchHostInner {
         Ok(result)
     }
 
-    fn reconcile_published_workspace_move(
+    fn reconcile_published_workspace_move_locked(
         &self,
         workspace: &WorkspaceRegistration,
         entry: &WorkbenchEntryBinding,
-    ) -> Result<()> {
+    ) -> Result<Option<WorkbenchAuthorizationRollback>> {
         if !entry.is_published() {
-            return Ok(());
+            return Ok(None);
         }
         let project_instance_id = entry
             .project_instance_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("published workbench entry has no project instance"))?;
-        let _gate = self
-            .authorization_store_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .state
             .lock()
@@ -2020,16 +2527,36 @@ impl WorkbenchHostInner {
             .filter(|pairing| {
                 pairing.project_id == self.project.id.as_str()
                     && pairing.project_instance_id == project_instance_id
+                    && (pairing.revoked_at.is_none()
+                        || pairing.revocation_cause
+                            == Some(WorkbenchPairingRevocationCause::WorkspaceMissing))
                     && (pairing.workspace_key != workspace.key
                         || pairing.workspace_root != workspace.root
                         || pairing.canonical_origin != entry.canonical_origin)
             })
             .map(|pairing| pairing.selector.clone())
             .collect::<HashSet<_>>();
-        if moved_pairings.is_empty() {
-            return Ok(());
+        let replaced_pairings = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| {
+                pairing.project_id == self.project.id.as_str()
+                    && pairing.workspace_key == workspace.key
+                    && pairing.project_instance_id != project_instance_id
+                    && pairing.revocation_cause != Some(WorkbenchPairingRevocationCause::Replaced)
+            })
+            .map(|pairing| pairing.selector.clone())
+            .collect::<HashSet<_>>();
+        if moved_pairings.is_empty() && replaced_pairings.is_empty() {
+            return Ok(None);
         }
 
+        let rollback = WorkbenchAuthorizationRollback {
+            session_grants: state.session_grants.clone(),
+            sessions: state.sessions.clone(),
+            pairing_grants: state.pairing_grants.clone(),
+            resume_outcomes: state.resume_outcomes.clone(),
+        };
         let mut candidate_sessions = state.session_grants.clone();
         let mut candidate_pairings = state.pairing_grants.clone();
         let mut candidate_outcomes = state.resume_outcomes.clone();
@@ -2040,16 +2567,25 @@ impl WorkbenchHostInner {
             pairing.workspace_key = workspace.key.clone();
             pairing.workspace_root = workspace.root.clone();
             pairing.canonical_origin = entry.canonical_origin.clone();
+            pairing.restore_missing_workspace_move();
+        }
+        for selector in &replaced_pairings {
+            candidate_pairings
+                .get_mut(selector)
+                .expect("replaced pairing exists")
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
         }
         candidate_sessions.retain(|_, session| {
-            session
-                .pairing_selector
-                .as_ref()
-                .is_none_or(|selector| !moved_pairings.contains(selector))
+            session.pairing_selector.as_ref().is_none_or(|selector| {
+                !moved_pairings.contains(selector) && !replaced_pairings.contains(selector)
+            })
         });
         candidate_outcomes.retain(|key, outcome| {
-            !moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal()
+            (!moved_pairings.contains(&key.pairing_selector) || outcome.is_terminal())
+                && (!replaced_pairings.contains(&key.pairing_selector) || outcome.is_terminal())
         });
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
         let store = authorization_store_from_collections(
             self.project.id.as_str(),
             &candidate_sessions,
@@ -2063,15 +2599,37 @@ impl WorkbenchHostInner {
         state.pairing_grants = candidate_pairings;
         state.resume_outcomes = candidate_outcomes;
         state.sessions.retain(|_, session| {
-            session
-                .pairing_selector
-                .as_ref()
-                .is_none_or(|selector| !moved_pairings.contains(selector))
+            session.pairing_selector.as_ref().is_none_or(|selector| {
+                !moved_pairings.contains(selector) && !replaced_pairings.contains(selector)
+            })
         });
         state.origin_bindings.retain(|_, binding| {
             binding.project_instance_id.as_deref() != Some(project_instance_id)
                 || binding.canonical_origin == entry.canonical_origin
         });
+        Ok(Some(rollback))
+    }
+
+    fn restore_published_workspace_move_locked(
+        &self,
+        rollback: WorkbenchAuthorizationRollback,
+    ) -> Result<()> {
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &rollback.session_grants,
+            &rollback.pairing_grants,
+            &rollback.resume_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .context("restore prior workbench pairing authority")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        state.session_grants = rollback.session_grants;
+        state.sessions = rollback.sessions;
+        state.pairing_grants = rollback.pairing_grants;
+        state.resume_outcomes = rollback.resume_outcomes;
         Ok(())
     }
 
@@ -2189,6 +2747,7 @@ impl WorkbenchHostInner {
                     absolute_expires_at,
                     nickname: None,
                     revoked_at: None,
+                    revocation_cause: None,
                 },
                 new_pairing_secret,
             )
@@ -2223,7 +2782,7 @@ impl WorkbenchHostInner {
             candidate_pairings
                 .get_mut(replaced_selector)
                 .expect("replaced pairing exists")
-                .revoked_at = Some(now);
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
             candidate_outcomes.retain(|key, outcome| {
                 key.pairing_selector.as_str() != replaced_selector || outcome.is_terminal()
             });
@@ -2527,8 +3086,7 @@ impl WorkbenchHostInner {
         candidate_pairings
             .get_mut(selector)
             .ok_or_else(|| anyhow::anyhow!("workbench pairing is unavailable"))?
-            .revoked_at
-            .get_or_insert(now);
+            .revoke(now, WorkbenchPairingRevocationCause::Explicit);
         candidate_sessions
             .retain(|_, session| session.pairing_selector.as_deref() != Some(selector));
         candidate_outcomes
@@ -2791,6 +3349,7 @@ impl WorkbenchHostInner {
         session_key: &str,
         credential_digest: &str,
     ) -> Option<WorkbenchSession> {
+        let _gate = self.authorization_store_gate.lock().ok()?;
         if !self.restore_session(session_key, credential_digest) {
             return None;
         }
@@ -2825,7 +3384,7 @@ impl WorkbenchHostInner {
             grant.last_activity = now;
         }
         drop(state);
-        if persist_activity && let Err(error) = self.persist_session_store() {
+        if persist_activity && let Err(error) = self.persist_session_store_locked() {
             eprintln!("exo daemon: failed to persist workbench session activity: {error}");
         }
         Some(session)
@@ -2848,6 +3407,10 @@ impl WorkbenchHostInner {
         }
         let now = unix_seconds();
         let expires_at = now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs());
+        let _gate = self
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let mut state = self
             .state
             .lock()
@@ -2869,7 +3432,7 @@ impl WorkbenchHostInner {
             .session_grants
             .insert(session.id.clone(), WorkbenchSessionGrantV1::from(&renewed));
         drop(state);
-        self.persist_session_store()
+        self.persist_session_store_locked()
             .context("persist renewed workbench session")?;
         Ok(Some(WorkbenchSessionResult {
             kind: "workbench.session",
@@ -2982,7 +3545,13 @@ impl WorkbenchHostInner {
         state
             .workspaces_by_key
             .insert(grant.workspace_key.clone(), workspace);
-        retain_project_workspace_limit(&mut state, &grant.workspace_key);
+        let evicted = retain_project_workspace_limit(&mut state, &grant.workspace_key);
+        state.origin_bindings.retain(|_, binding| {
+            binding
+                .workspace_key
+                .as_ref()
+                .is_none_or(|workspace_key| !evicted.contains(workspace_key))
+        });
         state.workspace_store_dirty = true;
         state.sessions.insert(
             credential_digest.to_string(),
@@ -3002,6 +3571,11 @@ impl WorkbenchHostInner {
             },
         );
         drop(state);
+        if let Ok(provider) = self.entry_provider.lock().map(|provider| provider.clone()) {
+            for workspace_key in evicted {
+                provider.release_workspace(&workspace_key);
+            }
+        }
         if let Err(error) = self.persist_workspace_store_if_due(true) {
             eprintln!("exo daemon: failed to persist restored workspace: {error}");
         }
@@ -3058,6 +3632,10 @@ impl WorkbenchHostInner {
             .authorization_store_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench session store is unavailable"))?;
+        self.persist_session_store_locked()
+    }
+
+    fn persist_session_store_locked(&self) -> Result<()> {
         let store = {
             let state = self
                 .state
@@ -3067,6 +3645,74 @@ impl WorkbenchHostInner {
         };
         write_authorization_store(&self.authorization_store_path, &store)
             .with_context(|| format!("write {}", self.authorization_store_path.display()))
+    }
+
+    fn invalidate_removed_workspace_authorizations_locked(
+        &self,
+        state: &mut WorkbenchState,
+        workspace_keys: &[String],
+        now: u64,
+    ) -> Result<()> {
+        if workspace_keys.is_empty() {
+            return Ok(());
+        }
+        let removed = workspace_keys.iter().cloned().collect::<HashSet<_>>();
+        let pairing_selectors = state
+            .pairing_grants
+            .values()
+            .filter(|pairing| removed.contains(&pairing.workspace_key))
+            .map(|pairing| pairing.selector.clone())
+            .collect::<HashSet<_>>();
+        let has_sessions = state
+            .session_grants
+            .values()
+            .any(|session| removed.contains(&session.workspace_key));
+        let has_live_pairings = pairing_selectors.iter().any(|selector| {
+            state
+                .pairing_grants
+                .get(selector)
+                .is_some_and(|pairing| pairing.revoked_at.is_none())
+        });
+        let has_nonterminal_outcomes = state.resume_outcomes.iter().any(|(key, outcome)| {
+            pairing_selectors.contains(&key.pairing_selector) && !outcome.is_terminal()
+        });
+        if !has_sessions && !has_live_pairings && !has_nonterminal_outcomes {
+            state
+                .sessions
+                .retain(|_, session| !removed.contains(&session.workspace_key));
+            return Ok(());
+        }
+
+        let mut candidate_sessions = state.session_grants.clone();
+        let mut candidate_pairings = state.pairing_grants.clone();
+        let mut candidate_outcomes = state.resume_outcomes.clone();
+        candidate_sessions.retain(|_, session| !removed.contains(&session.workspace_key));
+        for selector in &pairing_selectors {
+            candidate_pairings
+                .get_mut(selector)
+                .expect("removed workspace pairing exists")
+                .revoke(now, WorkbenchPairingRevocationCause::WorkspaceMissing);
+        }
+        candidate_outcomes.retain(|key, outcome| {
+            !pairing_selectors.contains(&key.pairing_selector) || outcome.is_terminal()
+        });
+        prune_retained_revoked_pairings(&mut candidate_pairings);
+        retain_candidate_resume_outcomes(&mut candidate_outcomes, &candidate_pairings, now);
+        let store = authorization_store_from_collections(
+            self.project.id.as_str(),
+            &candidate_sessions,
+            &candidate_pairings,
+            &candidate_outcomes,
+        );
+        write_authorization_store(&self.authorization_store_path, &store)
+            .context("persist removed worktree authorization invalidation")?;
+        state.session_grants = candidate_sessions;
+        state.pairing_grants = candidate_pairings;
+        state.resume_outcomes = candidate_outcomes;
+        state
+            .sessions
+            .retain(|_, session| !removed.contains(&session.workspace_key));
+        Ok(())
     }
 
     fn persist_workspace_store_if_due(&self, force: bool) -> Result<()> {
@@ -3114,9 +3760,10 @@ impl WorkbenchHostInner {
         Ok(())
     }
 
-    fn server_stopped(&self, error: Option<String>) {
+    fn server_stopped(&self, generation: u64, error: Option<String>) {
         if let Ok(mut state) = self.state.lock()
             && let Some(host) = state.host.as_mut()
+            && host.generation == generation
         {
             host.server_task_alive = false;
             host.updated_at = timestamp_now();
@@ -3130,6 +3777,7 @@ impl WorkbenchHostInner {
             && let Some(host) = state.host.as_mut()
         {
             host.server_task_alive = false;
+            host.publication_listener = None;
             host.updated_at = timestamp_now();
         }
         self.persist_host_record();
@@ -3238,6 +3886,28 @@ impl WorkbenchPairingGrantV1 {
                 && revoked_at <= now
         } else {
             self.is_live(now)
+        }
+    }
+
+    fn revoke(&mut self, now: u64, cause: WorkbenchPairingRevocationCause) {
+        self.revoked_at.get_or_insert(now);
+        match cause {
+            WorkbenchPairingRevocationCause::WorkspaceMissing => {
+                if self.revocation_cause.is_none() {
+                    self.revocation_cause = Some(cause);
+                }
+            }
+            WorkbenchPairingRevocationCause::Explicit
+            | WorkbenchPairingRevocationCause::Replaced => {
+                self.revocation_cause = Some(cause);
+            }
+        }
+    }
+
+    fn restore_missing_workspace_move(&mut self) {
+        if self.revocation_cause == Some(WorkbenchPairingRevocationCause::WorkspaceMissing) {
+            self.revoked_at = None;
+            self.revocation_cause = None;
         }
     }
 
@@ -3595,6 +4265,9 @@ fn valid_pairing_grant(pairing: &WorkbenchPairingGrantV1, project_id: &str, now:
         && !pairing.project_instance_id.is_empty()
         && pairing.canonical_origin.starts_with("https://")
         && expected_host_from_origin(&pairing.canonical_origin).is_some()
+        && pairing
+            .revocation_cause
+            .is_none_or(|_| pairing.revoked_at.is_some())
 }
 
 fn unix_seconds() -> u64 {

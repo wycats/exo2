@@ -1,3 +1,4 @@
+use crate::process_spawn::CommandSpawnExt as _;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -177,7 +178,7 @@ fn read_effective_local_git_config(repo_root: &Path) -> io::Result<Vec<GitConfig
         .arg("-C")
         .arg(repo_root)
         .args(["config", "--local", "--includes", "--null", "--list"])
-        .output()?;
+        .output_guarded()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "git config --local --includes failed in {}: {}",

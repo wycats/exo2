@@ -4,6 +4,7 @@ use crate::ExoResult;
 use crate::api::protocol::ErrorCode;
 use crate::context::ExoState;
 use crate::failure::ExoFailure;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::steering::{SuggestedAction, WorkIntent};
 use serde::Serialize;
 use std::path::Path;
@@ -33,7 +34,7 @@ fn run_git_capture(root: &Path, args: &[&str]) -> ExoResult<Output> {
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()?)
+        .output_with_configured_stdio_guarded()?)
 }
 
 fn escape_commit_message_for_cmd(msg: &str) -> String {

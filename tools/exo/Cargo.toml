@@ -44,6 +44,7 @@ tokio = { version = "1", features = [
   "macros",
   "net",
   "io-util",
+  "process",
   "signal",
   "sync",
   "time",
@@ -58,11 +59,19 @@ fs2 = "0.4.3"
 mime_guess = "2.0.5"
 nix = { version = "0.31.1", features = ["process", "signal"] }
 tempfile = "3.10"
+
+[target.'cfg(unix)'.dependencies]
+locald-core = { git = "https://github.com/wycats/locald.git", rev = "28b7cdf403dd0e933a28cf4d38eeb75cebf1d51c" }
+locald-publisher-client = { git = "https://github.com/wycats/locald.git", rev = "28b7cdf403dd0e933a28cf4d38eeb75cebf1d51c" }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.0"
 proptest = "1.7.0"
 test-case = "3.3"
+
+[target.'cfg(unix)'.dev-dependencies]
+locald-server = { git = "https://github.com/wycats/locald.git", rev = "28b7cdf403dd0e933a28cf4d38eeb75cebf1d51c", default-features = false }
 
 [features]
 default = ["pretty-print", "ui"]

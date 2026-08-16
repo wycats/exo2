@@ -17,6 +17,7 @@ use crate::dogfood_activation::{
     DOGFOOD_ACTIVATION_ENV, DogfoodActivation, DogfoodActivationBinding,
 };
 use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
 use exosuit_storage::rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -1195,7 +1196,7 @@ fn proxy_health_probe(
         .stderr(Stdio::null());
     configure_proxy_health_probe_process(&mut child_command);
 
-    let mut child = match child_command.spawn() {
+    let mut child = match child_command.spawn_guarded() {
         Ok(child) => child,
         Err(error) => {
             let _ = fs::remove_file(&output_path);
@@ -2634,7 +2635,7 @@ fn inspect_workspace_mcp_servers(root: &Path) -> ExoResult<McpRestartReport> {
             "-Command",
             "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress",
         ])
-        .output()
+        .output_guarded()
         .context("Failed to scan Windows processes")?;
     if !output.status.success() {
         bail!(
@@ -2739,7 +2740,7 @@ fn inspect_workspace_mcp_servers(root: &Path) -> ExoResult<McpRestartReport> {
     let target_proxy_exe = debug_binary_path(&root, "exo-mcp");
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
-        .output()
+        .output_guarded()
         .context("Failed to scan processes with ps")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let current_parent_pid = stdout
@@ -2899,7 +2900,7 @@ fn mcp_process_decision(
 fn process_cwd(pid: u32) -> Option<PathBuf> {
     let output = std::process::Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -2919,7 +2920,7 @@ fn git_output(root: &Path, args: &[&str]) -> ExoResult<String> {
         .arg("-C")
         .arg(root)
         .args(args)
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to run git in {}", root.display()))?;
     if !output.status.success() {
         bail!(

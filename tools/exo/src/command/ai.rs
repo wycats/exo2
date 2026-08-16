@@ -6,6 +6,7 @@
 
 use super::traits::{Command, CommandBox, CommandContext, CommandOutput, OutputFormat};
 use crate::api::protocol::Effect;
+use crate::process_spawn::CommandSpawnExt as _;
 use anyhow::{Context, Result as ExoResult};
 use serde::Serialize;
 use std::fs;
@@ -394,7 +395,7 @@ impl Command for AiChatHistory {
 
         // Execute exohistory
         let output = cmd
-            .output()
+            .output_guarded()
             .context("Failed to execute exohistory. Is it installed? (cargo install --path crates/exohistory)")?;
 
         if output.status.success() {

@@ -292,6 +292,7 @@ mod tests {
     use crate::mcp::{executable_identity_for_path, test_support};
 
     use super::*;
+    use crate::process_spawn::CommandSpawnExt as _;
 
     fn fingerprint(path: &Path) -> DogfoodActivationBinary {
         DogfoodActivationBinary {
@@ -447,7 +448,7 @@ mod tests {
                 reference.to_str().expect("reference path"),
                 path.to_str().expect("proxy path"),
             ])
-            .status()
+            .status_guarded()
             .expect("restore mtime");
         assert!(status.success());
 

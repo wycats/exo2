@@ -1,3 +1,5 @@
+use crate::process_spawn::CommandSpawnExt as _;
+
 pub const AGENTS_MD: &str = r#"<!-- core start -->
 
 # Agent Workflow & Philosophy
@@ -436,7 +438,7 @@ fn is_git_worktree(root: &std::path::Path) -> Result<bool, std::io::Error> {
         .arg(root)
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
-        .output()?;
+        .output_guarded()?;
 
     Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
@@ -449,7 +451,7 @@ fn git_config_get(root: &std::path::Path, key: &str) -> Result<Option<String>, s
         .arg("--local")
         .arg("--get")
         .arg(key)
-        .output()?;
+        .output_guarded()?;
 
     if output.status.success() {
         Ok(Some(
@@ -468,7 +470,7 @@ fn git_config_set(root: &std::path::Path, key: &str, value: &str) -> Result<(), 
         .arg("--local")
         .arg(key)
         .arg(value)
-        .status()?;
+        .status_guarded()?;
 
     if status.success() {
         Ok(())
@@ -490,7 +492,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .arg("init")
             .arg(repo)
-            .status()
+            .status_guarded()
             .expect("run git init");
         assert!(status.success());
 

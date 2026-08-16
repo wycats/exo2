@@ -9,6 +9,7 @@ use super::traits::{
     OutputFormat,
 };
 use crate::api::protocol::Effect;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::Result as ExoResult;
 use serde::Serialize;
@@ -126,7 +127,7 @@ impl Command for CommitStatus {
         let output = ProcessCommand::new("git")
             .args(["status", "--porcelain"])
             .current_dir(ctx.root)
-            .output()?;
+            .output_guarded()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let files: Vec<FileStatus> = stdout
@@ -250,7 +251,7 @@ impl MutableCommand for Commit {
         let status_output = ProcessCommand::new("git")
             .args(["status", "--porcelain"])
             .current_dir(ctx.root)
-            .output()?;
+            .output_guarded()?;
 
         let status_stdout = String::from_utf8_lossy(&status_output.stdout);
         let files_changed = status_stdout.lines().filter(|l| !l.is_empty()).count();
@@ -274,7 +275,7 @@ impl MutableCommand for Commit {
         let add_output = ProcessCommand::new("git")
             .args(["add", "-A"])
             .current_dir(ctx.root)
-            .output()?;
+            .output_guarded()?;
 
         if !add_output.status.success() {
             anyhow::bail!(
@@ -287,7 +288,7 @@ impl MutableCommand for Commit {
         let commit_output = ProcessCommand::new("git")
             .args(["commit", "-m", &self.message])
             .current_dir(ctx.root)
-            .output()?;
+            .output_guarded()?;
 
         if !commit_output.status.success() {
             anyhow::bail!(
@@ -300,7 +301,7 @@ impl MutableCommand for Commit {
         let hash_output = ProcessCommand::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .current_dir(ctx.root)
-            .output()?;
+            .output_guarded()?;
 
         let hash = String::from_utf8_lossy(&hash_output.stdout)
             .trim()

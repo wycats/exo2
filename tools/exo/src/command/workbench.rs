@@ -4,7 +4,7 @@ use super::traits::{
     Command, CommandBox, CommandContext, CommandOutput, MutableCommand, MutableCommandContext,
 };
 use crate::api::protocol::Effect;
-use crate::workbench::daemon_required_failure;
+use crate::workbench::{WorkbenchLaunchMode, daemon_required_failure};
 use anyhow::Result as ExoResult;
 
 fn mutable_command_unreachable(name: &str) -> ! {
@@ -305,9 +305,13 @@ impl Command for WorkbenchLaunch {
             .runtime_services
             .ok_or_else(|| anyhow::Error::new(daemon_required_failure()))?;
         let result = services.launch(ctx.root)?;
+        let entry_label = match result.launch_mode {
+            WorkbenchLaunchMode::DirectLoopback => "Direct loopback workbench",
+            WorkbenchLaunchMode::Published => "Published locald workbench",
+        };
         let message = format!(
-            "Open the Exo workbench for {}:\n{}\n\nThis one-time browser enrollment link expires in one hour.",
-            result.workspace.label, result.url
+            "{entry_label} for {}:\n{}\n\nThis one-time browser enrollment link expires in one hour.",
+            result.workspace.label, result.url,
         );
         Ok(CommandOutput::new(result, message))
     }
@@ -364,15 +368,25 @@ mod tests {
     }
 
     #[test]
-    fn registered_workbench_commands_are_pure_replayable_reads() {
+    fn registered_workbench_reads_are_pure_and_replayable() {
         let spec = CommandSpec::from_registry(&default_registry());
-        for operation in ["launch", "snapshot", "inspect", "pairing.list"] {
+        for operation in ["snapshot", "inspect", "pairing.list"] {
             let operation = spec
                 .operation("workbench", operation)
                 .expect("registered workbench operation");
             assert_eq!(operation.effect, Effect::Pure);
             assert_eq!(operation.recovery_class, RecoveryClass::ReplayableRead);
         }
+    }
+
+    #[test]
+    fn launch_is_a_replayable_runtime_operation() {
+        let spec = CommandSpec::from_registry(&default_registry());
+        let operation = spec
+            .operation("workbench", "launch")
+            .expect("registered workbench launch");
+        assert_eq!(operation.effect, Effect::Pure);
+        assert_eq!(operation.recovery_class, RecoveryClass::ReplayableRead);
     }
 
     #[test]
@@ -390,9 +404,6 @@ mod tests {
     #[test]
     fn direct_workbench_commands_require_daemon_runtime_services() {
         for error in [
-            WorkbenchLaunch
-                .execute(&direct_context())
-                .expect_err("direct launch must fail"),
             WorkbenchSnapshot
                 .execute(&direct_context())
                 .expect_err("direct snapshot must fail"),
@@ -412,5 +423,16 @@ mod tests {
                 "workbench.daemon_required"
             );
         }
+        let error = WorkbenchLaunch
+            .execute(&direct_context())
+            .expect_err("direct launch must fail");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("structured workbench failure");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().expect("details")["kind"],
+            "workbench.daemon_required"
+        );
     }
 }

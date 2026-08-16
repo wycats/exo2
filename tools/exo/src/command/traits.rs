@@ -797,6 +797,7 @@ pub fn recovery_class_for_command(
 mod tests {
     use super::*;
     use crate::command::toml::TomlRead;
+    use crate::process_spawn::CommandSpawnExt as _;
     use std::path::PathBuf;
     use std::process::Command as ProcessCommand;
 
@@ -901,7 +902,7 @@ mod tests {
         let output = ProcessCommand::new("git")
             .args(["init"])
             .current_dir(root)
-            .output()
+            .output_guarded()
             .expect("run git init");
 
         assert!(

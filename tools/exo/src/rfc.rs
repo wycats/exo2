@@ -1,3 +1,4 @@
+use crate::process_spawn::CommandSpawnExt as _;
 use anyhow::{Context, Result};
 use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
@@ -788,7 +789,7 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<Option<String>> {
         .arg("-C")
         .arg(root)
         .args(args)
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to run git in {}", root.display()))?;
     if !output.status.success() {
         return Ok(None);
@@ -811,7 +812,7 @@ fn canonical_rfc_blobs(root: &Path, canonical: &CanonicalGitRef) -> Result<Vec<C
             "--",
             RFCS_DIR,
         ])
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to enumerate RFCs from {}", canonical.ref_name))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -861,7 +862,7 @@ fn canonical_rfc_blobs(root: &Path, canonical: &CanonicalGitRef) -> Result<Vec<C
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .context("Failed to start git cat-file --batch")?;
     let mut stdin = child
         .stdin
@@ -949,7 +950,7 @@ fn canonical_history_contains_anchor(
             "--",
             RFCS_DIR,
         ])
-        .output()
+        .output_guarded()
         .with_context(|| format!("Failed to inspect RFC history from {}", canonical.ref_name))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -3374,7 +3375,7 @@ fn move_rfc_file(root: &Path, old_path: &Path, new_path: &Path) -> Result<()> {
         .arg(&old_rel)
         .arg(&new_rel)
         .current_dir(root)
-        .status();
+        .status_guarded();
 
     if git_mv.is_ok_and(|status| status.success()) {
         return Ok(());
@@ -3876,7 +3877,7 @@ pub fn promote(path: &Path, id: &str) -> Result<()> {
             .arg(&file_path)
             .arg(&new_path)
             .current_dir(path)
-            .status();
+            .status_guarded();
 
         match status {
             Ok(s) if s.success() => {}
@@ -3948,7 +3949,7 @@ pub fn withdraw(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> 
             .arg(&file_path)
             .arg(&new_path)
             .current_dir(path)
-            .status();
+            .status_guarded();
 
         match status {
             Ok(s) if s.success() => {}
@@ -4027,7 +4028,7 @@ pub fn archive(path: &Path, id: &str, reason: Option<&str>) -> Result<PathBuf> {
             .arg(&file_path)
             .arg(&new_path)
             .current_dir(path)
-            .status();
+            .status_guarded();
 
         match status {
             Ok(s) if s.success() => {}
@@ -4638,7 +4639,7 @@ fn open_rfc_in_editor(path: &Path) -> Result<()> {
 
     let status = std::process::Command::new(&editor)
         .arg(path)
-        .status()
+        .status_guarded()
         .with_context(|| format!("Failed to launch editor '{editor}' for {}", path.display()))?;
 
     if !status.success() {
@@ -5366,7 +5367,7 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(args)
-            .output()
+            .output_guarded()
             .unwrap();
         assert!(
             output.status.success(),

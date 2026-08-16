@@ -49,6 +49,7 @@ use crate::daemon_outcomes::{
     request_declared_recovery, resolved_request_recovery,
 };
 use crate::daemon_transport::{DaemonEndpoint, DaemonStream};
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, ProjectResolver, git_common_dir_from_filesystem};
 use crate::workbench::{
     DaemonRequestDispatcher, DaemonRuntimeServices, WorkbenchHostManager, WorkbenchHostRecord,
@@ -1281,7 +1282,7 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
     }
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()?;
+        .output_guarded()?;
     let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || start.is_empty() {
         return Err(io::Error::new(
@@ -1298,7 +1299,7 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
         format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks");
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()?;
+        .output_guarded()?;
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1319,7 +1320,7 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
 fn process_start_identity(pid: u32) -> io::Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()?;
+        .output_guarded()?;
     let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || start.is_empty() {
         return Err(io::Error::new(
@@ -1378,7 +1379,7 @@ fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
 fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
     let Ok(output) = Command::new("ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
-        .output()
+        .output_guarded()
     else {
         return false;
     };
@@ -1394,7 +1395,7 @@ fn legacy_daemon_command_matches(workspace_root: &Path, pid: u32) -> bool {
     let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
     let Ok(output) = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
+        .output_guarded()
     else {
         return false;
     };
@@ -1449,7 +1450,7 @@ fn process_alive(pid: u32) -> bool {
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .output_with_configured_stdio_guarded()
         .is_ok_and(|output| {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
@@ -1477,7 +1478,7 @@ fn terminate_pid(pid: u32) -> bool {
         .args(["/PID", &pid_text, "/T"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_guarded()
         .is_ok_and(|status| status.success())
 }
 
@@ -1502,7 +1503,7 @@ fn force_terminate_pid(pid: u32) -> bool {
         .args(["/PID", &pid_text, "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_guarded()
         .is_ok_and(|status| status.success())
 }
 
@@ -1840,6 +1841,7 @@ fn execute_ledgered_daemon_request(
     effect: Effect,
     instance_id: &str,
     diagnostics: &DaemonDiagnostics,
+    runtime_services: Option<&DaemonRuntimeServices>,
 ) -> OutcomeExecution {
     let response_id = request.id.clone();
     if let Some(request_id) =
@@ -1863,12 +1865,23 @@ fn execute_ledgered_daemon_request(
                     return daemon_workspace_error_response(request_id, &error);
                 }
             };
-            handle_request_with_project_and_diagnostics_as_writer(
-                &context.workspace_root,
-                Some(&context.project),
-                request,
-                diagnostics,
-            )
+            match runtime_services {
+                Some(runtime_services) => {
+                    handle_request_with_project_and_diagnostics_as_daemon_writer(
+                        &context.workspace_root,
+                        Some(&context.project),
+                        request,
+                        diagnostics,
+                        runtime_services,
+                    )
+                }
+                None => handle_request_with_project_and_diagnostics_as_writer(
+                    &context.workspace_root,
+                    Some(&context.project),
+                    request,
+                    diagnostics,
+                ),
+            }
         },
     );
     outcome.response.id = response_id;
@@ -2165,7 +2178,7 @@ fn spawn_daemon_process(
         command.process_group(0);
     }
 
-    command.spawn()?;
+    command.spawn_guarded()?;
 
     Ok(())
 }
@@ -2264,7 +2277,7 @@ fn spawn_daemon_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
+        .status_guarded()?;
 
     if !status.success() {
         return Err(std::io::Error::other(format!(
@@ -2998,6 +3011,7 @@ pub async fn run_daemon(
                                 recovery.effect,
                                 &instance_id,
                                 &diagnostics,
+                                Some(&handler_runtime_services),
                             );
                             let advances_revision =
                                 !outcome.replayed && response_committed_write(&outcome.response);
@@ -3495,7 +3509,7 @@ mod tests {
         let output = Command::new("git")
             .args(args)
             .current_dir(cwd)
-            .output()
+            .output_guarded()
             .expect("run git command");
         assert!(
             output.status.success(),
@@ -4156,6 +4170,7 @@ mod tests {
             Effect::Exec,
             "instance-a",
             &diagnostics,
+            None,
         );
         let second = execute_ledgered_daemon_request(
             &primary,
@@ -4165,6 +4180,7 @@ mod tests {
             Effect::Exec,
             "instance-a",
             &diagnostics,
+            None,
         );
 
         assert!(!first.replayed);
@@ -4343,6 +4359,7 @@ mod tests {
             reserved.effect,
             "replacement-instance",
             &DaemonDiagnostics::disabled(),
+            None,
         );
 
         assert!(!retry.replayed);
@@ -4421,6 +4438,7 @@ mod tests {
             Effect::Write,
             "instance-a",
             &DaemonDiagnostics::disabled(),
+            None,
         );
 
         assert!(execution.replayed);
@@ -4458,6 +4476,7 @@ mod tests {
             Effect::Write,
             "instance-a",
             &DaemonDiagnostics::disabled(),
+            None,
         );
 
         assert!(!execution.replayed);
@@ -4988,7 +5007,7 @@ mod tests {
         let output = Command::new("git")
             .arg("init")
             .current_dir(workspace)
-            .output()
+            .output_guarded()
             .unwrap();
         assert!(output.status.success());
 

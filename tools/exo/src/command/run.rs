@@ -8,6 +8,7 @@ use super::traits::{
     OutputFormat,
 };
 use crate::api::protocol::Effect;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::run::load_config;
 use anyhow::Result as ExoResult;
 use serde_json::{Value as JsonValue, json};
@@ -236,7 +237,7 @@ impl MutableCommand for RunTaskCommand {
             .current_dir(cwd)
             .env(TASK_DIRECT_MODE_ENV, "1")
             .env(TASK_PARENT_DAEMON_PID_ENV, std::process::id().to_string())
-            .output()?;
+            .output_guarded()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

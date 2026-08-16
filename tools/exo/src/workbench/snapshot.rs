@@ -12,6 +12,7 @@ use crate::context::sqlite_loader::PhaseDetailsData;
 use crate::context::{Epoch, ExoState, Phase, SqliteLoader, WorkbenchLaneData};
 use crate::failure::ExoFailure;
 use crate::phase_owner::PhaseOwnerViewContext;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::Project;
 use crate::status::between_phases_context_for_epoch;
 use crate::steering::derive_phase_steering;
@@ -658,8 +659,9 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         .arg(root)
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .output_with_configured_stdio_guarded()
         .ok()?;
     output
         .status
