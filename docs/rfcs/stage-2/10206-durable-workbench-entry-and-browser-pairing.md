@@ -472,6 +472,10 @@ whose workspace registration still resolves to the same physical worktree. It
 requires locald to return the pairing's exact project instance and canonical
 origin before it republishes the private listener. Missing, revoked, expired,
 relocated, or contradictory pairing state never creates publication authority.
+The core daemon socket starts independently of this work. Restoration runs in
+the background, isolates failures by workspace, and retries failed acquisition
+with bounded backoff while the pairing remains live. One slow or unavailable
+route therefore cannot delay Exo commands or suppress another worktree's route.
 
 When the private listener changes, Exo starts the candidate and rebinds each
 worktree supervisor independently. Locald owns the authenticated atomic commit

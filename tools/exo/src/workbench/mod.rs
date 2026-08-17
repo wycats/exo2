@@ -25,7 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(target_os = "macos")]
 use std::time::Instant;
@@ -57,6 +57,8 @@ const MAX_PAIRING_NICKNAME_CHARS: usize = 80;
 const PAIRING_SELECTOR_DISPLAY_CHARS: usize = 12;
 const MAX_PROJECT_WORKSPACES: usize = 128;
 const MAX_EVENT_STREAMS: usize = 32;
+const PUBLICATION_RESTORE_INITIAL_RETRY: Duration = Duration::from_millis(250);
+const PUBLICATION_RESTORE_MAX_RETRY: Duration = Duration::from_secs(30);
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_COOKIE_PREFIX: &str = "exo_workbench_session_";
 pub(crate) const PAIRING_COOKIE_NAME: &str = "exo_workbench_pairing";
@@ -301,6 +303,9 @@ struct WorkbenchHostInner {
     entry_provider: Mutex<Arc<dyn WorkbenchEntryProvider>>,
     host_launch_gate: Mutex<()>,
     host_generation: AtomicU64,
+    publication_restore_shutdown: watch::Sender<bool>,
+    publication_restore_task: Mutex<Option<JoinHandle<()>>>,
+    shutting_down: AtomicBool,
     state: Mutex<WorkbenchState>,
     event_admission: Arc<Semaphore>,
     completion_review_admission: Arc<Semaphore>,
@@ -1083,6 +1088,7 @@ impl WorkbenchHostManager {
         let authorization_store_path = runtime_dir.join("workbench.authorizations.json");
         let legacy_session_store_path = runtime_dir.join("workbench.sessions.json");
         let workspace_store_path = runtime_dir.join("workbench.workspaces.json");
+        let (publication_restore_shutdown, _) = watch::channel(false);
         let now = unix_seconds();
         let mut state = WorkbenchState::default();
         match load_authorization_state(
@@ -1151,6 +1157,9 @@ impl WorkbenchHostManager {
                 )),
                 host_launch_gate: Mutex::new(()),
                 host_generation: AtomicU64::new(0),
+                publication_restore_shutdown,
+                publication_restore_task: Mutex::new(None),
+                shutting_down: AtomicBool::new(false),
                 state: Mutex::new(state),
                 event_admission: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
                 completion_review_admission: Arc::new(Semaphore::new(
@@ -1173,13 +1182,70 @@ impl WorkbenchHostManager {
                         .values()
                         .any(|pairing| pairing.is_live(unix_seconds())))
         });
-        if resume_host && let Err(error) = self.restore_prior_host() {
-            eprintln!("exo daemon: failed to resume the prior workbench origin: {error}");
+        if resume_host {
+            self.start_publication_restore_task()?;
         }
         Ok(())
     }
 
+    fn start_publication_restore_task(&self) -> Result<()> {
+        let mut restore_task = self
+            .inner
+            .publication_restore_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench publication restoration is unavailable"))?;
+        if restore_task
+            .as_ref()
+            .is_some_and(|restore_task| !restore_task.is_finished())
+        {
+            return Ok(());
+        }
+
+        let weak = Arc::downgrade(&self.inner);
+        let mut shutdown = self.inner.publication_restore_shutdown.subscribe();
+        let task = self.inner.runtime.spawn(async move {
+            let mut retry_delay = PUBLICATION_RESTORE_INITIAL_RETRY;
+            loop {
+                if *shutdown.borrow() {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let manager = WorkbenchHostManager { inner };
+                let restored = tokio::task::spawn_blocking(move || manager.restore_prior_host())
+                    .await;
+                match restored {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "exo daemon: failed to resume every prior workbench origin; retrying: {error:#}"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "exo daemon: workbench publication restoration stopped unexpectedly; retrying: {error}"
+                        );
+                    }
+                }
+
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(PUBLICATION_RESTORE_MAX_RETRY);
+            }
+        });
+        *restore_task = Some(task);
+        Ok(())
+    }
+
     fn restore_prior_host(&self) -> Result<()> {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("workbench publication restoration is shutting down");
+        }
         let publications = self.retained_publications()?;
         if publications.is_empty() {
             self.ensure_host()?;
@@ -1210,6 +1276,8 @@ impl WorkbenchHostManager {
             .try_clone()
             .context("retain restored workbench publication listener")?;
 
+        let mut first_failure = None;
+        let mut failure_count = 0usize;
         for (workspace, expected) in publications {
             let previous_bindings = {
                 let state = self
@@ -1250,6 +1318,9 @@ impl WorkbenchHostManager {
             };
             let rebind_provider = Arc::clone(&provider);
             let mut ensure_started = || {
+                if self.inner.shutting_down.load(Ordering::Acquire) {
+                    anyhow::bail!("workbench publication restoration is shutting down");
+                }
                 if self.start_host_plan(&mut host_plan)? {
                     rebind_provider.rebind_all(&publication_listener, listener_generation)?;
                     self.retire_replaced_hosts();
@@ -1276,19 +1347,28 @@ impl WorkbenchHostManager {
                     });
                     state.origin_bindings.extend(previous_bindings);
                 }
-                return match resolved {
-                    Ok(_) => Err(anyhow::Error::new(workbench_failure(
+                let error = match resolved {
+                    Ok(_) => anyhow::Error::new(workbench_failure(
                         "workbench.publisher_binding_changed",
                         "The retained workbench pairing no longer matches the published service",
-                    ))),
-                    Err(error) => Err(error),
+                    )),
+                    Err(error) => error,
                 };
+                failure_count += 1;
+                if first_failure.is_none() {
+                    first_failure = Some((workspace.key.clone(), error));
+                }
             }
         }
         if provider.all_on_listener_generation(listener_generation) {
             self.retire_replaced_hosts();
         }
-        Ok(())
+        match first_failure {
+            None => Ok(()),
+            Some((workspace_key, error)) => Err(error.context(format!(
+                "failed to restore {failure_count} retained workbench publication(s); first workspace {workspace_key}"
+            ))),
+        }
     }
 
     fn retained_publications(&self) -> Result<Vec<(WorkspaceRegistration, WorkbenchEntryBinding)>> {
@@ -1673,6 +1753,8 @@ impl WorkbenchHostManager {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        let _ = self.inner.publication_restore_shutdown.send(true);
         let entry_provider = self
             .inner
             .entry_provider
@@ -1681,6 +1763,20 @@ impl WorkbenchHostManager {
             .ok();
         if let Some(entry_provider) = entry_provider {
             let _ = tokio::task::spawn_blocking(move || entry_provider.shutdown()).await;
+        }
+        let restore_task = self
+            .inner
+            .publication_restore_task
+            .lock()
+            .ok()
+            .and_then(|mut restore_task| restore_task.take());
+        if let Some(mut restore_task) = restore_task
+            && tokio::time::timeout(Duration::from_secs(2), &mut restore_task)
+                .await
+                .is_err()
+        {
+            restore_task.abort();
+            let _ = restore_task.await;
         }
 
         let tasks = {
