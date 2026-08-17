@@ -1389,6 +1389,12 @@ timeout = 1
         .inner
         .persist_session_store()
         .expect("persist retained publication pairing");
+    assert!(provider.replay_authority_current(&first_entry, listener_generation));
+    provider.shutdown();
+    assert!(
+        !provider.replay_authority_current(&first_entry, listener_generation),
+        "a shutting-down locald provider cannot authorize replay"
+    );
     manager.shutdown().await;
     assert_eq!(provider.publication_count(), 0);
 
@@ -1741,7 +1747,10 @@ async fn launch_replay_retention_uses_issuance_time_host_and_workspace_identity(
     let host_error = manager
         .retain_launch_replay("launch-host-race", &host_response)
         .expect_err("host replacement before retention must fail closed");
-    assert!(host_error.to_string().contains("host"), "{host_error:#}");
+    assert!(
+        host_error.to_string().contains("not pending"),
+        "{host_error:#}"
+    );
     manager
         .inner
         .state
@@ -1789,7 +1798,7 @@ async fn launch_replay_retention_uses_issuance_time_host_and_workspace_identity(
         .retain_launch_replay("launch-workspace-race", &workspace_response)
         .expect_err("remove and re-register before retention must fail closed");
     assert!(
-        workspace_error.to_string().contains("registration"),
+        workspace_error.to_string().contains("not pending"),
         "{workspace_error:#}"
     );
     manager.shutdown().await;
@@ -1939,6 +1948,24 @@ async fn published_launch_replay_requires_current_entry_and_publication_authorit
             .expect("published authority is current"),
         &response,
     );
+
+    let authority_gap = manager
+        .launch(&fixture.root)
+        .expect("launch published authority-gap fixture");
+    let authority_gap_response =
+        launch_response_envelope("launch-published-authority-gap", &authority_gap);
+    manager
+        .retain_launch_replay("launch-published-authority-gap", &authority_gap_response)
+        .expect("retain published authority-gap replay");
+    assert!(
+        manager
+            .replay_launch_response_with_before_relock("launch-published-authority-gap", || {
+                provider.current.store(false, Ordering::Release)
+            },)
+            .is_none(),
+        "published replay rechecks provider authority after external validation"
+    );
+    provider.current.store(true, Ordering::Release);
 
     let mut origin_mismatch = launch_response_envelope("launch-origin-mismatch", &launch);
     let (_, ticket) = launch_parts(&launch);
@@ -2541,16 +2568,19 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
         MAX_PROJECT_WORKSPACES
     );
     assert!(state.workspaces_by_key.contains_key(&current_key));
-    assert!(state.workspaces_by_key.contains_key("workspace-000"));
+    assert!(
+        !state.workspaces_by_key.contains_key("workspace-000"),
+        "an issuance-invalid pending capability must not protect a stale workspace"
+    );
     assert!(state.workspaces_by_key.contains_key("workspace-001"));
     assert!(state.workspaces_by_key.contains_key("workspace-002"));
     assert!(state.workspaces_by_key.contains_key("workspace-003"));
     assert!(state.workspaces_by_key.contains_key("workspace-127"));
-    assert!(!state.workspaces_by_key.contains_key("workspace-004"));
+    assert!(state.workspaces_by_key.contains_key("workspace-004"));
     assert!(
         !state
             .workspace_registration_generations
-            .contains_key("workspace-004")
+            .contains_key("workspace-000")
     );
 }
 
@@ -4919,6 +4949,190 @@ async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
     assert_eq!(
         provider.released_workspace_keys(),
         vec![workspace_key.clone(), workspace_key]
+    );
+
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn issuance_invalid_pending_launches_do_not_hold_publication_residency() {
+    for replace_workspace in [false, true] {
+        for forget in [false, true] {
+            let fixture = fixture();
+            let manager = test_manager(Arc::clone(&fixture.project));
+            let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+            manager.set_entry_provider(provider.clone());
+
+            let paired = manager
+                .launch(&fixture.root)
+                .expect("launch paired workbench");
+            let workspace_key = paired.workspace.key.clone();
+            let (_, paired_ticket) = launch_parts(&paired);
+            let paired_payload = published_ticket_payload(paired_ticket);
+            let entry = WorkbenchEntryBinding::published(
+                paired_payload.canonical_origin,
+                paired_payload.project_instance_id,
+                paired_payload.workspace_key,
+            )
+            .expect("published workbench entry");
+            manager
+                .inner
+                .enroll_pairing(paired_ticket, None, &entry)
+                .expect("enroll durable pairing");
+            let selector = manager
+                .inner
+                .state
+                .lock()
+                .expect("workbench state")
+                .pairing_grants
+                .keys()
+                .next()
+                .expect("durable pairing")
+                .clone();
+
+            let pending = manager
+                .launch(&fixture.root)
+                .expect("launch pending workbench");
+            let request_id = format!(
+                "launch-stale-{}-{}",
+                if replace_workspace {
+                    "workspace"
+                } else {
+                    "host"
+                },
+                if forget { "forget" } else { "revoke" }
+            );
+            manager
+                .retain_launch_replay(
+                    &request_id,
+                    &launch_response_envelope(&request_id, &pending),
+                )
+                .expect("retain pending replay");
+            let pending_payload = published_ticket_payload(launch_parts(&pending).1);
+            {
+                let mut state = manager.inner.state.lock().expect("workbench state");
+                if replace_workspace {
+                    let generation = state
+                        .workspace_registration_generations
+                        .get_mut(&workspace_key)
+                        .expect("workspace registration generation");
+                    *generation = generation.saturating_add(1);
+                } else {
+                    state.host.as_mut().expect("live workbench host").generation += 1;
+                }
+            }
+
+            if forget {
+                manager
+                    .inner
+                    .forget_pairing(&selector, None)
+                    .expect("forget durable pairing");
+            } else {
+                manager
+                    .inner
+                    .revoke_pairing(&selector, None)
+                    .expect("revoke durable pairing");
+            }
+            assert!(!manager.requires_daemon_residency(unix_seconds()));
+            assert_eq!(provider.released_workspace_keys(), vec![workspace_key]);
+            let state = manager.inner.state.lock().expect("workbench state");
+            assert!(
+                !state
+                    .pending_capabilities
+                    .contains_key(&pending_payload.capability_id)
+            );
+            assert!(!state.launch_replays.contains_key(&request_id));
+            drop(state);
+
+            manager.shutdown().await;
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_pending_launch_releases_only_its_workspace_with_a_live_sibling() {
+    let fixture = fixture();
+    let linked = fixture
+        ._temp
+        .path()
+        .join("residency-expiry-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "residency-expiry-linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let expiring = manager
+        .launch(&fixture.root)
+        .expect("launch expiring workspace");
+    let expiring_workspace_key = expiring.workspace.key.clone();
+    let expiring_request_id = "launch-expiring-with-live-sibling";
+    manager
+        .retain_launch_replay(
+            expiring_request_id,
+            &launch_response_envelope(expiring_request_id, &expiring),
+        )
+        .expect("retain expiring replay");
+    let expiring_payload = published_ticket_payload(launch_parts(&expiring).1);
+
+    let sibling = manager.launch(&linked).expect("launch sibling workbench");
+    let sibling_workspace_key = sibling.workspace.key.clone();
+    let (_, sibling_ticket) = launch_parts(&sibling);
+    let sibling_payload = published_ticket_payload(sibling_ticket);
+    let sibling_entry = WorkbenchEntryBinding::published(
+        sibling_payload.canonical_origin,
+        sibling_payload.project_instance_id,
+        sibling_payload.workspace_key,
+    )
+    .expect("sibling published entry");
+    manager
+        .inner
+        .enroll_pairing(sibling_ticket, None, &sibling_entry)
+        .expect("enroll sibling pairing");
+
+    let now = unix_seconds();
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pending_capabilities
+        .get_mut(&expiring_payload.capability_id)
+        .expect("expiring pending capability")
+        .expires_at = now;
+
+    assert!(manager.requires_daemon_residency(now));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![expiring_workspace_key.clone()]
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        !state
+            .pending_capabilities
+            .contains_key(&expiring_payload.capability_id)
+    );
+    assert!(!state.launch_replays.contains_key(expiring_request_id));
+    assert!(
+        state.pairing_grants.values().any(|pairing| {
+            pairing.workspace_key == sibling_workspace_key && pairing.is_live(now)
+        })
+    );
+    drop(state);
+    assert!(
+        !provider
+            .released_workspace_keys()
+            .contains(&sibling_workspace_key)
     );
 
     manager.shutdown().await;
