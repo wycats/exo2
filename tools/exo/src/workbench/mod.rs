@@ -8,7 +8,7 @@ mod publication;
 mod publication;
 mod snapshot;
 
-use crate::api::protocol::{RequestEnvelope, ResponseEnvelope};
+use crate::api::protocol::{RequestEnvelope, ResponseEnvelope, Status};
 use crate::failure::ExoFailure;
 use crate::project::{Project, ProjectResolver};
 use anyhow::{Context, Result};
@@ -184,6 +184,22 @@ impl DaemonRuntimeServices {
         self.host.launch(workspace_root)
     }
 
+    pub(crate) fn retain_launch_replay(
+        &self,
+        request_id: &str,
+        response: &ResponseEnvelope,
+    ) -> Result<()> {
+        self.host.retain_launch_replay(request_id, response)
+    }
+
+    pub(crate) fn replay_launch_response(&self, request_id: &str) -> Option<ResponseEnvelope> {
+        self.host.replay_launch_response(request_id)
+    }
+
+    pub(crate) fn discard_launch_replay(&self, request_id: &str) {
+        self.host.discard_launch_replay(request_id);
+    }
+
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
         self.host.snapshot(workspace_root)
     }
@@ -321,7 +337,10 @@ struct WorkbenchState {
     preferred_port: Option<u16>,
     workspaces_by_root: HashMap<PathBuf, String>,
     workspaces_by_key: HashMap<String, WorkspaceRegistration>,
+    workspace_registration_generations: HashMap<String, u64>,
+    next_workspace_registration_generation: u64,
     pending_capabilities: HashMap<String, PendingCapability>,
+    launch_replays: HashMap<String, Arc<WorkbenchLaunchReplay>>,
     session_grants: HashMap<String, WorkbenchSessionGrantV1>,
     sessions: HashMap<String, WorkbenchSession>,
     pairing_grants: HashMap<String, WorkbenchPairingGrantV1>,
@@ -368,6 +387,14 @@ trait WorkbenchEntryProvider: Send + Sync {
 
     fn all_on_listener_generation(&self, _listener_generation: u64) -> bool {
         true
+    }
+
+    fn replay_authority_current(
+        &self,
+        entry: &WorkbenchEntryBinding,
+        _listener_generation: u64,
+    ) -> bool {
+        !entry.is_published()
     }
 
     fn shutdown(&self) {}
@@ -525,6 +552,18 @@ pub(super) struct WorkspaceProjection {
 struct PendingCapability {
     workspace_key: String,
     entry: WorkbenchEntryBinding,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WorkbenchLaunchReplay {
+    response: ResponseEnvelope,
+    capability_id: String,
+    workspace_key: String,
+    workspace_root: PathBuf,
+    workspace_registration_generation: u64,
+    entry: WorkbenchEntryBinding,
+    host_generation: u64,
     expires_at: u64,
 }
 
@@ -1114,6 +1153,13 @@ impl WorkbenchHostManager {
         match read_workspace_store(&workspace_store_path, project.id.as_str()) {
             Ok(workspaces) => {
                 for workspace in workspaces {
+                    state.next_workspace_registration_generation = state
+                        .next_workspace_registration_generation
+                        .saturating_add(1);
+                    state.workspace_registration_generations.insert(
+                        workspace.key.clone(),
+                        state.next_workspace_registration_generation,
+                    );
                     state
                         .workspaces_by_root
                         .insert(workspace.root.clone(), workspace.key.clone());
@@ -1683,9 +1729,7 @@ impl WorkbenchHostManager {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
-        state
-            .pending_capabilities
-            .retain(|_, pending| pending.expires_at > issued_at);
+        retain_live_pending_capabilities(&mut state, issued_at);
         state.pending_capabilities.insert(
             capability_id,
             PendingCapability {
@@ -1763,6 +1807,181 @@ impl WorkbenchHostManager {
         self.inner
             .release_workspace_publications(&inactive_publications);
         resident
+    }
+
+    fn retain_launch_replay(&self, request_id: &str, response: &ResponseEnvelope) -> Result<()> {
+        if response.status != Status::Ok {
+            return Ok(());
+        }
+        let result = response
+            .result
+            .as_ref()
+            .filter(|result| {
+                result.get("kind").and_then(serde_json::Value::as_str) == Some("workbench.launch")
+            })
+            .ok_or_else(|| anyhow::anyhow!("workbench launch response is missing its result"))?;
+        let url = result
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("workbench launch response is missing its URL"))?;
+        let (response_origin, ticket) = url
+            .split_once("#ticket=")
+            .filter(|(_, ticket)| !ticket.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("workbench launch response has no enrollment ticket"))?;
+        let verified = self
+            .inner
+            .verify_ticket(ticket)
+            .map_err(|_| anyhow::anyhow!("workbench launch response ticket is not current"))?;
+        if response_origin.strip_suffix('/') != Some(verified.entry.canonical_origin.as_str()) {
+            return Err(anyhow::anyhow!(
+                "workbench launch response origin does not match its ticket authority"
+            ));
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let pending = state
+            .pending_capabilities
+            .get(&verified.capability_id)
+            .filter(|pending| {
+                pending.workspace_key == verified.workspace_key
+                    && pending.entry == verified.entry
+                    && pending.expires_at == verified.expires_at
+            })
+            .ok_or_else(|| anyhow::anyhow!("workbench launch capability is not pending"))?;
+        let workspace = state
+            .workspaces_by_key
+            .get(&verified.workspace_key)
+            .filter(|workspace| {
+                state.workspaces_by_root.get(&workspace.root) == Some(&workspace.key)
+            })
+            .ok_or_else(|| anyhow::anyhow!("workbench launch workspace is not registered"))?;
+        let workspace_registration_generation = *state
+            .workspace_registration_generations
+            .get(&workspace.key)
+            .ok_or_else(|| {
+                anyhow::anyhow!("workbench launch workspace registration has no generation")
+            })?;
+        let host = state
+            .host
+            .as_ref()
+            .filter(|host| host.server_task_alive)
+            .ok_or_else(|| anyhow::anyhow!("workbench launch host is not alive"))?;
+        let host_generation = host.generation;
+        if pending.entry.is_published() {
+            if state.origin_bindings.get(&pending.entry.canonical_origin) != Some(&pending.entry) {
+                return Err(anyhow::anyhow!(
+                    "workbench launch publication authority is not installed"
+                ));
+            }
+        } else if host.origin != pending.entry.canonical_origin {
+            return Err(anyhow::anyhow!(
+                "workbench launch loopback origin is not current"
+            ));
+        }
+        let replay = WorkbenchLaunchReplay {
+            response: response.clone(),
+            capability_id: verified.capability_id,
+            workspace_key: workspace.key.clone(),
+            workspace_root: workspace.root.clone(),
+            workspace_registration_generation,
+            entry: pending.entry.clone(),
+            host_generation,
+            expires_at: pending.expires_at,
+        };
+        state
+            .launch_replays
+            .insert(request_id.to_string(), Arc::new(replay));
+        drop(state);
+        Ok(())
+    }
+
+    fn replay_launch_response(&self, request_id: &str) -> Option<ResponseEnvelope> {
+        self.replay_launch_response_with_before_relock(request_id, || {})
+    }
+
+    fn replay_launch_response_with_before_relock<F>(
+        &self,
+        request_id: &str,
+        before_relock: F,
+    ) -> Option<ResponseEnvelope>
+    where
+        F: FnOnce(),
+    {
+        let replay = {
+            let mut state = self.inner.state.lock().ok()?;
+            let replay = Arc::clone(state.launch_replays.get(request_id)?);
+            if !launch_replay_state_current(&state, request_id, &replay, unix_seconds()) {
+                state.launch_replays.remove(request_id);
+                return None;
+            }
+            drop(state);
+            replay
+        };
+
+        if self
+            .inner
+            .validate_session_workspace(&replay.workspace_root)
+            .is_err()
+        {
+            self.discard_launch_replay_if_current(request_id, &replay);
+            return None;
+        }
+
+        if replay.entry.is_published() {
+            let provider = self.inner.entry_provider.lock().ok()?.clone();
+            if !provider.replay_authority_current(&replay.entry, replay.host_generation) {
+                self.discard_launch_replay_if_current(request_id, &replay);
+                return None;
+            }
+        }
+
+        before_relock();
+        let mut state = self.inner.state.lock().ok()?;
+        if !launch_replay_state_current(&state, request_id, &replay, unix_seconds()) {
+            if state
+                .launch_replays
+                .get(request_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &replay))
+            {
+                state.launch_replays.remove(request_id);
+            }
+            return None;
+        }
+        let response = replay.response.clone();
+        drop(state);
+        Some(response)
+    }
+
+    fn discard_launch_replay_if_current(
+        &self,
+        request_id: &str,
+        expected: &Arc<WorkbenchLaunchReplay>,
+    ) {
+        if let Ok(mut state) = self.inner.state.lock()
+            && state
+                .launch_replays
+                .get(request_id)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            state.launch_replays.remove(request_id);
+        }
+    }
+
+    fn discard_launch_replay(&self, request_id: &str) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.launch_replays.remove(request_id);
+        }
+    }
+
+    pub(crate) fn has_live_pending_enrollment(&self, now: u64) -> bool {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return false;
+        };
+        retain_live_pending_capabilities(&mut state, now);
+        !state.pending_capabilities.is_empty()
     }
 
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
@@ -2067,6 +2286,23 @@ impl WorkbenchHostManager {
                 .as_ref()
                 .map_or(now, |workspace| workspace.registered_at),
         };
+        if previous.is_none() {
+            state.next_workspace_registration_generation = state
+                .next_workspace_registration_generation
+                .saturating_add(1);
+            let generation = state.next_workspace_registration_generation;
+            state
+                .workspace_registration_generations
+                .insert(key.clone(), generation);
+        } else if !state.workspace_registration_generations.contains_key(&key) {
+            state.next_workspace_registration_generation = state
+                .next_workspace_registration_generation
+                .saturating_add(1);
+            let generation = state.next_workspace_registration_generation;
+            state
+                .workspace_registration_generations
+                .insert(key.clone(), generation);
+        }
         let changed = previous.as_ref() != Some(&workspace);
         let new_registration = previous.is_none();
         state.workspaces_by_root.insert(root, key.clone());
@@ -2536,6 +2772,72 @@ fn workspace_registrations_share_git_identity(
     }
 }
 
+fn launch_replay_state_current(
+    state: &WorkbenchState,
+    request_id: &str,
+    replay: &Arc<WorkbenchLaunchReplay>,
+    now: u64,
+) -> bool {
+    let exact_cache_entry = state
+        .launch_replays
+        .get(request_id)
+        .is_some_and(|current| Arc::ptr_eq(current, replay));
+    let workspace_current = state
+        .workspaces_by_key
+        .get(&replay.workspace_key)
+        .is_some_and(|workspace| {
+            workspace.root == replay.workspace_root
+                && state
+                    .workspace_registration_generations
+                    .get(&replay.workspace_key)
+                    == Some(&replay.workspace_registration_generation)
+                && state.workspaces_by_root.get(&replay.workspace_root)
+                    == Some(&replay.workspace_key)
+        });
+    let pending_current = state
+        .pending_capabilities
+        .get(&replay.capability_id)
+        .is_some_and(|pending| {
+            pending.workspace_key == replay.workspace_key
+                && pending.entry == replay.entry
+                && pending.expires_at == replay.expires_at
+                && pending.expires_at > now
+        });
+    let host_current = state
+        .host
+        .as_ref()
+        .is_some_and(|host| host.generation == replay.host_generation && host.server_task_alive);
+    let entry_current = if replay.entry.is_published() {
+        state.origin_bindings.get(&replay.entry.canonical_origin) == Some(&replay.entry)
+    } else {
+        state.host.as_ref().is_some_and(|host| {
+            host.generation == replay.host_generation
+                && host.origin == replay.entry.canonical_origin
+        })
+    };
+    exact_cache_entry && workspace_current && pending_current && host_current && entry_current
+}
+
+fn retain_live_pending_capabilities(state: &mut WorkbenchState, now: u64) {
+    state
+        .pending_capabilities
+        .retain(|_, pending| pending.expires_at > now);
+    let live_capabilities = state
+        .pending_capabilities
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    state.launch_replays.retain(|_, replay| {
+        replay.expires_at > now && live_capabilities.contains(&replay.capability_id)
+    });
+}
+
+fn remove_launch_replays_for_capability(state: &mut WorkbenchState, capability_id: &str) {
+    state
+        .launch_replays
+        .retain(|_, replay| replay.capability_id != capability_id);
+}
+
 fn retain_project_workspace_limit(
     state: &mut WorkbenchState,
     current_workspace_key: &str,
@@ -2795,6 +3097,17 @@ impl WorkbenchHostInner {
         &self,
         ticket: &str,
     ) -> Result<(String, WorkbenchSessionResult), TicketExchangeError> {
+        self.redeem_ticket_with_before_persist(ticket, || {})
+    }
+
+    fn redeem_ticket_with_before_persist<F>(
+        &self,
+        ticket: &str,
+        before_persist: F,
+    ) -> Result<(String, WorkbenchSessionResult), TicketExchangeError>
+    where
+        F: FnOnce(),
+    {
         let payload = self.verify_ticket(ticket)?;
         if payload.entry.launch_mode != WorkbenchLaunchMode::DirectLoopback {
             return Err(TicketExchangeError::Invalid);
@@ -2808,16 +3121,15 @@ impl WorkbenchHostInner {
             .state
             .lock()
             .map_err(|_| TicketExchangeError::Invalid)?;
-        state
-            .pending_capabilities
-            .retain(|_, pending| pending.expires_at > now);
+        retain_live_pending_capabilities(&mut state, now);
         retain_live_sessions(&mut state, now);
         if state.session_grants.len() >= MAX_SESSIONS {
             return Err(TicketExchangeError::Busy);
         }
         let pending = state
             .pending_capabilities
-            .remove(&payload.capability_id)
+            .get(&payload.capability_id)
+            .cloned()
             .ok_or(TicketExchangeError::Invalid)?;
         if pending.workspace_key != payload.workspace_key
             || pending.entry != payload.entry
@@ -2867,16 +3179,21 @@ impl WorkbenchHostInner {
             },
         );
         drop(state);
+        before_persist();
         if self.persist_session_store_locked().is_err() {
             if let Ok(mut state) = self.state.lock() {
                 state.sessions.remove(&credential_digest);
                 state.session_grants.remove(&credential_digest);
-                state
-                    .pending_capabilities
-                    .insert(payload.capability_id, pending);
             }
             return Err(TicketExchangeError::Unavailable);
         }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TicketExchangeError::Unavailable)?;
+        state.pending_capabilities.remove(&payload.capability_id);
+        remove_launch_replays_for_capability(&mut state, &payload.capability_id);
+        drop(state);
         Ok(result)
     }
 
@@ -3035,6 +3352,7 @@ impl WorkbenchHostInner {
             .state
             .lock()
             .map_err(|_| PairingExchangeError::Unavailable)?;
+        retain_live_pending_capabilities(&mut state, now);
         retain_live_authorizations(&mut state, now);
         if state.session_grants.len() >= MAX_SESSIONS {
             return Err(PairingExchangeError::Busy);
@@ -3178,6 +3496,7 @@ impl WorkbenchHostInner {
             .map_err(|_| PairingExchangeError::Unavailable)?;
 
         state.pending_capabilities.remove(&payload.capability_id);
+        remove_launch_replays_for_capability(&mut state, &payload.capability_id);
         state.session_grants = candidate_sessions;
         state.pairing_grants = candidate_pairings;
         state.resume_outcomes = candidate_outcomes;

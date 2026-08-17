@@ -202,6 +202,42 @@ impl RebindTrackingPublishedEntryProvider {
 }
 
 #[cfg(feature = "ui")]
+#[derive(Debug)]
+struct ReplayAuthorityPublishedEntryProvider {
+    current: AtomicBool,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for ReplayAuthorityPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
+        )
+    }
+
+    fn replay_authority_current(
+        &self,
+        entry: &WorkbenchEntryBinding,
+        _listener_generation: u64,
+    ) -> bool {
+        entry.is_published() && self.current.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "ui")]
 impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
     fn resolve(
         &self,
@@ -1399,6 +1435,251 @@ fn published_ticket_payload(ticket: &str) -> WorkbenchTicketV2 {
     serde_json::from_slice(&bytes).expect("parse ticket payload")
 }
 
+#[cfg(feature = "ui")]
+fn launch_response_envelope(id: &str, launch: &WorkbenchLaunchResult) -> ResponseEnvelope {
+    ResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id: id.to_string(),
+        status: Status::Ok,
+        result: Some(serde_json::to_value(launch).expect("serialize launch")),
+        error: None,
+        ticket: None,
+        steering: None,
+        reminders: None,
+        display: None,
+        preview: None,
+        effect: Some(Effect::Write),
+        trace: None,
+    }
+}
+
+#[cfg(feature = "ui")]
+fn assert_same_response(left: &ResponseEnvelope, right: &ResponseEnvelope) {
+    assert_eq!(
+        serde_json::to_value(left).expect("serialize left response"),
+        serde_json::to_value(right).expect("serialize right response")
+    );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test]
+async fn launch_replay_requires_live_pending_capability_host_and_workspace_registration() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let response = launch_response_envelope("launch-live", &launch);
+    manager
+        .retain_launch_replay("launch-live", &response)
+        .expect("retain launch replay");
+    assert_same_response(
+        &manager
+            .replay_launch_response("launch-live")
+            .expect("current launch replays"),
+        &response,
+    );
+
+    let (_, ticket) = launch_parts(&launch);
+    let signing_secret = manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .host
+        .as_ref()
+        .expect("live host")
+        .secret;
+    for path in [
+        &manager.inner.host_record_path,
+        &manager.inner.authorization_store_path,
+        &manager.inner.workspace_store_path,
+    ] {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows(ticket.len())
+                .any(|window| window == ticket.as_bytes()),
+            "launch bearer persisted in {}",
+            path.display()
+        );
+        assert!(
+            !bytes
+                .windows(signing_secret.len())
+                .any(|window| window == signing_secret),
+            "launch signing material persisted in {}",
+            path.display()
+        );
+    }
+    manager
+        .inner
+        .redeem_ticket(ticket)
+        .expect("consume launch capability");
+    assert!(manager.replay_launch_response("launch-live").is_none());
+
+    let expiring = manager
+        .launch(&fixture.root)
+        .expect("launch expiring ticket");
+    let expiring_response = launch_response_envelope("launch-expired", &expiring);
+    manager
+        .retain_launch_replay("launch-expired", &expiring_response)
+        .expect("retain expiring replay");
+    let payload = ticket_payload(launch_parts(&expiring).1);
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pending_capabilities
+        .get_mut(&payload.capability_id)
+        .expect("pending capability")
+        .expires_at = unix_seconds().saturating_sub(1);
+    assert!(manager.replay_launch_response("launch-expired").is_none());
+
+    let host_bound = manager
+        .launch(&fixture.root)
+        .expect("launch host-bound ticket");
+    let host_response = launch_response_envelope("launch-host", &host_bound);
+    manager
+        .retain_launch_replay("launch-host", &host_response)
+        .expect("retain host-bound replay");
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .host
+        .as_mut()
+        .expect("live host")
+        .generation += 1;
+    assert!(manager.replay_launch_response("launch-host").is_none());
+
+    let workspace_bound = manager
+        .launch(&fixture.root)
+        .expect("launch workspace-bound ticket");
+    let workspace_response = launch_response_envelope("launch-workspace", &workspace_bound);
+    manager
+        .retain_launch_replay("launch-workspace", &workspace_response)
+        .expect("retain workspace-bound replay");
+    let generation_updated = manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .workspace_registration_generations
+        .get_mut(&workspace_bound.workspace.key)
+        .is_some_and(|generation| {
+            *generation = generation.saturating_add(1);
+            true
+        });
+    assert!(
+        generation_updated,
+        "workspace registration has a generation"
+    );
+    assert!(manager.replay_launch_response("launch-workspace").is_none());
+
+    let cache_bound = manager
+        .launch(&fixture.root)
+        .expect("launch cache-bound ticket");
+    let cache_response = launch_response_envelope("launch-cache-identity", &cache_bound);
+    manager
+        .retain_launch_replay("launch-cache-identity", &cache_response)
+        .expect("retain cache-bound replay");
+    assert!(
+        manager
+            .replay_launch_response_with_before_relock("launch-cache-identity", || {
+                let mut state = manager.inner.state.lock().expect("workbench state");
+                let replacement = Arc::new(
+                    (**state
+                        .launch_replays
+                        .get("launch-cache-identity")
+                        .expect("cached launch replay"))
+                    .clone(),
+                );
+                state
+                    .launch_replays
+                    .insert("launch-cache-identity".to_string(), replacement);
+            })
+            .is_none(),
+        "replay must reject a cache entry replaced during external validation"
+    );
+    assert_same_response(
+        &manager
+            .replay_launch_response("launch-cache-identity")
+            .expect("replacement replay remains available"),
+        &cache_response,
+    );
+
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test]
+async fn published_launch_replay_requires_current_entry_and_publication_authority() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(ReplayAuthorityPublishedEntryProvider {
+        current: AtomicBool::new(true),
+    });
+    manager.set_entry_provider(provider.clone());
+
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let response = launch_response_envelope("launch-published", &launch);
+    manager
+        .retain_launch_replay("launch-published", &response)
+        .expect("retain published replay");
+    assert_same_response(
+        &manager
+            .replay_launch_response("launch-published")
+            .expect("published authority is current"),
+        &response,
+    );
+
+    let mut origin_mismatch = launch_response_envelope("launch-origin-mismatch", &launch);
+    let (_, ticket) = launch_parts(&launch);
+    origin_mismatch.result.as_mut().expect("launch result")["url"] =
+        json!(format!("https://wrong-origin.localhost/#ticket={ticket}"));
+    let error = manager
+        .retain_launch_replay("launch-origin-mismatch", &origin_mismatch)
+        .expect_err("response origin must match the verified ticket entry");
+    assert!(error.to_string().contains("origin"), "{error:#}");
+    assert!(
+        manager
+            .replay_launch_response("launch-origin-mismatch")
+            .is_none()
+    );
+
+    provider.current.store(false, Ordering::Release);
+    assert!(manager.replay_launch_response("launch-published").is_none());
+
+    let entry_mismatch = manager
+        .launch(&fixture.root)
+        .expect("launch for entry mismatch");
+    let mismatch_response = launch_response_envelope("launch-entry", &entry_mismatch);
+    manager
+        .retain_launch_replay("launch-entry", &mismatch_response)
+        .expect("retain entry replay");
+    provider.current.store(true, Ordering::Release);
+    let origin = entry_mismatch
+        .url
+        .split_once("/#ticket=")
+        .expect("published URL")
+        .0;
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .origin_bindings
+        .remove(origin);
+    assert!(manager.replay_launch_response("launch-entry").is_none());
+
+    manager.shutdown().await;
+}
+
 #[test]
 fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
     let summary = WorkbenchLaneSummary {
@@ -2312,6 +2593,68 @@ async fn direct_ticket_redemption_waits_for_authorization_transition() {
             .session(&session.session_key, &session_secret)
             .is_some(),
         "the serialized direct session remains usable"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(all(feature = "ui", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn launch_replay_rejects_an_exact_linked_worktree_replaced_by_another_root() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("launch-replay-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "workbench-launch-replay-linked",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    let linked_root = linked.canonicalize().expect("canonical linked worktree");
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let launch = manager
+        .launch(&linked_root)
+        .expect("launch linked worktree");
+    let response = launch_response_envelope("launch-removed-worktree", &launch);
+    manager
+        .retain_launch_replay("launch-removed-worktree", &response)
+        .expect("retain linked-worktree launch replay");
+    assert_same_response(
+        &manager
+            .replay_launch_response("launch-removed-worktree")
+            .expect("linked worktree initially replays"),
+        &response,
+    );
+
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    std::os::unix::fs::symlink(&fixture.root, &linked)
+        .expect("replace linked worktree with primary-worktree symlink");
+
+    assert!(
+        manager
+            .replay_launch_response("launch-removed-worktree")
+            .is_none(),
+        "a substituted exact workspace must invalidate launch replay"
+    );
+    assert!(
+        !manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .launch_replays
+            .contains_key("launch-removed-worktree"),
+        "a failed workspace validation must discard only that replay"
     );
     manager.shutdown().await;
 }
@@ -4445,14 +4788,26 @@ async fn ticket_persistence_failure_restores_the_one_time_capability() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
     let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let response = launch_response_envelope("launch-persistence-rollback", &launch);
+    manager
+        .retain_launch_replay("launch-persistence-rollback", &response)
+        .expect("retain launch replay");
     let (_, ticket) = launch_parts(&launch);
     let payload = ticket_payload(ticket);
     fs::create_dir(&manager.inner.authorization_store_path)
         .expect("block the session store with a directory");
 
+    let mut replay_during_persistence = None;
     assert_eq!(
-        manager.inner.redeem_ticket(ticket),
+        manager.inner.redeem_ticket_with_before_persist(ticket, || {
+            replay_during_persistence =
+                manager.replay_launch_response("launch-persistence-rollback");
+        }),
         Err(TicketExchangeError::Unavailable)
+    );
+    assert_same_response(
+        &replay_during_persistence.expect("launch replays until redemption is durable"),
+        &response,
     );
     assert!(
         manager
@@ -4464,6 +4819,12 @@ async fn ticket_persistence_failure_restores_the_one_time_capability() {
             .contains_key(&payload.capability_id),
         "a failed durable exchange must restore the one-time capability"
     );
+    assert_same_response(
+        &manager
+            .replay_launch_response("launch-persistence-rollback")
+            .expect("failed persistence preserves the launch replay"),
+        &response,
+    );
 
     fs::remove_dir(&manager.inner.authorization_store_path)
         .expect("restore the session store destination");
@@ -4471,6 +4832,12 @@ async fn ticket_persistence_failure_restores_the_one_time_capability() {
         .inner
         .redeem_ticket(ticket)
         .expect("retry the restored ticket");
+    assert!(
+        manager
+            .replay_launch_response("launch-persistence-rollback")
+            .is_none(),
+        "successful redemption removes the launch replay"
+    );
     manager.shutdown().await;
 }
 

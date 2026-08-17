@@ -44,7 +44,7 @@ use crate::daemon_diagnostics::{
     response_status,
 };
 use crate::daemon_outcomes::{
-    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger,
+    DAEMON_OUTCOME_DB_NAME, OutcomeExecution, RequestOutcomeLedger, is_workbench_launch_request,
     normalize_retryable_daemon_busy_response_if_needed, request_command_path,
     request_declared_recovery, resolved_request_recovery,
 };
@@ -1857,40 +1857,62 @@ fn execute_ledgered_daemon_request(
         request.id = request_id;
     }
     let handler_response_id = response_id.clone();
-    let mut outcome = outcome_ledger.execute(
-        request,
-        effect,
-        instance_id,
-        Duration::from_secs(30),
-        |mut request| {
-            request.id = handler_response_id;
-            let request_id = request.id.clone();
-            let context = match daemon_request_context(startup_workspace, startup_project, &request)
-            {
-                Ok(context) => context,
-                Err(error) => {
-                    return daemon_workspace_error_response(request_id, &error);
-                }
-            };
-            match runtime_services {
-                Some(runtime_services) => {
-                    handle_request_with_project_and_diagnostics_as_daemon_writer(
-                        &context.workspace_root,
-                        Some(&context.project),
-                        request,
-                        diagnostics,
-                        runtime_services,
-                    )
-                }
-                None => handle_request_with_project_and_diagnostics_as_writer(
-                    &context.workspace_root,
-                    Some(&context.project),
-                    request,
-                    diagnostics,
-                ),
+    let is_workbench_launch = is_workbench_launch_request(&request);
+    let execute = |mut request: RequestEnvelope| {
+        request.id = handler_response_id;
+        let request_id = request.id.clone();
+        let context = match daemon_request_context(startup_workspace, startup_project, &request) {
+            Ok(context) => context,
+            Err(error) => {
+                return daemon_workspace_error_response(request_id, &error);
             }
-        },
-    );
+        };
+        match runtime_services {
+            Some(runtime_services) => handle_request_with_project_and_diagnostics_as_daemon_writer(
+                &context.workspace_root,
+                Some(&context.project),
+                request,
+                diagnostics,
+                runtime_services,
+            ),
+            None => handle_request_with_project_and_diagnostics_as_writer(
+                &context.workspace_root,
+                Some(&context.project),
+                request,
+                diagnostics,
+            ),
+        }
+    };
+    let mut outcome = if is_workbench_launch {
+        let Some(runtime_services) = runtime_services else {
+            return OutcomeExecution {
+                response: daemon_handler_error_response(
+                    response_id,
+                    ErrorCode::PreconditionFailed,
+                    "workbench launch requires daemon runtime services".to_string(),
+                ),
+                replayed: false,
+            };
+        };
+        outcome_ledger.execute_workbench_launch(
+            request,
+            effect,
+            instance_id,
+            Duration::from_secs(30),
+            execute,
+            |request_id, response| runtime_services.retain_launch_replay(request_id, response),
+            |request_id| runtime_services.replay_launch_response(request_id),
+            |request_id| runtime_services.discard_launch_replay(request_id),
+        )
+    } else {
+        outcome_ledger.execute(
+            request,
+            effect,
+            instance_id,
+            Duration::from_secs(30),
+            execute,
+        )
+    };
     outcome.response.id = response_id;
     outcome
 }
@@ -2809,6 +2831,7 @@ pub async fn run_daemon(
     let request_outcome_ledger = Arc::clone(&outcome_ledger);
     let request_instance_id = Arc::clone(&instance_id);
     let request_runtime_services = runtime_services.clone();
+    let replay_runtime_services = runtime_services.clone();
     let request_write_tx = write_tx.clone();
     let request_admission = Arc::new(tokio::sync::Semaphore::new(
         DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS,
@@ -2862,8 +2885,14 @@ pub async fn run_daemon(
                         request
                     });
                     let recovery_request = recovery_request.as_ref().unwrap_or(&req);
-                    if let Ok(Some(mut outcome)) =
-                        outcome_ledger.terminal_outcome_before_preparation(recovery_request)
+                    let replay_launch = |request_id: &str| {
+                        handler_runtime_services.replay_launch_response(request_id)
+                    };
+                    if let Ok(Some(mut outcome)) = outcome_ledger
+                        .terminal_outcome_before_preparation_with_launch_replay(
+                            recovery_request,
+                            Some(&replay_launch),
+                        )
                     {
                         outcome.response.id = handler_request_id;
                         return outcome.response;
@@ -2916,8 +2945,11 @@ pub async fn run_daemon(
                         None
                     };
                     if project_state_guard.is_some()
-                        && let Ok(Some(mut outcome)) =
-                            outcome_ledger.terminal_outcome_before_preparation(recovery_request)
+                        && let Ok(Some(mut outcome)) = outcome_ledger
+                            .terminal_outcome_before_preparation_with_launch_replay(
+                                recovery_request,
+                                Some(&replay_launch),
+                            )
                     {
                         outcome.response.id = handler_request_id;
                         return outcome.response;
@@ -3010,6 +3042,7 @@ pub async fn run_daemon(
                         Some(recovery)
                             if matches!(recovery.effect, Effect::Write | Effect::Exec) =>
                         {
+                            let workbench_launch = is_workbench_launch_request(&req);
                             let outcome = execute_ledgered_daemon_request(
                                 &workspace,
                                 project.as_ref(),
@@ -3020,8 +3053,9 @@ pub async fn run_daemon(
                                 &diagnostics,
                                 Some(&handler_runtime_services),
                             );
-                            let advances_revision =
-                                !outcome.replayed && response_committed_write(&outcome.response);
+                            let advances_revision = !workbench_launch
+                                && !outcome.replayed
+                                && response_committed_write(&outcome.response);
                             (outcome.response, advances_revision)
                         }
                         _ => {
@@ -3062,6 +3096,7 @@ pub async fn run_daemon(
     .with_terminal_replay(move |request: RequestEnvelope| {
         let outcome_ledger = Arc::clone(&replay_outcome_ledger);
         let request_admission = Arc::clone(&replay_request_admission);
+        let runtime_services = replay_runtime_services.clone();
         async move {
             let permit = request_admission
                 .try_acquire_owned()
@@ -3069,8 +3104,13 @@ pub async fn run_daemon(
             let request_id = request.id.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let replay_launch =
+                    |request_id: &str| runtime_services.replay_launch_response(request_id);
                 outcome_ledger
-                    .terminal_outcome_before_preparation(&request)
+                    .terminal_outcome_before_preparation_with_launch_replay(
+                        &request,
+                        Some(&replay_launch),
+                    )
                     .map(|outcome| {
                         outcome.map(|mut outcome| {
                             outcome.response.id = request_id;

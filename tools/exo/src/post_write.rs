@@ -11,8 +11,16 @@ use anyhow::Result as ExoResult;
 use fs2::FileExt;
 use serde::Serialize;
 
-// These remain ledgered writes, but they mutate machine-local authorization
-// rather than project state.
+// These remain ledgered writes, but they mutate daemon-local workbench state
+// rather than canonical project state.
+fn is_machine_local_workbench_write(namespace: &str, operation: &str) -> bool {
+    namespace == "workbench"
+        && matches!(
+            operation,
+            "launch" | "pairing.revoke" | "pairing.forget" | "pairing.rename"
+        )
+}
+
 fn is_machine_local_authorization_mutation(namespace: &str, operation: &str) -> bool {
     namespace == "workbench"
         && matches!(
@@ -26,7 +34,7 @@ pub fn should_write_sql_dump(namespace: &str, operation: &str, effect: Effect) -
         return false;
     }
 
-    if is_machine_local_authorization_mutation(namespace, operation) {
+    if is_machine_local_workbench_write(namespace, operation) {
         return false;
     }
 
@@ -448,6 +456,31 @@ mod tests {
             preflight_sidecar_post_write(Some(&project), "workbench", operation, Effect::Write)
                 .expect("machine-local pairing mutation skips sidecar ownership");
         }
+    }
+
+    #[test]
+    fn workbench_launch_logs_an_event_without_canonical_project_persistence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let sidecar_root = temp.path().join("sidecar");
+        let project = sidecar_project(workspace, sidecar_root);
+
+        assert!(!should_write_sql_dump("workbench", "launch", Effect::Write));
+        assert!(!should_auto_persist_after_success(
+            Effect::Write,
+            "workbench",
+            "launch",
+            Some(&project)
+        ));
+        assert!(!should_persist_after_success(
+            Some(&project),
+            "workbench",
+            "launch",
+            Effect::Write
+        ));
+        assert!(should_log_command_event("workbench", "launch"));
+        preflight_sidecar_post_write(Some(&project), "workbench", "launch", Effect::Write)
+            .expect("daemon-local launch skips sidecar ownership preflight");
     }
 
     #[test]

@@ -14,7 +14,7 @@ fn mutable_command_unreachable(name: &str) -> ! {
 #[derive(Debug, Clone, exospec::ExoSpec)]
 #[exo(namespace = "workbench", description = "Local lane workbench commands")]
 pub enum WorkbenchCommands {
-    #[exo(effect = "pure", description = "Launch the local lane workbench")]
+    #[exo(effect = "write", description = "Launch the local lane workbench")]
     Launch,
 
     #[exo(
@@ -316,6 +316,10 @@ impl Command for WorkbenchLaunch {
         Ok(CommandOutput::new(result, message))
     }
 
+    fn effect(&self) -> Effect {
+        Effect::Write
+    }
+
     fn description(&self) -> &'static str {
         "Launch the local lane workbench"
     }
@@ -380,13 +384,13 @@ mod tests {
     }
 
     #[test]
-    fn launch_is_a_replayable_runtime_operation() {
+    fn launch_is_an_external_at_most_once_runtime_write() {
         let spec = CommandSpec::from_registry(&default_registry());
         let operation = spec
             .operation("workbench", "launch")
             .expect("registered workbench launch");
-        assert_eq!(operation.effect, Effect::Pure);
-        assert_eq!(operation.recovery_class, RecoveryClass::ReplayableRead);
+        assert_eq!(operation.effect, Effect::Write);
+        assert_eq!(operation.recovery_class, RecoveryClass::ExternalAtMostOnce);
     }
 
     #[test]

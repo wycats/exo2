@@ -15,13 +15,15 @@ and tasks for the workspace that launched it. Agent guidance and diagnostics,
 when present, are secondary coordination context rather than the user's task
 list.
 
-The design adds two pure, replayable Exo commands. `exo workbench launch`
-starts or reuses the daemon's loopback HTTP host and returns a capability-scoped
-URL. `exo workbench snapshot` returns the data model behind the screen. MCP
-presents a successful launch as normal text containing the URL and as structured
-launch data, so an agent can give the user an openable workbench without opening
-a browser on the user's behalf. Rich link presentation is deferred until the
-agent host and Exo negotiate a content shape that host accepts.
+The design adds two Exo commands with different recovery boundaries.
+`exo workbench launch` is an external-at-most-once write: it starts or reuses
+the daemon's host and returns a one-time capability URL without placing that
+bearer in durable recovery state. `exo workbench snapshot` is a pure,
+replayable read of the data model behind the screen. MCP presents a successful
+launch as normal text containing the URL and as structured launch data, so an
+agent can give the user an openable workbench without opening a browser on the
+user's behalf. Rich link presentation is deferred until the agent host and Exo
+negotiate a content shape that host accepts.
 
 The first implementation is deliberately narrow. It lets a user inspect the
 focused lane and focus a different existing lane. It does not create lanes,
@@ -66,11 +68,19 @@ exo workbench launch
 
 The command returns a local link together with a project identifier, an opaque
 workspace key and label, the daemon instance that issued the link, and the
-one-hour enrollment-ticket expiration. The command is safe to repeat. The
-first launch starts the host; later launches reuse it and issue a fresh
-capability. Neither case changes canonical project state or opens a browser.
+one-hour enrollment-ticket expiration. The first launch starts the host;
+deliberate later launches use new request IDs, reuse the host, and issue fresh
+capabilities. Neither case changes canonical project state or opens a browser.
 The enrollment ticket is only the browser's one-time entry credential; after
 exchange, the independent renewable session lifetime governs the open cockpit.
+
+If delivery of a launch response is ambiguous, the caller retries with the same
+request ID. The issuing daemon returns the exact original response while its
+one-time capability and every workspace, entry, host, and publication binding
+remain current. It never creates a second capability for that request. Once the
+capability is consumed or expired, the daemon is replaced, or any binding is no
+longer exact, Exo fails closed and asks the caller to use a new request ID for a
+deliberate fresh launch.
 
 An agent invokes the same command through `exo-run`. MCP clients receive a
 normal text result containing the complete URL and expiration, plus structured
@@ -119,7 +129,7 @@ The generated command namespace is:
 #[derive(Debug, exospec::ExoSpec)]
 #[exo(namespace = "workbench", description = "Local lane workbench commands")]
 pub enum WorkbenchCommands {
-    #[exo(effect = "pure", description = "Launch the local lane workbench")]
+    #[exo(effect = "write", description = "Launch the local lane workbench")]
     Launch,
 
     #[exo(effect = "pure", description = "Read the current lane workbench snapshot")]
@@ -127,11 +137,19 @@ pub enum WorkbenchCommands {
 }
 ```
 
-Both operations have `Effect::Pure` and
-`RecoveryClass::ReplayableRead`. Launching a loopback listener and issuing an
-ephemeral capability are runtime presentation effects; they do not mutate
-canonical SQLite state, the filesystem, Git, or a remote system. Retrying a
-launch can safely return a fresh ticket for the same validated workspace.
+`workbench launch` has `Effect::Write` and
+`RecoveryClass::ExternalAtMostOnce`. Starting or reusing a host and issuing a
+one-time capability changes machine-local authority even though it does not
+mutate canonical project SQLite state, Git, or a remote system. A same-request
+retry must therefore recover the original live result or fail closed; it must
+not issue a fresh ticket. `workbench snapshot` remains `Effect::Pure` and
+`RecoveryClass::ReplayableRead`.
+
+Launch is excluded from canonical post-write persistence: it does not write a
+project SQL dump, preflight or checkpoint a sidecar, advance the workbench
+revision, or broadcast a project write. It does emit the ordinary secret-free
+command event so operators can observe that a launch occurred without recording
+its URL, ticket, display body, signing material, or workspace path.
 
 The two commands require daemon runtime services. Normal CLI execution already
 uses daemon dispatch. The MCP adapter must route requests whose resolved command
@@ -227,16 +245,14 @@ The Rust output type and the TypeScript mirror serialize this shape:
 interface WorkbenchLaunchResult {
   kind: "workbench.launch";
   ok: true;
-  schema_version: 1;
+  schema_version: 2;
+  launch_mode: "direct_loopback" | "published";
   url: string;
   expires_at: string;
   expires_in_seconds: 3600;
   reused_host: boolean;
   project: {
     id: string;
-  };
-  daemon: {
-    instance_id: string;
   };
   workspace: {
     key: string;
@@ -255,7 +271,9 @@ The human result labels it as a one-time browser enrollment link with a
 one-hour lifetime and does not print the raw workspace path. `workspace.key` is
 an opaque, random daemon-lifetime identifier mapped to the validated canonical
 workspace root in memory. `workspace.label` is the branch name when attached
-and `detached@<short-head>` otherwise.
+and `detached@<short-head>` otherwise. `launch_mode` distinguishes the original
+numeric-loopback entry from RFC 10206's published canonical entry; it does not
+change the response schema or the capability's one-time semantics.
 
 The URL has the form:
 
@@ -263,8 +281,44 @@ The URL has the form:
 http://127.0.0.1:<port>/#ticket=<ticket>
 ```
 
-No ticket, URL, session identifier, or cookie value is written to daemon
-identity, health, diagnostics, command events, SQL, or sidecar projections.
+No ticket, URL, display body, signing material, session identifier, or cookie
+value is written to daemon identity, health, diagnostics, command events,
+project SQL, sidecar projections, host records, workspace registrations, or
+authorization stores.
+
+### Launch request recovery
+
+The daemon outcome ledger reserves `workbench launch` like any other
+external-at-most-once operation, but successful completion uses a
+launch-specific adapter. The ledger stores only a typed, secret-free completion
+marker. The exact `ResponseEnvelope`, including text and structured URL
+presentation, remains in daemon-lifetime memory associated with the original
+request ID and pending capability.
+
+A terminal pre-dispatch retry and a concurrent waiter both resolve the marker
+through that live adapter after the ledger has verified the request hash. The
+adapter returns the original envelope, changing only transport-level response
+ID normalization, when all of these facts are still current:
+
+- the capability exists, is unconsumed, and has not expired;
+- the exact workspace registration and canonical root still match;
+- the exact entry mode and canonical origin still match;
+- the issuing host generation is alive; and
+- for a published entry, current publication authority is ready for that exact
+  project instance, workspace, origin, and listener generation.
+
+If the memory entry is missing, the daemon instance changed, or any validation
+fails, the marker produces `workbench.launch_replay_unavailable` with
+`retry_with_new_request_id: true`. The same request ID is terminal and never
+re-executes. A non-successful launch response is returned once but is not
+retained as live capability authority, so retrying that request ID reaches the
+same fail-closed boundary. Ordinary external-at-most-once commands continue to
+persist and replay their response envelopes unchanged.
+
+The outcome database and any live WAL or shared-memory companions are
+owner-only. On startup, a legacy successful launch row that contains a raw URL
+is replaced by the marker with secure deletion and WAL truncation; it is never
+replayed as bearer authority after daemon replacement.
 
 ### Launch ticket
 
@@ -274,6 +328,10 @@ an in-memory HMAC key. A ticket is:
 ```text
 v1.<base64url(payload-json)>.<base64url(hmac-sha256(payload-json))>
 ```
+
+This version-1 form is the direct-loopback ticket. RFC 10206 extends the same
+one-time boundary with a version-2 published ticket that additionally binds the
+locald project instance and canonical origin.
 
 The encoded payload is signed exactly as emitted; verification does not
 reserialize it. The payload is:
@@ -593,11 +651,13 @@ phase without a focused lane is not a between-phases state.
 ### Events and freshness
 
 The daemon keeps an in-memory `u64` workbench revision initialized to zero. It
-increments after every response whose effect records a committed write,
-including a response that reports post-commit persistence or outcome-finalizing
-failure, and broadcasts the new value. Existing machine clients still receive
-the current `write_happened` notification; the event payload expansion is
-internal to the daemon.
+increments after every response whose effect records a committed canonical
+project write, including a response that reports post-commit persistence or
+outcome-finalizing failure, and broadcasts the new value. Machine-local
+`workbench launch` authority is deliberately excluded even though the command
+is classified as a write for recovery. Existing machine clients still receive
+the current `write_happened` notification for canonical writes; the event
+payload expansion is internal to the daemon.
 
 An authenticated `GET /api/events` stream first sends:
 
@@ -729,6 +789,7 @@ The adapter uses stable diagnostic kinds:
 | `workbench.daemon_required` | A workbench command ran without daemon runtime services |
 | `workbench.host_unavailable` | The loopback host could not start or its task stopped |
 | `workbench.ui_unavailable` | The binary was built without embedded UI assets |
+| `workbench.launch_replay_unavailable` | The original launch response no longer has matching live capability and routing authority; retry with a new request ID |
 | `workbench.ticket_invalid` | Ticket validation or one-time redemption failed |
 | `workbench.session_invalid` | The session is missing, expired, or cannot be revalidated for the exact project and workspace |
 | `workbench.origin_mismatch` | Host or Origin validation failed |
@@ -741,12 +802,13 @@ malformed credentials. They do not include steering that reveals local
 workspaces. A stopped host does not trigger daemon replacement. Existing daemon
 status and recovery remain the operator path.
 
-Snapshot is replayable. `lane_focus` uses the existing atomic-project-state
-recovery contract. The browser treats a connection loss as an unknown delivery
-state and retries the same request ID after reconnecting; it never substitutes a
-new request ID until the terminal response is known. A deliberate retry after a
-known terminal response is a new request. The HTTP adapter neither persists its
-own outcomes nor translates a retryable Exo response into success.
+Snapshot is replayable. Launch uses the live external-at-most-once adapter above.
+`lane_focus` uses the existing atomic-project-state recovery contract. The
+browser treats a connection loss as an unknown delivery state and retries the
+same request ID after reconnecting; it never substitutes a new request ID until
+the terminal response is known. A deliberate retry after a known terminal
+response is a new request. The HTTP adapter neither persists its own outcomes
+nor translates a retryable Exo response into success.
 
 ## Security Considerations
 
@@ -764,10 +826,12 @@ tickets, or workflow outcomes through a nominal lane action. Every allowed
 operation is a closed enum translated by server code.
 
 The launch URL is a bearer secret. Exo may display it to the invoking human or
-agent host, but it must not include it in logs, diagnostics, telemetry, events,
-SQL, sidecar data, crash messages, or resource catalogs. Browser code removes
-the fragment immediately after exchange and sets `Referrer-Policy: no-referrer`
-before rendering links.
+agent host and retain that exact response in issuing-daemon memory for bounded
+same-request recovery, but it must not include it in logs, diagnostics,
+telemetry, events, SQL, outcome DB/WAL/shared-memory files, sidecar data, host or
+authorization stores, crash messages, or resource catalogs. Browser code
+removes the fragment immediately after exchange and sets
+`Referrer-Policy: no-referrer` before rendering links.
 
 This design does not provide remote access, multi-user identity, TLS, or an
 organizational authorization model. Exposing the listener beyond loopback is a
@@ -781,15 +845,19 @@ sessions, workspace keys, and revision counter are machine-local runtime data
 and never enter portable or reactive SQL projection.
 
 Existing CLI, MCP, machine-channel, VS Code, lane, daemon authority, admission,
-outcome recovery, and workspace-validation behavior remains valid. The MCP
+and workspace-validation behavior remains valid. The launch-specific marker is
+an internal exception inside the existing external-at-most-once ledger; generic
+external mutations retain their durable response replay behavior. The MCP
 adapter's daemon routing change is limited to the `workbench` namespace. Text
 content and structured launch data use existing tool-result fields and avoid
 requiring a client to accept a new content variant.
 
-The workbench schema starts at version 1. Rust serialization is normative;
-TypeScript runtime decoding and shared fixtures prevent silent drift. Future
-additive fields do not change the version. Removing a field, changing its
-meaning, or adding an operation requires a schema or capability version change.
+The launch schema is version 2 after RFC 10206 added `launch_mode`; the original
+snapshot and HTTP protocol schemas retain their independently versioned
+contracts. Rust serialization is normative; TypeScript runtime decoding and
+shared fixtures prevent silent drift. Future additive fields do not change the
+version. Removing a field, changing its meaning, or adding an operation requires
+a schema or capability version change.
 
 ## Relationship to Existing RFCs
 
@@ -877,6 +945,13 @@ Both slices retain Exo as the only project, session, and command authority. The
 browser does not own a parallel state model, and the implemented HTTP
 capability remains limited to snapshot reads and lane focus.
 
+The launch-recovery hardening keeps that authority one-time across ambiguous
+machine-channel delivery. It adds a typed durable completion marker, an exact
+daemon-memory response cache bound to live capability and routing facts, and a
+launch-only replay adapter at both terminal recovery points. It also separates
+launch from canonical post-write persistence and revision signals while
+retaining a secret-free command event.
+
 ## Validation Evidence
 
 Rust unit and integration coverage exercises ticket signing and redemption,
@@ -885,6 +960,15 @@ path redaction, runtime-record generation matching, daemon-only command
 execution, MCP presentation, snapshot coherence, event invalidation, and host
 cleanup. The linked-worktree daemon suite proves that two worktrees share one
 project host while retaining distinct workspace keys, snapshots, and focus.
+
+Launch-recovery coverage additionally proves exact same-daemon replay without a
+second capability, concurrent-waiter replay, and fail-closed behavior after
+consumption, expiry, daemon replacement, workspace re-registration, entry or
+origin mismatch, host-generation change, and publication-authority loss. It
+also preserves ordinary external-mutation replay and checks that raw legacy
+launch rows are scrubbed, outcome files are owner-only, and bearer material is
+absent from durable outcome, event, host, workspace, authorization, SQL, and
+sidecar surfaces.
 
 The cockpit is covered by Vitest protocol and interaction tests, Svelte
 validation, and a production build. Post-merge dogfooding then ran the Vite
