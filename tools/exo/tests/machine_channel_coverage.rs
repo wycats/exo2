@@ -186,17 +186,17 @@ fn machine_channel_coverage_all_operations(backend: &str) {
     let (operations, namespaced_count, root_count, expected_total) = collect_operations();
 
     // Keep this in sync with the generated command spec.
-    assert_eq!(namespaced_count, 130, "expected 130 namespaced operations");
+    assert_eq!(namespaced_count, 135, "expected 135 namespaced operations");
     assert_eq!(root_count, 4, "expected 4 root operations");
 
     if let Some(total) = expected_total {
         assert_eq!(operations.len() as u64, total, "operation count mismatch");
         assert_eq!(
-            total, 134,
-            "expected command spec operation_count to be 134"
+            total, 139,
+            "expected command spec operation_count to be 139"
         );
     } else {
-        assert_eq!(operations.len(), 134, "expected 134 total operations");
+        assert_eq!(operations.len(), 139, "expected 139 total operations");
     }
 
     let mut failures = Vec::new();
