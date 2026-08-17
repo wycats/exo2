@@ -888,6 +888,7 @@ timeout = 1
         }))
         .expect("install replacement publication dispatcher");
     assert_eq!(replacement_provider.publication_count(), 1);
+    assert!(replacement.requires_daemon_residency(unix_seconds()));
     assert_eq!(
         replacement
             .inner
@@ -3749,26 +3750,50 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
-async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
+async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
 
     let launch = manager.launch(&fixture.root).expect("launch workbench");
     let (_, ticket) = launch_parts(&launch);
     let now = unix_seconds();
-    assert!(manager.has_live_pending_enrollment(now));
+    assert!(manager.requires_daemon_residency(now));
 
+    let payload = published_ticket_payload(ticket);
+    let entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("published workbench entry");
     manager
         .inner
-        .redeem_ticket(ticket)
-        .expect("redeem enrollment ticket");
-    assert!(!manager.has_live_pending_enrollment(now));
+        .enroll_pairing(ticket, None, &entry)
+        .expect("enroll durable pairing");
+    assert!(manager.requires_daemon_residency(now));
+
+    let pairing_selector = manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pairing_grants
+        .keys()
+        .next()
+        .expect("durable pairing")
+        .clone();
+    manager
+        .inner
+        .revoke_pairing(&pairing_selector, None)
+        .expect("revoke durable pairing");
+    assert!(!manager.requires_daemon_residency(now));
 
     let expiring = manager
         .launch(&fixture.root)
         .expect("launch workbench again");
     let (_, expiring_ticket) = launch_parts(&expiring);
-    let expiring_payload = ticket_payload(expiring_ticket);
+    let expiring_payload = published_ticket_payload(expiring_ticket);
     manager
         .inner
         .state
@@ -3778,7 +3803,7 @@ async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
         .get_mut(&expiring_payload.capability_id)
         .expect("pending enrollment")
         .expires_at = now;
-    assert!(!manager.has_live_pending_enrollment(now));
+    assert!(!manager.requires_daemon_residency(now));
 
     manager.shutdown().await;
 }

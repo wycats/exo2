@@ -1567,7 +1567,7 @@ impl WorkbenchHostManager {
         })
     }
 
-    pub(crate) fn has_live_pending_enrollment(&self, now: u64) -> bool {
+    pub(crate) fn requires_daemon_residency(&self, now: u64) -> bool {
         let Ok(mut state) = self.inner.state.lock() else {
             return false;
         };
@@ -1575,6 +1575,10 @@ impl WorkbenchHostManager {
             .pending_capabilities
             .retain(|_, pending| pending.expires_at > now);
         !state.pending_capabilities.is_empty()
+            || state
+                .pairing_grants
+                .values()
+                .any(|pairing| pairing.is_live(now))
     }
 
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {

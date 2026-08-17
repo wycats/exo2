@@ -461,9 +461,11 @@ reimplement those concerns.
 
 Exo keeps a publication supervisor per exact workspace and locald project
 instance. The supervisor owns only that worktree's lease. Lease renewal and
-epoch-driven reacquisition do not count as user activity or keep an otherwise
-idle Exo daemon alive. Releasing one supervisor never releases another
-worktree's route or closes a shared listener still in use.
+epoch-driven reacquisition do not count as user activity. A live published
+pairing is durable publication intent and keeps the Exo daemon resident until
+the pairing is revoked or expires; otherwise the daemon's idle shutdown would
+silently withdraw a bookmarkable origin. Releasing one supervisor never
+releases another worktree's route or closes a shared listener still in use.
 
 A replacement daemon reconstructs supervisors only for live retained pairings
 whose workspace registration still resolves to the same physical worktree. It

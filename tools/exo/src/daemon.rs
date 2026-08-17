@@ -3152,7 +3152,7 @@ pub async fn run_daemon(
             let last = last_activity_checker.load(Ordering::Relaxed);
             let elapsed = now_secs().saturating_sub(last);
             if elapsed >= timeout {
-                if idle_workbench_host.has_live_pending_enrollment(now_secs()) {
+                if idle_workbench_host.requires_daemon_residency(now_secs()) {
                     continue;
                 }
                 let refreshed_last = last_activity_checker.load(Ordering::Relaxed);
