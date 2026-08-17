@@ -468,7 +468,9 @@ silently withdraw a bookmarkable origin. Each supervisor is released when its
 workspace has no live enrollment or pairing authority, independently of other
 workspaces. A build without workbench assets does not treat retained pairings
 as daemon-residency intent. Releasing one supervisor never releases another
-worktree's route or closes a shared listener still in use.
+worktree's route or closes a shared listener still in use. Exo reconciles this
+authority on a bounded maintenance interval even while unrelated daemon traffic
+continues, and serializes release against a fresh launch for the same workspace.
 
 A replacement daemon reconstructs supervisors only for live retained pairings
 whose workspace registration still resolves to the same physical worktree. It
@@ -478,7 +480,9 @@ relocated, or contradictory pairing state never creates publication authority.
 The core daemon socket starts independently of this work. Restoration runs in
 the background, isolates failures by workspace, and retries failed acquisition
 with bounded backoff while the pairing remains live. One slow or unavailable
-route therefore cannot delay Exo commands or suppress another worktree's route.
+route therefore cannot hold the authorization store, delay Exo commands, or
+suppress another worktree's route. Shutdown prevents an in-flight restoration
+attempt from publishing after provider teardown begins.
 
 When the private listener changes, Exo starts the candidate and rebinds each
 worktree supervisor independently. Locald owns the authenticated atomic commit

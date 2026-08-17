@@ -27,11 +27,12 @@ use std::pin::Pin;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
-use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const TICKET_LIFETIME: Duration = Duration::from_hours(1);
@@ -1214,18 +1215,37 @@ impl WorkbenchHostManager {
                     return;
                 };
                 let manager = WorkbenchHostManager { inner };
-                let restored = tokio::task::spawn_blocking(move || manager.restore_prior_host())
-                    .await;
-                match restored {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => {
-                        eprintln!(
-                            "exo daemon: failed to resume every prior workbench origin; retrying: {error:#}"
-                        );
+                let runtime = manager.inner.runtime.clone();
+                let (restored_tx, restored_rx) = oneshot::channel();
+                let restored = match thread::Builder::new()
+                    .name("exo-workbench-publication-restore".to_string())
+                    .spawn(move || {
+                        let _runtime_guard = runtime.enter();
+                        let _ = restored_tx.send(manager.restore_prior_host());
+                    })
+                {
+                    Ok(worker) => {
+                        drop(worker);
+                        tokio::select! {
+                            _ = shutdown.changed() => return,
+                            restored = restored_rx => restored
+                                .map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "workbench publication restoration worker stopped unexpectedly"
+                                    )
+                                })
+                                .and_then(|restored| restored),
+                        }
                     }
+                    Err(error) => Err(anyhow::Error::new(error).context(
+                        "start workbench publication restoration worker",
+                    )),
+                };
+                match restored {
+                    Ok(()) => return,
                     Err(error) => {
                         eprintln!(
-                            "exo daemon: workbench publication restoration stopped unexpectedly; retrying: {error}"
+                            "exo daemon: failed to resume every prior workbench origin; retrying: {error:#}"
                         );
                     }
                 }
@@ -1258,11 +1278,6 @@ impl WorkbenchHostManager {
             .host_launch_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
-        let _authorization_gate = self
-            .inner
-            .authorization_store_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
         let provider = self
             .inner
             .entry_provider
@@ -1297,6 +1312,13 @@ impl WorkbenchHostManager {
             };
             let mut authorized = false;
             let mut authorize = |entry: &WorkbenchEntryBinding| {
+                let _authorization_gate =
+                    self.inner.authorization_store_gate.lock().map_err(|_| {
+                        anyhow::anyhow!("workbench authorization store is unavailable")
+                    })?;
+                if self.inner.shutting_down.load(Ordering::Acquire) {
+                    anyhow::bail!("workbench publication restoration is shutting down");
+                }
                 if entry != &expected {
                     return Err(anyhow::Error::new(workbench_failure(
                         "workbench.publisher_binding_changed",
@@ -1308,6 +1330,18 @@ impl WorkbenchHostManager {
                     .state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+                if !workspace_has_live_published_binding(
+                    &state,
+                    &workspace.key,
+                    &workspace.root,
+                    &expected,
+                    unix_seconds(),
+                ) {
+                    return Err(anyhow::Error::new(workbench_failure(
+                        "workbench.publisher_authority_expired",
+                        "The retained workbench pairing is no longer live",
+                    )));
+                }
                 state
                     .origin_bindings
                     .retain(|_, binding| !binding.conflicts_with_transition(&workspace.key, entry));
@@ -1336,8 +1370,21 @@ impl WorkbenchHostManager {
                 &mut authorize,
                 &mut ensure_started,
             );
+            let authority_live = self.inner.state.lock().is_ok_and(|state| {
+                workspace_has_live_published_binding(
+                    &state,
+                    &workspace.key,
+                    &workspace.root,
+                    &expected,
+                    unix_seconds(),
+                )
+            });
             let restore_failed = match resolved.as_ref() {
-                Ok(entry) => entry != &expected,
+                Ok(entry) => {
+                    entry != &expected
+                        || !authority_live
+                        || self.inner.shutting_down.load(Ordering::Acquire)
+                }
                 Err(_) => true,
             };
             if restore_failed {
@@ -1352,9 +1399,12 @@ impl WorkbenchHostManager {
                         .insert(workspace.key.clone());
                 }
                 let error = match resolved {
+                    Ok(_) if self.inner.shutting_down.load(Ordering::Acquire) => {
+                        anyhow::anyhow!("workbench publication restoration is shutting down")
+                    }
                     Ok(_) => anyhow::Error::new(workbench_failure(
                         "workbench.publisher_binding_changed",
-                        "The retained workbench pairing no longer matches the published service",
+                        "The retained workbench pairing no longer authorizes the published service",
                     )),
                     Err(error) => error,
                 };
@@ -1445,17 +1495,20 @@ impl WorkbenchHostManager {
             )));
         }
 
+        let workspace = self.register_workspace(workspace_root)?;
         let _launch_gate = self
             .inner
             .host_launch_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("workbench host is shutting down");
+        }
         let _authorization_gate = self
             .inner
             .authorization_store_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
-        let workspace = self.register_workspace(workspace_root)?;
         let entry_provider = self
             .inner
             .entry_provider
@@ -1517,14 +1570,22 @@ impl WorkbenchHostManager {
             }
             Ok(())
         };
-        let entry = match entry_provider.resolve(
+        let resolved = entry_provider.resolve(
             &workspace,
             &direct_origin,
             &publication_listener,
             listener_generation,
             &mut authorize,
             &mut ensure_started,
-        ) {
+        );
+        let resolved = resolved.and_then(|entry| {
+            if self.inner.shutting_down.load(Ordering::Acquire) {
+                entry_provider.release_workspace(&workspace.key);
+                anyhow::bail!("workbench host is shutting down");
+            }
+            Ok(entry)
+        });
+        let entry = match resolved {
             Ok(entry) => entry,
             Err(error) => {
                 if let Some((replacement, previous_entry_bindings, authorization_rollback)) =
@@ -1568,7 +1629,8 @@ impl WorkbenchHostManager {
                 existing.workspace_key.as_deref() != Some(workspace.key.as_str())
             });
             drop(state);
-            self.release_workspace_publications(&removed_workspace_keys);
+            self.inner
+                .release_workspace_publications(&removed_workspace_keys);
         }
         let issued_at = unix_seconds();
         let expires_at = issued_at.saturating_add(TICKET_LIFETIME.as_secs());
@@ -1666,6 +1728,9 @@ impl WorkbenchHostManager {
         if !assets_available {
             return false;
         }
+        let Ok(_launch_gate) = self.inner.host_launch_gate.lock() else {
+            return false;
+        };
         let Ok(mut state) = self.inner.state.lock() else {
             return false;
         };
@@ -1695,7 +1760,8 @@ impl WorkbenchHostManager {
                 .values()
                 .any(|pairing| pairing.is_live(now));
         drop(state);
-        self.release_workspace_publications(&inactive_publications);
+        self.inner
+            .release_workspace_publications(&inactive_publications);
         resident
     }
 
@@ -1868,6 +1934,12 @@ impl WorkbenchHostManager {
     }
 
     fn release_workspace_publications(&self, workspace_keys: &[String]) {
+        if workspace_keys.is_empty() {
+            return;
+        }
+        let Ok(_launch_gate) = self.inner.host_launch_gate.lock() else {
+            return;
+        };
         self.inner.release_workspace_publications(workspace_keys);
     }
 
@@ -2174,6 +2246,7 @@ impl WorkbenchHostManager {
             .cloned()
             .collect::<Vec<_>>();
         drop(state);
+        drop(_authorization_gate);
         self.release_workspace_publications(&removed_workspace_keys);
 
         if let Err(error) = self.inner.persist_workspace_store_if_due(changed) {
@@ -3491,6 +3564,10 @@ impl WorkbenchHostInner {
         if !valid_pairing_selector_reference(selector_reference) {
             return Err(PairingManagementError::Invalid);
         }
+        let _launch_gate = self
+            .host_launch_gate
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
         let _gate = self
             .authorization_store_gate
             .lock()
@@ -3515,7 +3592,7 @@ impl WorkbenchHostInner {
             mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
         drop(state);
         if release_publication {
-            self.release_workspace_publications(&[pairing_workspace_key]);
+            WorkbenchHostInner::release_workspace_publications(self, &[pairing_workspace_key]);
         }
         Ok(WorkbenchPairingMutationResult {
             kind: "workbench.pairing.revoke",
@@ -3533,6 +3610,10 @@ impl WorkbenchHostInner {
         if !valid_pairing_selector_reference(selector_reference) {
             return Err(PairingManagementError::Invalid);
         }
+        let _launch_gate = self
+            .host_launch_gate
+            .lock()
+            .map_err(|_| PairingManagementError::Unavailable)?;
         let _gate = self
             .authorization_store_gate
             .lock()
@@ -3577,7 +3658,7 @@ impl WorkbenchHostInner {
             mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
         drop(state);
         if release_publication {
-            self.release_workspace_publications(&[pairing_workspace_key]);
+            WorkbenchHostInner::release_workspace_publications(self, &[pairing_workspace_key]);
         }
         Ok(WorkbenchPairingMutationResult {
             kind: "workbench.pairing.forget",
@@ -4408,6 +4489,22 @@ fn workspace_has_live_published_authority(
         pairing.workspace_key == workspace_key
             && pairing.launch_mode == WorkbenchLaunchMode::Published
             && pairing.is_live(now)
+    })
+}
+
+fn workspace_has_live_published_binding(
+    state: &WorkbenchState,
+    workspace_key: &str,
+    workspace_root: &Path,
+    expected: &WorkbenchEntryBinding,
+    now: u64,
+) -> bool {
+    state.pairing_grants.values().any(|pairing| {
+        pairing.workspace_key == workspace_key
+            && pairing.workspace_root == workspace_root
+            && pairing.is_live(now)
+            && pairing.project_instance_id == expected.project_instance_id.as_deref().unwrap_or("")
+            && pairing.canonical_origin == expected.canonical_origin
     })
 }
 
