@@ -1,5 +1,6 @@
 use super::{
-    WorkbenchEntryBinding, WorkbenchEntryProvider, WorkspaceRegistration, workbench_failure,
+    ResponseEnvelope, WorkbenchEntryBinding, WorkbenchEntryProvider, WorkspaceRegistration,
+    workbench_failure,
 };
 use anyhow::Result;
 use locald_core::LocaldConfig;
@@ -120,6 +121,14 @@ impl LocaldWorkbenchEntryProvider {
                 .filter(|publication| publication.requires_replacement().unwrap_or(true))
                 .count()
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn publication_registry_locked_for_test(&self) -> bool {
+        matches!(
+            self.publications.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 
     #[cfg(test)]
@@ -390,43 +399,58 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
         })
     }
 
-    fn replay_authority_current(
+    fn replay_with_current_authority(
         &self,
         entry: &WorkbenchEntryBinding,
         listener_generation: u64,
-    ) -> bool {
+        validate: &mut dyn FnMut() -> Option<ResponseEnvelope>,
+    ) -> Option<ResponseEnvelope> {
         if self.shutting_down.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
         let (Some(workspace_key), Some(project_instance_id)) = (
             entry.workspace_key.as_ref(),
             entry.project_instance_id.as_ref(),
         ) else {
-            return false;
+            return None;
         };
         let key = PublicationKey {
             workspace_key: workspace_key.clone(),
             project_instance_id: project_instance_id.clone(),
         };
-        let Ok(publications) = self.publications.lock() else {
-            return false;
-        };
-        let Some(publication) = publications.get(&key) else {
-            return false;
-        };
-        if publication.entry != *entry || publication.lifecycle.is_stopping() {
-            return false;
+        let publications = self.publications.lock().ok()?;
+        let publication = publications.get(&key)?;
+
+        // Keep registry membership, lifecycle authority, and lease state continuous through the
+        // final manager-state validation. Provider removal and lease changes then linearize on
+        // one side of the returned replay rather than inside its validation interval.
+        let _authority = publication.lifecycle.enter().ok()?;
+        if self.shutting_down.load(Ordering::Acquire) || publication.entry != *entry {
+            return None;
         }
-        let current = publication.state.lock().is_ok_and(|state| {
-            state.listener_generation == listener_generation
-                && state.last_error.is_none()
-                && state.lease.as_ref().is_some_and(|lease| {
-                    let snapshot = lease.snapshot();
-                    matches!(snapshot.state(), LeaseState::Active)
-                        && snapshot.publication_state() == PublicationState::Ready
-                })
-        });
-        current && !self.shutting_down.load(Ordering::Acquire)
+        let state = publication.state.lock().ok()?;
+        if state.listener_generation != listener_generation || state.last_error.is_some() {
+            return None;
+        }
+        let lease = state.lease.as_ref()?;
+        let before = lease.snapshot();
+        if !matches!(before.state(), LeaseState::Active)
+            || before.publication_state() != PublicationState::Ready
+        {
+            return None;
+        }
+
+        let response = validate()?;
+        let after = lease.snapshot();
+        if after.sequence() != before.sequence()
+            || !matches!(after.state(), LeaseState::Active)
+            || after.publication_state() != PublicationState::Ready
+            || publication.lifecycle.is_stopping()
+            || self.shutting_down.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(response)
     }
 
     fn shutdown(&self) {

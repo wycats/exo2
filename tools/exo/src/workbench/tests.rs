@@ -205,6 +205,7 @@ impl RebindTrackingPublishedEntryProvider {
 #[derive(Debug)]
 struct ReplayAuthorityPublishedEntryProvider {
     current: AtomicBool,
+    invalidate_before_return: AtomicBool,
 }
 
 #[cfg(feature = "ui")]
@@ -228,12 +229,20 @@ impl WorkbenchEntryProvider for ReplayAuthorityPublishedEntryProvider {
         )
     }
 
-    fn replay_authority_current(
+    fn replay_with_current_authority(
         &self,
         entry: &WorkbenchEntryBinding,
         _listener_generation: u64,
-    ) -> bool {
-        entry.is_published() && self.current.load(Ordering::Acquire)
+        validate: &mut dyn FnMut() -> Option<ResponseEnvelope>,
+    ) -> Option<ResponseEnvelope> {
+        if !entry.is_published() || !self.current.load(Ordering::Acquire) {
+            return None;
+        }
+        let response = validate()?;
+        if self.invalidate_before_return.swap(false, Ordering::AcqRel) {
+            self.current.store(false, Ordering::Release);
+        }
+        self.current.load(Ordering::Acquire).then_some(response)
     }
 }
 
@@ -264,12 +273,17 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         Ok(())
     }
 
-    fn replay_authority_current(
+    fn replay_with_current_authority(
         &self,
         entry: &WorkbenchEntryBinding,
         _listener_generation: u64,
-    ) -> bool {
-        entry.is_published()
+        validate: &mut dyn FnMut() -> Option<ResponseEnvelope>,
+    ) -> Option<ResponseEnvelope> {
+        if entry.is_published() {
+            validate()
+        } else {
+            None
+        }
     }
 
     fn release_workspace(&self, workspace_key: &str) {
@@ -1369,6 +1383,54 @@ timeout = 1
     assert_eq!(provider.publication_count(), 2);
     assert!(provider.all_on_listener_generation(listener_generation));
 
+    let second_entry = WorkbenchEntryBinding::published(
+        second_origin.clone(),
+        second_project_instance,
+        second.workspace.key.clone(),
+    )
+    .expect("second published entry");
+    let second_workspace_key = second.workspace.key.clone();
+    let provider_for_release = Arc::clone(&provider);
+    let mut release_handle = None;
+    let mut authorize_replay = || {
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        release_handle = Some(std::thread::spawn({
+            let second_workspace_key = second_workspace_key.clone();
+            let provider = Arc::clone(&provider_for_release);
+            move || {
+                attempting_tx
+                    .send(())
+                    .expect("announce publication removal");
+                provider.release_workspace(&second_workspace_key);
+            }
+        }));
+        attempting_rx.recv().expect("publication removal started");
+        assert!(
+            provider.publication_registry_locked_for_test(),
+            "replay authority must retain exact provider registry membership"
+        );
+        Some(launch_response_envelope(
+            "provider-removal-race",
+            &recovered_second,
+        ))
+    };
+    assert!(
+        provider
+            .replay_with_current_authority(
+                &second_entry,
+                listener_generation,
+                &mut authorize_replay,
+            )
+            .is_some(),
+        "replay linearizes before a concurrent publication removal"
+    );
+    release_handle
+        .take()
+        .expect("publication release thread")
+        .join()
+        .expect("join publication release thread");
+    assert_eq!(provider.publication_count(), 1);
+
     let (_, first_ticket) = launch_parts(&first);
     let first_entry = WorkbenchEntryBinding::published(
         first_origin.clone(),
@@ -1389,10 +1451,36 @@ timeout = 1
         .inner
         .persist_session_store()
         .expect("persist retained publication pairing");
-    assert!(provider.replay_authority_current(&first_entry, listener_generation));
-    provider.shutdown();
+    let mut authorize_replay = || {
+        Some(launch_response_envelope(
+            "provider-current",
+            &recovered_first,
+        ))
+    };
     assert!(
-        !provider.replay_authority_current(&first_entry, listener_generation),
+        provider
+            .replay_with_current_authority(
+                &first_entry,
+                listener_generation,
+                &mut authorize_replay,
+            )
+            .is_some()
+    );
+    provider.shutdown();
+    let mut authorize_replay = || {
+        Some(launch_response_envelope(
+            "provider-stopped",
+            &recovered_first,
+        ))
+    };
+    assert!(
+        provider
+            .replay_with_current_authority(
+                &first_entry,
+                listener_generation,
+                &mut authorize_replay,
+            )
+            .is_none(),
         "a shutting-down locald provider cannot authorize replay"
     );
     manager.shutdown().await;
@@ -1902,6 +1990,7 @@ async fn launch_replay_is_fenced_and_cleared_by_host_shutdown() {
     let published = test_manager(Arc::clone(&published_fixture.project));
     let provider = Arc::new(ReplayAuthorityPublishedEntryProvider {
         current: AtomicBool::new(true),
+        invalidate_before_return: AtomicBool::new(false),
     });
     published.set_entry_provider(provider);
     let launch = published
@@ -1932,6 +2021,7 @@ async fn published_launch_replay_requires_current_entry_and_publication_authorit
     let manager = test_manager(Arc::clone(&fixture.project));
     let provider = Arc::new(ReplayAuthorityPublishedEntryProvider {
         current: AtomicBool::new(true),
+        invalidate_before_return: AtomicBool::new(false),
     });
     manager.set_entry_provider(provider.clone());
 
@@ -1964,6 +2054,24 @@ async fn published_launch_replay_requires_current_entry_and_publication_authorit
             },)
             .is_none(),
         "published replay rechecks provider authority after external validation"
+    );
+    provider.current.store(true, Ordering::Release);
+
+    let return_gap = manager
+        .launch(&fixture.root)
+        .expect("launch published return-gap fixture");
+    let return_gap_response = launch_response_envelope("launch-published-return-gap", &return_gap);
+    manager
+        .retain_launch_replay("launch-published-return-gap", &return_gap_response)
+        .expect("retain published return-gap replay");
+    provider
+        .invalidate_before_return
+        .store(true, Ordering::Release);
+    assert!(
+        manager
+            .replay_launch_response("launch-published-return-gap")
+            .is_none(),
+        "published replay rejects authority lost after final manager validation"
     );
     provider.current.store(true, Ordering::Release);
 

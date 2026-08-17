@@ -389,12 +389,17 @@ trait WorkbenchEntryProvider: Send + Sync {
         true
     }
 
-    fn replay_authority_current(
+    fn replay_with_current_authority(
         &self,
         entry: &WorkbenchEntryBinding,
         _listener_generation: u64,
-    ) -> bool {
-        !entry.is_published()
+        validate: &mut dyn FnMut() -> Option<ResponseEnvelope>,
+    ) -> Option<ResponseEnvelope> {
+        if entry.is_published() {
+            None
+        } else {
+            validate()
+        }
     }
 
     fn shutdown(&self) {}
@@ -1974,14 +1979,28 @@ impl WorkbenchHostManager {
         }
 
         before_relock();
-        if replay.entry.is_published() {
+        let response = if replay.entry.is_published() {
             let provider = self.inner.entry_provider.lock().ok()?.clone();
-            if !provider.replay_authority_current(&replay.entry, replay.host_generation) {
-                self.discard_launch_replay_if_current(request_id, &replay);
-                return None;
-            }
+            let mut validate = || self.replay_if_state_current(request_id, &replay);
+            provider.replay_with_current_authority(
+                &replay.entry,
+                replay.host_generation,
+                &mut validate,
+            )
+        } else {
+            self.replay_if_state_current(request_id, &replay)
+        };
+        if response.is_none() {
+            self.discard_launch_replay_if_current(request_id, &replay);
         }
+        response
+    }
 
+    fn replay_if_state_current(
+        &self,
+        request_id: &str,
+        replay: &Arc<WorkbenchLaunchReplay>,
+    ) -> Option<ResponseEnvelope> {
         let mut state = self.inner.state.lock().ok()?;
         if self.inner.shutting_down.load(Ordering::Acquire)
             || !launch_replay_state_current(&state, request_id, &replay, unix_seconds())
@@ -1995,9 +2014,7 @@ impl WorkbenchHostManager {
             }
             return None;
         }
-        let response = replay.response.clone();
-        drop(state);
-        Some(response)
+        Some(replay.response.clone())
     }
 
     fn discard_launch_replay_if_current(
