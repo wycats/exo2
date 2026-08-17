@@ -42,6 +42,7 @@ impl PublicationKey {
 pub(super) struct LocaldWorkbenchEntryProvider {
     client: PublisherClient,
     sandbox: Option<SandboxPublisherContext>,
+    shutting_down: AtomicBool,
     publications: Mutex<HashMap<PublicationKey, Arc<ManagedPublication>>>,
 }
 
@@ -80,6 +81,7 @@ impl LocaldWorkbenchEntryProvider {
         Self {
             client: PublisherClient::production(),
             sandbox: None,
+            shutting_down: AtomicBool::new(false),
             publications: Mutex::new(HashMap::new()),
         }
     }
@@ -98,6 +100,7 @@ impl LocaldWorkbenchEntryProvider {
                 Arc::new(TestNoHostSuspendWakeMonitor),
             ),
             sandbox: Some(sandbox),
+            shutting_down: AtomicBool::new(false),
             publications: Mutex::new(HashMap::new()),
         }
     }
@@ -186,11 +189,23 @@ impl LocaldWorkbenchEntryProvider {
     }
 
     fn insert_publication(&self, publication: Arc<ManagedPublication>) -> Result<()> {
-        self.publications
+        let mut publications = self
+            .publications
             .lock()
-            .map_err(|_| anyhow::anyhow!("workbench publication registry is unavailable"))?
-            .insert(publication.key.clone(), publication);
+            .map_err(|_| anyhow::anyhow!("workbench publication registry is unavailable"))?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(publication_stopping_error());
+        }
+        publications.insert(publication.key.clone(), publication);
         Ok(())
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(publication_stopping_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -204,6 +219,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
         authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
         ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
+        self.ensure_running()?;
         let opt_in = published_workbench_opt_in(&workspace.root)?;
         if !opt_in {
             self.release_workspace(&workspace.key);
@@ -244,6 +260,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             ensure_started()?;
             publication.ensure_listener(listener, listener_generation)?;
             publication.wait_ready()?;
+            self.ensure_running()?;
             self.remove_conflicting_publications(&key);
             return Ok(entry);
         }
@@ -298,6 +315,10 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
             listener_generation,
         );
         if let Err(error) = publication.wait_ready() {
+            publication.stop_and_release();
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_running() {
             publication.stop_and_release();
             return Err(error);
         }
@@ -370,6 +391,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
     }
 
     fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         let publications: Vec<Arc<ManagedPublication>> = self
             .publications
             .lock()
@@ -892,6 +914,21 @@ mod tests {
         let error = lifecycle
             .enter()
             .expect_err("stopped publication must reject authority changes");
+        assert!(error.to_string().contains("publication is stopping"));
+    }
+
+    #[test]
+    fn provider_shutdown_permanently_fences_new_publications() {
+        let provider = LocaldWorkbenchEntryProvider::production();
+        provider
+            .ensure_running()
+            .expect("provider starts available");
+
+        provider.shutdown();
+
+        let error = provider
+            .ensure_running()
+            .expect_err("shutdown provider must reject publication work");
         assert!(error.to_string().contains("publication is stopping"));
     }
 

@@ -68,6 +68,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default idle timeout in seconds (5 minutes).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const MAX_WORKBENCH_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_DAEMON_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_DAEMON_MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -101,6 +102,12 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+fn daemon_maintenance_interval(timeout: Duration) -> Duration {
+    (timeout / 2)
+        .max(Duration::from_secs(1))
+        .min(MAX_WORKBENCH_MAINTENANCE_INTERVAL)
 }
 
 /// Project-local runtime paths.
@@ -3134,9 +3141,10 @@ pub async fn run_daemon(
 
     // Idle timeout checker task.
     //
-    // Polling strategy: We check every `timeout/2` seconds whether the time since
-    // last activity exceeds the timeout. This means:
-    // - Worst case: daemon exits up to `timeout/2` seconds after the actual timeout
+    // Polling strategy: We check every `timeout/2` seconds, capped at 30 seconds,
+    // so publication expiry is reconciled even while ordinary requests keep the
+    // daemon active. This means:
+    // - Worst case: daemon exits up to one check interval after the actual timeout
     // - Best case: daemon exits immediately after the timeout
     // - Tradeoff: More frequent polling = more responsive but more CPU wake-ups
     //
@@ -3144,15 +3152,17 @@ pub async fn run_daemon(
     // (e.g., NTP correction), the daemon may exit early. Clock jumps backward will
     // delay exit. For a dev tool with 5-minute default timeout, this is acceptable.
     let timeout_duration = Duration::from_secs(timeout);
-    let check_interval = timeout_duration / 2;
+    let check_interval = daemon_maintenance_interval(timeout_duration);
     let last_activity_checker = Arc::clone(&last_activity);
     let idle_checker = tokio::spawn(async move {
         loop {
             tokio::time::sleep(check_interval).await;
             let last = last_activity_checker.load(Ordering::Relaxed);
-            let elapsed = now_secs().saturating_sub(last);
+            let now = now_secs();
+            let workbench_requires_residency = idle_workbench_host.requires_daemon_residency(now);
+            let elapsed = now.saturating_sub(last);
             if elapsed >= timeout {
-                if idle_workbench_host.has_live_pending_enrollment(now_secs()) {
+                if workbench_requires_residency {
                     continue;
                 }
                 let refreshed_last = last_activity_checker.load(Ordering::Relaxed);
@@ -3504,6 +3514,22 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn daemon_maintenance_interval_stays_prompt_under_long_idle_timeouts() {
+        assert_eq!(
+            daemon_maintenance_interval(Duration::from_secs(2)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            daemon_maintenance_interval(Duration::from_secs(300)),
+            MAX_WORKBENCH_MAINTENANCE_INTERVAL
+        );
+        assert_eq!(
+            daemon_maintenance_interval(Duration::from_secs(24 * 60 * 60)),
+            MAX_WORKBENCH_MAINTENANCE_INTERVAL
+        );
+    }
 
     fn run_test_git(cwd: &Path, args: &[&str]) {
         let output = Command::new("git")

@@ -186,7 +186,19 @@ impl WorkbenchEntryProvider for TestPublishedEntryProvider {
 #[cfg(feature = "ui")]
 #[derive(Debug, Default)]
 struct RebindTrackingPublishedEntryProvider {
+    resolves: AtomicU64,
     rebinds: AtomicU64,
+    released_workspace_keys: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "ui")]
+impl RebindTrackingPublishedEntryProvider {
+    fn released_workspace_keys(&self) -> Vec<String> {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .clone()
+    }
 }
 
 #[cfg(feature = "ui")]
@@ -200,6 +212,7 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
         ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
+        self.resolves.fetch_add(1, Ordering::AcqRel);
         TestPublishedEntryProvider.resolve(
             workspace,
             direct_origin,
@@ -214,11 +227,538 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         self.rebinds.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
+
+    fn release_workspace(&self, workspace_key: &str) {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .push(workspace_key.to_string());
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct RetryingPublishedEntryProvider {
+    attempts: AtomicU64,
+    completed_attempts: AtomicU64,
+    allow_success: AtomicBool,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for RetryingPublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
+        if attempt == 1 {
+            anyhow::bail!("injected transient publication failure");
+        }
+        while !self.allow_success.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
+        );
+        self.completed_attempts.fetch_add(1, Ordering::AcqRel);
+        result
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Default)]
+struct BlockingReleasePublishedEntryProvider {
+    resolves: AtomicU64,
+    release_started: AtomicBool,
+    allow_release: AtomicBool,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for BlockingReleasePublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        self.resolves.fetch_add(1, Ordering::AcqRel);
+        TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
+        )
+    }
+
+    fn release_workspace(&self, _workspace_key: &str) {
+        self.release_started.store(true, Ordering::Release);
+        while !self.allow_release.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+struct SelectivePublishedEntryProvider {
+    rejected_workspace_key: String,
+    attempted_workspace_keys: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "ui")]
+impl WorkbenchEntryProvider for SelectivePublishedEntryProvider {
+    fn resolve(
+        &self,
+        workspace: &WorkspaceRegistration,
+        direct_origin: &str,
+        listener: &TcpListener,
+        listener_generation: u64,
+        authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
+        ensure_started: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<WorkbenchEntryBinding> {
+        self.attempted_workspace_keys
+            .lock()
+            .expect("attempted workspace keys")
+            .push(workspace.key.clone());
+        if workspace.key == self.rejected_workspace_key {
+            anyhow::bail!("injected workspace publication failure");
+        }
+        TestPublishedEntryProvider.resolve(
+            workspace,
+            direct_origin,
+            listener,
+            listener_generation,
+            authorize,
+            ensure_started,
+        )
+    }
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_daemon_restores_publication_from_a_live_pairing() {
+    let fixture = fixture();
+    let first = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "first-published-workbench-instance",
+    );
+    use_test_published_entries(&first);
+    let launch = first
+        .launch(&fixture.root)
+        .expect("launch first published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let expected = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("expected retained publication");
+    first
+        .inner
+        .enroll_pairing(ticket, None, &expected)
+        .expect("enroll durable pairing");
+    {
+        let mut state = first.inner.state.lock().expect("first workbench state");
+        state.sessions.clear();
+        state.session_grants.clear();
+    }
+    first
+        .inner
+        .persist_session_store()
+        .expect("persist pairing without a resumable session");
+    first.shutdown().await;
+    fs::remove_file(&first.inner.host_record_path)
+        .expect("remove the prior host record before replacement");
+
+    let mismatched = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("mismatched-published-workbench-instance"),
+        Arc::from("mismatched-published-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    mismatched.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    mismatched
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install mismatched replacement dispatcher");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let state = mismatched
+            .inner
+            .state
+            .lock()
+            .expect("mismatched workbench state");
+        assert!(state.origin_bindings.is_empty());
+        assert!(state.host.is_none());
+        assert_eq!(state.pairing_grants.len(), 1);
+    }
+    mismatched.shutdown().await;
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("replacement-published-workbench-instance"),
+        Arc::from("replacement-published-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    replacement.set_entry_provider(provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install replacement dispatcher");
+
+    wait_for_workbench_condition("replacement publication restoration", || {
+        provider.resolves.load(Ordering::Acquire) >= 1
+    })
+    .await;
+
+    assert_eq!(provider.resolves.load(Ordering::Acquire), 1);
+    assert!(replacement.host_status().is_some());
+    assert_eq!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("replacement workbench state")
+            .origin_bindings
+            .get(&expected.canonical_origin),
+        Some(&expected)
+    );
+    replacement.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_publication_retries_without_blocking_daemon_startup() {
+    let fixture = fixture();
+    let first = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "first-retrying-workbench-instance",
+    );
+    use_test_published_entries(&first);
+    let launch = first
+        .launch(&fixture.root)
+        .expect("launch first published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let expected = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("expected retained publication");
+    first
+        .inner
+        .enroll_pairing(ticket, None, &expected)
+        .expect("enroll durable pairing");
+    first.shutdown().await;
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("retrying-workbench-instance"),
+        Arc::from("retrying-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let provider = Arc::new(RetryingPublishedEntryProvider::default());
+    replacement.set_entry_provider(provider.clone());
+    let started_at = std::time::Instant::now();
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install retrying replacement dispatcher");
+    assert!(
+        started_at.elapsed() < Duration::from_millis(100),
+        "dispatcher installation must not wait for publication readiness"
+    );
+
+    wait_for_workbench_condition("second publication restoration attempt", || {
+        provider.attempts.load(Ordering::Acquire) >= 2
+    })
+    .await;
+    assert!(replacement.host_status().is_none());
+    assert!(
+        replacement
+            .inner
+            .authorization_store_gate
+            .try_lock()
+            .is_ok(),
+        "publication readiness must not hold the authorization store gate"
+    );
+    provider.allow_success.store(true, Ordering::Release);
+    wait_for_workbench_condition("completed publication restoration", || {
+        provider.completed_attempts.load(Ordering::Acquire) >= 1
+    })
+    .await;
+    assert!(replacement.host_status().is_some());
+    assert_eq!(provider.attempts.load(Ordering::Acquire), 2);
+    assert_eq!(provider.completed_attempts.load(Ordering::Acquire), 1);
+    replacement.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_blocked_publication_restoration_without_republishing() {
+    let fixture = fixture();
+    let first = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "first-shutdown-workbench-instance",
+    );
+    use_test_published_entries(&first);
+    let launch = first
+        .launch(&fixture.root)
+        .expect("launch first published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let expected = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("expected retained publication");
+    first
+        .inner
+        .enroll_pairing(ticket, None, &expected)
+        .expect("enroll durable pairing");
+    first.shutdown().await;
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("shutdown-workbench-instance"),
+        Arc::from("shutdown-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let provider = Arc::new(RetryingPublishedEntryProvider::default());
+    replacement.set_entry_provider(provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install shutdown replacement dispatcher");
+    wait_for_workbench_condition("blocked publication restoration", || {
+        provider.attempts.load(Ordering::Acquire) >= 2
+    })
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(1), replacement.shutdown())
+        .await
+        .expect("shutdown must not wait for the blocking restoration worker");
+    provider.allow_success.store(true, Ordering::Release);
+    wait_for_workbench_condition("cancelled restoration worker completion", || {
+        provider.completed_attempts.load(Ordering::Acquire) >= 1
+    })
+    .await;
+    assert!(replacement.host_status().is_none());
+    assert!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("shutdown workbench state")
+            .origin_bindings
+            .is_empty(),
+        "a restoration worker cannot publish after shutdown"
+    );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_publication_failure_does_not_block_other_workspaces() {
+    let fixture = fixture();
+    let linked = fixture
+        .root
+        .parent()
+        .expect("fixture parent")
+        .join("linked");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+
+    let first = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "first-multi-workspace-instance",
+    );
+    use_test_published_entries(&first);
+    let mut retained = Vec::new();
+    for workspace in [&fixture.root, &linked] {
+        let launch = first.launch(workspace).expect("launch published workbench");
+        let (_, ticket) = launch_parts(&launch);
+        let payload = published_ticket_payload(ticket);
+        let entry = WorkbenchEntryBinding::published(
+            payload.canonical_origin,
+            payload.project_instance_id,
+            payload.workspace_key,
+        )
+        .expect("retained publication");
+        first
+            .inner
+            .enroll_pairing(ticket, None, &entry)
+            .expect("enroll durable pairing");
+        retained.push((launch.workspace.key, entry));
+    }
+    first.shutdown().await;
+    retained.sort_by(|left, right| left.0.cmp(&right.0));
+    let rejected = retained[0].clone();
+    let restored = retained[1].clone();
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("multi-workspace-replacement-instance"),
+        Arc::from("multi-workspace-replacement-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let provider = Arc::new(SelectivePublishedEntryProvider {
+        rejected_workspace_key: rejected.0.clone(),
+        attempted_workspace_keys: Mutex::new(Vec::new()),
+    });
+    replacement.set_entry_provider(provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install multi-workspace replacement dispatcher");
+
+    wait_for_workbench_condition("independent workspace publication", || {
+        let state = replacement.inner.state.lock().expect("replacement state");
+        state.origin_bindings.get(&restored.1.canonical_origin) == Some(&restored.1)
+    })
+    .await;
+    let attempted = provider
+        .attempted_workspace_keys
+        .lock()
+        .expect("attempted workspace keys")
+        .clone();
+    assert!(attempted.contains(&rejected.0));
+    assert!(attempted.contains(&restored.0));
+    let state = replacement.inner.state.lock().expect("replacement state");
+    assert!(
+        !state
+            .origin_bindings
+            .contains_key(&rejected.1.canonical_origin)
+    );
+    assert_eq!(
+        state.origin_bindings.get(&restored.1.canonical_origin),
+        Some(&restored.1)
+    );
+    drop(state);
+    replacement.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
 fn use_test_published_entries(manager: &WorkbenchHostManager) {
     manager.set_entry_provider(Arc::new(TestPublishedEntryProvider));
+}
+
+#[cfg(feature = "ui")]
+async fn wait_for_workbench_condition(label: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {label}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
@@ -640,7 +1180,7 @@ timeout = 1
     )
     .expect("create proof project state root");
     drop(SqliteWriter::open(project.db_path()).expect("initialize proof project database"));
-    let manager = test_manager_with_identity(project, "b37-publication-proof");
+    let manager = test_manager_with_identity(Arc::clone(&project), "b37-publication-proof");
     let provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
         sandbox.context(),
     ));
@@ -712,8 +1252,77 @@ timeout = 1
     assert_eq!(provider.publication_count(), 2);
     assert!(provider.all_on_listener_generation(listener_generation));
 
+    let (_, first_ticket) = launch_parts(&first);
+    let first_entry = WorkbenchEntryBinding::published(
+        first_origin.clone(),
+        first_project_instance,
+        first.workspace.key.clone(),
+    )
+    .expect("first retained published entry");
+    manager
+        .inner
+        .enroll_pairing(first_ticket, None, &first_entry)
+        .expect("enroll retained publication pairing");
+    {
+        let mut state = manager.inner.state.lock().expect("published state");
+        state.sessions.clear();
+        state.session_grants.clear();
+    }
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist retained publication pairing");
     manager.shutdown().await;
     assert_eq!(provider.publication_count(), 0);
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&project),
+        Arc::from("b37-replacement-publication-proof"),
+        Arc::from("b37-replacement-publication-process-start"),
+        project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let replacement_provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
+        sandbox.context(),
+    ));
+    replacement.set_entry_provider(replacement_provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install replacement publication dispatcher");
+    wait_for_workbench_condition("real locald publication restoration", || {
+        replacement_provider.publication_count() == 1
+    })
+    .await;
+    assert_eq!(replacement_provider.publication_count(), 1);
+    assert!(replacement.requires_daemon_residency(unix_seconds()));
+    assert_eq!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("replacement publication state")
+            .origin_bindings
+            .get(&first_origin),
+        Some(&first_entry)
+    );
+    replacement.shutdown().await;
+    assert_eq!(replacement_provider.publication_count(), 0);
     sandbox.stop(&mut daemon);
 }
 
@@ -3563,26 +4172,57 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
-async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
+async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
 
     let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let workspace_key = launch.workspace.key.clone();
     let (_, ticket) = launch_parts(&launch);
     let now = unix_seconds();
-    assert!(manager.has_live_pending_enrollment(now));
+    assert!(manager.requires_daemon_residency(now));
+    assert!(!manager.requires_daemon_residency_with_assets(now, false));
 
+    let payload = published_ticket_payload(ticket);
+    let entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("published workbench entry");
     manager
         .inner
-        .redeem_ticket(ticket)
-        .expect("redeem enrollment ticket");
-    assert!(!manager.has_live_pending_enrollment(now));
+        .enroll_pairing(ticket, None, &entry)
+        .expect("enroll durable pairing");
+    assert!(manager.requires_daemon_residency(now));
+
+    let pairing_selector = manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .pairing_grants
+        .keys()
+        .next()
+        .expect("durable pairing")
+        .clone();
+    manager
+        .inner
+        .revoke_pairing(&pairing_selector, None)
+        .expect("revoke durable pairing");
+    assert!(!manager.requires_daemon_residency(now));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![workspace_key.clone()]
+    );
 
     let expiring = manager
         .launch(&fixture.root)
         .expect("launch workbench again");
     let (_, expiring_ticket) = launch_parts(&expiring);
-    let expiring_payload = ticket_payload(expiring_ticket);
+    let expiring_payload = published_ticket_payload(expiring_ticket);
     manager
         .inner
         .state
@@ -3592,7 +4232,209 @@ async fn pending_enrollment_liveness_tracks_redemption_and_expiration() {
         .get_mut(&expiring_payload.capability_id)
         .expect("pending enrollment")
         .expires_at = now;
-    assert!(!manager.has_live_pending_enrollment(now));
+    assert!(!manager.requires_daemon_residency(now));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![workspace_key.clone(), workspace_key]
+    );
+
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_publication_release_finishes_before_a_fresh_workspace_launch() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(BlockingReleasePublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("published workbench entry");
+    manager
+        .inner
+        .enroll_pairing(ticket, None, &entry)
+        .expect("enroll durable pairing");
+    let now = unix_seconds();
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let pairing = state
+            .pairing_grants
+            .values_mut()
+            .next()
+            .expect("durable pairing");
+        pairing.idle_expires_at = now;
+    }
+
+    let maintenance_manager = manager.clone();
+    let maintenance = tokio::task::spawn_blocking(move || {
+        assert!(!maintenance_manager.requires_daemon_residency(now));
+    });
+    wait_for_workbench_condition("publication release", || {
+        provider.release_started.load(Ordering::Acquire)
+    })
+    .await;
+
+    let launch_manager = manager.clone();
+    let launch_root = fixture.root.clone();
+    let relaunch = tokio::task::spawn_blocking(move || launch_manager.launch(&launch_root));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        provider.resolves.load(Ordering::Acquire),
+        1,
+        "a fresh launch must wait until the previous publication release finishes"
+    );
+
+    provider.allow_release.store(true, Ordering::Release);
+    maintenance.await.expect("join publication maintenance");
+    relaunch
+        .await
+        .expect("join fresh launch")
+        .expect("fresh launch after release");
+    assert_eq!(provider.resolves.load(Ordering::Acquire), 2);
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_mutations_release_authorization_before_publication_io() {
+    for forget in [false, true] {
+        let fixture = fixture();
+        let manager = test_manager(Arc::clone(&fixture.project));
+        let provider = Arc::new(BlockingReleasePublishedEntryProvider::default());
+        manager.set_entry_provider(provider.clone());
+
+        let launch = manager.launch(&fixture.root).expect("launch workbench");
+        let (_, ticket) = launch_parts(&launch);
+        let payload = published_ticket_payload(ticket);
+        let entry = WorkbenchEntryBinding::published(
+            payload.canonical_origin,
+            payload.project_instance_id,
+            payload.workspace_key,
+        )
+        .expect("published workbench entry");
+        manager
+            .inner
+            .enroll_pairing(ticket, None, &entry)
+            .expect("enroll durable pairing");
+        let selector = manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .keys()
+            .next()
+            .expect("durable pairing")
+            .clone();
+
+        let mutation_manager = manager.clone();
+        let mutation = tokio::task::spawn_blocking(move || {
+            if forget {
+                mutation_manager.inner.forget_pairing(&selector, None)
+            } else {
+                mutation_manager.inner.revoke_pairing(&selector, None)
+            }
+        });
+        wait_for_workbench_condition("blocked pairing publication release", || {
+            provider.release_started.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            manager.inner.authorization_store_gate.try_lock().is_ok(),
+            "pairing mutation publication I/O must not hold the authorization store gate"
+        );
+
+        provider.allow_release.store(true, Ordering::Release);
+        mutation
+            .await
+            .expect("join pairing mutation")
+            .expect("complete pairing mutation");
+        manager.shutdown().await;
+    }
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_one_workspace_publication_preserves_another_live_workspace() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("residency-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "residency-linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let mut pairings = Vec::new();
+    for workspace in [&fixture.root, &linked] {
+        let launch = manager
+            .launch(workspace)
+            .expect("launch published workbench");
+        let workspace_key = launch.workspace.key.clone();
+        let (_, ticket) = launch_parts(&launch);
+        let payload = published_ticket_payload(ticket);
+        let entry = WorkbenchEntryBinding::published(
+            payload.canonical_origin,
+            payload.project_instance_id,
+            payload.workspace_key,
+        )
+        .expect("published entry");
+        manager
+            .inner
+            .enroll_pairing(ticket, None, &entry)
+            .expect("enroll durable pairing");
+        let selector = manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .values()
+            .find(|pairing| pairing.workspace_key == workspace_key)
+            .expect("workspace pairing")
+            .selector
+            .clone();
+        pairings.push((workspace_key, selector));
+    }
+
+    manager
+        .inner
+        .forget_pairing(&pairings[0].1, None)
+        .expect("forget first workspace pairing");
+    assert!(manager.requires_daemon_residency(unix_seconds()));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![pairings[0].0.clone()]
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(pairings[0].0.as_str()))
+    );
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(pairings[1].0.as_str()))
+    );
+    drop(state);
 
     manager.shutdown().await;
 }
@@ -3702,6 +4544,10 @@ async fn sessions_restore_and_renew_across_compatible_host_replacement() {
         Arc::clone(&fixture.project),
         "replacement-workbench-instance",
     );
+    wait_for_workbench_condition("compatible session host restoration", || {
+        replacement.host_status().is_some()
+    })
+    .await;
     let replacement_origin = replacement
         .host_status()
         .expect("replacement resumes the compatible workbench host")
