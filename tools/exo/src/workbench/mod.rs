@@ -1976,14 +1976,6 @@ impl WorkbenchHostManager {
         }
     }
 
-    pub(crate) fn has_live_pending_enrollment(&self, now: u64) -> bool {
-        let Ok(mut state) = self.inner.state.lock() else {
-            return false;
-        };
-        retain_live_pending_capabilities(&mut state, now);
-        !state.pending_capabilities.is_empty()
-    }
-
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
         self.snapshot_with_before_state_gate(workspace_root, || {})
     }
