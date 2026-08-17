@@ -1778,9 +1778,7 @@ impl WorkbenchHostManager {
         let Ok(mut state) = self.inner.state.lock() else {
             return false;
         };
-        state
-            .pending_capabilities
-            .retain(|_, pending| pending.expires_at > now);
+        retain_live_pending_capabilities(&mut state, now);
         let inactive_publications = state
             .origin_bindings
             .values()

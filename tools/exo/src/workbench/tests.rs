@@ -4564,6 +4564,10 @@ async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
     let expiring = manager
         .launch(&fixture.root)
         .expect("launch workbench again");
+    let expiring_response = launch_response_envelope("launch-expiring", &expiring);
+    manager
+        .retain_launch_replay("launch-expiring", &expiring_response)
+        .expect("retain expiring launch replay");
     let (_, expiring_ticket) = launch_parts(&expiring);
     let expiring_payload = published_ticket_payload(expiring_ticket);
     manager
@@ -4576,6 +4580,16 @@ async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
         .expect("pending enrollment")
         .expires_at = now;
     assert!(!manager.requires_daemon_residency(now));
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .launch_replays
+            .is_empty(),
+        "residency maintenance prunes replay responses for expired capabilities"
+    );
     assert_eq!(
         provider.released_workspace_keys(),
         vec![workspace_key.clone(), workspace_key]
