@@ -186,6 +186,7 @@ impl WorkbenchEntryProvider for TestPublishedEntryProvider {
 #[cfg(feature = "ui")]
 #[derive(Debug, Default)]
 struct RebindTrackingPublishedEntryProvider {
+    resolves: AtomicU64,
     rebinds: AtomicU64,
 }
 
@@ -200,6 +201,7 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         authorize: &mut dyn FnMut(&WorkbenchEntryBinding) -> Result<()>,
         ensure_started: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WorkbenchEntryBinding> {
+        self.resolves.fetch_add(1, Ordering::AcqRel);
         TestPublishedEntryProvider.resolve(
             workspace,
             direct_origin,
@@ -214,6 +216,126 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         self.rebinds.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn replacement_daemon_restores_publication_from_a_live_pairing() {
+    let fixture = fixture();
+    let first = test_manager_with_identity(
+        Arc::clone(&fixture.project),
+        "first-published-workbench-instance",
+    );
+    use_test_published_entries(&first);
+    let launch = first
+        .launch(&fixture.root)
+        .expect("launch first published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let expected = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key,
+    )
+    .expect("expected retained publication");
+    first
+        .inner
+        .enroll_pairing(ticket, None, &expected)
+        .expect("enroll durable pairing");
+    {
+        let mut state = first.inner.state.lock().expect("first workbench state");
+        state.sessions.clear();
+        state.session_grants.clear();
+    }
+    first
+        .inner
+        .persist_session_store()
+        .expect("persist pairing without a resumable session");
+    first.shutdown().await;
+    fs::remove_file(&first.inner.host_record_path)
+        .expect("remove the prior host record before replacement");
+
+    let mismatched = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("mismatched-published-workbench-instance"),
+        Arc::from("mismatched-published-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    mismatched.set_entry_provider(Arc::new(TestReplacementPublishedEntryProvider));
+    mismatched
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install mismatched replacement dispatcher");
+    {
+        let state = mismatched
+            .inner
+            .state
+            .lock()
+            .expect("mismatched workbench state");
+        assert!(state.origin_bindings.is_empty());
+        assert!(state.host.is_none());
+        assert_eq!(state.pairing_grants.len(), 1);
+    }
+    mismatched.shutdown().await;
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&fixture.project),
+        Arc::from("replacement-published-workbench-instance"),
+        Arc::from("replacement-published-workbench-process-start"),
+        fixture.project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    replacement.set_entry_provider(provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install replacement dispatcher");
+
+    assert_eq!(provider.resolves.load(Ordering::Acquire), 1);
+    assert!(replacement.host_status().is_some());
+    assert_eq!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("replacement workbench state")
+            .origin_bindings
+            .get(&expected.canonical_origin),
+        Some(&expected)
+    );
+    replacement.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -640,7 +762,7 @@ timeout = 1
     )
     .expect("create proof project state root");
     drop(SqliteWriter::open(project.db_path()).expect("initialize proof project database"));
-    let manager = test_manager_with_identity(project, "b37-publication-proof");
+    let manager = test_manager_with_identity(Arc::clone(&project), "b37-publication-proof");
     let provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
         sandbox.context(),
     ));
@@ -712,8 +834,72 @@ timeout = 1
     assert_eq!(provider.publication_count(), 2);
     assert!(provider.all_on_listener_generation(listener_generation));
 
+    let (_, first_ticket) = launch_parts(&first);
+    let first_entry = WorkbenchEntryBinding::published(
+        first_origin.clone(),
+        first_project_instance,
+        first.workspace.key.clone(),
+    )
+    .expect("first retained published entry");
+    manager
+        .inner
+        .enroll_pairing(first_ticket, None, &first_entry)
+        .expect("enroll retained publication pairing");
+    {
+        let mut state = manager.inner.state.lock().expect("published state");
+        state.sessions.clear();
+        state.session_grants.clear();
+    }
+    manager
+        .inner
+        .persist_session_store()
+        .expect("persist retained publication pairing");
     manager.shutdown().await;
     assert_eq!(provider.publication_count(), 0);
+
+    let replacement = WorkbenchHostManager::new(
+        Arc::clone(&project),
+        Arc::from("b37-replacement-publication-proof"),
+        Arc::from("b37-replacement-publication-process-start"),
+        project.runtime_dir(),
+        Arc::new(AtomicU64::new(unix_seconds())),
+        tokio::runtime::Handle::current(),
+    );
+    let replacement_provider = Arc::new(publication::LocaldWorkbenchEntryProvider::with_sandbox(
+        sandbox.context(),
+    ));
+    replacement.set_entry_provider(replacement_provider.clone());
+    replacement
+        .set_dispatcher(DaemonRequestDispatcher::new(|request| async move {
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                id: request.id,
+                status: Status::Ok,
+                result: Some(json!({ "kind": "test.dispatch", "ok": true })),
+                error: None,
+                ticket: None,
+                steering: None,
+                reminders: None,
+                display: None,
+                preview: None,
+                effect: Some(Effect::Pure),
+                trace: None,
+            }
+        }))
+        .expect("install replacement publication dispatcher");
+    assert_eq!(replacement_provider.publication_count(), 1);
+    assert_eq!(
+        replacement
+            .inner
+            .state
+            .lock()
+            .expect("replacement publication state")
+            .origin_bindings
+            .get(&first_origin),
+        Some(&first_entry)
+    );
+    replacement.shutdown().await;
+    assert_eq!(replacement_provider.publication_count(), 0);
     sandbox.stop(&mut daemon);
 }
 

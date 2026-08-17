@@ -1122,7 +1122,12 @@ impl WorkbenchHostManager {
             }
         }
         state.workspace_store_persisted_at = now;
-        if !state.session_grants.is_empty() {
+        if !state.session_grants.is_empty()
+            || state
+                .pairing_grants
+                .values()
+                .any(|pairing| pairing.is_live(now))
+        {
             state.preferred_port = resumable_host_port(&host_record_path);
         }
         Self {
@@ -1160,15 +1165,177 @@ impl WorkbenchHostManager {
             .dispatcher
             .set(dispatcher)
             .map_err(|_| anyhow::anyhow!("daemon request dispatcher was already installed"))?;
-        let resume_host = self
-            .inner
-            .state
-            .lock()
-            .is_ok_and(|state| assets::available() && state.preferred_port.is_some());
-        if resume_host && let Err(error) = self.ensure_host() {
+        let resume_host = self.inner.state.lock().is_ok_and(|state| {
+            assets::available()
+                && (state.preferred_port.is_some()
+                    || state
+                        .pairing_grants
+                        .values()
+                        .any(|pairing| pairing.is_live(unix_seconds())))
+        });
+        if resume_host && let Err(error) = self.restore_prior_host() {
             eprintln!("exo daemon: failed to resume the prior workbench origin: {error}");
         }
         Ok(())
+    }
+
+    fn restore_prior_host(&self) -> Result<()> {
+        let publications = self.retained_publications()?;
+        if publications.is_empty() {
+            self.ensure_host()?;
+            return Ok(());
+        }
+
+        let _launch_gate = self
+            .inner
+            .host_launch_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench launch coordination is unavailable"))?;
+        let _authorization_gate = self
+            .inner
+            .authorization_store_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench authorization store is unavailable"))?;
+        let provider = self
+            .inner
+            .entry_provider
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench entry provider is unavailable"))?
+            .clone();
+        let mut host_plan = self.prepare_host()?;
+        let direct_origin = host_plan.origin().to_string();
+        let listener_generation = host_plan.generation();
+        let publication_listener = host_plan
+            .listener()?
+            .try_clone()
+            .context("retain restored workbench publication listener")?;
+
+        for (workspace, expected) in publications {
+            let previous_bindings = {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+                state
+                    .origin_bindings
+                    .iter()
+                    .filter(|(_, binding)| {
+                        binding.conflicts_with_transition(&workspace.key, &expected)
+                    })
+                    .map(|(origin, binding)| (origin.clone(), binding.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let mut authorized = false;
+            let mut authorize = |entry: &WorkbenchEntryBinding| {
+                if entry != &expected {
+                    return Err(anyhow::Error::new(workbench_failure(
+                        "workbench.publisher_binding_changed",
+                        "The retained workbench pairing no longer matches the published service",
+                    )));
+                }
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+                state
+                    .origin_bindings
+                    .retain(|_, binding| !binding.conflicts_with_transition(&workspace.key, entry));
+                state
+                    .origin_bindings
+                    .insert(entry.canonical_origin.clone(), entry.clone());
+                authorized = true;
+                Ok(())
+            };
+            let rebind_provider = Arc::clone(&provider);
+            let mut ensure_started = || {
+                if self.start_host_plan(&mut host_plan)? {
+                    rebind_provider.rebind_all(&publication_listener, listener_generation)?;
+                    self.retire_replaced_hosts();
+                }
+                Ok(())
+            };
+            let resolved = provider.resolve(
+                &workspace,
+                &direct_origin,
+                &publication_listener,
+                listener_generation,
+                &mut authorize,
+                &mut ensure_started,
+            );
+            let restore_failed = match resolved.as_ref() {
+                Ok(entry) => entry != &expected,
+                Err(_) => true,
+            };
+            if restore_failed {
+                provider.release_workspace(&workspace.key);
+                if authorized && let Ok(mut state) = self.inner.state.lock() {
+                    state.origin_bindings.retain(|_, binding| {
+                        !binding.conflicts_with_transition(&workspace.key, &expected)
+                    });
+                    state.origin_bindings.extend(previous_bindings);
+                }
+                return match resolved {
+                    Ok(_) => Err(anyhow::Error::new(workbench_failure(
+                        "workbench.publisher_binding_changed",
+                        "The retained workbench pairing no longer matches the published service",
+                    ))),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+        if provider.all_on_listener_generation(listener_generation) {
+            self.retire_replaced_hosts();
+        }
+        Ok(())
+    }
+
+    fn retained_publications(&self) -> Result<Vec<(WorkspaceRegistration, WorkbenchEntryBinding)>> {
+        let now = unix_seconds();
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let mut publications =
+            HashMap::<String, (WorkspaceRegistration, WorkbenchEntryBinding)>::new();
+        for pairing in state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+        {
+            let Some(workspace) = state.workspaces_by_key.get(&pairing.workspace_key) else {
+                continue;
+            };
+            if workspace.root != pairing.workspace_root {
+                continue;
+            }
+            let entry = WorkbenchEntryBinding::published(
+                pairing.canonical_origin.clone(),
+                pairing.project_instance_id.clone(),
+                pairing.workspace_key.clone(),
+            )?;
+            if let Some((_, previous)) = publications.get(&workspace.key)
+                && previous != &entry
+            {
+                return Err(anyhow::Error::new(workbench_failure(
+                    "workbench.publisher_binding_changed",
+                    "Retained workbench pairings disagree about the published service binding",
+                )));
+            }
+            publications.insert(workspace.key.clone(), (workspace.clone(), entry));
+        }
+        drop(state);
+
+        let mut publications = publications.into_values().collect::<Vec<_>>();
+        publications.retain(|(workspace, _)| {
+            self.inner
+                .validate_workspace(&workspace.root)
+                .is_ok_and(|root| root == workspace.root)
+        });
+        publications.sort_by(|left, right| left.0.key.cmp(&right.0.key));
+        Ok(publications)
     }
 
     #[cfg(test)]

@@ -110,7 +110,12 @@ same tab can resume.
 
 Locald does not start, stop, signal, restart, or select Exo. An agent, CLI
 invocation, or editor adapter invokes `workbench launch` or an equivalent
-Exo-owned ensure operation. Provider-triggered activation is outside this RFC.
+Exo-owned ensure operation. When a replacement Exo daemon restores a live
+published pairing, daemon startup is that ensure operation: Exo revalidates the
+exact retained workspace, locald project instance, and canonical origin before
+reacquiring publication. A retained pairing is the durable publication intent;
+Locald does not infer it and provider-triggered activation remains outside this
+RFC.
 
 ### Recovery and revocation stay understandable
 
@@ -459,6 +464,12 @@ instance. The supervisor owns only that worktree's lease. Lease renewal and
 epoch-driven reacquisition do not count as user activity or keep an otherwise
 idle Exo daemon alive. Releasing one supervisor never releases another
 worktree's route or closes a shared listener still in use.
+
+A replacement daemon reconstructs supervisors only for live retained pairings
+whose workspace registration still resolves to the same physical worktree. It
+requires locald to return the pairing's exact project instance and canonical
+origin before it republishes the private listener. Missing, revoked, expired,
+relocated, or contradictory pairing state never creates publication authority.
 
 When the private listener changes, Exo starts the candidate and rebinds each
 worktree supervisor independently. Locald owns the authenticated atomic commit
