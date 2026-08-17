@@ -316,6 +316,7 @@ struct WorkbenchState {
     host: Option<BoundHost>,
     retiring_hosts: Vec<BoundHost>,
     origin_bindings: HashMap<String, WorkbenchEntryBinding>,
+    released_publication_workspaces: HashSet<String>,
     preferred_port: Option<u16>,
     workspaces_by_root: HashMap<PathBuf, String>,
     workspaces_by_key: HashMap<String, WorkspaceRegistration>,
@@ -1346,6 +1347,9 @@ impl WorkbenchHostManager {
                         !binding.conflicts_with_transition(&workspace.key, &expected)
                     });
                     state.origin_bindings.extend(previous_bindings);
+                    state
+                        .released_publication_workspaces
+                        .insert(workspace.key.clone());
                 }
                 let error = match resolved {
                     Ok(_) => anyhow::Error::new(workbench_failure(
@@ -1358,6 +1362,8 @@ impl WorkbenchHostManager {
                 if first_failure.is_none() {
                     first_failure = Some((workspace.key.clone(), error));
                 }
+            } else if let Ok(mut state) = self.inner.state.lock() {
+                state.released_publication_workspaces.remove(&workspace.key);
             }
         }
         if provider.all_on_listener_generation(listener_generation) {
@@ -1543,6 +1549,11 @@ impl WorkbenchHostManager {
                 return Err(error);
             }
         };
+        if entry.is_published()
+            && let Ok(mut state) = self.inner.state.lock()
+        {
+            state.released_publication_workspaces.remove(&workspace.key);
+        }
         if entry_provider.all_on_listener_generation(listener_generation) {
             self.retire_replaced_hosts();
         }
@@ -1648,17 +1659,44 @@ impl WorkbenchHostManager {
     }
 
     pub(crate) fn requires_daemon_residency(&self, now: u64) -> bool {
+        self.requires_daemon_residency_with_assets(now, assets::available())
+    }
+
+    fn requires_daemon_residency_with_assets(&self, now: u64, assets_available: bool) -> bool {
+        if !assets_available {
+            return false;
+        }
         let Ok(mut state) = self.inner.state.lock() else {
             return false;
         };
         state
             .pending_capabilities
             .retain(|_, pending| pending.expires_at > now);
-        !state.pending_capabilities.is_empty()
+        let inactive_publications = state
+            .origin_bindings
+            .values()
+            .filter(|binding| binding.is_published())
+            .filter_map(|binding| binding.workspace_key.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|workspace_key| {
+                !workspace_has_live_published_authority(&state, workspace_key, now)
+                    && !state
+                        .released_publication_workspaces
+                        .contains(workspace_key)
+            })
+            .collect::<Vec<_>>();
+        state
+            .released_publication_workspaces
+            .extend(inactive_publications.iter().cloned());
+        let resident = !state.pending_capabilities.is_empty()
             || state
                 .pairing_grants
                 .values()
-                .any(|pairing| pairing.is_live(now))
+                .any(|pairing| pairing.is_live(now));
+        drop(state);
+        self.release_workspace_publications(&inactive_publications);
+        resident
     }
 
     pub fn snapshot(&self, workspace_root: &Path) -> Result<WorkbenchSnapshot> {
@@ -1830,17 +1868,7 @@ impl WorkbenchHostManager {
     }
 
     fn release_workspace_publications(&self, workspace_keys: &[String]) {
-        let Ok(provider) = self
-            .inner
-            .entry_provider
-            .lock()
-            .map(|provider| provider.clone())
-        else {
-            return;
-        };
-        for workspace_key in workspace_keys {
-            provider.release_workspace(workspace_key);
-        }
+        self.inner.release_workspace_publications(workspace_keys);
     }
 
     fn reconcile_direct_workspace_move_locked(
@@ -2513,6 +2541,15 @@ fn retain_project_workspace_limit(
 }
 
 impl WorkbenchHostInner {
+    fn release_workspace_publications(&self, workspace_keys: &[String]) {
+        let Ok(provider) = self.entry_provider.lock().map(|provider| provider.clone()) else {
+            return;
+        };
+        for workspace_key in workspace_keys {
+            provider.release_workspace(workspace_key);
+        }
+    }
+
     pub(crate) fn dispatcher(&self) -> Option<&DaemonRequestDispatcher> {
         self.dispatcher.get()
     }
@@ -3466,8 +3503,20 @@ impl WorkbenchHostInner {
         retain_live_authorizations(&mut state, now);
         let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
             .ok_or(PairingManagementError::NotFound)?;
+        let pairing_workspace_key = state
+            .pairing_grants
+            .get(&selector)
+            .expect("resolved pairing exists")
+            .workspace_key
+            .clone();
         self.persist_pairing_revocation_locked(&mut state, &selector, now, None)
             .map_err(|_| PairingManagementError::Unavailable)?;
+        let release_publication =
+            mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
+        drop(state);
+        if release_publication {
+            self.release_workspace_publications(&[pairing_workspace_key]);
+        }
         Ok(WorkbenchPairingMutationResult {
             kind: "workbench.pairing.revoke",
             ok: true,
@@ -3496,6 +3545,12 @@ impl WorkbenchHostInner {
         retain_live_authorizations(&mut state, now);
         let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
             .ok_or(PairingManagementError::NotFound)?;
+        let pairing_workspace_key = state
+            .pairing_grants
+            .get(&selector)
+            .expect("resolved pairing exists")
+            .workspace_key
+            .clone();
         let mut candidate_sessions = state.session_grants.clone();
         let mut candidate_pairings = state.pairing_grants.clone();
         let mut candidate_outcomes = state.resume_outcomes.clone();
@@ -3518,6 +3573,12 @@ impl WorkbenchHostInner {
             .sessions
             .retain(|_, session| session.pairing_selector.as_deref() != Some(selector.as_str()));
         retain_live_sessions(&mut state, now);
+        let release_publication =
+            mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
+        drop(state);
+        if release_publication {
+            self.release_workspace_publications(&[pairing_workspace_key]);
+        }
         Ok(WorkbenchPairingMutationResult {
             kind: "workbench.pairing.forget",
             ok: true,
@@ -4332,6 +4393,35 @@ fn terminal_resume_outcome(
             terminal_error: error,
         },
     }
+}
+
+fn workspace_has_live_published_authority(
+    state: &WorkbenchState,
+    workspace_key: &str,
+    now: u64,
+) -> bool {
+    state.pending_capabilities.values().any(|pending| {
+        pending.workspace_key == workspace_key
+            && pending.expires_at > now
+            && pending.entry.is_published()
+    }) || state.pairing_grants.values().any(|pairing| {
+        pairing.workspace_key == workspace_key
+            && pairing.launch_mode == WorkbenchLaunchMode::Published
+            && pairing.is_live(now)
+    })
+}
+
+fn mark_inactive_workspace_publication_released(
+    state: &mut WorkbenchState,
+    workspace_key: &str,
+    now: u64,
+) -> bool {
+    if workspace_has_live_published_authority(state, workspace_key, now) {
+        return false;
+    }
+    state
+        .released_publication_workspaces
+        .insert(workspace_key.to_string())
 }
 
 fn prune_retained_revoked_pairings(pairings: &mut HashMap<String, WorkbenchPairingGrantV1>) {

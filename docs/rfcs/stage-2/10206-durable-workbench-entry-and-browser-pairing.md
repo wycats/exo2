@@ -464,8 +464,11 @@ instance. The supervisor owns only that worktree's lease. Lease renewal and
 epoch-driven reacquisition do not count as user activity. A live published
 pairing is durable publication intent and keeps the Exo daemon resident until
 the pairing is revoked or expires; otherwise the daemon's idle shutdown would
-silently withdraw a bookmarkable origin. Releasing one supervisor never
-releases another worktree's route or closes a shared listener still in use.
+silently withdraw a bookmarkable origin. Each supervisor is released when its
+workspace has no live enrollment or pairing authority, independently of other
+workspaces. A build without workbench assets does not treat retained pairings
+as daemon-residency intent. Releasing one supervisor never releases another
+worktree's route or closes a shared listener still in use.
 
 A replacement daemon reconstructs supervisors only for live retained pairings
 whose workspace registration still resolves to the same physical worktree. It

@@ -188,6 +188,17 @@ impl WorkbenchEntryProvider for TestPublishedEntryProvider {
 struct RebindTrackingPublishedEntryProvider {
     resolves: AtomicU64,
     rebinds: AtomicU64,
+    released_workspace_keys: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "ui")]
+impl RebindTrackingPublishedEntryProvider {
+    fn released_workspace_keys(&self) -> Vec<String> {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .clone()
+    }
 }
 
 #[cfg(feature = "ui")]
@@ -215,6 +226,13 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
     fn rebind_all(&self, _listener: &TcpListener, _listener_generation: u64) -> Result<()> {
         self.rebinds.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    fn release_workspace(&self, workspace_key: &str) {
+        self.released_workspace_keys
+            .lock()
+            .expect("released workspace keys")
+            .push(workspace_key.to_string());
     }
 }
 
@@ -4026,12 +4044,15 @@ async fn replacement_project_instance_revokes_stale_workspace_pairing_authority(
 async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
-    use_test_published_entries(&manager);
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
 
     let launch = manager.launch(&fixture.root).expect("launch workbench");
+    let workspace_key = launch.workspace.key.clone();
     let (_, ticket) = launch_parts(&launch);
     let now = unix_seconds();
     assert!(manager.requires_daemon_residency(now));
+    assert!(!manager.requires_daemon_residency_with_assets(now, false));
 
     let payload = published_ticket_payload(ticket);
     let entry = WorkbenchEntryBinding::published(
@@ -4061,6 +4082,10 @@ async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
         .revoke_pairing(&pairing_selector, None)
         .expect("revoke durable pairing");
     assert!(!manager.requires_daemon_residency(now));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![workspace_key.clone()]
+    );
 
     let expiring = manager
         .launch(&fixture.root)
@@ -4077,6 +4102,88 @@ async fn workbench_residency_tracks_enrollment_pairing_and_expiration() {
         .expect("pending enrollment")
         .expires_at = now;
     assert!(!manager.requires_daemon_residency(now));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![workspace_key.clone(), workspace_key]
+    );
+
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_one_workspace_publication_preserves_another_live_workspace() {
+    let fixture = fixture();
+    let linked = fixture._temp.path().join("residency-linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "residency-linked",
+            linked.to_str().expect("UTF-8 linked worktree"),
+        ],
+    );
+    let manager = test_manager(Arc::clone(&fixture.project));
+    let provider = Arc::new(RebindTrackingPublishedEntryProvider::default());
+    manager.set_entry_provider(provider.clone());
+
+    let mut pairings = Vec::new();
+    for workspace in [&fixture.root, &linked] {
+        let launch = manager
+            .launch(workspace)
+            .expect("launch published workbench");
+        let workspace_key = launch.workspace.key.clone();
+        let (_, ticket) = launch_parts(&launch);
+        let payload = published_ticket_payload(ticket);
+        let entry = WorkbenchEntryBinding::published(
+            payload.canonical_origin,
+            payload.project_instance_id,
+            payload.workspace_key,
+        )
+        .expect("published entry");
+        manager
+            .inner
+            .enroll_pairing(ticket, None, &entry)
+            .expect("enroll durable pairing");
+        let selector = manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .values()
+            .find(|pairing| pairing.workspace_key == workspace_key)
+            .expect("workspace pairing")
+            .selector
+            .clone();
+        pairings.push((workspace_key, selector));
+    }
+
+    manager
+        .inner
+        .forget_pairing(&pairings[0].1, None)
+        .expect("forget first workspace pairing");
+    assert!(manager.requires_daemon_residency(unix_seconds()));
+    assert_eq!(
+        provider.released_workspace_keys(),
+        vec![pairings[0].0.clone()]
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(pairings[0].0.as_str()))
+    );
+    assert!(
+        state
+            .origin_bindings
+            .values()
+            .any(|binding| binding.workspace_key.as_deref() == Some(pairings[1].0.as_str()))
+    );
+    drop(state);
 
     manager.shutdown().await;
 }
