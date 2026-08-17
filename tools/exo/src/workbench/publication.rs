@@ -395,6 +395,9 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
         entry: &WorkbenchEntryBinding,
         listener_generation: u64,
     ) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
         let (Some(workspace_key), Some(project_instance_id)) = (
             entry.workspace_key.as_ref(),
             entry.project_instance_id.as_ref(),
@@ -414,7 +417,7 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
         if publication.entry != *entry || publication.lifecycle.is_stopping() {
             return false;
         }
-        publication.state.lock().is_ok_and(|state| {
+        let current = publication.state.lock().is_ok_and(|state| {
             state.listener_generation == listener_generation
                 && state.last_error.is_none()
                 && state.lease.as_ref().is_some_and(|lease| {
@@ -422,7 +425,8 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
                     matches!(snapshot.state(), LeaseState::Active)
                         && snapshot.publication_state() == PublicationState::Ready
                 })
-        })
+        });
+        current && !self.shutting_down.load(Ordering::Acquire)
     }
 
     fn shutdown(&self) {

@@ -1322,10 +1322,12 @@ impl RequestOutcomeLedger {
 
     fn prune_completed(&self, connection: &Connection) -> Result<()> {
         let cutoff = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS;
+        let launch_marker = workbench_launch_completion_marker_json();
         connection.execute(
             "DELETE FROM daemon_request_outcomes
-             WHERE completed_at IS NOT NULL AND completed_at < ?1",
-            [cutoff],
+             WHERE completed_at IS NOT NULL AND completed_at < ?1
+               AND response_json != ?2",
+            params![cutoff, launch_marker],
         )?;
         Ok(())
     }
@@ -2349,6 +2351,91 @@ mod tests {
         assert!(
             ledger.prune_completed(&connection).is_err(),
             "the fixture must deterministically reject retention pruning"
+        );
+    }
+
+    #[test]
+    fn completed_outcome_pruning_preserves_launch_tombstones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let launch = launch_request("launch-retained-tombstone", "/workspace-a");
+        let first = ledger.execute_workbench_launch(
+            launch.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| launch_response(&launch.id, "retention-bearer"),
+            |_, _| Ok(()),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        let ordinary = request("ordinary-expired-outcome", "task-a");
+        let ordinary_result = ledger.execute(
+            ordinary.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        assert_eq!(ordinary_result.response.status, Status::Ok);
+
+        let connection = ledger.connection().expect("open retention fixture");
+        connection
+            .execute(
+                "UPDATE daemon_request_outcomes SET completed_at = ?1
+                 WHERE request_id IN (?2, ?3)",
+                params![
+                    now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS - 1,
+                    launch.id,
+                    ordinary.id,
+                ],
+            )
+            .expect("expire completed outcomes");
+        ledger
+            .prune_completed(&connection)
+            .expect("prune ordinary outcomes");
+
+        let retained: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM daemon_request_outcomes WHERE request_id = ?1
+                 )",
+                [&launch.id],
+                |row| row.get(0),
+            )
+            .expect("inspect launch tombstone");
+        let ordinary_retained: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM daemon_request_outcomes WHERE request_id = ?1
+                 )",
+                [&ordinary.id],
+                |row| row.get(0),
+            )
+            .expect("inspect ordinary outcome");
+        assert!(retained, "launch request IDs remain terminal");
+        assert!(
+            !ordinary_retained,
+            "ordinary completed outcomes still prune"
+        );
+        drop(connection);
+
+        let retry = ledger.execute_workbench_launch(
+            launch,
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            |_| panic!("retained launch request ID must not execute again"),
+            |_, _| panic!("retained launch request ID must not replace its marker"),
+            |_| None,
+            |_| {},
+        );
+        assert!(retry.replayed);
+        assert_eq!(
+            error_kind(&retry.response),
+            Some("workbench.launch_replay_unavailable")
         );
     }
 

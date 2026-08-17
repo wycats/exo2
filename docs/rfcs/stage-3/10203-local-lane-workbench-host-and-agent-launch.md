@@ -293,7 +293,10 @@ external-at-most-once operation, but successful completion uses a
 launch-specific adapter. The ledger stores only a typed, secret-free completion
 marker. The exact `ResponseEnvelope`, including text and structured URL
 presentation, remains in daemon-lifetime memory associated with the original
-request ID and pending capability.
+request ID and pending capability. At issuance, that capability captures the
+exact workspace root, workspace-registration generation, host generation, and
+entry binding; replay retention cannot replace those facts with a later
+runtime snapshot.
 
 A terminal pre-dispatch retry and a concurrent waiter both resolve the marker
 through that live adapter after the ledger has verified the request hash. The
@@ -310,10 +313,20 @@ ID normalization, when all of these facts are still current:
 If the memory entry is missing, the daemon instance changed, or any validation
 fails, the marker produces `workbench.launch_replay_unavailable` with
 `retry_with_new_request_id: true`. The same request ID is terminal and never
-re-executes. A non-successful launch response is returned once but is not
-retained as live capability authority, so retrying that request ID reaches the
-same fail-closed boundary. Ordinary external-at-most-once commands continue to
-persist and replay their response envelopes unchanged.
+re-executes. The secret-free marker is retained beyond the generic completed
+outcome retention window so that boundary remains durable. A non-successful
+launch response is returned once but is not retained as live capability
+authority, so retrying that request ID reaches the same fail-closed boundary.
+Ordinary external-at-most-once commands continue to persist and replay their
+response envelopes unchanged.
+
+Host shutdown fences both replay retention and replay reads, clears all cached
+launch responses when shutdown begins, and rechecks the fence after external
+publication validation. Published replay additionally requires a provider that
+is not shutting down. A replacement daemon may restore a durable pairing and
+its exact publication, but it cannot reconstruct the prior daemon's launch
+response; the old marker fails closed while a launch issued by the replacement
+can establish its own same-daemon replay.
 
 The outcome database and any live WAL or shared-memory companions are
 owner-only. On startup, a legacy successful launch row that contains a raw URL

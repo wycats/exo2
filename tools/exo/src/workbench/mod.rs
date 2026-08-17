@@ -551,7 +551,10 @@ pub(super) struct WorkspaceProjection {
 #[derive(Debug, Clone)]
 struct PendingCapability {
     workspace_key: String,
+    workspace_root: PathBuf,
+    workspace_registration_generation: u64,
     entry: WorkbenchEntryBinding,
+    host_generation: u64,
     expires_at: u64,
 }
 
@@ -1729,12 +1732,34 @@ impl WorkbenchHostManager {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("workbench runtime state is unavailable"))?;
+        let workspace_registration_generation = state
+            .workspaces_by_key
+            .get(&workspace.key)
+            .filter(|registered| registered.root == workspace.root)
+            .and_then(|registered| {
+                state
+                    .workspace_registration_generations
+                    .get(&registered.key)
+            })
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!("workbench launch workspace registration changed during issuance")
+            })?;
+        let host_generation = state
+            .host
+            .as_ref()
+            .filter(|host| host.server_task_alive && host.generation == listener_generation)
+            .map(|host| host.generation)
+            .ok_or_else(|| anyhow::anyhow!("workbench launch host changed during issuance"))?;
         retain_live_pending_capabilities(&mut state, issued_at);
         state.pending_capabilities.insert(
             capability_id,
             PendingCapability {
                 workspace_key: workspace.key.clone(),
+                workspace_root: workspace.root.clone(),
+                workspace_registration_generation,
                 entry: entry.clone(),
+                host_generation,
                 expires_at,
             },
         );
@@ -1811,6 +1836,9 @@ impl WorkbenchHostManager {
         if response.status != Status::Ok {
             return Ok(());
         }
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("workbench host is shutting down");
+        }
         let result = response
             .result
             .as_ref()
@@ -1848,24 +1876,30 @@ impl WorkbenchHostManager {
                     && pending.entry == verified.entry
                     && pending.expires_at == verified.expires_at
             })
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("workbench launch capability is not pending"))?;
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("workbench host is shutting down");
+        }
         let workspace = state
             .workspaces_by_key
             .get(&verified.workspace_key)
             .filter(|workspace| {
-                state.workspaces_by_root.get(&workspace.root) == Some(&workspace.key)
+                workspace.root == pending.workspace_root
+                    && state.workspaces_by_root.get(&workspace.root) == Some(&workspace.key)
             })
             .ok_or_else(|| anyhow::anyhow!("workbench launch workspace is not registered"))?;
         let workspace_registration_generation = *state
             .workspace_registration_generations
             .get(&workspace.key)
+            .filter(|generation| **generation == pending.workspace_registration_generation)
             .ok_or_else(|| {
-                anyhow::anyhow!("workbench launch workspace registration has no generation")
+                anyhow::anyhow!("workbench launch workspace registration changed after issuance")
             })?;
         let host = state
             .host
             .as_ref()
-            .filter(|host| host.server_task_alive)
+            .filter(|host| host.server_task_alive && host.generation == pending.host_generation)
             .ok_or_else(|| anyhow::anyhow!("workbench launch host is not alive"))?;
         let host_generation = host.generation;
         if pending.entry.is_published() {
@@ -1883,7 +1917,7 @@ impl WorkbenchHostManager {
             response: response.clone(),
             capability_id: verified.capability_id,
             workspace_key: workspace.key.clone(),
-            workspace_root: workspace.root.clone(),
+            workspace_root: pending.workspace_root,
             workspace_registration_generation,
             entry: pending.entry.clone(),
             host_generation,
@@ -1893,6 +1927,10 @@ impl WorkbenchHostManager {
             .launch_replays
             .insert(request_id.to_string(), Arc::new(replay));
         drop(state);
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            self.discard_launch_replay(request_id);
+            anyhow::bail!("workbench host is shutting down");
+        }
         Ok(())
     }
 
@@ -1908,8 +1946,15 @@ impl WorkbenchHostManager {
     where
         F: FnOnce(),
     {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         let replay = {
             let mut state = self.inner.state.lock().ok()?;
+            if self.inner.shutting_down.load(Ordering::Acquire) {
+                state.launch_replays.remove(request_id);
+                return None;
+            }
             let replay = Arc::clone(state.launch_replays.get(request_id)?);
             if !launch_replay_state_current(&state, request_id, &replay, unix_seconds()) {
                 state.launch_replays.remove(request_id);
@@ -1938,7 +1983,9 @@ impl WorkbenchHostManager {
 
         before_relock();
         let mut state = self.inner.state.lock().ok()?;
-        if !launch_replay_state_current(&state, request_id, &replay, unix_seconds()) {
+        if self.inner.shutting_down.load(Ordering::Acquire)
+            || !launch_replay_state_current(&state, request_id, &replay, unix_seconds())
+        {
             if state
                 .launch_replays
                 .get(request_id)
@@ -2067,6 +2114,9 @@ impl WorkbenchHostManager {
 
     pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.launch_replays.clear();
+        }
         let _ = self.inner.publication_restore_shutdown.send(true);
         let entry_provider = self
             .inner
@@ -2187,6 +2237,7 @@ impl WorkbenchHostManager {
         for root in removed_roots {
             if let Some(key) = state.workspaces_by_root.remove(&root) {
                 state.workspaces_by_key.remove(&key);
+                state.workspace_registration_generations.remove(&key);
             }
         }
         state.origin_bindings.retain(|_, binding| {
@@ -2447,6 +2498,7 @@ impl WorkbenchHostManager {
             for root in removed {
                 if let Some(key) = state.workspaces_by_root.remove(&root) {
                     state.workspaces_by_key.remove(&key);
+                    state.workspace_registration_generations.remove(&key);
                     removed_workspace_keys.push(key);
                     changed = true;
                 }
@@ -2789,9 +2841,13 @@ fn launch_replay_state_current(
         .get(&replay.capability_id)
         .is_some_and(|pending| {
             pending.workspace_key == replay.workspace_key
+                && pending.workspace_root == replay.workspace_root
+                && pending.workspace_registration_generation
+                    == replay.workspace_registration_generation
                 && pending.entry == replay.entry
+                && pending.host_generation == replay.host_generation
                 && pending.expires_at == replay.expires_at
-                && pending.expires_at > now
+                && pending_capability_issuance_current(state, pending, now)
         });
     let host_current = state
         .host
@@ -2806,6 +2862,34 @@ fn launch_replay_state_current(
         })
     };
     exact_cache_entry && workspace_current && pending_current && host_current && entry_current
+}
+
+fn pending_capability_issuance_current(
+    state: &WorkbenchState,
+    pending: &PendingCapability,
+    now: u64,
+) -> bool {
+    let workspace_current = state
+        .workspaces_by_key
+        .get(&pending.workspace_key)
+        .is_some_and(|workspace| {
+            workspace.root == pending.workspace_root
+                && state.workspaces_by_root.get(&pending.workspace_root)
+                    == Some(&pending.workspace_key)
+                && state
+                    .workspace_registration_generations
+                    .get(&pending.workspace_key)
+                    == Some(&pending.workspace_registration_generation)
+        });
+    let host_current = state.host.as_ref().is_some_and(|host| {
+        host.server_task_alive
+            && host.generation == pending.host_generation
+            && (pending.entry.is_published() || host.origin == pending.entry.canonical_origin)
+    });
+    let entry_current = !pending.entry.is_published()
+        || state.origin_bindings.get(&pending.entry.canonical_origin) == Some(&pending.entry);
+
+    pending.expires_at > now && workspace_current && host_current && entry_current
 }
 
 fn retain_live_pending_capabilities(state: &mut WorkbenchState, now: u64) {
@@ -2902,6 +2986,9 @@ fn retain_project_workspace_limit(
     state
         .workspaces_by_root
         .retain(|_, key| retained.contains(key));
+    state
+        .workspace_registration_generations
+        .retain(|key, _| retained.contains(key));
     removed
 }
 
@@ -3124,14 +3211,13 @@ impl WorkbenchHostInner {
         if pending.workspace_key != payload.workspace_key
             || pending.entry != payload.entry
             || pending.expires_at != payload.expires_at
+            || !pending_capability_issuance_current(&state, &pending, now)
         {
             return Err(TicketExchangeError::Invalid);
         }
-        let workspace = state
-            .workspaces_by_key
-            .get(&payload.workspace_key)
-            .cloned()
-            .ok_or(TicketExchangeError::Invalid)?;
+        let workspace_root = self
+            .validate_session_workspace(&pending.workspace_root)
+            .map_err(|_| TicketExchangeError::Invalid)?;
         let session_secret = random_token().map_err(|_| TicketExchangeError::Invalid)?;
         let credential_digest = session_credential_digest(&session_secret);
         let session_key = random_token().map_err(|_| TicketExchangeError::Invalid)?;
@@ -3141,7 +3227,7 @@ impl WorkbenchHostInner {
             selector: session_key.clone(),
             project_id: payload.project_id.clone(),
             workspace_key: payload.workspace_key.clone(),
-            workspace_root: workspace.root,
+            workspace_root,
             capabilities: upgraded_session_capabilities(payload.capabilities),
             entry: payload.entry,
             pairing_selector: None,
@@ -3357,13 +3443,11 @@ impl WorkbenchHostInner {
             })
             .cloned()
             .ok_or(PairingExchangeError::Invalid)?;
-        let workspace = state
-            .workspaces_by_key
-            .get(&payload.workspace_key)
-            .cloned()
-            .ok_or(PairingExchangeError::Invalid)?;
+        if !pending_capability_issuance_current(&state, &pending, now) {
+            return Err(PairingExchangeError::Invalid);
+        }
         let workspace_root = self
-            .validate_session_workspace(&workspace.root)
+            .validate_session_workspace(&pending.workspace_root)
             .map_err(|_| PairingExchangeError::Expired)?;
         let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
 

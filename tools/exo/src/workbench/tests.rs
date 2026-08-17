@@ -264,6 +264,14 @@ impl WorkbenchEntryProvider for RebindTrackingPublishedEntryProvider {
         Ok(())
     }
 
+    fn replay_authority_current(
+        &self,
+        entry: &WorkbenchEntryBinding,
+        _listener_generation: u64,
+    ) -> bool {
+        entry.is_published()
+    }
+
     fn release_workspace(&self, workspace_key: &str) {
         self.released_workspace_keys
             .lock()
@@ -405,6 +413,27 @@ async fn replacement_daemon_restores_publication_from_a_live_pairing() {
         payload.workspace_key,
     )
     .expect("expected retained publication");
+    let outcome_ledger = crate::daemon_outcomes::RequestOutcomeLedger::open(
+        fixture
+            ._temp
+            .path()
+            .join("replacement-launch-outcomes.sqlite"),
+    )
+    .expect("open replacement launch outcome ledger");
+    let original_request =
+        workbench_launch_request("restored-publication-old-launch", &fixture.root);
+    let original_response = launch_response_envelope(&original_request.id, &launch);
+    let original = outcome_ledger.execute_workbench_launch(
+        original_request.clone(),
+        Effect::Write,
+        "first-published-workbench-instance",
+        Duration::ZERO,
+        |_| original_response.clone(),
+        |request_id, response| first.retain_launch_replay(request_id, response),
+        |request_id| first.replay_launch_response(request_id),
+        |request_id| first.discard_launch_replay(request_id),
+    );
+    assert_same_response(&original.response, &original_response);
     first
         .inner
         .enroll_pairing(ticket, None, &expected)
@@ -508,6 +537,58 @@ async fn replacement_daemon_restores_publication_from_a_live_pairing() {
             .get(&expected.canonical_origin),
         Some(&expected)
     );
+
+    let old_retry = outcome_ledger.execute_workbench_launch(
+        original_request,
+        Effect::Write,
+        "replacement-published-workbench-instance",
+        Duration::ZERO,
+        |_| panic!("replacement daemon must not execute an old launch request ID"),
+        |request_id, response| replacement.retain_launch_replay(request_id, response),
+        |request_id| replacement.replay_launch_response(request_id),
+        |request_id| replacement.discard_launch_replay(request_id),
+    );
+    assert!(old_retry.replayed);
+    assert_eq!(
+        old_retry
+            .response
+            .error
+            .as_ref()
+            .and_then(|error| error.details.as_ref())
+            .and_then(|details| details["kind"].as_str()),
+        Some("workbench.launch_replay_unavailable"),
+        "restored publication does not reconstruct prior-daemon replay authority"
+    );
+
+    let fresh_launch = replacement
+        .launch(&fixture.root)
+        .expect("launch through restored publication");
+    let fresh_request =
+        workbench_launch_request("restored-publication-fresh-launch", &fixture.root);
+    let fresh_response = launch_response_envelope(&fresh_request.id, &fresh_launch);
+    let fresh = outcome_ledger.execute_workbench_launch(
+        fresh_request.clone(),
+        Effect::Write,
+        "replacement-published-workbench-instance",
+        Duration::ZERO,
+        |_| fresh_response.clone(),
+        |request_id, response| replacement.retain_launch_replay(request_id, response),
+        |request_id| replacement.replay_launch_response(request_id),
+        |request_id| replacement.discard_launch_replay(request_id),
+    );
+    assert_same_response(&fresh.response, &fresh_response);
+    let fresh_retry = outcome_ledger.execute_workbench_launch(
+        fresh_request,
+        Effect::Write,
+        "replacement-published-workbench-instance",
+        Duration::ZERO,
+        |_| panic!("same-daemon fresh launch retry must not execute again"),
+        |request_id, response| replacement.retain_launch_replay(request_id, response),
+        |request_id| replacement.replay_launch_response(request_id),
+        |request_id| replacement.discard_launch_replay(request_id),
+    );
+    assert!(fresh_retry.replayed);
+    assert_same_response(&fresh_retry.response, &fresh_response);
     replacement.shutdown().await;
 }
 
@@ -1454,6 +1535,24 @@ fn launch_response_envelope(id: &str, launch: &WorkbenchLaunchResult) -> Respons
 }
 
 #[cfg(feature = "ui")]
+fn workbench_launch_request(id: &str, workspace_root: &Path) -> RequestEnvelope {
+    RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        id: id.to_string(),
+        op: Op::Call(crate::api::protocol::CallParams {
+            address: crate::api::protocol::Address::Operation {
+                path: vec!["workbench".to_string(), "launch".to_string()],
+            },
+            input: json!({}),
+        }),
+        workspace_root: Some(workspace_root.to_path_buf()),
+        auth: None,
+        workflow_confirmation: None,
+        agent_id: None,
+    }
+}
+
+#[cfg(feature = "ui")]
 fn assert_same_response(left: &ResponseEnvelope, right: &ResponseEnvelope) {
     assert_eq!(
         serde_json::to_value(left).expect("serialize left response"),
@@ -1612,6 +1711,209 @@ async fn launch_replay_requires_live_pending_capability_host_and_workspace_regis
     );
 
     manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test]
+async fn launch_replay_retention_uses_issuance_time_host_and_workspace_identity() {
+    let direct_fixture = fixture();
+    let manager = test_manager(Arc::clone(&direct_fixture.project));
+
+    let host_bound = manager
+        .launch(&direct_fixture.root)
+        .expect("launch host race fixture");
+    let host_response = launch_response_envelope("launch-host-race", &host_bound);
+    let (_, host_ticket) = launch_parts(&host_bound);
+    let original_host_generation = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let host = state.host.as_mut().expect("live host");
+        let original = host.generation;
+        host.generation = host.generation.saturating_add(1);
+        original
+    };
+    assert_eq!(
+        manager
+            .inner
+            .redeem_ticket(host_ticket)
+            .expect_err("host replacement before redemption must fail closed"),
+        TicketExchangeError::Invalid
+    );
+    let host_error = manager
+        .retain_launch_replay("launch-host-race", &host_response)
+        .expect_err("host replacement before retention must fail closed");
+    assert!(host_error.to_string().contains("host"), "{host_error:#}");
+    manager
+        .inner
+        .state
+        .lock()
+        .expect("workbench state")
+        .host
+        .as_mut()
+        .expect("live host")
+        .generation = original_host_generation;
+
+    let workspace_bound = manager
+        .launch(&direct_fixture.root)
+        .expect("launch workspace race fixture");
+    let workspace_response = launch_response_envelope("launch-workspace-race", &workspace_bound);
+    let (_, workspace_ticket) = launch_parts(&workspace_bound);
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let key = workspace_bound.workspace.key.clone();
+        let registration = state
+            .workspaces_by_key
+            .remove(&key)
+            .expect("issued workspace registration");
+        state.workspaces_by_root.remove(&registration.root);
+        state.workspace_registration_generations.remove(&key);
+        state.next_workspace_registration_generation = state
+            .next_workspace_registration_generation
+            .saturating_add(1);
+        let replacement_generation = state.next_workspace_registration_generation;
+        state
+            .workspace_registration_generations
+            .insert(key.clone(), replacement_generation);
+        state
+            .workspaces_by_root
+            .insert(registration.root.clone(), key.clone());
+        state.workspaces_by_key.insert(key, registration);
+    }
+    assert_eq!(
+        manager
+            .inner
+            .redeem_ticket(workspace_ticket)
+            .expect_err("remove and re-register before redemption must fail closed"),
+        TicketExchangeError::Invalid
+    );
+    let workspace_error = manager
+        .retain_launch_replay("launch-workspace-race", &workspace_response)
+        .expect_err("remove and re-register before retention must fail closed");
+    assert!(
+        workspace_error.to_string().contains("registration"),
+        "{workspace_error:#}"
+    );
+    manager.shutdown().await;
+
+    let published_fixture = fixture();
+    let published = test_manager(Arc::clone(&published_fixture.project));
+    use_test_published_entries(&published);
+    let published_launch = published
+        .launch(&published_fixture.root)
+        .expect("launch published enrollment race fixture");
+    let (_, published_ticket) = launch_parts(&published_launch);
+    let payload = published_ticket_payload(published_ticket);
+    let published_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin,
+        payload.project_instance_id,
+        payload.workspace_key.clone(),
+    )
+    .expect("published entry");
+    {
+        let mut state = published.inner.state.lock().expect("workbench state");
+        let generation = state
+            .workspace_registration_generations
+            .get_mut(&payload.workspace_key)
+            .expect("published workspace registration generation");
+        *generation = generation.saturating_add(1);
+    }
+    assert_eq!(
+        published
+            .inner
+            .enroll_pairing(published_ticket, None, &published_entry)
+            .expect_err("registration replacement before enrollment must fail closed"),
+        PairingExchangeError::Invalid
+    );
+    let published_response =
+        launch_response_envelope("launch-published-workspace-race", &published_launch);
+    assert!(
+        published
+            .retain_launch_replay("launch-published-workspace-race", &published_response)
+            .is_err(),
+        "registration replacement before published replay retention must fail closed"
+    );
+    published.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test]
+async fn launch_replay_is_fenced_and_cleared_by_host_shutdown() {
+    let direct_fixture = fixture();
+    let manager = test_manager(Arc::clone(&direct_fixture.project));
+
+    let rejected = manager
+        .launch(&direct_fixture.root)
+        .expect("launch shutdown-retention fixture");
+    let rejected_response = launch_response_envelope("launch-retain-shutdown", &rejected);
+    manager.inner.shutting_down.store(true, Ordering::Release);
+    assert!(
+        manager
+            .retain_launch_replay("launch-retain-shutdown", &rejected_response)
+            .is_err(),
+        "shutdown rejects newly retained replay authority"
+    );
+    manager.inner.shutting_down.store(false, Ordering::Release);
+
+    let direct = manager
+        .launch(&direct_fixture.root)
+        .expect("launch direct shutdown fixture");
+    let direct_response = launch_response_envelope("launch-direct-shutdown", &direct);
+    manager
+        .retain_launch_replay("launch-direct-shutdown", &direct_response)
+        .expect("retain direct replay");
+    assert!(
+        manager
+            .replay_launch_response_with_before_relock("launch-direct-shutdown", || {
+                manager.inner.shutting_down.store(true, Ordering::Release);
+            })
+            .is_none(),
+        "direct replay rechecks shutdown before returning"
+    );
+    manager.inner.shutting_down.store(false, Ordering::Release);
+
+    let retained = manager
+        .launch(&direct_fixture.root)
+        .expect("launch shutdown-clear fixture");
+    let retained_response = launch_response_envelope("launch-shutdown-clear", &retained);
+    manager
+        .retain_launch_replay("launch-shutdown-clear", &retained_response)
+        .expect("retain replay before shutdown");
+    manager.shutdown().await;
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("shutdown workbench state")
+            .launch_replays
+            .is_empty(),
+        "shutdown clears bearer-bearing replay responses"
+    );
+
+    let published_fixture = fixture();
+    let published = test_manager(Arc::clone(&published_fixture.project));
+    let provider = Arc::new(ReplayAuthorityPublishedEntryProvider {
+        current: AtomicBool::new(true),
+    });
+    published.set_entry_provider(provider);
+    let launch = published
+        .launch(&published_fixture.root)
+        .expect("launch published shutdown fixture");
+    let response = launch_response_envelope("launch-published-shutdown", &launch);
+    published
+        .retain_launch_replay("launch-published-shutdown", &response)
+        .expect("retain published replay");
+    published.inner.shutting_down.store(true, Ordering::Release);
+    assert!(
+        published
+            .replay_launch_response("launch-published-shutdown")
+            .is_none(),
+        "published replay is fenced while the host shuts down"
+    );
+    published
+        .inner
+        .shutting_down
+        .store(false, Ordering::Release);
+    published.shutdown().await;
 }
 
 #[cfg(feature = "ui")]
@@ -2048,6 +2350,12 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
             .values()
             .all(|session| session.workspace_key != sibling_key)
     );
+    assert!(
+        !state
+            .workspace_registration_generations
+            .contains_key(&sibling_key),
+        "Git worktree removal drops its replay-authority generation"
+    );
     drop(state);
     let store: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
         &fs::read(&manager.inner.authorization_store_path)
@@ -2120,6 +2428,9 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
         let key = format!("workspace-{index:03}");
         let root = PathBuf::from(format!("/tmp/exo-workbench-{index:03}"));
         state.workspaces_by_root.insert(root.clone(), key.clone());
+        state
+            .workspace_registration_generations
+            .insert(key.clone(), index as u64);
         state.workspaces_by_key.insert(
             key.clone(),
             WorkspaceRegistration {
@@ -2139,6 +2450,9 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
     state
         .workspaces_by_root
         .insert(current_root.clone(), current_key.clone());
+    state
+        .workspace_registration_generations
+        .insert(current_key.clone(), MAX_PROJECT_WORKSPACES as u64);
     state.workspaces_by_key.insert(
         current_key.clone(),
         WorkspaceRegistration {
@@ -2157,7 +2471,10 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
         "pending-capability".to_string(),
         PendingCapability {
             workspace_key: "workspace-000".to_string(),
+            workspace_root: PathBuf::from("/tmp/exo-workbench-000"),
+            workspace_registration_generation: 0,
             entry: test_direct_entry(),
+            host_generation: 1,
             expires_at: now.saturating_add(TICKET_LIFETIME.as_secs()),
         },
     );
@@ -2219,6 +2536,10 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
     assert!(!retain_project_workspace_limit(&mut state, &current_key).is_empty());
     assert_eq!(state.workspaces_by_key.len(), MAX_PROJECT_WORKSPACES);
     assert_eq!(state.workspaces_by_root.len(), MAX_PROJECT_WORKSPACES);
+    assert_eq!(
+        state.workspace_registration_generations.len(),
+        MAX_PROJECT_WORKSPACES
+    );
     assert!(state.workspaces_by_key.contains_key(&current_key));
     assert!(state.workspaces_by_key.contains_key("workspace-000"));
     assert!(state.workspaces_by_key.contains_key("workspace-001"));
@@ -2226,6 +2547,11 @@ fn project_workspace_registry_limit_keeps_current_and_fresh_observations() {
     assert!(state.workspaces_by_key.contains_key("workspace-003"));
     assert!(state.workspaces_by_key.contains_key("workspace-127"));
     assert!(!state.workspaces_by_key.contains_key("workspace-004"));
+    assert!(
+        !state
+            .workspace_registration_generations
+            .contains_key("workspace-004")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
