@@ -3701,13 +3701,102 @@
       "name": "workbench",
       "description": "Local lane workbench commands",
       "operations": {
+        "inspect": {
+          "name": "inspect",
+          "description": "Inspect a workbench lane without focusing it",
+          "effect": "pure",
+          "recovery_class": "replayable_read",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "id",
+              "name": "id",
+              "description": "Lane ID",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
         "launch": {
           "name": "launch",
           "description": "Launch the local lane workbench",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": false,
+          "args": []
+        },
+        "pairing.forget": {
+          "name": "pairing.forget",
+          "description": "Delete a retained browser pairing record",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "selector",
+              "name": "selector",
+              "description": "Pairing selector",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "pairing.list": {
+          "name": "pairing.list",
+          "description": "List durable browser pairings",
           "effect": "pure",
           "recovery_class": "replayable_read",
           "needs_upgrade_gate": false,
           "args": []
+        },
+        "pairing.rename": {
+          "name": "pairing.rename",
+          "description": "Name a durable browser pairing",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "selector",
+              "name": "selector",
+              "description": "Pairing selector",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            },
+            {
+              "id": "nickname",
+              "name": "nickname",
+              "description": "Pairing nickname",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
+        },
+        "pairing.revoke": {
+          "name": "pairing.revoke",
+          "description": "Revoke a durable browser pairing",
+          "effect": "write",
+          "recovery_class": "external_at_most_once",
+          "needs_upgrade_gate": false,
+          "args": [
+            {
+              "id": "selector",
+              "name": "selector",
+              "description": "Pairing selector",
+              "kind": "positional",
+              "value_type": "string",
+              "optional": false,
+              "repeatable": false
+            }
+          ]
         },
         "snapshot": {
           "name": "snapshot",
@@ -3819,5 +3908,5 @@
       ]
     }
   },
-  "operation_count": 134
+  "operation_count": 139
 }

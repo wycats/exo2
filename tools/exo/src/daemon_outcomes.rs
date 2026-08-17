@@ -3,7 +3,9 @@
 //! Mutating requests are reserved before command dispatch and their complete
 //! response is persisted before the daemon writes to the client socket. A
 //! reconnecting client can therefore resend the same request envelope without
-//! executing the command a second time.
+//! executing the command a second time. `workbench.launch` is the deliberate
+//! exception: its bearer-bearing response stays in daemon memory while SQLite
+//! stores only a typed, secret-free completion marker.
 
 use crate::api::protocol::{
     Address, Effect, ErrorBody, ErrorCode, Op, PROTOCOL_VERSION, RecoveryClass, RequestEnvelope,
@@ -16,23 +18,56 @@ use anyhow::{Context, Result, anyhow};
 use exosuit_storage::rusqlite::{OpenFlags, TransactionBehavior};
 use exosuit_storage::{Connection, OptionalExtension, RequestTransaction, params};
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::thread;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DAEMON_OUTCOME_DB_NAME: &str = "daemon-outcomes.sqlite3";
 const COMPLETED_OUTCOME_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+const WORKBENCH_LAUNCH_COMPLETION_KIND: &str = "workbench.launch.completed";
+const WORKBENCH_LAUNCH_COMPLETION_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub struct RequestOutcomeLedger {
     path: PathBuf,
+    notifications: Arc<OutcomeNotifications>,
 }
+
+#[derive(Debug, Default)]
+struct OutcomeNotifications {
+    generation: Mutex<u64>,
+    changed: Condvar,
+    #[cfg(test)]
+    waiters: AtomicUsize,
+}
+
+#[cfg(test)]
+struct OutcomeWaiterGuard<'a>(&'a AtomicUsize);
+
+#[cfg(test)]
+impl Drop for OutcomeWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+enum PersistedCompletion {
+    Response(Box<ResponseEnvelope>),
+    WorkbenchLaunchMarker,
+}
+
+type LaunchReplayCallback<'a> = dyn Fn(&str) -> Option<ResponseEnvelope> + 'a;
 
 #[derive(Debug)]
 enum Reservation {
     Execute,
-    Replay(Box<ResponseEnvelope>),
+    Replay(PersistedCompletion),
     InFlight {
         instance_id: String,
         recovery_class: Option<RecoveryClass>,
@@ -42,7 +77,7 @@ enum Reservation {
 
 #[derive(Debug)]
 enum WaitForResponse {
-    Completed(Box<ResponseEnvelope>),
+    Completed(PersistedCompletion),
     TimedOut,
     ReservationReleased,
 }
@@ -91,7 +126,10 @@ impl RequestHashes {
 
 impl RequestOutcomeLedger {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let ledger = Self { path: path.into() };
+        let ledger = Self {
+            path: path.into(),
+            notifications: Arc::new(OutcomeNotifications::default()),
+        };
         if let Some(parent) = ledger.path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -100,6 +138,7 @@ impl RequestOutcomeLedger {
                 )
             })?;
         }
+        create_owner_only_file_if_missing(&ledger.path)?;
         let connection = ledger.connection()?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS daemon_request_outcomes (
@@ -129,7 +168,9 @@ impl RequestOutcomeLedger {
                 [],
             )?;
         }
+        ledger.sanitize_legacy_workbench_launch_responses(&connection)?;
         ledger.prune_completed(&connection)?;
+        ledger.harden_owner_only_files()?;
         Ok(ledger)
     }
 
@@ -140,11 +181,21 @@ impl RequestOutcomeLedger {
     /// Return a completed runtime response or request-ID conflict before
     /// request preparation. Canonical atomic outcomes still pass through the
     /// atomic recovery path so finalization can repopulate this runtime ledger.
+    #[cfg(test)]
     pub(crate) fn terminal_outcome_before_preparation(
         &self,
         request: &RequestEnvelope,
     ) -> Result<Option<OutcomeExecution>> {
+        self.terminal_outcome_before_preparation_with_launch_replay(request, None)
+    }
+
+    pub(crate) fn terminal_outcome_before_preparation_with_launch_replay(
+        &self,
+        request: &RequestEnvelope,
+        replay_launch: Option<&LaunchReplayCallback<'_>>,
+    ) -> Result<Option<OutcomeExecution>> {
         let request_hashes = request_hashes(request)?;
+        self.harden_owner_only_files()?;
         let runtime_outcome =
             Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))
@@ -186,8 +237,37 @@ impl RequestOutcomeLedger {
                 }));
             }
             if let Some(response_json) = response_json {
-                let response: ResponseEnvelope = serde_json::from_str(response_json)
-                    .context("deserialize recorded daemon response")?;
+                let legacy_launch = is_workbench_launch_request(request)
+                    && raw_response_is_workbench_launch(response_json);
+                if legacy_launch {
+                    self.replace_legacy_workbench_launch_response(
+                        &request.id,
+                        stored_hash,
+                        response_json,
+                    )?;
+                }
+                let completion = if legacy_launch {
+                    PersistedCompletion::WorkbenchLaunchMarker
+                } else {
+                    persisted_completion_from_json(response_json)?
+                };
+                if is_workbench_launch_request(request) {
+                    return Ok(Some(OutcomeExecution {
+                        response: replay_workbench_launch_completion(
+                            &request.id,
+                            effect,
+                            completion,
+                            replay_launch,
+                        ),
+                        replayed: true,
+                    }));
+                }
+                let PersistedCompletion::Response(response) = completion else {
+                    return Err(anyhow!(
+                        "workbench launch completion marker was recorded for a non-launch request"
+                    ));
+                };
+                let response = *response;
                 if request.auth.as_ref().is_some_and(|auth| auth.confirm)
                     && is_transient_execution_confirmation(&response)
                 {
@@ -343,9 +423,9 @@ impl RequestOutcomeLedger {
                 RecoveryClass::ExternalAtMostOnce,
                 instance_id,
             ) {
-                Ok(Reservation::Replay(response)) => {
+                Ok(Reservation::Replay(completion)) => {
                     return OutcomeExecution {
-                        response: *response,
+                        response: generic_replay_response(&request_id, effect, completion),
                         replayed: true,
                     };
                 }
@@ -359,9 +439,9 @@ impl RequestOutcomeLedger {
                     instance_id: owner, ..
                 }) if owner == instance_id => {
                     match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
-                        Ok(WaitForResponse::Completed(response)) => {
+                        Ok(WaitForResponse::Completed(completion)) => {
                             return OutcomeExecution {
-                                response: *response,
+                                response: generic_replay_response(&request_id, effect, completion),
                                 replayed: true,
                             };
                         }
@@ -371,7 +451,7 @@ impl RequestOutcomeLedger {
                                 replayed: false,
                             };
                         }
-                        Ok(WaitForResponse::ReservationReleased) => continue,
+                        Ok(WaitForResponse::ReservationReleased) => {}
                         Err(error) => {
                             return OutcomeExecution {
                                 response: ledger_error_response(
@@ -481,6 +561,220 @@ impl RequestOutcomeLedger {
         }
     }
 
+    /// Execute `workbench.launch` without persisting its bearer-bearing response.
+    ///
+    /// The durable row records only a typed completion marker. Exact retry
+    /// successful responses live in daemon memory and are returned through
+    /// `replay_launch` only while the original enrollment authority remains
+    /// current. Terminal launch errors also become markers: their first
+    /// diagnostic is returned once, and a retry must use a new request ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_workbench_launch<F, Retain, Replay, Discard>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        instance_id: &str,
+        in_flight_wait: Duration,
+        execute: F,
+        retain_launch: Retain,
+        replay_launch: Replay,
+        discard_launch: Discard,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        Retain: Fn(&str, &ResponseEnvelope) -> Result<()>,
+        Replay: Fn(&str) -> Option<ResponseEnvelope>,
+        Discard: Fn(&str),
+    {
+        let request_id = request.id.clone();
+        let request_hashes = match request_hashes(&request) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                return OutcomeExecution {
+                    response: ledger_error_response(
+                        request_id,
+                        effect,
+                        "daemon.request_outcome_fingerprint_failed",
+                        error,
+                        false,
+                    ),
+                    replayed: false,
+                };
+            }
+        };
+        let request_hash = request_hashes.current.clone();
+
+        let mut request = Some(request);
+        let mut execute = Some(execute);
+        loop {
+            match self.reserve_compatible(
+                &request_id,
+                &request_hashes,
+                effect,
+                RecoveryClass::ExternalAtMostOnce,
+                instance_id,
+            ) {
+                Ok(Reservation::Replay(completion)) => {
+                    return OutcomeExecution {
+                        response: replay_workbench_launch_completion(
+                            &request_id,
+                            effect,
+                            completion,
+                            Some(&replay_launch),
+                        ),
+                        replayed: true,
+                    };
+                }
+                Ok(Reservation::Conflict) => {
+                    return OutcomeExecution {
+                        response: request_id_conflict_response(request_id, effect),
+                        replayed: false,
+                    };
+                }
+                Ok(Reservation::InFlight {
+                    instance_id: owner, ..
+                }) if owner == instance_id => {
+                    match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
+                        Ok(WaitForResponse::Completed(completion)) => {
+                            return OutcomeExecution {
+                                response: replay_workbench_launch_completion(
+                                    &request_id,
+                                    effect,
+                                    completion,
+                                    Some(&replay_launch),
+                                ),
+                                replayed: true,
+                            };
+                        }
+                        Ok(WaitForResponse::TimedOut) => {
+                            return OutcomeExecution {
+                                response: in_flight_response(request_id, effect, &owner, false),
+                                replayed: false,
+                            };
+                        }
+                        Ok(WaitForResponse::ReservationReleased) => {}
+                        Err(error) => {
+                            return OutcomeExecution {
+                                response: ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_lookup_failed",
+                                    error,
+                                    false,
+                                ),
+                                replayed: false,
+                            };
+                        }
+                    }
+                }
+                Ok(Reservation::InFlight { .. }) => {
+                    return OutcomeExecution {
+                        response: workbench_launch_replay_unavailable_response(request_id, effect),
+                        replayed: false,
+                    };
+                }
+                Ok(Reservation::Execute) => {
+                    let (Some(execute), Some(request)) = (execute.take(), request.take()) else {
+                        return OutcomeExecution {
+                            response: ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_execution_state_invalid",
+                                anyhow!("workbench launch execution state was already consumed"),
+                                false,
+                            ),
+                            replayed: false,
+                        };
+                    };
+                    let response = execute(request);
+                    if is_retryable_daemon_busy_response(&response) {
+                        return match self.abandon(&request_id, &request_hash, instance_id) {
+                            Ok(()) => OutcomeExecution {
+                                response: normalize_retryable_daemon_busy_response(response),
+                                replayed: false,
+                            },
+                            Err(error) => OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_abandon_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            },
+                        };
+                    }
+                    if response.status == Status::ConfirmRequired
+                        || is_rejected_execution_confirmation(&response)
+                    {
+                        return match self.abandon(&request_id, &request_hash, instance_id) {
+                            Ok(()) => OutcomeExecution {
+                                response,
+                                replayed: false,
+                            },
+                            Err(error) => OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_abandon_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            },
+                        };
+                    }
+
+                    let retained = retain_launch(&request_id, &response);
+                    let completed =
+                        self.complete_workbench_launch_marker(&request_id, &request_hash);
+                    if let Err(error) = completed {
+                        discard_launch(&request_id);
+                        return OutcomeExecution {
+                            response: ledger_error_response(
+                                request_id,
+                                effect,
+                                "daemon.request_outcome_persist_failed",
+                                error,
+                                true,
+                            ),
+                            replayed: false,
+                        };
+                    }
+                    if let Err(error) = retained {
+                        return OutcomeExecution {
+                            response: ledger_error_response(
+                                request_id,
+                                effect,
+                                "workbench.launch_replay_cache_failed",
+                                error,
+                                true,
+                            ),
+                            replayed: false,
+                        };
+                    }
+                    return OutcomeExecution {
+                        response,
+                        replayed: false,
+                    };
+                }
+                Err(error) => {
+                    return OutcomeExecution {
+                        response: ledger_error_response(
+                            request_id,
+                            effect,
+                            "daemon.request_outcome_reservation_failed",
+                            error,
+                            false,
+                        ),
+                        replayed: false,
+                    };
+                }
+            }
+        }
+    }
+
     /// Execute a canonical project-state request with state and core response
     /// committed in one SQLite transaction.
     ///
@@ -527,9 +821,9 @@ impl RequestOutcomeLedger {
             RecoveryClass::AtomicProjectState,
             instance_id,
         ) {
-            Ok(Reservation::Replay(response)) => {
+            Ok(Reservation::Replay(completion)) => {
                 return OutcomeExecution {
-                    response: *response,
+                    response: generic_replay_response(&request_id, effect, completion),
                     replayed: true,
                 };
             }
@@ -545,9 +839,9 @@ impl RequestOutcomeLedger {
                 instance_id: owner, ..
             }) if owner == instance_id => {
                 match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
-                    Ok(WaitForResponse::Completed(response)) => {
+                    Ok(WaitForResponse::Completed(completion)) => {
                         return OutcomeExecution {
-                            response: *response,
+                            response: generic_replay_response(&request_id, effect, completion),
                             replayed: true,
                         };
                     }
@@ -689,12 +983,86 @@ impl RequestOutcomeLedger {
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path)
+        create_owner_only_file_if_missing(&self.path)?;
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .with_context(|| format!("open daemon outcome ledger {}", self.path.display()))?;
         connection.pragma_update(None, "journal_mode", "wal")?;
         connection.pragma_update(None, "synchronous", "full")?;
         connection.pragma_update(None, "busy_timeout", 5_000)?;
+        connection.pragma_update(None, "secure_delete", "on")?;
+        self.harden_owner_only_files()?;
         Ok(connection)
+    }
+
+    fn harden_owner_only_files(&self) -> Result<()> {
+        for path in outcome_file_paths(&self.path) {
+            if path.exists() {
+                set_owner_only_file_permissions(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn notify_waiters(&self) {
+        let Ok(mut generation) = self.notifications.generation.lock() else {
+            return;
+        };
+        *generation = generation.wrapping_add(1);
+        self.notifications.changed.notify_all();
+    }
+
+    fn sanitize_legacy_workbench_launch_responses(&self, connection: &Connection) -> Result<()> {
+        connection.pragma_update(None, "secure_delete", "on")?;
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT request_id, response_json
+                 FROM daemon_request_outcomes
+                 WHERE response_json IS NOT NULL",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let legacy_request_ids = rows
+            .into_iter()
+            .filter_map(|(request_id, response_json)| {
+                raw_response_is_workbench_launch(&response_json).then_some(request_id)
+            })
+            .collect::<Vec<_>>();
+        if legacy_request_ids.is_empty() {
+            return Ok(());
+        }
+        let marker = workbench_launch_completion_marker_json();
+        for request_id in legacy_request_ids {
+            connection.execute(
+                "UPDATE daemon_request_outcomes SET response_json = ?2 WHERE request_id = ?1",
+                params![request_id, marker],
+            )?;
+        }
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        self.harden_owner_only_files()?;
+        Ok(())
+    }
+
+    fn replace_legacy_workbench_launch_response(
+        &self,
+        request_id: &str,
+        request_hash: &str,
+        response_json: &str,
+    ) -> Result<()> {
+        let marker = workbench_launch_completion_marker_json();
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE daemon_request_outcomes
+             SET response_json = ?4
+             WHERE request_id = ?1 AND request_hash = ?2 AND response_json = ?3",
+            params![request_id, request_hash, response_json, marker],
+        )?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        self.harden_owner_only_files()?;
+        Ok(())
     }
 
     fn runtime_outcome_state(
@@ -796,10 +1164,9 @@ impl RequestOutcomeLedger {
             Some((stored_hash, _, _, _)) if !request_hashes.matches(&stored_hash) => {
                 Reservation::Conflict
             }
-            Some((_, _, _, Some(response_json))) => Reservation::Replay(Box::new(
-                serde_json::from_str(&response_json)
-                    .context("deserialize recorded daemon response")?,
-            )),
+            Some((_, _, _, Some(response_json))) => {
+                Reservation::Replay(persisted_completion_from_json(&response_json)?)
+            }
             Some((_, owner_instance_id, stored_recovery_class, None)) => Reservation::InFlight {
                 instance_id: owner_instance_id,
                 recovery_class: stored_recovery_class
@@ -846,7 +1213,32 @@ impl RequestOutcomeLedger {
                 "daemon outcome reservation disappeared before completion"
             ));
         }
-        self.prune_completed(&connection)?;
+        self.notify_waiters();
+        // The completed response is already durable. Retention cleanup is
+        // best-effort maintenance and must not change the request outcome.
+        let _ = self.prune_completed(&connection);
+        Ok(())
+    }
+
+    fn complete_workbench_launch_marker(&self, request_id: &str, request_hash: &str) -> Result<()> {
+        let marker = workbench_launch_completion_marker_json();
+        let connection = self.connection()?;
+        let updated = connection.execute(
+            "UPDATE daemon_request_outcomes
+             SET response_json = ?3, completed_at = ?4
+             WHERE request_id = ?1 AND request_hash = ?2 AND response_json IS NULL",
+            params![request_id, request_hash, marker, now_timestamp()],
+        )?;
+        if updated != 1 {
+            return Err(anyhow!(
+                "daemon outcome reservation disappeared before workbench launch completion"
+            ));
+        }
+        self.notify_waiters();
+        // Marker durability is the safety boundary. Retention cleanup is
+        // maintenance and must not make the owner discard the matching live
+        // response after waiters can already observe the committed marker.
+        let _ = self.prune_completed(&connection);
         Ok(())
     }
 
@@ -856,8 +1248,17 @@ impl RequestOutcomeLedger {
         request_hash: &str,
         timeout: Duration,
     ) -> Result<WaitForResponse> {
+        #[cfg(test)]
+        self.notifications.waiters.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        let _waiter = OutcomeWaiterGuard(&self.notifications.waiters);
         let deadline = Instant::now() + timeout;
         loop {
+            let observed_generation = *self
+                .notifications
+                .generation
+                .lock()
+                .map_err(|_| anyhow!("daemon outcome waiter notification is unavailable"))?;
             let connection = self.connection()?;
             let row = connection
                 .query_row(
@@ -868,19 +1269,34 @@ impl RequestOutcomeLedger {
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .optional()?;
+            drop(connection);
             match row {
                 Some((stored_hash, _)) if stored_hash != request_hash => {
                     return Err(anyhow!("request id was reused with a different payload"));
                 }
                 Some((_, Some(response_json))) => {
-                    return Ok(WaitForResponse::Completed(Box::new(
-                        serde_json::from_str(&response_json)
-                            .context("deserialize recorded daemon response")?,
-                    )));
+                    return Ok(WaitForResponse::Completed(persisted_completion_from_json(
+                        &response_json,
+                    )?));
                 }
                 None => return Ok(WaitForResponse::ReservationReleased),
                 Some((_, None)) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(25));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let generation = self.notifications.generation.lock().map_err(|_| {
+                        anyhow!("daemon outcome waiter notification is unavailable")
+                    })?;
+                    if *generation == observed_generation {
+                        drop(
+                            self.notifications
+                                .changed
+                                .wait_timeout(generation, remaining)
+                                .map_err(|_| {
+                                    anyhow!("daemon outcome waiter notification is unavailable")
+                                })?,
+                        );
+                    } else {
+                        drop(generation);
+                    }
                 }
                 Some((_, None)) => return Ok(WaitForResponse::TimedOut),
             }
@@ -900,15 +1316,18 @@ impl RequestOutcomeLedger {
                 "daemon outcome reservation disappeared before abandonment"
             ));
         }
+        self.notify_waiters();
         Ok(())
     }
 
     fn prune_completed(&self, connection: &Connection) -> Result<()> {
         let cutoff = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS;
+        let launch_marker = workbench_launch_completion_marker_json();
         connection.execute(
             "DELETE FROM daemon_request_outcomes
-             WHERE completed_at IS NOT NULL AND completed_at < ?1",
-            [cutoff],
+             WHERE completed_at IS NOT NULL AND completed_at < ?1
+               AND response_json != ?2",
+            params![cutoff, launch_marker],
         )?;
         Ok(())
     }
@@ -1053,6 +1472,84 @@ pub fn request_command_path(request: &RequestEnvelope) -> Option<(String, String
         [namespace, first, second] => Some((namespace.clone(), format!("{first}.{second}"))),
         _ => None,
     }
+}
+
+pub(crate) fn is_workbench_launch_request(request: &RequestEnvelope) -> bool {
+    matches!(
+        request_command_path(request),
+        Some((namespace, operation))
+            if namespace == "workbench" && operation == "launch"
+    )
+}
+
+fn workbench_launch_completion_marker_json() -> String {
+    serde_json::json!({
+        "kind": WORKBENCH_LAUNCH_COMPLETION_KIND,
+        "schema_version": WORKBENCH_LAUNCH_COMPLETION_SCHEMA_VERSION,
+    })
+    .to_string()
+}
+
+fn persisted_completion_from_json(json: &str) -> Result<PersistedCompletion> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("deserialize recorded daemon completion")?;
+    if value.get("kind").and_then(serde_json::Value::as_str)
+        == Some(WORKBENCH_LAUNCH_COMPLETION_KIND)
+        && value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(WORKBENCH_LAUNCH_COMPLETION_SCHEMA_VERSION))
+    {
+        return Ok(PersistedCompletion::WorkbenchLaunchMarker);
+    }
+    serde_json::from_value(value)
+        .map(Box::new)
+        .map(PersistedCompletion::Response)
+        .context("deserialize recorded daemon response")
+}
+
+fn raw_response_is_workbench_launch(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json).map_or_else(
+        |_| json.contains("workbench.launch") && json.contains("#ticket="),
+        |value| {
+            value
+                .get("result")
+                .and_then(|result| result.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("workbench.launch")
+        },
+    )
+}
+
+fn generic_replay_response(
+    request_id: &str,
+    effect: Effect,
+    completion: PersistedCompletion,
+) -> ResponseEnvelope {
+    match completion {
+        PersistedCompletion::Response(response) => *response,
+        PersistedCompletion::WorkbenchLaunchMarker => {
+            workbench_launch_replay_unavailable_response(request_id.to_string(), effect)
+        }
+    }
+}
+
+fn replay_workbench_launch_completion(
+    request_id: &str,
+    effect: Effect,
+    completion: PersistedCompletion,
+    replay_launch: Option<&LaunchReplayCallback<'_>>,
+) -> ResponseEnvelope {
+    if !matches!(completion, PersistedCompletion::WorkbenchLaunchMarker) {
+        // Old Exo versions durably recorded the full launch response. It may
+        // contain a live bearer ticket, so never deserialize it into a replay.
+        return workbench_launch_replay_unavailable_response(request_id.to_string(), effect);
+    }
+    let Some(mut response) = replay_launch.and_then(|replay| replay(request_id)) else {
+        return workbench_launch_replay_unavailable_response(request_id.to_string(), effect);
+    };
+    response.id = request_id.to_string();
+    response
 }
 
 pub fn resolved_request_effect(workspace_root: &Path, request: &RequestEnvelope) -> Option<Effect> {
@@ -1285,6 +1782,39 @@ fn now_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn create_owner_only_file_if_missing(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    drop(
+        options
+            .open(path)
+            .with_context(|| format!("create daemon outcome ledger {}", path.display()))?,
+    );
+    set_owner_only_file_permissions(path)
+}
+
+fn outcome_file_paths(path: &Path) -> [PathBuf; 3] {
+    let with_suffix = |suffix: &str| {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        PathBuf::from(candidate)
+    };
+    [path.to_path_buf(), with_suffix("-wal"), with_suffix("-shm")]
+}
+
+#[cfg(unix)]
+fn set_owner_only_file_permissions(path: &Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure daemon outcome ledger file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 const fn effect_name(effect: Effect) -> &'static str {
     match effect {
         Effect::Pure => "pure",
@@ -1392,6 +1922,22 @@ fn in_flight_response(
     )
 }
 
+fn workbench_launch_replay_unavailable_response(id: String, effect: Effect) -> ResponseEnvelope {
+    response_error(
+        id.clone(),
+        effect,
+        ErrorCode::PreconditionFailed,
+        "The original workbench launch cannot be replayed safely. Use a new request ID to issue a fresh one-time enrollment link."
+            .to_string(),
+        serde_json::json!({
+            "kind": "workbench.launch_replay_unavailable",
+            "request_id": id,
+            "retry_with_new_request_id": true,
+            "mutation_replayed": false,
+        }),
+    )
+}
+
 fn ledger_error_response(
     id: String,
     effect: Effect,
@@ -1421,7 +1967,8 @@ mod tests {
     use crate::context::SqliteWriter;
     use exosuit_storage::open_database;
     use std::cell::Cell;
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
 
     fn request(id: &str, task_id: &str) -> RequestEnvelope {
         RequestEnvelope {
@@ -1455,6 +2002,63 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn launch_request(id: &str, workspace_root: &str) -> RequestEnvelope {
+        RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec!["workbench".to_string(), "launch".to_string()],
+                },
+                input: serde_json::json!({}),
+            }),
+            workspace_root: Some(PathBuf::from(workspace_root)),
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        }
+    }
+
+    fn launch_response(id: &str, bearer: &str) -> ResponseEnvelope {
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.to_string(),
+            status: Status::Ok,
+            result: Some(serde_json::json!({
+                "kind": "workbench.launch",
+                "ok": true,
+                "schema_version": 2,
+                "url": format!("https://workbench.example/#ticket={bearer}"),
+            })),
+            error: None,
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: Some(crate::api::protocol::Display {
+                invocation_message: "Launching workbench".to_string(),
+                summary: "Open the Exo workbench".to_string(),
+                body: Some(format!("Open https://workbench.example/#ticket={bearer}")),
+            }),
+            preview: None,
+            effect: Some(Effect::Write),
+            trace: None,
+        }
+    }
+
+    fn response_json(response: &ResponseEnvelope) -> serde_json::Value {
+        serde_json::to_value(response).expect("serialize response")
+    }
+
+    fn error_kind(response: &ResponseEnvelope) -> Option<&str> {
+        response
+            .error
+            .as_ref()?
+            .details
+            .as_ref()?
+            .get("kind")?
+            .as_str()
     }
 
     fn reconcile_busy_response(id: &str) -> ResponseEnvelope {
@@ -1548,6 +2152,421 @@ mod tests {
     }
 
     #[test]
+    fn workbench_launch_replays_exact_memory_response_without_persisting_bearer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let request = launch_request("launch-once", "/workspace-a");
+        let expected = launch_response(&request.id, "secret-launch-bearer");
+        let cached = Arc::new(Mutex::new(None::<ResponseEnvelope>));
+        let invocations = AtomicUsize::new(0);
+
+        let first_cache = Arc::clone(&cached);
+        let first = ledger.execute_workbench_launch(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| {
+                invocations.fetch_add(1, Ordering::Relaxed);
+                expected.clone()
+            },
+            |_, response| {
+                *first_cache.lock().expect("cache launch") = Some(response.clone());
+                Ok(())
+            },
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(response_json(&first.response), response_json(&expected));
+
+        let replay_cache = Arc::clone(&cached);
+        let second = ledger.execute_workbench_launch(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| panic!("same request must not launch again"),
+            |_, _| panic!("replay must not replace the cache"),
+            move |_| replay_cache.lock().expect("read cache").clone(),
+            |_| {},
+        );
+        assert!(second.replayed);
+        assert_eq!(response_json(&second.response), response_json(&expected));
+        assert_eq!(invocations.load(Ordering::Relaxed), 1);
+
+        let recorded: String = ledger
+            .connection()
+            .expect("open ledger")
+            .query_row(
+                "SELECT response_json FROM daemon_request_outcomes WHERE request_id = ?1",
+                [&request.id],
+                |row| row.get(0),
+            )
+            .expect("recorded marker");
+        assert_eq!(recorded, workbench_launch_completion_marker_json());
+        assert!(!recorded.contains("secret-launch-bearer"));
+        assert!(!recorded.contains("url"));
+        assert!(!recorded.contains("display"));
+        let path = ledger.path().to_path_buf();
+        drop(ledger);
+        for candidate in outcome_file_paths(&path) {
+            if candidate.exists() {
+                let bytes = std::fs::read(&candidate).expect("read outcome file");
+                assert!(
+                    !bytes
+                        .windows("secret-launch-bearer".len())
+                        .any(|window| window == b"secret-launch-bearer"),
+                    "launch bearer reached {}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_commit_prune_failure_preserves_exact_launch_for_owner_and_waiter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(
+            RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+                .expect("open ledger"),
+        );
+        let connection = ledger.connection().expect("open prune fixture connection");
+        connection
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, recovery_class,
+                     response_json, started_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)",
+                params![
+                    "stale-prune-probe",
+                    "stale-hash",
+                    "write",
+                    "stale-instance",
+                    "external_at_most_once",
+                    serde_json::to_string(&response("stale-prune-probe"))
+                        .expect("serialize stale response"),
+                ],
+            )
+            .expect("insert stale completed response");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_stale_prune
+                 BEFORE DELETE ON daemon_request_outcomes
+                 WHEN OLD.request_id = 'stale-prune-probe'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced prune failure');
+                 END;",
+            )
+            .expect("install deterministic prune failure");
+        drop(connection);
+        let request = launch_request("launch-concurrent", "/workspace-a");
+        let expected = launch_response(&request.id, "concurrent-launch-bearer");
+        let cached = Arc::new(Mutex::new(None::<ResponseEnvelope>));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let owner_ledger = Arc::clone(&ledger);
+        let owner_request = request.clone();
+        let owner_expected = expected.clone();
+        let owner_cache = Arc::clone(&cached);
+        let owner_invocations = Arc::clone(&invocations);
+        let owner = std::thread::spawn(move || {
+            owner_ledger.execute_workbench_launch(
+                owner_request,
+                Effect::Write,
+                "instance-a",
+                Duration::from_secs(2),
+                |_| {
+                    owner_invocations.fetch_add(1, Ordering::Relaxed);
+                    started_tx.send(()).expect("announce launch");
+                    release_rx.recv().expect("release launch");
+                    owner_expected
+                },
+                |_, response| {
+                    *owner_cache.lock().expect("cache launch") = Some(response.clone());
+                    Ok(())
+                },
+                |_| None,
+                |_| {},
+            )
+        });
+        started_rx.recv().expect("launch started");
+
+        let waiter_ledger = Arc::clone(&ledger);
+        let waiter_request = request;
+        let waiter_cache = Arc::clone(&cached);
+        let waiter = std::thread::spawn(move || {
+            waiter_ledger.execute_workbench_launch(
+                waiter_request,
+                Effect::Write,
+                "instance-a",
+                Duration::from_secs(2),
+                |_| panic!("waiter must not launch again"),
+                |_, _| panic!("waiter must not replace cache"),
+                move |_| waiter_cache.lock().expect("read cache").clone(),
+                |_| {},
+            )
+        });
+        let waiter_deadline = Instant::now() + Duration::from_secs(1);
+        while ledger.notifications.waiters.load(Ordering::Acquire) == 0
+            && Instant::now() < waiter_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            ledger.notifications.waiters.load(Ordering::Acquire),
+            1,
+            "the concurrent retry must be waiting on the owner's in-flight reservation"
+        );
+        release_tx.send(()).expect("release owner");
+
+        let owner = owner.join().expect("join owner");
+        let waiter = waiter.join().expect("join waiter");
+        assert_eq!(response_json(&owner.response), response_json(&expected));
+        assert_eq!(response_json(&waiter.response), response_json(&expected));
+        assert!(waiter.replayed);
+        assert_eq!(invocations.load(Ordering::Relaxed), 1);
+
+        let connection = ledger.connection().expect("inspect completed launch");
+        let marker: String = connection
+            .query_row(
+                "SELECT response_json FROM daemon_request_outcomes WHERE request_id = ?1",
+                [&expected.id],
+                |row| row.get(0),
+            )
+            .expect("launch marker was committed");
+        assert_eq!(marker, workbench_launch_completion_marker_json());
+        let stale_row_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM daemon_request_outcomes WHERE request_id = 'stale-prune-probe'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect stale prune probe");
+        assert!(stale_row_exists, "the forced retention prune must fail");
+        assert!(
+            ledger.prune_completed(&connection).is_err(),
+            "the fixture must deterministically reject retention pruning"
+        );
+    }
+
+    #[test]
+    fn completed_outcome_pruning_preserves_launch_tombstones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let launch = launch_request("launch-retained-tombstone", "/workspace-a");
+        let first = ledger.execute_workbench_launch(
+            launch.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| launch_response(&launch.id, "retention-bearer"),
+            |_, _| Ok(()),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        let ordinary = request("ordinary-expired-outcome", "task-a");
+        let ordinary_result = ledger.execute(
+            ordinary.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |request| response(&request.id),
+        );
+        assert_eq!(ordinary_result.response.status, Status::Ok);
+
+        let connection = ledger.connection().expect("open retention fixture");
+        connection
+            .execute(
+                "UPDATE daemon_request_outcomes SET completed_at = ?1
+                 WHERE request_id IN (?2, ?3)",
+                params![
+                    now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS - 1,
+                    launch.id,
+                    ordinary.id,
+                ],
+            )
+            .expect("expire completed outcomes");
+        ledger
+            .prune_completed(&connection)
+            .expect("prune ordinary outcomes");
+
+        let retained: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM daemon_request_outcomes WHERE request_id = ?1
+                 )",
+                [&launch.id],
+                |row| row.get(0),
+            )
+            .expect("inspect launch tombstone");
+        let ordinary_retained: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM daemon_request_outcomes WHERE request_id = ?1
+                 )",
+                [&ordinary.id],
+                |row| row.get(0),
+            )
+            .expect("inspect ordinary outcome");
+        assert!(retained, "launch request IDs remain terminal");
+        assert!(
+            !ordinary_retained,
+            "ordinary completed outcomes still prune"
+        );
+        drop(connection);
+
+        let retry = ledger.execute_workbench_launch(
+            launch,
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            |_| panic!("retained launch request ID must not execute again"),
+            |_, _| panic!("retained launch request ID must not replace its marker"),
+            |_| None,
+            |_| {},
+        );
+        assert!(retry.replayed);
+        assert_eq!(
+            error_kind(&retry.response),
+            Some("workbench.launch_replay_unavailable")
+        );
+    }
+
+    #[test]
+    fn workbench_launch_marker_fails_closed_without_live_same_daemon_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let request = launch_request("launch-cross-daemon", "/workspace-a");
+        let first_ledger = RequestOutcomeLedger::open(&path).expect("open first ledger");
+        let first = first_ledger.execute_workbench_launch(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| launch_response(&request.id, "cross-daemon-bearer"),
+            |_, _| Ok(()),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        drop(first_ledger);
+
+        let replacement = RequestOutcomeLedger::open(path).expect("open replacement ledger");
+        let replay = replacement.execute_workbench_launch(
+            request,
+            Effect::Write,
+            "instance-b",
+            Duration::ZERO,
+            |_| panic!("replacement daemon must not launch again"),
+            |_, _| panic!("replacement daemon must not retain a response"),
+            |_| None,
+            |_| {},
+        );
+        assert!(replay.replayed);
+        assert_eq!(replay.response.status, Status::Error);
+        assert_eq!(
+            error_kind(&replay.response),
+            Some("workbench.launch_replay_unavailable")
+        );
+        assert_eq!(
+            replay
+                .response
+                .error
+                .as_ref()
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap()["retry_with_new_request_id"],
+            true
+        );
+    }
+
+    #[test]
+    fn terminal_workbench_launch_error_requires_a_new_request_id_on_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let request = launch_request("launch-terminal-error", "/workspace-a");
+        let original = error_response(
+            &request.id,
+            ErrorCode::PreconditionFailed,
+            Some(serde_json::json!({ "kind": "workbench.publisher_not_ready" })),
+        );
+        let first = ledger.execute_workbench_launch(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| original.clone(),
+            |_, _| Ok(()),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(response_json(&first.response), response_json(&original));
+
+        let retry = ledger.execute_workbench_launch(
+            request,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| panic!("terminal launch error must not execute twice"),
+            |_, _| panic!("terminal launch error has no replay cache"),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(
+            error_kind(&retry.response),
+            Some("workbench.launch_replay_unavailable")
+        );
+    }
+
+    #[test]
+    fn workbench_launch_request_conflict_never_consults_live_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let original = launch_request("launch-conflict", "/workspace-a");
+        ledger.execute_workbench_launch(
+            original.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| launch_response(&original.id, "conflict-bearer"),
+            |_, _| Ok(()),
+            |_| None,
+            |_| {},
+        );
+
+        let conflicting = launch_request("launch-conflict", "/workspace-b");
+        let replay_consulted = Cell::new(false);
+        let conflict = ledger.execute_workbench_launch(
+            conflicting,
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| panic!("conflicting request must not execute"),
+            |_, _| panic!("conflicting request must not retain"),
+            |_| {
+                replay_consulted.set(true);
+                None
+            },
+            |_| {},
+        );
+        assert_eq!(
+            error_kind(&conflict.response),
+            Some("daemon.request_id_conflict")
+        );
+        assert!(!replay_consulted.get());
+    }
+
+    #[test]
     fn completed_legacy_authenticated_hash_replays_after_upgrade() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
@@ -1594,6 +2613,155 @@ mod tests {
         assert_eq!(replay.response.id, recorded_response.id);
         assert_eq!(replay.response.status, recorded_response.status);
         assert_eq!(replay.response.result, recorded_response.result);
+    }
+
+    #[test]
+    fn legacy_raw_workbench_launch_is_scrubbed_and_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let request = launch_request("legacy-launch", "/workspace-a");
+        let ledger = RequestOutcomeLedger::open(&path).expect("open ledger");
+        let response = launch_response(&request.id, "legacy-secret-bearer");
+        ledger
+            .connection()
+            .expect("open ledger connection")
+            .execute(
+                "INSERT INTO daemon_request_outcomes (
+                     request_id, request_hash, effect, instance_id, recovery_class,
+                     response_json, started_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    request.id,
+                    request_hash(&request).unwrap(),
+                    effect_name(Effect::Write),
+                    "legacy-instance",
+                    recovery_class_name(RecoveryClass::ExternalAtMostOnce),
+                    serde_json::to_string(&response).unwrap(),
+                    now_timestamp(),
+                    now_timestamp(),
+                ],
+            )
+            .expect("insert legacy launch response");
+        drop(ledger);
+
+        let ledger = RequestOutcomeLedger::open(&path).expect("reopen and scrub ledger");
+        let replay = ledger
+            .terminal_outcome_before_preparation_with_launch_replay(&request, Some(&|_| None))
+            .expect("read scrubbed outcome")
+            .expect("terminal launch marker");
+        assert_eq!(
+            error_kind(&replay.response),
+            Some("workbench.launch_replay_unavailable")
+        );
+        let recorded: String = ledger
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT response_json FROM daemon_request_outcomes WHERE request_id = ?1",
+                [&request.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, workbench_launch_completion_marker_json());
+
+        drop(ledger);
+        for candidate in outcome_file_paths(&path) {
+            if candidate.exists() {
+                let bytes = std::fs::read(&candidate).expect("read outcome file");
+                assert!(
+                    !bytes
+                        .windows("legacy-secret-bearer".len())
+                        .any(|window| window == b"legacy-secret-bearer"),
+                    "legacy bearer remained in {}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_external_response_containing_ticket_fragment_replays_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let ledger = RequestOutcomeLedger::open(&path).expect("open ledger");
+        let request = request("generic-ticket-fragment", "task-a");
+        let mut response = response(&request.id);
+        response.result = Some(serde_json::json!({
+            "note": "documentation example https://example.test/#ticket=not-a-workbench-ticket"
+        }));
+        let first = ledger.execute(
+            request.clone(),
+            Effect::Write,
+            "instance-a",
+            Duration::ZERO,
+            |_| response.clone(),
+        );
+        assert_eq!(response_json(&first.response), response_json(&response));
+        drop(ledger);
+
+        let ledger = RequestOutcomeLedger::open(path).expect("reopen ledger");
+        let second = ledger.execute(request, Effect::Write, "instance-b", Duration::ZERO, |_| {
+            panic!("generic response must replay")
+        });
+        assert_eq!(response_json(&second.response), response_json(&response));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_outcome_database_and_live_wal_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let ledger = RequestOutcomeLedger::open(&path).expect("open ledger");
+        let connection = ledger.connection().expect("open live connection");
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable automatic WAL checkpoints");
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS outcome_permission_probe (value INTEGER);
+                 INSERT INTO outcome_permission_probe VALUES (1);
+                 COMMIT;",
+            )
+            .expect("materialize WAL files");
+
+        let outcome_files = outcome_file_paths(&path);
+        for candidate in &outcome_files {
+            assert!(
+                candidate.exists(),
+                "normal ledger writes must materialize {}",
+                candidate.display()
+            );
+            let mode = std::fs::metadata(candidate)
+                .expect("outcome metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "unexpected mode for {}", candidate.display());
+        }
+
+        for candidate in &outcome_files {
+            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o644))
+                .expect("weaken fixture permissions");
+        }
+        let repair = ledger.connection().expect("reopen and repair permissions");
+        for candidate in &outcome_files {
+            let mode = std::fs::metadata(candidate)
+                .expect("repaired outcome metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "mode was not repaired for {}",
+                candidate.display()
+            );
+        }
+        drop(repair);
+        drop(connection);
     }
 
     #[test]
@@ -2900,6 +4068,7 @@ mod tests {
         std::fs::create_dir(&unusable_ledger_path).expect("create unusable ledger path");
         let ledger = RequestOutcomeLedger {
             path: unusable_ledger_path,
+            notifications: Arc::new(OutcomeNotifications::default()),
         };
         let request = request("request-without-runtime-ledger", "task-a");
         assert!(

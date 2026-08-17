@@ -3082,6 +3082,8 @@ mod tests {
             data: json!({
                 "kind": "workbench.launch",
                 "ok": true,
+                "schema_version": 2,
+                "launch_mode": "direct_loopback",
                 "url": "http://127.0.0.1:49152/#ticket=secret",
                 "workspace": { "label": "feature/lane-ui" },
             }),
@@ -3089,7 +3091,7 @@ mod tests {
                 "Open the Exo workbench for feature/lane-ui:\nhttp://127.0.0.1:49152/#ticket=secret\n\nThis one-time browser enrollment link expires in one hour."
                     .to_string(),
             ),
-            effect: Effect::Pure,
+            effect: Effect::Write,
             trace: exosuit_storage::Trace::default(),
         };
 
@@ -3112,6 +3114,86 @@ mod tests {
                 .as_deref()
                 .is_some_and(|body| body.contains("http://127.0.0.1:49152/#ticket=secret"))
         );
+    }
+
+    #[test]
+    fn workbench_launch_command_event_is_secret_free() {
+        let temp = tempfile::tempdir().expect("create event fixture");
+        let cache = temp.path().join(".cache");
+        std::fs::create_dir_all(&cache).expect("create event database parent");
+        let db_path = crate::context::db_path(temp.path(), None);
+        drop(crate::context::SqliteWriter::open(&db_path).expect("initialize event database"));
+
+        let bearer = "v2.launch-bearer-must-not-persist";
+        let launch_url = format!("http://127.0.0.1:49152/#ticket={bearer}");
+        assert!(
+            log_command_event(
+                temp.path(),
+                None,
+                "workbench-launch-event",
+                HandlerRuntime::External,
+                Some("agent-test"),
+                "workbench",
+                "launch",
+                &json!({ "request_secret": bearer }),
+                &json!({
+                    "kind": "workbench.launch",
+                    "ok": true,
+                    "url": launch_url,
+                }),
+                Effect::Write,
+                7,
+                "Open the Exo workbench",
+            )
+            .expect("log launch event")
+        );
+
+        let event: (String, String, String, String, String) =
+            crate::event_db::with_event_db(&db_path, |connection| {
+                connection.query_row(
+                    "SELECT event_type, namespace, operation, effect, summary
+                     FROM agent_events
+                     WHERE namespace = 'workbench' AND operation = 'launch'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+            })
+            .expect("read logged launch event");
+        assert_eq!(
+            event,
+            (
+                "command".to_string(),
+                "workbench".to_string(),
+                "launch".to_string(),
+                "write".to_string(),
+                "Open the Exo workbench".to_string(),
+            )
+        );
+
+        for path in [
+            db_path.clone(),
+            db_path.with_extension("db-wal"),
+            db_path.with_extension("db-shm"),
+        ] {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            assert!(
+                !bytes
+                    .windows(bearer.len())
+                    .any(|window| window == bearer.as_bytes()),
+                "launch bearer persisted in {}",
+                path.display()
+            );
+        }
     }
 
     #[test]

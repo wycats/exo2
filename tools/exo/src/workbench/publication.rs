@@ -3,7 +3,7 @@ use super::{
 };
 use anyhow::Result;
 use locald_core::LocaldConfig;
-use locald_publisher_client::protocol::ServiceName;
+use locald_publisher_client::protocol::{PublicationState, ServiceName};
 use locald_publisher_client::{
     InstalledPublisher, Lease, LeaseState, PublisherClient, SandboxPublisherContext, WaitOutcome,
     probe_installation, probe_sandbox_publisher,
@@ -388,6 +388,45 @@ impl WorkbenchEntryProvider for LocaldWorkbenchEntryProvider {
                     .is_ok_and(|state| state.listener_generation == listener_generation)
             })
         })
+    }
+
+    fn replay_authority_current(
+        &self,
+        entry: &WorkbenchEntryBinding,
+        listener_generation: u64,
+    ) -> bool {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
+        let (Some(workspace_key), Some(project_instance_id)) = (
+            entry.workspace_key.as_ref(),
+            entry.project_instance_id.as_ref(),
+        ) else {
+            return false;
+        };
+        let key = PublicationKey {
+            workspace_key: workspace_key.clone(),
+            project_instance_id: project_instance_id.clone(),
+        };
+        let Ok(publications) = self.publications.lock() else {
+            return false;
+        };
+        let Some(publication) = publications.get(&key) else {
+            return false;
+        };
+        if publication.entry != *entry || publication.lifecycle.is_stopping() {
+            return false;
+        }
+        let current = publication.state.lock().is_ok_and(|state| {
+            state.listener_generation == listener_generation
+                && state.last_error.is_none()
+                && state.lease.as_ref().is_some_and(|lease| {
+                    let snapshot = lease.snapshot();
+                    matches!(snapshot.state(), LeaseState::Active)
+                        && snapshot.publication_state() == PublicationState::Ready
+                })
+        });
+        current && !self.shutting_down.load(Ordering::Acquire)
     }
 
     fn shutdown(&self) {

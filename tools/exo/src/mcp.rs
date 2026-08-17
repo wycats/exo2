@@ -2789,7 +2789,8 @@ mod tests {
             result: Some(json!({
                 "kind": "workbench.launch",
                 "ok": true,
-                "schema_version": 1,
+                "schema_version": 2,
+                "launch_mode": "direct_loopback",
                 "url": "http://127.0.0.1:49152/#ticket=secret",
                 "expires_at": "2026-07-28T21:00:00Z",
                 "expires_in_seconds": 3600,
@@ -2809,7 +2810,7 @@ mod tests {
             reminders: None,
             display: None,
             preview: None,
-            effect: Some(Effect::Pure),
+            effect: Some(Effect::Write),
             trace: None,
         };
 
