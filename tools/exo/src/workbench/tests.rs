@@ -4304,6 +4304,65 @@ async fn expired_publication_release_finishes_before_a_fresh_workspace_launch() 
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
+async fn pairing_mutations_release_authorization_before_publication_io() {
+    for forget in [false, true] {
+        let fixture = fixture();
+        let manager = test_manager(Arc::clone(&fixture.project));
+        let provider = Arc::new(BlockingReleasePublishedEntryProvider::default());
+        manager.set_entry_provider(provider.clone());
+
+        let launch = manager.launch(&fixture.root).expect("launch workbench");
+        let (_, ticket) = launch_parts(&launch);
+        let payload = published_ticket_payload(ticket);
+        let entry = WorkbenchEntryBinding::published(
+            payload.canonical_origin,
+            payload.project_instance_id,
+            payload.workspace_key,
+        )
+        .expect("published workbench entry");
+        manager
+            .inner
+            .enroll_pairing(ticket, None, &entry)
+            .expect("enroll durable pairing");
+        let selector = manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pairing_grants
+            .keys()
+            .next()
+            .expect("durable pairing")
+            .clone();
+
+        let mutation_manager = manager.clone();
+        let mutation = tokio::task::spawn_blocking(move || {
+            if forget {
+                mutation_manager.inner.forget_pairing(&selector, None)
+            } else {
+                mutation_manager.inner.revoke_pairing(&selector, None)
+            }
+        });
+        wait_for_workbench_condition("blocked pairing publication release", || {
+            provider.release_started.load(Ordering::Acquire)
+        })
+        .await;
+        assert!(
+            manager.inner.authorization_store_gate.try_lock().is_ok(),
+            "pairing mutation publication I/O must not hold the authorization store gate"
+        );
+
+        provider.allow_release.store(true, Ordering::Release);
+        mutation
+            .await
+            .expect("join pairing mutation")
+            .expect("complete pairing mutation");
+        manager.shutdown().await;
+    }
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
 async fn forgetting_one_workspace_publication_preserves_another_live_workspace() {
     let fixture = fixture();
     let linked = fixture._temp.path().join("residency-linked-worktree");

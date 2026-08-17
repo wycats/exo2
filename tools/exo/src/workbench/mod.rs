@@ -3591,6 +3591,7 @@ impl WorkbenchHostInner {
         let release_publication =
             mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
         drop(state);
+        drop(_gate);
         if release_publication {
             WorkbenchHostInner::release_workspace_publications(self, &[pairing_workspace_key]);
         }
@@ -3657,6 +3658,7 @@ impl WorkbenchHostInner {
         let release_publication =
             mark_inactive_workspace_publication_released(&mut state, &pairing_workspace_key, now);
         drop(state);
+        drop(_gate);
         if release_publication {
             WorkbenchHostInner::release_workspace_publications(self, &[pairing_workspace_key]);
         }
