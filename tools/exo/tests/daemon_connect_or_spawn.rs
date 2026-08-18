@@ -3564,14 +3564,22 @@ async fn stale_rfc_lock_holder_returns_bounded_busy_without_exhausting_daemon(ba
         "all admitted requests must release their permits within the reconcile-lock bound"
     );
     assert_eq!(responses.len(), 40);
-    assert!(responses.iter().all(|response| {
-        response["status"] == "error"
-            && response["error"]["code"] == "precondition_failed"
-            && response["error"]["details"]["kind"] == "daemon.busy"
-            && response["error"]["details"]["retryable"] == true
-            && response["error"]["details"]["retry_with_same_request_id"] == true
-            && response["error"]["details"]["request_outcome_checked"] == false
-    }));
+    let unexpected = responses
+        .iter()
+        .filter(|response| {
+            !(response["status"] == "error"
+                && response["error"]["code"] == "precondition_failed"
+                && response["error"]["details"]["kind"] == "daemon.busy"
+                && response["error"]["details"]["retryable"] == true
+                && response["error"]["details"]["retry_with_same_request_id"] == true
+                && response["error"]["details"]["request_outcome_checked"] == false)
+        })
+        .map(|response| (&response["id"], response))
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "all held-lock responses must use the retryable daemon.busy contract; unexpected response IDs and bodies: {unexpected:#?}"
+    );
     assert!(
         responses
             .iter()

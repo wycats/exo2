@@ -389,12 +389,17 @@ trait WorkbenchEntryProvider: Send + Sync {
         true
     }
 
-    fn replay_authority_current(
+    fn replay_with_current_authority(
         &self,
         entry: &WorkbenchEntryBinding,
         _listener_generation: u64,
-    ) -> bool {
-        !entry.is_published()
+        validate: &mut dyn FnMut() -> Option<ResponseEnvelope>,
+    ) -> Option<ResponseEnvelope> {
+        if entry.is_published() {
+            None
+        } else {
+            validate()
+        }
     }
 
     fn shutdown(&self) {}
@@ -1973,15 +1978,29 @@ impl WorkbenchHostManager {
             return None;
         }
 
-        if replay.entry.is_published() {
-            let provider = self.inner.entry_provider.lock().ok()?.clone();
-            if !provider.replay_authority_current(&replay.entry, replay.host_generation) {
-                self.discard_launch_replay_if_current(request_id, &replay);
-                return None;
-            }
-        }
-
         before_relock();
+        let response = if replay.entry.is_published() {
+            let provider = self.inner.entry_provider.lock().ok()?.clone();
+            let mut validate = || self.replay_if_state_current(request_id, &replay);
+            provider.replay_with_current_authority(
+                &replay.entry,
+                replay.host_generation,
+                &mut validate,
+            )
+        } else {
+            self.replay_if_state_current(request_id, &replay)
+        };
+        if response.is_none() {
+            self.discard_launch_replay_if_current(request_id, &replay);
+        }
+        response
+    }
+
+    fn replay_if_state_current(
+        &self,
+        request_id: &str,
+        replay: &Arc<WorkbenchLaunchReplay>,
+    ) -> Option<ResponseEnvelope> {
         let mut state = self.inner.state.lock().ok()?;
         if self.inner.shutting_down.load(Ordering::Acquire)
             || !launch_replay_state_current(&state, request_id, &replay, unix_seconds())
@@ -1995,9 +2014,7 @@ impl WorkbenchHostManager {
             }
             return None;
         }
-        let response = replay.response.clone();
-        drop(state);
-        Some(response)
+        Some(replay.response.clone())
     }
 
     fn discard_launch_replay_if_current(
@@ -2893,14 +2910,16 @@ fn pending_capability_issuance_current(
 }
 
 fn retain_live_pending_capabilities(state: &mut WorkbenchState, now: u64) {
-    state
-        .pending_capabilities
-        .retain(|_, pending| pending.expires_at > now);
     let live_capabilities = state
         .pending_capabilities
-        .keys()
+        .iter()
+        .filter(|(_, pending)| pending_capability_issuance_current(state, pending, now))
+        .map(|(capability_id, _)| capability_id)
         .cloned()
         .collect::<HashSet<_>>();
+    state
+        .pending_capabilities
+        .retain(|capability_id, _| live_capabilities.contains(capability_id));
     state.launch_replays.retain(|_, replay| {
         replay.expires_at > now && live_capabilities.contains(&replay.capability_id)
     });
@@ -2926,7 +2945,7 @@ fn retain_project_workspace_limit(
         state
             .pending_capabilities
             .values()
-            .filter(|pending| pending.expires_at > now)
+            .filter(|pending| pending_capability_issuance_current(state, pending, now))
             .map(|pending| pending.workspace_key.clone()),
     );
     protected.extend(
@@ -3970,6 +3989,7 @@ impl WorkbenchHostInner {
             .lock()
             .map_err(|_| PairingManagementError::Unavailable)?;
         let now = unix_seconds();
+        retain_live_pending_capabilities(&mut state, now);
         retain_live_authorizations(&mut state, now);
         let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
             .ok_or(PairingManagementError::NotFound)?;
@@ -4017,6 +4037,7 @@ impl WorkbenchHostInner {
             .lock()
             .map_err(|_| PairingManagementError::Unavailable)?;
         let now = unix_seconds();
+        retain_live_pending_capabilities(&mut state, now);
         retain_live_authorizations(&mut state, now);
         let selector = resolve_pairing_selector(&state, selector_reference, workspace_key)
             .ok_or(PairingManagementError::NotFound)?;
@@ -4878,8 +4899,8 @@ fn workspace_has_live_published_authority(
 ) -> bool {
     state.pending_capabilities.values().any(|pending| {
         pending.workspace_key == workspace_key
-            && pending.expires_at > now
             && pending.entry.is_published()
+            && pending_capability_issuance_current(state, pending, now)
     }) || state.pairing_grants.values().any(|pairing| {
         pairing.workspace_key == workspace_key
             && pairing.launch_mode == WorkbenchLaunchMode::Published
