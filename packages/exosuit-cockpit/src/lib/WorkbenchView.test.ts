@@ -1292,7 +1292,7 @@ describe("focus-only lane workbench", () => {
     expect(onFocus).not.toHaveBeenCalled();
   });
 
-  it("keeps every lane from the latest completed campaign visible by completion time", async () => {
+  it("keeps every lane from the latest completed campaign above current work", async () => {
     const snapshot = fixture();
     snapshot.lanes.push(
       {
@@ -1428,6 +1428,53 @@ describe("focus-only lane workbench", () => {
       "Local workbench host",
       "Focus-only lane workspace",
     ]);
+  });
+
+  it("preserves sub-millisecond completion ordering", () => {
+    const snapshot = fixture();
+    snapshot.lanes.push(
+      {
+        id: "lane-newer-nanosecond",
+        title: "Newer nanosecond campaign",
+        state: "prepared",
+        phase_id: "phase-z-newer",
+        phase_title: "Newer campaign",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00.123456789+00:00",
+        focused_here: false,
+      },
+      {
+        id: "lane-older-nanosecond",
+        title: "Older nanosecond campaign",
+        state: "prepared",
+        phase_id: "phase-a-older",
+        phase_title: "Older campaign",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00.123456788+00:00",
+        focused_here: false,
+      },
+    );
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(
+        document.querySelectorAll(".lane-list > .lane-row .lane-copy strong"),
+      ).map((node) => node.textContent),
+    ).toEqual([
+      "Newer nanosecond campaign",
+      "Local workbench host",
+      "Focus-only lane workspace",
+    ]);
+    expect(
+      screen.getByRole("button", {
+        name: "Inspect Older nanosecond campaign, phase completed",
+      }),
+    ).toBeTruthy();
   });
 
   it("keeps completed lanes without completion evidence in history", () => {

@@ -1541,6 +1541,124 @@ describe("cockpit page", () => {
     );
   });
 
+  for (const resolutionOrder of [
+    "original-first",
+    "replacement-first",
+  ] as const) {
+    it(`keeps bootstrap loading bound to the authoritative restored inspection (${resolutionOrder})`, async () => {
+      const initialSnapshot = structuredClone(snapshotFixture);
+      initialSnapshot.lanes.push({
+        id: "lane-history",
+        title: "Completed lane",
+        state: "executing",
+        phase_id: "phase-history",
+        phase_title: "Completed phase",
+        phase_status: "completed",
+        phase_completed_at: null,
+        focused_here: false,
+      });
+      const updatedSnapshot = structuredClone(initialSnapshot);
+      updatedSnapshot.revision += 1;
+      history.replaceState(
+        {
+          "sveltekit:history": 3,
+          "sveltekit:navigation": 3,
+          "sveltekit:states": {
+            exoWorkbenchSessionKey: "restored-session",
+            exoWorkbenchInspectedLaneId: "lane-history",
+          },
+        },
+        "",
+        "/",
+      );
+
+      let currentSnapshot = initialSnapshot;
+      let inspectionAttempts = 0;
+      const inspectionRequestIds: string[] = [];
+      const originalInspection = deferred<Response>();
+      const replacementInspection = deferred<Response>();
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+        if (path === "/api/session/renew") {
+          return sessionResponse("restored-session");
+        }
+        const request = JSON.parse(String(init?.body));
+        if (request.operation.kind === "lane_inspect") {
+          inspectionAttempts += 1;
+          inspectionRequestIds.push(request.id);
+          return inspectionAttempts === 1
+            ? originalInspection.promise
+            : replacementInspection.promise;
+        }
+        return new Response(
+          JSON.stringify({
+            protocol_version: 1,
+            id: request.id,
+            status: "ok",
+            result: currentSnapshot,
+          }),
+          { status: 200 },
+        );
+      });
+      vi.stubGlobal("fetch", fetcher);
+
+      render(Page);
+
+      expect(
+        await screen.findByRole("heading", { name: "Opening lane workspace" }),
+      ).toBeTruthy();
+      await waitFor(() => expect(inspectionAttempts).toBe(1));
+
+      currentSnapshot = updatedSnapshot;
+      TestEventSource.instances[0]!.emit("invalidate");
+      await waitFor(() => expect(inspectionAttempts).toBe(2));
+
+      const originalResponse = new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestIds[0],
+          status: "ok",
+          result: laneInspection(initialSnapshot, "lane-history", "historical"),
+        }),
+        { status: 200 },
+      );
+      const replacementResponse = new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestIds[1],
+          status: "ok",
+          result: laneInspection(updatedSnapshot, "lane-history", "historical"),
+        }),
+        { status: 200 },
+      );
+
+      if (resolutionOrder === "original-first") {
+        originalInspection.resolve(originalResponse);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(
+          screen.getByRole("heading", { name: "Opening lane workspace" }),
+        ).toBeTruthy();
+        replacementInspection.resolve(replacementResponse);
+      } else {
+        replacementInspection.resolve(replacementResponse);
+      }
+
+      expect(
+        await screen.findByRole("heading", { name: "Completed lane" }),
+      ).toBeTruthy();
+      expect(screen.getByText("Project history")).toBeTruthy();
+
+      if (resolutionOrder === "replacement-first") {
+        originalInspection.resolve(originalResponse);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(
+          screen.getByRole("heading", { name: "Completed lane" }),
+        ).toBeTruthy();
+      }
+    });
+  }
+
   it("restores the saved lane after the initial snapshot retry succeeds", async () => {
     const snapshot = structuredClone(snapshotFixture);
     snapshot.lanes.push({

@@ -140,13 +140,15 @@ summary leads with what the lane set out to do, what completed, the approved
 goal or task outcomes that remain available, and the phase completion evidence.
 Detailed task progress can be disclosed without making the first view a raw log.
 
-The lane rail keeps focused and non-completed lanes visible, followed by every
-lane from the latest authoritatively completed phase. That previous campaign is
-selected by the greatest non-null phase completion time, with stable phase
-identity breaking an exact timestamp tie. Lanes from older completed phases and
-lanes whose phase has no authoritative completion time remain available under
-Earlier lanes. Creation order, lane order, task completion, and outcome presence
-never stand in for phase completion evidence.
+The lane rail keeps every lane from the latest authoritatively completed phase
+visible immediately above the focused and other non-completed lanes. This keeps
+the just-finished campaign available as the current work's nearest context while
+the focused lane remains visibly distinct. The previous campaign is selected by
+the greatest non-null phase completion time, with stable phase identity breaking
+an exact timestamp tie. Lanes from older completed phases and lanes whose phase
+has no authoritative completion time remain available under Earlier lanes.
+Creation order, lane order, task completion, and outcome presence never stand in
+for phase completion evidence.
 
 This is historical inspection rather than restoration. Reopening a completed
 lane does not make old controls look available, and it does not suggest that the

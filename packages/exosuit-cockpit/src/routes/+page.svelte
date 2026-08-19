@@ -167,6 +167,7 @@
   let pendingRestoredLaneId: string | null = null;
   let pendingRestoredLaneHistoryMode: InspectionHistoryMode = "none";
   let bootstrapInspectionLoading = false;
+  let bootstrapInspectionRequestGeneration: number | null = null;
   let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
@@ -434,6 +435,7 @@
       pendingRestoredLaneId = null;
       pendingRestoredLaneHistoryMode = "none";
       bootstrapInspectionLoading = false;
+      bootstrapInspectionRequestGeneration = null;
       confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
@@ -781,27 +783,22 @@
         const restoredHistoryMode = pendingRestoredLaneHistoryMode;
         pendingRestoredLaneId = null;
         pendingRestoredLaneHistoryMode = "none";
-        const restoration = inspectLane(
+        void inspectLane(
           restoredLaneId,
           restoredHistoryMode,
           true,
           true,
+          bootstrapInspectionLoading,
         );
-        if (bootstrapInspectionLoading) {
-          void restoration.finally(() => {
-            bootstrapInspectionLoading = false;
-            if (
-              screen === "loading" &&
-              snapshot &&
-              sessionRecovery === "connected"
-            ) {
-              screen = "ready";
-            }
-          });
-        }
       } else if (requestedLaneId) {
         if (snapshotChanged) {
-          void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
+          void inspectLane(
+            requestedLaneId,
+            requestedHistoryMode,
+            true,
+            true,
+            bootstrapInspectionLoading,
+          );
         }
       } else if (retryLaneId && snapshotChanged) {
         void inspectLane(retryLaneId, retryHistoryMode, true, true);
@@ -897,6 +894,7 @@
     historyMode: InspectionHistoryMode = "push",
     retryOnStale = true,
     preserveFocusedSelection = false,
+    bootstrapLoading = false,
   ): Promise<void> {
     if (!client || !snapshot || sessionRecovery !== "connected") {
       return;
@@ -908,6 +906,9 @@
 
     const activeClient = client;
     const requestGeneration = ++inspectionRequestGeneration;
+    if (bootstrapLoading) {
+      bootstrapInspectionRequestGeneration = requestGeneration;
+    }
     inspectionRequestedLaneId = laneId;
     inspectionRequestedHistoryMode = historyMode;
     inspectionLoading = true;
@@ -929,7 +930,13 @@
         if (retryOnStale) {
           await refreshSnapshot(true);
           if (requestGeneration === inspectionRequestGeneration) {
-            await inspectLane(laneId, historyMode, false, true);
+            await inspectLane(
+              laneId,
+              historyMode,
+              false,
+              true,
+              bootstrapLoading,
+            );
           }
         } else {
           inspectionFailure =
@@ -988,6 +995,20 @@
         inspectionRequestedLaneId = null;
         inspectionRequestedHistoryMode = "none";
         inspectionLoading = false;
+      }
+      if (
+        bootstrapLoading &&
+        bootstrapInspectionRequestGeneration === requestGeneration
+      ) {
+        bootstrapInspectionRequestGeneration = null;
+        bootstrapInspectionLoading = false;
+        if (
+          screen === "loading" &&
+          snapshot &&
+          sessionRecovery === "connected"
+        ) {
+          screen = "ready";
+        }
       }
     }
   }

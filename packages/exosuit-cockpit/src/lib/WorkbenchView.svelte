@@ -438,22 +438,38 @@
     return `Inspect ${lane.title}, phase ${displayStatus(lane.phase_status)}`;
   };
 
-  const completedLaneTime = (lane: WorkbenchLaneSummary): number => {
-    const timestamp = Date.parse(lane.phase_completed_at ?? "");
-    return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp;
+  const compareStableId = (left: string, right: string): number =>
+    left < right ? -1 : left > right ? 1 : 0;
+
+  const compareCompletionTimeDescending = (
+    left: string | null,
+    right: string | null,
+  ): number => {
+    if (left === right) {
+      return 0;
+    }
+    if (left === null) {
+      return 1;
+    }
+    if (right === null) {
+      return -1;
+    }
+    return left > right ? -1 : 1;
   };
 
   const compareCompletedLanes = (
     left: WorkbenchLaneSummary,
     right: WorkbenchLaneSummary,
   ): number => {
-    const leftCompletion = completedLaneTime(left);
-    const rightCompletion = completedLaneTime(right);
-    if (leftCompletion !== rightCompletion) {
-      return leftCompletion > rightCompletion ? -1 : 1;
+    const byCompletion = compareCompletionTimeDescending(
+      left.phase_completed_at,
+      right.phase_completed_at,
+    );
+    if (byCompletion !== 0) {
+      return byCompletion;
     }
-    const byPhase = left.phase_id.localeCompare(right.phase_id);
-    return byPhase !== 0 ? byPhase : left.id.localeCompare(right.id);
+    const byPhase = compareStableId(left.phase_id, right.phase_id);
+    return byPhase !== 0 ? byPhase : compareStableId(left.id, right.id);
   };
 
   let completedLanes = $derived(
@@ -462,9 +478,8 @@
       .toSorted(compareCompletedLanes),
   );
   let latestCompletedPhaseId = $derived(
-    completedLanes.find(
-      (lane) => completedLaneTime(lane) !== Number.NEGATIVE_INFINITY,
-    )?.phase_id ?? null,
+    completedLanes.find((lane) => lane.phase_completed_at !== null)?.phase_id ??
+      null,
   );
   let recentCompletedLanes = $derived(
     completedLanes.filter((lane) => lane.phase_id === latestCompletedPhaseId),
