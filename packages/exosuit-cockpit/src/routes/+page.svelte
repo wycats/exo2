@@ -600,7 +600,13 @@
         const laneId = inspectedLaneFromHistory(event.state);
         if (laneId) {
           if (sessionRecovery === "connected") {
-            void inspectLane(laneId, "none", true, true);
+            void inspectLane(
+              laneId,
+              "none",
+              true,
+              true,
+              bootstrapInspectionLoading,
+            );
           } else {
             pendingRestoredLaneId = laneId;
             pendingRestoredLaneHistoryMode = "none";
@@ -844,7 +850,33 @@
     retainTabResumeState(nextState);
   }
 
+  function finishBootstrapInspection(
+    requestGeneration: number | null = null,
+  ): void {
+    if (
+      !bootstrapInspectionLoading ||
+      (requestGeneration !== null &&
+        bootstrapInspectionRequestGeneration !== requestGeneration)
+    ) {
+      return;
+    }
+    bootstrapInspectionRequestGeneration = null;
+    bootstrapInspectionLoading = false;
+    if (screen !== "loading" || !snapshot) {
+      return;
+    }
+    if (sessionRecovery === "reload_required") {
+      screen = "client_update_required";
+    } else if (sessionRecovery === "connected") {
+      screen = "ready";
+    }
+  }
+
   function clearInspection(mode: InspectionHistoryMode = "push"): void {
+    const currentHistory = workbenchHistoryState(history.state);
+    const historyAlreadyShowsCurrentWork =
+      inspectedLaneFromHistory(currentHistory) === null &&
+      !projectOverviewFromHistory(currentHistory);
     inspectionRequestGeneration += 1;
     inspection = null;
     inspectionLoading = false;
@@ -856,7 +888,11 @@
     pendingRestoredLaneId = null;
     pendingRestoredLaneHistoryMode = "none";
     projectOverview = false;
-    if (mode !== "none") {
+    finishBootstrapInspection();
+    if (
+      mode !== "none" &&
+      !(mode === "push" && historyAlreadyShowsCurrentWork)
+    ) {
       writeInspectionHistory(null, mode);
     }
   }
@@ -875,6 +911,7 @@
     pendingRestoredLaneId = null;
     pendingRestoredLaneHistoryMode = "none";
     projectOverview = true;
+    finishBootstrapInspection();
     if (mode === "none") {
       return;
     }
@@ -980,6 +1017,10 @@
         sessionRecoveryMessage = messageFrom(error);
         refreshFailure = null;
         stopLiveUpdates?.();
+        if (bootstrapLoading || screen === "loading") {
+          screen = "client_update_required";
+          screenMessage = sessionRecoveryMessage;
+        }
       } else if (terminalFailure(error)) {
         pendingRestoredLaneId = laneId;
         pendingRestoredLaneHistoryMode = historyMode;
@@ -996,19 +1037,8 @@
         inspectionRequestedHistoryMode = "none";
         inspectionLoading = false;
       }
-      if (
-        bootstrapLoading &&
-        bootstrapInspectionRequestGeneration === requestGeneration
-      ) {
-        bootstrapInspectionRequestGeneration = null;
-        bootstrapInspectionLoading = false;
-        if (
-          screen === "loading" &&
-          snapshot &&
-          sessionRecovery === "connected"
-        ) {
-          screen = "ready";
-        }
+      if (bootstrapLoading) {
+        finishBootstrapInspection(requestGeneration);
       }
     }
   }

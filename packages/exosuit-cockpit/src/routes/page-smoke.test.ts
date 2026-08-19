@@ -1541,6 +1541,240 @@ describe("cockpit page", () => {
     );
   });
 
+  it("offers reload when a restored lane requires a newer client", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-new-schema",
+      title: "New schema lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      phase_completed_at: null,
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-new-schema",
+        },
+      },
+      "",
+      "/",
+    );
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      const result =
+        request.operation.kind === "lane_inspect"
+          ? {
+              ...laneInspection(snapshot, request.operation.lane_id, "historical"),
+              schema_version: 3,
+            }
+          : snapshot;
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Workbench update available" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeNull();
+  });
+
+  it("releases bootstrap loading when history returns to current work", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Completed lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      phase_completed_at: null,
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      },
+      "",
+      "/",
+    );
+    const inspectionResult = deferred<Response>();
+    let inspectionAttempts = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectionAttempts += 1;
+        return inspectionResult.promise;
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+    expect(
+      await screen.findByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+    await waitFor(() => expect(inspectionAttempts).toBe(1));
+
+    window.dispatchEvent(
+      new PopStateEvent("popstate", {
+        state: { exoWorkbenchSessionKey: "restored-session" },
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeNull();
+  });
+
+  it("transfers bootstrap loading to a lane selected through history", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    for (const [id, title] of [
+      ["lane-history-a", "History lane A"],
+      ["lane-history-b", "History lane B"],
+    ] as const) {
+      snapshot.lanes.push({
+        id,
+        title,
+        state: "executing",
+        phase_id: "phase-history",
+        phase_title: "Completed phase",
+        phase_status: "completed",
+        phase_completed_at: null,
+        focused_here: false,
+      });
+    }
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history-a",
+        },
+      },
+      "",
+      "/",
+    );
+    const inspections = new Map([
+      ["lane-history-a", deferred<Response>()],
+      ["lane-history-b", deferred<Response>()],
+    ]);
+    const inspectionRequestIds = new Map<string, string>();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        return sessionResponse("restored-session");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectionRequestIds.set(request.operation.lane_id, request.id);
+        return inspections.get(request.operation.lane_id)!.promise;
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+    expect(
+      await screen.findByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(inspectionRequestIds.has("lane-history-a")).toBe(true);
+    });
+
+    window.dispatchEvent(
+      new PopStateEvent("popstate", {
+        state: {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history-b",
+        },
+      }),
+    );
+    await waitFor(() => {
+      expect(inspectionRequestIds.has("lane-history-b")).toBe(true);
+    });
+
+    inspections.get("lane-history-a")!.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestIds.get("lane-history-a"),
+          status: "ok",
+          result: laneInspection(snapshot, "lane-history-a", "historical"),
+        }),
+        { status: 200 },
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      screen.getByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+
+    inspections.get("lane-history-b")!.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestIds.get("lane-history-b"),
+          status: "ok",
+          result: laneInspection(snapshot, "lane-history-b", "historical"),
+        }),
+        { status: 200 },
+      ),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "History lane B" }),
+    ).toBeTruthy();
+  });
+
   for (const resolutionOrder of [
     "original-first",
     "replacement-first",
@@ -1935,6 +2169,81 @@ describe("cockpit page", () => {
       await screen.findByRole("heading", { name: "Completed lane" }),
     ).toBeTruthy();
     expect(operations).toEqual(["snapshot", "lane_inspect", "lane_inspect"]);
+  });
+
+  it("does not add history when a first inspection is canceled", async () => {
+    history.replaceState({}, "", "/#ticket=v1.launch-ticket");
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-slow",
+      title: "Slow lane",
+      state: "prepared",
+      phase_id: "phase-fixture",
+      phase_title: "Workbench foundation",
+      phase_status: "in-progress",
+      phase_completed_at: null,
+      focused_here: false,
+    });
+    const inspectionResult = deferred<Response>();
+    let inspectionRequestId = "";
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session") {
+        return sessionResponse("session-selector");
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectionRequestId = request.id;
+        return inspectionResult.promise;
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    const initialHistoryIndex = history.state["sveltekit:history"];
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Inspect Slow lane, phase in progress",
+      }),
+    );
+    await screen.findByRole("button", { name: "Opening Slow lane" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Back to current work" }),
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(history.state["sveltekit:history"]).toBe(initialHistoryIndex);
+    expect(
+      workbenchHistoryState(history.state).exoWorkbenchInspectedLaneId,
+    ).toBeUndefined();
+
+    inspectionResult.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestId,
+          status: "ok",
+          result: laneInspection(snapshot, "lane-slow"),
+        }),
+        { status: 200 },
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
   });
 
   it("offers a retry when the first lane inspection fails", async () => {
