@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import inspectionFixture from "./workbench-lane-inspection.v1.json";
-import snapshotFixture from "./workbench-snapshot.v3.json";
+import inspectionFixture from "./workbench-lane-inspection.v2.json";
+import snapshotFixture from "./workbench-snapshot.v4.json";
 import type { WorkbenchPlanningRequest } from "./workbench";
 import {
   clearPairingResumeRequestId,
@@ -387,7 +387,7 @@ describe("workbench browser client", () => {
         protocol_version: 1,
         id: request.id,
         status: "ok",
-        result: { ...snapshotFixture, schema_version: 4 },
+        result: { ...snapshotFixture, schema_version: 5 },
       });
     });
 

@@ -7,7 +7,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import snapshotFixture from "$lib/workbench-snapshot.v3.json";
+import snapshotFixture from "$lib/workbench-snapshot.v4.json";
 import type { WorkbenchPlanningRequest } from "$lib/workbench";
 import {
   pairingResumeRequestIdFromHistory,
@@ -141,7 +141,7 @@ function laneInspection(
   return {
     kind: "workbench.lane_inspection",
     ok: true,
-    schema_version: 1,
+    schema_version: 2,
     observed_at: snapshot.observed_at,
     revision: snapshot.revision,
     project: snapshot.project,
@@ -421,6 +421,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Historical delivery",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     let snapshotReads = 0;
@@ -499,6 +500,7 @@ describe("cockpit page", () => {
         phase_id: "phase-fixture",
         phase_title: "Workbench foundation",
         phase_status: "in-progress",
+        phase_completed_at: null,
         focused_here: false,
       });
     }
@@ -596,6 +598,7 @@ describe("cockpit page", () => {
         phase_id: "phase-fixture",
         phase_title: "Workbench foundation",
         phase_status: "in-progress",
+        phase_completed_at: null,
         focused_here: false,
       });
     }
@@ -782,7 +785,7 @@ describe("cockpit page", () => {
           result:
             snapshotReads === 1
               ? snapshotFixture
-              : { ...snapshotFixture, schema_version: 4 },
+              : { ...snapshotFixture, schema_version: 5 },
         }),
         { status: 200 },
       );
@@ -1459,6 +1462,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     history.replaceState(
@@ -1474,22 +1478,24 @@ describe("cockpit page", () => {
       "/",
     );
     const operations: string[] = [];
+    const inspectionResult = deferred<Response>();
+    let inspectionRequestId = "";
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session/renew") {
         return sessionResponse("restored-session");
       }
       const request = JSON.parse(String(init?.body));
       operations.push(request.operation.kind);
-      const result =
-        request.operation.kind === "lane_inspect"
-          ? laneInspection(snapshot, request.operation.lane_id, "historical")
-          : snapshot;
+      if (request.operation.kind === "lane_inspect") {
+        inspectionRequestId = request.id;
+        return inspectionResult.promise;
+      }
       return new Response(
         JSON.stringify({
           protocol_version: 1,
           id: request.id,
           status: "ok",
-          result,
+          result: snapshot,
         }),
         { status: 200 },
       );
@@ -1497,6 +1503,30 @@ describe("cockpit page", () => {
     vi.stubGlobal("fetch", fetcher);
 
     render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Local workbench host" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Opening Completed lane" }),
+    ).toBeNull();
+    await waitFor(() => {
+      expect(operations).toEqual(["snapshot", "lane_inspect"]);
+    });
+    inspectionResult.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: inspectionRequestId,
+          status: "ok",
+          result: laneInspection(snapshot, "lane-history", "historical"),
+        }),
+        { status: 200 },
+      ),
+    );
 
     expect(
       await screen.findByRole("heading", { name: "Completed lane" }),
@@ -1520,6 +1550,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     history.replaceState(
@@ -1598,6 +1629,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     history.replaceState(
@@ -1729,6 +1761,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     const operations: string[] = [];
@@ -1796,6 +1829,7 @@ describe("cockpit page", () => {
       phase_id: "phase-fixture",
       phase_title: "Workbench foundation",
       phase_status: "in-progress",
+      phase_completed_at: null,
       focused_here: false,
     });
     let attempts = 0;
@@ -1872,6 +1906,7 @@ describe("cockpit page", () => {
         phase_id: "phase-fixture",
         phase_title: "Workbench foundation",
         phase_status: "in-progress",
+        phase_completed_at: null,
         focused_here: false,
       });
     }
@@ -2026,6 +2061,7 @@ describe("cockpit page", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: null,
       focused_here: false,
     });
     const updatedSnapshot = structuredClone(initialSnapshot);
@@ -2123,6 +2159,7 @@ describe("cockpit page", () => {
       phase_id: "phase-fixture",
       phase_title: "Workbench foundation",
       phase_status: "in-progress",
+      phase_completed_at: null,
       focused_here: false,
     });
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
@@ -2134,7 +2171,7 @@ describe("cockpit page", () => {
         request.operation.kind === "lane_inspect"
           ? {
               ...laneInspection(snapshot, request.operation.lane_id),
-              schema_version: 2,
+              schema_version: 3,
             }
           : snapshot;
       return new Response(
@@ -2228,6 +2265,7 @@ describe("cockpit page", () => {
         phase_id: "phase-fixture",
         phase_title: "Workbench foundation",
         phase_status: "in-progress",
+        phase_completed_at: null,
         focused_here: false,
       });
     }
@@ -2266,6 +2304,11 @@ describe("cockpit page", () => {
         name: "Inspect Slow lane, phase in progress",
       }),
     );
+    const openingLane = await screen.findByRole("button", {
+      name: "Opening Slow lane",
+    });
+    expect(openingLane.getAttribute("aria-busy")).toBe("true");
+    expect(document.querySelector(".inspection-loading")).toBeNull();
     await fireEvent.click(
       screen.getByRole("button", {
         name: "Inspect Fast lane, phase in progress",
@@ -2319,6 +2362,7 @@ describe("cockpit page", () => {
         phase_id: "phase-fixture",
         phase_title: "Workbench foundation",
         phase_status: "in-progress",
+        phase_completed_at: null,
         focused_here: false,
       });
     }
@@ -2407,6 +2451,7 @@ describe("cockpit page", () => {
       phase_id: "phase-fixture",
       phase_title: "Workbench foundation",
       phase_status: "in-progress",
+      phase_completed_at: null,
       focused_here: false,
     });
     const focusRequestIds: string[] = [];

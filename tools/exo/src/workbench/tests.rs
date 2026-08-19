@@ -2126,12 +2126,13 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         phase_id: "phase-fixture".to_string(),
         phase_title: "Workbench foundation".to_string(),
         phase_status: "in-progress".to_string(),
+        phase_completed_at: None,
         focused_here: true,
     };
     let snapshot = WorkbenchSnapshot {
         kind: "workbench.snapshot",
         ok: true,
-        schema_version: 3,
+        schema_version: 4,
         observed_at: "2026-07-28T20:00:00.000Z".to_string(),
         revision: 7,
         project: WorkbenchProjectIdentity {
@@ -2233,7 +2234,7 @@ fn rust_snapshot_serialization_matches_the_cockpit_contract_fixture() {
         diagnostics: vec![],
     };
     let fixture: JsonValue = serde_json::from_str(include_str!(
-        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v3.json"
+        "../../../../packages/exosuit-cockpit/src/lib/workbench-snapshot.v4.json"
     ))
     .expect("parse cockpit snapshot fixture");
 
@@ -2335,7 +2336,7 @@ async fn project_workspace_projection_is_path_free_fresh_and_focus_preserving() 
     let snapshot = manager
         .snapshot(&current_root)
         .expect("read project snapshot");
-    assert_eq!(snapshot.schema_version, 3);
+    assert_eq!(snapshot.schema_version, 4);
     assert_eq!(snapshot.project_workspaces.len(), 2);
 
     let current = snapshot
@@ -2848,7 +2849,7 @@ fn rust_lane_inspection_serialization_matches_the_cockpit_contract_fixture() {
     let inspection = WorkbenchLaneInspection {
         kind: "workbench.lane_inspection",
         ok: true,
-        schema_version: 1,
+        schema_version: 2,
         observed_at: "2026-08-06T20:00:00.000Z".to_string(),
         revision: 9,
         project: WorkbenchProjectIdentity {
@@ -2875,6 +2876,7 @@ fn rust_lane_inspection_serialization_matches_the_cockpit_contract_fixture() {
                 phase_id: "phase-history".to_string(),
                 phase_title: "Cockpit foundation".to_string(),
                 phase_status: "completed".to_string(),
+                phase_completed_at: Some("2026-08-05T20:00:00+00:00".to_string()),
                 focused_here: false,
             },
             intent: "Establish the first useful lane workbench".to_string(),
@@ -2910,7 +2912,7 @@ fn rust_lane_inspection_serialization_matches_the_cockpit_contract_fixture() {
         },
     };
     let fixture: JsonValue = serde_json::from_str(include_str!(
-        "../../../../packages/exosuit-cockpit/src/lib/workbench-lane-inspection.v1.json"
+        "../../../../packages/exosuit-cockpit/src/lib/workbench-lane-inspection.v2.json"
     ))
     .expect("parse cockpit inspection fixture");
 
@@ -6380,6 +6382,9 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
             .expect("add progress");
     }
     writer
+        .add_task_log("historical-task", "progress", "")
+        .expect("add empty progress");
+    writer
         .add_task_log(
             "historical-task",
             "progress",
@@ -6445,7 +6450,7 @@ async fn lane_inspection_projects_bounded_history_without_changing_focus() {
         .expect("read focus after inspection");
 
     assert_eq!(inspection.kind, "workbench.lane_inspection");
-    assert_eq!(inspection.schema_version, 1);
+    assert_eq!(inspection.schema_version, 2);
     assert_eq!(inspection.relationship, "historical");
     assert!(!inspection.can_focus_here);
     assert_eq!(inspection.lane.summary.id, lane);
@@ -6601,9 +6606,24 @@ async fn snapshot_projects_truthful_between_phase_context_for_the_workspace() {
 
     let manager = test_manager(Arc::clone(&fixture.project));
     let snapshot = manager.snapshot(&fixture.root).expect("read snapshot");
-    assert_eq!(snapshot.schema_version, 3);
+    assert_eq!(snapshot.schema_version, 4);
     assert!(snapshot.focused_lane.is_none());
     assert!(snapshot.phase.is_none());
+    assert_eq!(
+        snapshot
+            .lanes
+            .iter()
+            .find(|lane| lane.id == finished_lane)
+            .and_then(|lane| lane.phase_completed_at.as_deref()),
+        Some("2026-08-01T12:00:00+00:00")
+    );
+    assert!(
+        snapshot
+            .lanes
+            .iter()
+            .find(|lane| lane.phase_id == up_next)
+            .is_some_and(|lane| lane.phase_completed_at.is_none())
+    );
 
     let context = snapshot
         .between_phases_context

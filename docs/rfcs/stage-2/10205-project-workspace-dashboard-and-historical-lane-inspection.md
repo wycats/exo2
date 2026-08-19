@@ -140,6 +140,14 @@ summary leads with what the lane set out to do, what completed, the approved
 goal or task outcomes that remain available, and the phase completion evidence.
 Detailed task progress can be disclosed without making the first view a raw log.
 
+The lane rail keeps focused and non-completed lanes visible, followed by every
+lane from the latest authoritatively completed phase. That previous campaign is
+selected by the greatest non-null phase completion time, with stable phase
+identity breaking an exact timestamp tie. Lanes from older completed phases and
+lanes whose phase has no authoritative completion time remain available under
+Earlier lanes. Creation order, lane order, task completion, and outcome presence
+never stand in for phase completion evidence.
+
 This is historical inspection rather than restoration. Reopening a completed
 lane does not make old controls look available, and it does not suggest that the
 phase can be resumed. Follow-up work begins in a new eligible lane and may link
@@ -161,13 +169,21 @@ evidence rather than repeated large text.
 
 ### A browser-safe project projection
 
-`workbench.snapshot` schema version 3 adds a browser-safe `project_workspaces`
+`workbench.snapshot` schema version 4 includes a browser-safe `project_workspaces`
 projection rather than asking the frontend to join lane, phase, Git, and runtime
 facts itself. Each summary includes an opaque workspace key, a path-free label,
 Git identity and optional cleanliness, the focused lane and active phase when
 known, an observation time, and `live`, `stale`, or `unavailable` availability.
 Detailed lane history remains a separate read, so adding another completed phase
 does not make every ordinary snapshot proportionally larger.
+
+Each lane summary also carries nullable `phase_completed_at` evidence from the
+canonical phase record. Exo emits the authoritative completion time in RFC 3339
+form when it exists and emits `null` otherwise. The snapshot does not infer a
+completion time from phase status, lane creation order, completed tasks, progress
+logs, or recorded outcomes. Consumers use this field to identify the immediately
+previous completed campaign and collapse completion history whose order is older
+or unknown.
 
 The current workspace continues to be sampled during snapshot composition. The
 daemon also records a bounded observation whenever it accepts a request from a
@@ -203,7 +219,7 @@ phases would have added roughly 191 KB before workbench-specific shaping. An
 on-demand read keeps snapshot refresh proportional to the project overview while
 making each lane available through one bounded request.
 
-`workbench inspect` returns `workbench.lane_inspection` schema version 1. The
+`workbench inspect` returns `workbench.lane_inspection` schema version 2. The
 result contains the observation time and workbench revision; path-free project,
 daemon, and current-workspace identities; the complete lane identity and intent;
 the lane's phase, goals, and tasks; and an inspection relationship derived from
@@ -255,9 +271,11 @@ unchanged. RFC 10204's planning operations continue to require the exact focused
 phase and remain unavailable while a historical or sibling view is being
 inspected.
 
-The historical-inspection slice remains a separate schema-version-1 result.
-Adding sibling summaries advances the ordinary `workbench.snapshot` contract
-from schema version 2 to version 3, with checked Rust and TypeScript fixtures.
+The historical-inspection slice remains a separate schema-version-2 result.
+Adding authoritative phase completion evidence advances the ordinary
+`workbench.snapshot` contract from schema version 3 to version 4 and the shared
+lane summary in `workbench.lane_inspection` from version 1 to version 2, with
+checked Rust and TypeScript fixtures.
 The embedded cockpit and daemon ship together and fail closed on a mismatched
 snapshot version. The daemon, CLI, MCP, and browser continue to share one project
 authority.
@@ -360,6 +378,6 @@ versioned and bounded schema, and browser navigation is testable independently
 from workspace focus.
 
 Stage 2 implementation begins with historical and prepared lane inspection and a
-schema-version-3 sibling-workspace projection. The RFC must not become a Stage 3
+schema-version-4 sibling-workspace projection. The RFC must not become a Stage 3
 candidate until the responsive project dashboard has been implemented and
 dogfooded across linked worktrees.

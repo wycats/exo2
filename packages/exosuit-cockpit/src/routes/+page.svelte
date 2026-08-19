@@ -162,10 +162,11 @@
   let beginSessionRecovery: (() => void) | null = null;
   let snapshotRefreshGeneration = 0;
   let inspectionRequestGeneration = 0;
-  let inspectionRequestedLaneId: string | null = null;
+  let inspectionRequestedLaneId = $state<string | null>(null);
   let inspectionRequestedHistoryMode: InspectionHistoryMode = "none";
   let pendingRestoredLaneId: string | null = null;
   let pendingRestoredLaneHistoryMode: InspectionHistoryMode = "none";
+  let bootstrapInspectionLoading = false;
   let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
@@ -432,6 +433,7 @@
       inspectionRequestedHistoryMode = "none";
       pendingRestoredLaneId = null;
       pendingRestoredLaneHistoryMode = "none";
+      bootstrapInspectionLoading = false;
       confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
@@ -552,6 +554,7 @@
           inspectedLaneFromHistory(resumeState);
         pendingRestoredLaneId = restoredLaneId;
         pendingRestoredLaneHistoryMode = "none";
+        bootstrapInspectionLoading = restoredLaneId !== null;
         projectOverview =
           !restoredLaneId &&
           (projectOverviewFromHistory(history.state) ||
@@ -719,7 +722,9 @@
       previousSnapshot.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
       previousSnapshot.revision !== nextSnapshot.revision;
     snapshot = nextSnapshot;
-    screen = "ready";
+    if (!bootstrapInspectionLoading) {
+      screen = "ready";
+    }
     screenMessage = null;
     screenRetryable = false;
     refreshFailure = null;
@@ -776,7 +781,24 @@
         const restoredHistoryMode = pendingRestoredLaneHistoryMode;
         pendingRestoredLaneId = null;
         pendingRestoredLaneHistoryMode = "none";
-        void inspectLane(restoredLaneId, restoredHistoryMode, true, true);
+        const restoration = inspectLane(
+          restoredLaneId,
+          restoredHistoryMode,
+          true,
+          true,
+        );
+        if (bootstrapInspectionLoading) {
+          void restoration.finally(() => {
+            bootstrapInspectionLoading = false;
+            if (
+              screen === "loading" &&
+              snapshot &&
+              sessionRecovery === "connected"
+            ) {
+              screen = "ready";
+            }
+          });
+        }
       } else if (requestedLaneId) {
         if (snapshotChanged) {
           void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
@@ -1464,6 +1486,7 @@
     {snapshot}
     {inspection}
     {inspectionLoading}
+    inspectionLaneId={inspectionRequestedLaneId}
     {inspectionFailure}
     {projectOverview}
     {refreshing}
@@ -1675,7 +1698,9 @@
     font-size: 0.72rem;
   }
 
-  .spin {
+  :global(svg.spin) {
+    transform-box: fill-box;
+    transform-origin: center;
     animation: spin 0.9s linear infinite;
   }
 
@@ -1686,7 +1711,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .spin {
+    :global(svg.spin) {
       animation: none;
     }
   }

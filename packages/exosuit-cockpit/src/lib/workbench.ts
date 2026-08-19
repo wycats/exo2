@@ -26,7 +26,7 @@ export interface WorkbenchWorkspaceIdentity {
 export interface WorkbenchSnapshot {
   kind: "workbench.snapshot";
   ok: true;
-  schema_version: 3;
+  schema_version: 4;
   observed_at: string;
   revision: number;
   project: {
@@ -48,7 +48,7 @@ export interface WorkbenchSnapshot {
 export interface WorkbenchLaneInspection {
   kind: "workbench.lane_inspection";
   ok: true;
-  schema_version: 1;
+  schema_version: 2;
   observed_at: string;
   revision: number;
   project: {
@@ -109,6 +109,7 @@ export interface WorkbenchLaneSummary {
   phase_id: string;
   phase_title: string;
   phase_status: string;
+  phase_completed_at: string | null;
   focused_here: boolean;
 }
 
@@ -301,7 +302,7 @@ export function decodeWorkbenchSnapshot(value: unknown): WorkbenchSnapshot {
   const snapshot = record(value, "workbench snapshot");
   literal(snapshot.kind, "workbench.snapshot", "kind");
   literal(snapshot.ok, true, "ok");
-  literal(snapshot.schema_version, 3, "schema_version");
+  literal(snapshot.schema_version, 4, "schema_version");
   string(snapshot.observed_at, "observed_at");
   finiteNumber(snapshot.revision, "revision");
   project(snapshot.project);
@@ -349,7 +350,7 @@ export function decodeWorkbenchLaneInspection(
     "inspection.kind",
   );
   literal(inspection.ok, true, "inspection.ok");
-  literal(inspection.schema_version, 1, "inspection.schema_version");
+  literal(inspection.schema_version, 2, "inspection.schema_version");
   string(inspection.observed_at, "inspection.observed_at");
   finiteNumber(inspection.revision, "inspection.revision");
   project(inspection.project);
@@ -468,6 +469,7 @@ function laneSummary(value: unknown): void {
   string(lane.phase_id, "lane.phase_id");
   string(lane.phase_title, "lane.phase_title");
   string(lane.phase_status, "lane.phase_status");
+  nullableString(lane.phase_completed_at, "lane.phase_completed_at");
   boolean(lane.focused_here, "lane.focused_here");
 }
 

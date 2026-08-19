@@ -1,7 +1,7 @@
 {
   "kind": "workbench.lane_inspection",
   "ok": true,
-  "schema_version": 1,
+  "schema_version": 2,
   "observed_at": "2026-08-06T20:00:00.000Z",
   "revision": 9,
   "project": {
@@ -27,6 +27,7 @@
     "phase_id": "phase-history",
     "phase_title": "Cockpit foundation",
     "phase_status": "completed",
+    "phase_completed_at": "2026-08-05T20:00:00+00:00",
     "focused_here": false,
     "intent": "Establish the first useful lane workbench",
     "created_at": "2026-07-28T19:00:00Z",
