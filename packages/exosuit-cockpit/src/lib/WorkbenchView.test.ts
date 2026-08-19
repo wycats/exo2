@@ -1036,6 +1036,41 @@ describe("focus-only lane workbench", () => {
     expect(container.querySelector(".inspection-loading")).toBeNull();
   });
 
+  it("makes the pending lane the sole selection while switching inspections", () => {
+    const snapshot = fixture();
+    const historicalValue = structuredClone(inspectionFixture);
+    snapshot.lanes.push({
+      id: historicalValue.lane.id,
+      title: historicalValue.lane.title,
+      state: "executing",
+      phase_id: historicalValue.lane.phase_id,
+      phase_title: historicalValue.lane.phase_title,
+      phase_status: "completed",
+      phase_completed_at: historicalValue.lane.phase_completed_at,
+      focused_here: false,
+    });
+
+    render(WorkbenchView, {
+      snapshot,
+      inspection: decodeWorkbenchLaneInspection(historicalValue),
+      inspectionLoading: true,
+      inspectionLaneId: "lane-next",
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const pendingLane = screen.getByRole("button", {
+      name: "Opening Focus-only lane workspace",
+    });
+    const previousLane = screen.getByRole("button", {
+      name: "Inspect Completed cockpit foundation, phase completed",
+    });
+    expect(pendingLane.getAttribute("aria-current")).toBe("page");
+    expect(pendingLane.classList.contains("selected")).toBe(true);
+    expect(previousLane.hasAttribute("aria-current")).toBe(false);
+    expect(previousLane.classList.contains("selected")).toBe(false);
+  });
+
   it("renders pending focus and retryable failure without changing local state", async () => {
     const onRetryFocus = vi.fn();
     render(WorkbenchView, {

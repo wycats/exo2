@@ -380,6 +380,9 @@
         ) {
           sessionRecovery = "needs_launch";
           sessionRecoveryMessage = messageFrom(error);
+          if (bootstrapInspectionLoading && pendingRestoredLaneId) {
+            finishBootstrapInspection();
+          }
           return;
         }
         if (
@@ -389,6 +392,9 @@
           sessionRecovery = "reload_required";
           sessionRecoveryMessage = messageFrom(error);
           refreshFailure = null;
+          if (bootstrapInspectionLoading && pendingRestoredLaneId) {
+            finishBootstrapInspection();
+          }
           return;
         }
         recoveryAttempt += 1;
@@ -865,11 +871,10 @@
     if (screen !== "loading" || !snapshot) {
       return;
     }
-    if (sessionRecovery === "reload_required") {
-      screen = "client_update_required";
-    } else if (sessionRecovery === "connected") {
-      screen = "ready";
-    }
+    screen =
+      sessionRecovery === "reload_required"
+        ? "client_update_required"
+        : "ready";
   }
 
   function clearInspection(mode: InspectionHistoryMode = "push"): void {
@@ -1026,6 +1031,9 @@
         pendingRestoredLaneHistoryMode = historyMode;
         projectOverview = false;
         applyTerminalFailure(error);
+        if (bootstrapLoading) {
+          screen = "loading";
+        }
       } else {
         inspectionFailure = messageFrom(error);
         inspectionRetryLaneId = laneId;
@@ -1037,7 +1045,13 @@
         inspectionRequestedHistoryMode = "none";
         inspectionLoading = false;
       }
-      if (bootstrapLoading) {
+      if (
+        bootstrapLoading &&
+        !(
+          pendingRestoredLaneId === laneId &&
+          sessionRecovery !== "connected"
+        )
+      ) {
         finishBootstrapInspection(requestGeneration);
       }
     }

@@ -415,13 +415,15 @@
   const lanePhaseActive = (lane: WorkbenchLaneSummary): boolean =>
     lane.phase_status === "in-progress";
 
-  const laneSelected = (lane: WorkbenchLaneSummary): boolean =>
-    inspection?.lane.id === lane.id ||
-    (inspectionLoading && inspectionLaneId === lane.id) ||
-    (!inspection &&
-      !inspectionLoading &&
-      !projectOverview &&
-      lane.focused_here);
+  const laneSelected = (lane: WorkbenchLaneSummary): boolean => {
+    if (inspectionLoading) {
+      return inspectionLaneId === lane.id;
+    }
+    return (
+      inspection?.lane.id === lane.id ||
+      (!inspection && !projectOverview && lane.focused_here)
+    );
+  };
 
   const laneTitle = (lane: WorkbenchLaneSummary): string => {
     if (inspectionLoading && inspectionLaneId === lane.id) {

@@ -1600,6 +1600,102 @@ describe("cockpit page", () => {
     ).toBeNull();
   });
 
+  it("keeps restored-lane bootstrap loading through session recovery", async () => {
+    const snapshot = structuredClone(snapshotFixture);
+    snapshot.lanes.push({
+      id: "lane-history",
+      title: "Recovered history lane",
+      state: "executing",
+      phase_id: "phase-history",
+      phase_title: "Completed phase",
+      phase_status: "completed",
+      phase_completed_at: null,
+      focused_here: false,
+    });
+    history.replaceState(
+      {
+        "sveltekit:history": 3,
+        "sveltekit:navigation": 3,
+        "sveltekit:states": {
+          exoWorkbenchSessionKey: "restored-session",
+          exoWorkbenchInspectedLaneId: "lane-history",
+        },
+      },
+      "",
+      "/",
+    );
+    const recoveryRenewal = deferred<Response>();
+    const recoveredInspection = deferred<Response>();
+    let renewalAttempts = 0;
+    let inspectionAttempts = 0;
+    let recoveredInspectionRequestId = "";
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
+      if (path === "/api/session/renew") {
+        renewalAttempts += 1;
+        return renewalAttempts === 1
+          ? sessionResponse("restored-session")
+          : recoveryRenewal.promise;
+      }
+      const request = JSON.parse(String(init?.body));
+      if (request.operation.kind === "lane_inspect") {
+        inspectionAttempts += 1;
+        if (inspectionAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              kind: "workbench.session_invalid",
+              ok: false,
+              message: "The workbench session is invalid",
+            }),
+            { status: 401 },
+          );
+        }
+        recoveredInspectionRequestId = request.id;
+        return recoveredInspection.promise;
+      }
+      return new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: request.id,
+          status: "ok",
+          result: snapshot,
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(Page);
+
+    await waitFor(() => expect(renewalAttempts).toBe(2));
+    expect(
+      screen.getByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Local workbench host" }),
+    ).toBeNull();
+
+    recoveryRenewal.resolve(sessionResponse("restored-session"));
+    await waitFor(() => expect(inspectionAttempts).toBe(2));
+    expect(
+      screen.getByRole("heading", { name: "Opening lane workspace" }),
+    ).toBeTruthy();
+
+    recoveredInspection.resolve(
+      new Response(
+        JSON.stringify({
+          protocol_version: 1,
+          id: recoveredInspectionRequestId,
+          status: "ok",
+          result: laneInspection(snapshot, "lane-history", "historical"),
+        }),
+        { status: 200 },
+      ),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Recovered history lane" }),
+    ).toBeTruthy();
+  });
+
   it("releases bootstrap loading when history returns to current work", async () => {
     const snapshot = structuredClone(snapshotFixture);
     snapshot.lanes.push({
