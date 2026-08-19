@@ -8,13 +8,14 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import inspectionFixture from "./workbench-lane-inspection.v1.json";
-import snapshotFixture from "./workbench-snapshot.v3.json";
+import inspectionFixture from "./workbench-lane-inspection.v2.json";
+import snapshotFixture from "./workbench-snapshot.v4.json";
 import {
   decodeWorkbenchLaneInspection,
   decodeWorkbenchSnapshot,
 } from "./workbench";
 import WorkbenchView from "./WorkbenchView.svelte";
+import workbenchViewSource from "./WorkbenchView.svelte?raw";
 
 afterEach(() => {
   cleanup();
@@ -31,6 +32,7 @@ const fixture = () => {
     phase_id: "phase-next",
     phase_title: "Lane workspace delivery",
     phase_status: "in-progress",
+    phase_completed_at: null,
     focused_here: false,
   });
   return decodeWorkbenchSnapshot(value);
@@ -995,6 +997,80 @@ describe("focus-only lane workbench", () => {
     expect(onFocus).not.toHaveBeenCalled();
   });
 
+  it("keeps lane inspection loading inside the selected row", () => {
+    const { container } = render(WorkbenchView, {
+      snapshot: fixture(),
+      inspectionLoading: true,
+      inspectionLaneId: "lane-next",
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const lane = screen.getByRole("button", {
+      name: "Opening Focus-only lane workspace",
+    });
+    const focusedLane = screen.getByRole("button", {
+      name: "Local workbench host, focused",
+    });
+    expect(lane.getAttribute("aria-busy")).toBe("true");
+    expect(lane.getAttribute("aria-current")).toBe("page");
+    expect(lane.classList.contains("selected")).toBe(true);
+    expect(focusedLane.classList.contains("focused")).toBe(true);
+    expect(focusedLane.classList.contains("selected")).toBe(false);
+    expect(focusedLane.hasAttribute("aria-current")).toBe(false);
+    expect(
+      screen.getByRole("heading", {
+        name: "Opening Focus-only lane workspace",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Loading the recorded lane plan")).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { name: "Local workbench host" }),
+    ).toBeNull();
+    const spinner = lane.querySelector<SVGElement>("svg.spin");
+    expect(spinner).toBeTruthy();
+    expect(workbenchViewSource).toContain(":global(svg.spin)");
+    expect(screen.getByText("Opening the selected lane").textContent).toBe(
+      "Opening the selected lane",
+    );
+    expect(container.querySelector(".inspection-loading")).toBeNull();
+  });
+
+  it("makes the pending lane the sole selection while switching inspections", () => {
+    const snapshot = fixture();
+    const historicalValue = structuredClone(inspectionFixture);
+    snapshot.lanes.push({
+      id: historicalValue.lane.id,
+      title: historicalValue.lane.title,
+      state: "executing",
+      phase_id: historicalValue.lane.phase_id,
+      phase_title: historicalValue.lane.phase_title,
+      phase_status: "completed",
+      phase_completed_at: historicalValue.lane.phase_completed_at,
+      focused_here: false,
+    });
+
+    render(WorkbenchView, {
+      snapshot,
+      inspection: decodeWorkbenchLaneInspection(historicalValue),
+      inspectionLoading: true,
+      inspectionLaneId: "lane-next",
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    const pendingLane = screen.getByRole("button", {
+      name: "Opening Focus-only lane workspace",
+    });
+    const previousLane = screen.getByRole("button", {
+      name: "Inspect Completed cockpit foundation, phase completed",
+    });
+    expect(pendingLane.getAttribute("aria-current")).toBe("page");
+    expect(pendingLane.classList.contains("selected")).toBe(true);
+    expect(previousLane.hasAttribute("aria-current")).toBe(false);
+    expect(previousLane.classList.contains("selected")).toBe(false);
+  });
+
   it("renders pending focus and retryable failure without changing local state", async () => {
     const onRetryFocus = vi.fn();
     render(WorkbenchView, {
@@ -1050,6 +1126,7 @@ describe("focus-only lane workbench", () => {
             ...lane,
             phase_title: "Project trajectory and workspace faces",
             phase_status: "pending",
+            phase_completed_at: null,
             focused_here: false,
           }
         : {
@@ -1057,6 +1134,7 @@ describe("focus-only lane workbench", () => {
             state: "prepared",
             phase_title: "Interactive lane planning",
             phase_status: "completed",
+            phase_completed_at: "2026-08-01T20:00:00Z",
             focused_here: false,
           },
     );
@@ -1227,6 +1305,7 @@ describe("focus-only lane workbench", () => {
       phase_id: "phase-history",
       phase_title: "Completed phase",
       phase_status: "completed",
+      phase_completed_at: "2026-08-02T20:00:00Z",
       focused_here: false,
     });
     const onInspect = vi.fn();
@@ -1248,6 +1327,268 @@ describe("focus-only lane workbench", () => {
     expect(onFocus).not.toHaveBeenCalled();
   });
 
+  it("keeps every lane from the latest completed campaign above current work", async () => {
+    const snapshot = fixture();
+    snapshot.lanes.push(
+      {
+        id: "lane-history-recent-a",
+        title: "Most recent completed lane A",
+        state: "prepared",
+        phase_id: "phase-history-recent",
+        phase_title: "Most recent completed phase",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00Z",
+        focused_here: false,
+      },
+      {
+        id: "lane-history-recent-b",
+        title: "Most recent completed lane B",
+        state: "prepared",
+        phase_id: "phase-history-recent",
+        phase_title: "Most recent completed phase",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00Z",
+        focused_here: false,
+      },
+      {
+        id: "lane-history-oldest",
+        title: "Oldest completed lane",
+        state: "prepared",
+        phase_id: "phase-history-oldest",
+        phase_title: "Oldest completed phase",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-01T20:00:00Z",
+        focused_here: false,
+      },
+      {
+        id: "lane-history-middle",
+        title: "Middle completed lane",
+        state: "prepared",
+        phase_id: "phase-history-middle",
+        phase_title: "Middle completed phase",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-02T20:00:00Z",
+        focused_here: false,
+      },
+    );
+    const onInspect = vi.fn();
+
+    const view = render(WorkbenchView, {
+      snapshot,
+      onInspect,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(
+        document.querySelectorAll(".lane-list > .lane-row .lane-copy strong"),
+      ).map((node) => node.textContent),
+    ).toEqual([
+      "Most recent completed lane A",
+      "Most recent completed lane B",
+      "Local workbench host",
+      "Focus-only lane workspace",
+    ]);
+    expect(screen.getByText("Earlier lanes")).toBeTruthy();
+    const oldest = screen.getByRole("button", {
+      name: "Inspect Oldest completed lane, phase completed",
+    });
+    const earlierLanes = screen.getByText("Earlier lanes").closest("details");
+    expect(earlierLanes).toBeTruthy();
+    expect(earlierLanes).toHaveProperty("open", false);
+    earlierLanes!.open = true;
+    await fireEvent(earlierLanes!, new Event("toggle"));
+    expect(earlierLanes).toHaveProperty("open", true);
+    await fireEvent.click(oldest);
+    expect(onInspect).toHaveBeenCalledWith("lane-history-oldest");
+
+    earlierLanes!.open = false;
+    await fireEvent(earlierLanes!, new Event("toggle"));
+    const historicalValue = structuredClone(inspectionFixture);
+    historicalValue.lane.id = "lane-history-oldest";
+    historicalValue.lane.title = "Oldest completed lane";
+    historicalValue.lane.phase_id = "phase-history-oldest";
+    historicalValue.lane.phase_title = "Oldest completed phase";
+    historicalValue.lane.phase_completed_at = "2026-08-01T20:00:00Z";
+    historicalValue.phase.id = "phase-history-oldest";
+    historicalValue.phase.title = "Oldest completed phase";
+    await view.rerender({
+      snapshot,
+      inspection: decodeWorkbenchLaneInspection(historicalValue),
+      onInspect,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+    await waitFor(() => expect(earlierLanes).toHaveProperty("open", true));
+  });
+
+  it("resolves equal completion timestamps by phase identity", () => {
+    const snapshot = fixture();
+    snapshot.lanes.push(
+      {
+        id: "lane-tied-z",
+        title: "Tied phase Z",
+        state: "prepared",
+        phase_id: "phase-z",
+        phase_title: "Tied campaign Z",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00Z",
+        focused_here: false,
+      },
+      {
+        id: "lane-tied-a",
+        title: "Tied phase A",
+        state: "prepared",
+        phase_id: "phase-a",
+        phase_title: "Tied campaign A",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00Z",
+        focused_here: false,
+      },
+    );
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(
+        document.querySelectorAll(".lane-list > .lane-row .lane-copy strong"),
+      ).map((node) => node.textContent),
+    ).toEqual([
+      "Tied phase A",
+      "Local workbench host",
+      "Focus-only lane workspace",
+    ]);
+  });
+
+  it("preserves sub-millisecond completion ordering", () => {
+    const snapshot = fixture();
+    snapshot.lanes.push(
+      {
+        id: "lane-newer-nanosecond",
+        title: "Newer nanosecond campaign",
+        state: "prepared",
+        phase_id: "phase-z-newer",
+        phase_title: "Newer campaign",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00.123456789+00:00",
+        focused_here: false,
+      },
+      {
+        id: "lane-older-nanosecond",
+        title: "Older nanosecond campaign",
+        state: "prepared",
+        phase_id: "phase-a-older",
+        phase_title: "Older campaign",
+        phase_status: "completed",
+        phase_completed_at: "2026-08-03T20:00:00.123456788+00:00",
+        focused_here: false,
+      },
+    );
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(
+        document.querySelectorAll(".lane-list > .lane-row .lane-copy strong"),
+      ).map((node) => node.textContent),
+    ).toEqual([
+      "Newer nanosecond campaign",
+      "Local workbench host",
+      "Focus-only lane workspace",
+    ]);
+    expect(
+      screen.getByRole("button", {
+        name: "Inspect Older nanosecond campaign, phase completed",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("keeps completed lanes without completion evidence in history", () => {
+    const snapshot = fixture();
+    snapshot.lanes.push({
+      id: "lane-legacy-complete",
+      title: "Legacy completed lane",
+      state: "prepared",
+      phase_id: "phase-legacy-complete",
+      phase_title: "Legacy completed phase",
+      phase_status: "completed",
+      phase_completed_at: null,
+      focused_here: false,
+    });
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(
+        document.querySelectorAll(".lane-list > .lane-row .lane-copy strong"),
+      ).map((node) => node.textContent),
+    ).toEqual(["Local workbench host", "Focus-only lane workspace"]);
+    expect(screen.getByText("Earlier lanes")).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Inspect Legacy completed lane, phase completed",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("puts active goals first and uses a native disclosure for completed goals", async () => {
+    const snapshot = fixture();
+    snapshot.phase!.goals = [
+      {
+        id: "completed-goal",
+        title: "Completed campaign",
+        status: "completed",
+        tasks: [],
+      },
+      {
+        id: "pending-goal",
+        title: "Later campaign",
+        status: "pending",
+        tasks: [],
+      },
+      snapshot.phase!.goals[0],
+    ];
+
+    render(WorkbenchView, {
+      snapshot,
+      onFocus: vi.fn(),
+      onRefresh: vi.fn(),
+    });
+
+    expect(
+      Array.from(document.querySelectorAll(".goal-list > .goal h3")).map(
+        (node) => node.textContent,
+      ),
+    ).toEqual(["Establish local host and launch", "Later campaign"]);
+    expect(screen.getByText("Working now")).toBeTruthy();
+
+    const completedSummary = screen
+      .getByText("1 completed goal")
+      .closest("summary");
+    const completedDisclosure = completedSummary?.closest("details");
+    expect(completedSummary).toBeTruthy();
+    expect(completedDisclosure).toHaveProperty("open", false);
+
+    await fireEvent.click(completedSummary!);
+    expect(completedDisclosure).toHaveProperty("open", true);
+    expect(
+      screen.getByRole("heading", { name: "Completed campaign" }),
+    ).toBeTruthy();
+  });
+
   it("opens pending lanes as read-only future plans", async () => {
     const snapshot = fixture();
     snapshot.lanes.push({
@@ -1257,6 +1598,7 @@ describe("focus-only lane workbench", () => {
       phase_id: "phase-future",
       phase_title: "Future phase",
       phase_status: "pending",
+      phase_completed_at: null,
       focused_here: false,
     });
     const onInspect = vi.fn();

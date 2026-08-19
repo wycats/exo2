@@ -162,10 +162,12 @@
   let beginSessionRecovery: (() => void) | null = null;
   let snapshotRefreshGeneration = 0;
   let inspectionRequestGeneration = 0;
-  let inspectionRequestedLaneId: string | null = null;
+  let inspectionRequestedLaneId = $state<string | null>(null);
   let inspectionRequestedHistoryMode: InspectionHistoryMode = "none";
   let pendingRestoredLaneId: string | null = null;
   let pendingRestoredLaneHistoryMode: InspectionHistoryMode = "none";
+  let bootstrapInspectionLoading = false;
+  let bootstrapInspectionRequestGeneration: number | null = null;
   let confirmedLocalFocus: ConfirmedLocalFocus | null = null;
 
   onMount(() => {
@@ -378,6 +380,9 @@
         ) {
           sessionRecovery = "needs_launch";
           sessionRecoveryMessage = messageFrom(error);
+          if (bootstrapInspectionLoading && pendingRestoredLaneId) {
+            finishBootstrapInspection();
+          }
           return;
         }
         if (
@@ -387,6 +392,9 @@
           sessionRecovery = "reload_required";
           sessionRecoveryMessage = messageFrom(error);
           refreshFailure = null;
+          if (bootstrapInspectionLoading && pendingRestoredLaneId) {
+            finishBootstrapInspection();
+          }
           return;
         }
         recoveryAttempt += 1;
@@ -432,6 +440,8 @@
       inspectionRequestedHistoryMode = "none";
       pendingRestoredLaneId = null;
       pendingRestoredLaneHistoryMode = "none";
+      bootstrapInspectionLoading = false;
+      bootstrapInspectionRequestGeneration = null;
       confirmedLocalFocus = null;
       pendingFocus = null;
       retryFocus = null;
@@ -552,6 +562,7 @@
           inspectedLaneFromHistory(resumeState);
         pendingRestoredLaneId = restoredLaneId;
         pendingRestoredLaneHistoryMode = "none";
+        bootstrapInspectionLoading = restoredLaneId !== null;
         projectOverview =
           !restoredLaneId &&
           (projectOverviewFromHistory(history.state) ||
@@ -595,7 +606,13 @@
         const laneId = inspectedLaneFromHistory(event.state);
         if (laneId) {
           if (sessionRecovery === "connected") {
-            void inspectLane(laneId, "none", true, true);
+            void inspectLane(
+              laneId,
+              "none",
+              true,
+              true,
+              bootstrapInspectionLoading,
+            );
           } else {
             pendingRestoredLaneId = laneId;
             pendingRestoredLaneHistoryMode = "none";
@@ -719,7 +736,9 @@
       previousSnapshot.daemon.instance_id !== nextSnapshot.daemon.instance_id ||
       previousSnapshot.revision !== nextSnapshot.revision;
     snapshot = nextSnapshot;
-    screen = "ready";
+    if (!bootstrapInspectionLoading) {
+      screen = "ready";
+    }
     screenMessage = null;
     screenRetryable = false;
     refreshFailure = null;
@@ -776,10 +795,22 @@
         const restoredHistoryMode = pendingRestoredLaneHistoryMode;
         pendingRestoredLaneId = null;
         pendingRestoredLaneHistoryMode = "none";
-        void inspectLane(restoredLaneId, restoredHistoryMode, true, true);
+        void inspectLane(
+          restoredLaneId,
+          restoredHistoryMode,
+          true,
+          true,
+          bootstrapInspectionLoading,
+        );
       } else if (requestedLaneId) {
         if (snapshotChanged) {
-          void inspectLane(requestedLaneId, requestedHistoryMode, true, true);
+          void inspectLane(
+            requestedLaneId,
+            requestedHistoryMode,
+            true,
+            true,
+            bootstrapInspectionLoading,
+          );
         }
       } else if (retryLaneId && snapshotChanged) {
         void inspectLane(retryLaneId, retryHistoryMode, true, true);
@@ -825,7 +856,32 @@
     retainTabResumeState(nextState);
   }
 
+  function finishBootstrapInspection(
+    requestGeneration: number | null = null,
+  ): void {
+    if (
+      !bootstrapInspectionLoading ||
+      (requestGeneration !== null &&
+        bootstrapInspectionRequestGeneration !== requestGeneration)
+    ) {
+      return;
+    }
+    bootstrapInspectionRequestGeneration = null;
+    bootstrapInspectionLoading = false;
+    if (screen !== "loading" || !snapshot) {
+      return;
+    }
+    screen =
+      sessionRecovery === "reload_required"
+        ? "client_update_required"
+        : "ready";
+  }
+
   function clearInspection(mode: InspectionHistoryMode = "push"): void {
+    const currentHistory = workbenchHistoryState(history.state);
+    const historyAlreadyShowsCurrentWork =
+      inspectedLaneFromHistory(currentHistory) === null &&
+      !projectOverviewFromHistory(currentHistory);
     inspectionRequestGeneration += 1;
     inspection = null;
     inspectionLoading = false;
@@ -837,7 +893,11 @@
     pendingRestoredLaneId = null;
     pendingRestoredLaneHistoryMode = "none";
     projectOverview = false;
-    if (mode !== "none") {
+    finishBootstrapInspection();
+    if (
+      mode !== "none" &&
+      !(mode === "push" && historyAlreadyShowsCurrentWork)
+    ) {
       writeInspectionHistory(null, mode);
     }
   }
@@ -856,6 +916,7 @@
     pendingRestoredLaneId = null;
     pendingRestoredLaneHistoryMode = "none";
     projectOverview = true;
+    finishBootstrapInspection();
     if (mode === "none") {
       return;
     }
@@ -875,6 +936,7 @@
     historyMode: InspectionHistoryMode = "push",
     retryOnStale = true,
     preserveFocusedSelection = false,
+    bootstrapLoading = false,
   ): Promise<void> {
     if (!client || !snapshot || sessionRecovery !== "connected") {
       return;
@@ -886,6 +948,9 @@
 
     const activeClient = client;
     const requestGeneration = ++inspectionRequestGeneration;
+    if (bootstrapLoading) {
+      bootstrapInspectionRequestGeneration = requestGeneration;
+    }
     inspectionRequestedLaneId = laneId;
     inspectionRequestedHistoryMode = historyMode;
     inspectionLoading = true;
@@ -907,7 +972,13 @@
         if (retryOnStale) {
           await refreshSnapshot(true);
           if (requestGeneration === inspectionRequestGeneration) {
-            await inspectLane(laneId, historyMode, false, true);
+            await inspectLane(
+              laneId,
+              historyMode,
+              false,
+              true,
+              bootstrapLoading,
+            );
           }
         } else {
           inspectionFailure =
@@ -951,11 +1022,18 @@
         sessionRecoveryMessage = messageFrom(error);
         refreshFailure = null;
         stopLiveUpdates?.();
+        if (bootstrapLoading || screen === "loading") {
+          screen = "client_update_required";
+          screenMessage = sessionRecoveryMessage;
+        }
       } else if (terminalFailure(error)) {
         pendingRestoredLaneId = laneId;
         pendingRestoredLaneHistoryMode = historyMode;
         projectOverview = false;
         applyTerminalFailure(error);
+        if (bootstrapLoading) {
+          screen = "loading";
+        }
       } else {
         inspectionFailure = messageFrom(error);
         inspectionRetryLaneId = laneId;
@@ -966,6 +1044,15 @@
         inspectionRequestedLaneId = null;
         inspectionRequestedHistoryMode = "none";
         inspectionLoading = false;
+      }
+      if (
+        bootstrapLoading &&
+        !(
+          pendingRestoredLaneId === laneId &&
+          sessionRecovery !== "connected"
+        )
+      ) {
+        finishBootstrapInspection(requestGeneration);
       }
     }
   }
@@ -1464,6 +1551,7 @@
     {snapshot}
     {inspection}
     {inspectionLoading}
+    inspectionLaneId={inspectionRequestedLaneId}
     {inspectionFailure}
     {projectOverview}
     {refreshing}
@@ -1675,7 +1763,9 @@
     font-size: 0.72rem;
   }
 
-  .spin {
+  :global(svg.spin) {
+    transform-box: fill-box;
+    transform-origin: center;
     animation: spin 0.9s linear infinite;
   }
 
@@ -1686,7 +1776,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .spin {
+    :global(svg.spin) {
       animation: none;
     }
   }

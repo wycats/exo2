@@ -17,7 +17,7 @@ use crate::project::Project;
 use crate::status::between_phases_context_for_epoch;
 use crate::steering::derive_phase_steering;
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -176,7 +176,7 @@ pub(super) fn inspect_with_git(
     Ok(WorkbenchLaneInspection {
         kind: "workbench.lane_inspection",
         ok: true,
-        schema_version: 1,
+        schema_version: 2,
         observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         revision,
         project: WorkbenchProjectIdentity {
@@ -361,7 +361,7 @@ fn build_with_git_and_after_state_hook(
     Ok(WorkbenchSnapshot {
         kind: "workbench.snapshot",
         ok: true,
-        schema_version: 3,
+        schema_version: 4,
         observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         revision,
         project: WorkbenchProjectIdentity {
@@ -604,6 +604,7 @@ fn lane_summary(
         phase_id: phase.id.clone(),
         phase_title: phase.title.clone(),
         phase_status: phase.status.clone(),
+        phase_completed_at: phase.completed_at.as_ref().map(DateTime::to_rfc3339),
         focused_here: focused_lane_id == Some(lane.text_id.as_str()),
     })
 }

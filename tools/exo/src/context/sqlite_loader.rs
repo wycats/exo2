@@ -143,7 +143,9 @@ fn bounded_prefix_byte_limit(max_bytes: usize) -> i64 {
 }
 
 fn bounded_task_log_from_row(row: &Row<'_>) -> exosuit_storage::rusqlite::Result<TaskLog> {
-    let message: Vec<u8> = row.get(1)?;
+    // SQLite represents substr(CAST('' AS BLOB), ...) as NULL. The source
+    // column is non-null, so that value is the bounded form of an empty log.
+    let message = row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
     Ok(TaskLog {
         kind: row.get(0)?,
         message: bounded_blob_text(message),

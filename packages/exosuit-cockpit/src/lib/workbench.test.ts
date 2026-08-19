@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import inspectionFixture from "./workbench-lane-inspection.v1.json";
-import snapshotFixture from "./workbench-snapshot.v3.json";
+import inspectionFixture from "./workbench-lane-inspection.v2.json";
+import snapshotFixture from "./workbench-snapshot.v4.json";
 import {
   decodeWorkbenchLaneInspection,
   decodeWorkbenchSnapshot,
 } from "./workbench";
 
 describe("workbench snapshot contract", () => {
-  it("decodes the Rust-owned version-three fixture", () => {
+  it("decodes the Rust-owned version-four fixture", () => {
     const snapshot = decodeWorkbenchSnapshot(snapshotFixture);
 
     expect(snapshot.kind).toBe("workbench.snapshot");
@@ -119,6 +119,16 @@ describe("workbench snapshot contract", () => {
     );
   });
 
+  it("requires explicit phase completion evidence on every lane summary", () => {
+    const malformed = structuredClone(snapshotFixture);
+    delete (malformed.lanes[0] as { phase_completed_at?: string | null })
+      .phase_completed_at;
+
+    expect(() => decodeWorkbenchSnapshot(malformed)).toThrow(
+      "Invalid workbench snapshot field: lane.phase_completed_at",
+    );
+  });
+
   it("accepts a bounded progress-history marker", () => {
     const bounded = structuredClone(snapshotFixture);
     (
@@ -144,7 +154,7 @@ describe("workbench snapshot contract", () => {
 });
 
 describe("workbench lane inspection contract", () => {
-  it("decodes the Rust-owned version-one fixture", () => {
+  it("decodes the Rust-owned version-two fixture", () => {
     const inspection = decodeWorkbenchLaneInspection(inspectionFixture);
 
     expect(inspection.kind).toBe("workbench.lane_inspection");

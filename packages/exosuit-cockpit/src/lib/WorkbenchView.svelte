@@ -7,6 +7,7 @@
     Check,
     CheckCheck,
     CheckCircle2,
+    ChevronDown,
     Circle,
     CircleDashed,
     CircleDot,
@@ -58,6 +59,7 @@
     snapshot: WorkbenchSnapshot;
     inspection?: WorkbenchLaneInspection | null;
     inspectionLoading?: boolean;
+    inspectionLaneId?: string | null;
     inspectionFailure?: string | null;
     projectOverview?: boolean;
     refreshing?: boolean;
@@ -112,6 +114,7 @@
     snapshot,
     inspection = null,
     inspectionLoading = false,
+    inspectionLaneId = null,
     inspectionFailure = null,
     projectOverview = false,
     refreshing = false,
@@ -168,6 +171,7 @@
   let pairingRenameValue = $state("");
   let completionReviewCard: HTMLElement | undefined = $state();
   let compactNavigation = $state(false);
+  let earlierLanesOpen = $state(false);
   let planningEditor = $state<PlanningEditor | null>(null);
   let planningEditorBinding = $state<WorkbenchPlanningBinding | null>(null);
   let planningValue = $state("");
@@ -187,6 +191,11 @@
       (lane) => lane.phase_id === nextPhase.id && lane.state === "prepared",
     );
   });
+  let pendingInspectionLane = $derived(
+    inspectionLoading && inspectionLaneId
+      ? (snapshot.lanes.find((lane) => lane.id === inspectionLaneId) ?? null)
+      : null,
+  );
   let liveProjectWorkspaces = $derived(
     snapshot.project_workspaces.filter(
       (workspace) => workspace.availability === "live",
@@ -406,7 +415,20 @@
   const lanePhaseActive = (lane: WorkbenchLaneSummary): boolean =>
     lane.phase_status === "in-progress";
 
+  const laneSelected = (lane: WorkbenchLaneSummary): boolean => {
+    if (inspectionLoading) {
+      return inspectionLaneId === lane.id;
+    }
+    return (
+      inspection?.lane.id === lane.id ||
+      (!inspection && !projectOverview && lane.focused_here)
+    );
+  };
+
   const laneTitle = (lane: WorkbenchLaneSummary): string => {
+    if (inspectionLoading && inspectionLaneId === lane.id) {
+      return `Opening ${lane.title}`;
+    }
     if (pendingLaneId === lane.id) {
       return `Focusing ${lane.title}`;
     }
@@ -417,6 +439,90 @@
     }
     return `Inspect ${lane.title}, phase ${displayStatus(lane.phase_status)}`;
   };
+
+  const compareStableId = (left: string, right: string): number =>
+    left < right ? -1 : left > right ? 1 : 0;
+
+  const compareCompletionTimeDescending = (
+    left: string | null,
+    right: string | null,
+  ): number => {
+    if (left === right) {
+      return 0;
+    }
+    if (left === null) {
+      return 1;
+    }
+    if (right === null) {
+      return -1;
+    }
+    return left > right ? -1 : 1;
+  };
+
+  const compareCompletedLanes = (
+    left: WorkbenchLaneSummary,
+    right: WorkbenchLaneSummary,
+  ): number => {
+    const byCompletion = compareCompletionTimeDescending(
+      left.phase_completed_at,
+      right.phase_completed_at,
+    );
+    if (byCompletion !== 0) {
+      return byCompletion;
+    }
+    const byPhase = compareStableId(left.phase_id, right.phase_id);
+    return byPhase !== 0 ? byPhase : compareStableId(left.id, right.id);
+  };
+
+  let completedLanes = $derived(
+    snapshot.lanes
+      .filter((lane) => statusTone(lane.phase_status) === "complete")
+      .toSorted(compareCompletedLanes),
+  );
+  let latestCompletedPhaseId = $derived(
+    completedLanes.find((lane) => lane.phase_completed_at !== null)?.phase_id ??
+      null,
+  );
+  let recentCompletedLanes = $derived(
+    completedLanes.filter((lane) => lane.phase_id === latestCompletedPhaseId),
+  );
+  let earlierCompletedLanes = $derived(
+    completedLanes.filter((lane) => lane.phase_id !== latestCompletedPhaseId),
+  );
+  let primaryLanes = $derived.by(() => {
+    const current = snapshot.lanes.filter(
+      (lane) => statusTone(lane.phase_status) !== "complete",
+    );
+    const focused = current.filter((lane) => lane.focused_here);
+    const available = current.filter((lane) => !lane.focused_here);
+    return [...recentCompletedLanes, ...focused, ...available];
+  });
+  let currentGoals = $derived.by(() => {
+    const goals =
+      snapshot.phase?.goals.filter(
+        (goal) => goalProgressTone(goal) !== "complete",
+      ) ?? [];
+    const active = goals.filter(
+      (goal) => goalProgressTone(goal) === "active",
+    );
+    const remaining = goals.filter(
+      (goal) => goalProgressTone(goal) !== "active",
+    );
+    return [...active, ...remaining];
+  });
+  let completedGoals = $derived(
+    snapshot.phase?.goals.filter(
+      (goal) => goalProgressTone(goal) === "complete",
+    ) ?? [],
+  );
+  $effect(() => {
+    if (
+      inspection &&
+      earlierCompletedLanes.some((lane) => lane.id === inspection.lane.id)
+    ) {
+      earlierLanesOpen = true;
+    }
+  });
 
   const workspaceAvailabilityLabel = (
     workspace: WorkbenchProjectWorkspaceSummary,
@@ -800,6 +906,48 @@
   }
 </script>
 
+{#snippet laneRow(lane: WorkbenchLaneSummary)}
+  <button
+    class:focused={lane.focused_here}
+    class:selected={laneSelected(lane)}
+    class="lane-row"
+    type="button"
+    aria-current={laneSelected(lane) ? "page" : undefined}
+    aria-label={laneTitle(lane)}
+    aria-busy={inspectionLoading && inspectionLaneId === lane.id
+      ? "true"
+      : undefined}
+    disabled={interactionDisabled || pendingLaneId !== null}
+    onclick={() => selectLane(lane.id)}
+  >
+    <span class="lane-state" aria-hidden="true">
+      {#if (inspectionLoading && inspectionLaneId === lane.id) ||
+      pendingLaneId === lane.id}
+        <LoaderCircle class="spin" size={17} />
+      {:else if lane.focused_here}
+        <Target size={17} />
+      {:else if statusTone(lane.phase_status) === "complete"}
+        <CheckCircle2 size={17} />
+      {:else if !lanePhaseActive(lane)}
+        <CircleDashed size={17} />
+      {:else if lane.state === "executing"}
+        <CirclePlay size={17} />
+      {:else}
+        <CircleDashed size={17} />
+      {/if}
+    </span>
+    <span class="lane-copy">
+      <strong>{lane.title}</strong>
+      <span>{lane.phase_title}</span>
+    </span>
+    <span
+      class={`state-dot ${lane.state}`}
+      title={lane.state}
+      aria-hidden="true"
+    ></span>
+  </button>
+{/snippet}
+
 <div class="workbench">
   <header class="topbar">
     <div class="brand">
@@ -1093,10 +1241,7 @@
   {/if}
 
   {#if inspectionLoading}
-    <div class="inspection-loading" role="status">
-      <LoaderCircle class="spin" size={16} aria-hidden="true" />
-      Opening the selected lane…
-    </div>
+    <span class="sr-only" role="status">Opening the selected lane</span>
   {/if}
 
   <div class:has-coordination={hasCoordination} class="workspace-grid">
@@ -1160,48 +1305,29 @@
         </div>
       {:else}
         <nav class="lane-list" aria-label="Available lanes">
-          {#each snapshot.lanes as lane (lane.id)}
-            <button
-              class:focused={lane.focused_here}
-              class:selected={inspection?.lane.id === lane.id ||
-                (!inspection && !projectOverview && lane.focused_here)}
-              class="lane-row"
-              type="button"
-              aria-current={inspection?.lane.id === lane.id ||
-              (!inspection && !projectOverview && lane.focused_here)
-                ? "page"
-                : undefined}
-              aria-label={laneTitle(lane)}
-              disabled={interactionDisabled ||
-                pendingLaneId !== null}
-              onclick={() => selectLane(lane.id)}
-            >
-              <span class="lane-state" aria-hidden="true">
-                {#if pendingLaneId === lane.id}
-                  <LoaderCircle class="spin" size={17} />
-                {:else if lane.focused_here}
-                  <Target size={17} />
-                {:else if statusTone(lane.phase_status) === "complete"}
-                  <CheckCircle2 size={17} />
-                {:else if !lanePhaseActive(lane)}
-                  <CircleDashed size={17} />
-                {:else if lane.state === "executing"}
-                  <CirclePlay size={17} />
-                {:else}
-                  <CircleDashed size={17} />
-                {/if}
-              </span>
-              <span class="lane-copy">
-                <strong>{lane.title}</strong>
-                <span>{lane.phase_title}</span>
-              </span>
-              <span
-                class={`state-dot ${lane.state}`}
-                title={lane.state}
-                aria-hidden="true"
-              ></span>
-            </button>
+          {#each primaryLanes as lane (lane.id)}
+            {@render laneRow(lane)}
           {/each}
+
+          {#if earlierCompletedLanes.length > 0}
+            <details class="earlier-lanes" bind:open={earlierLanesOpen}>
+              <summary>
+                <span
+                  class:expanded={earlierLanesOpen}
+                  class="disclosure-chevron"
+                >
+                  <ChevronDown size={15} aria-hidden="true" />
+                </span>
+                <span>Earlier lanes</span>
+                <span>{earlierCompletedLanes.length}</span>
+              </summary>
+              <div class="earlier-lane-list">
+                {#each earlierCompletedLanes as lane (lane.id)}
+                  {@render laneRow(lane)}
+                {/each}
+              </div>
+            </details>
+          {/if}
         </nav>
       {/if}
     </aside>
@@ -1339,6 +1465,59 @@
               {/each}
             </div>
           {/if}
+        </section>
+      {:else if inspectionLoading && inspectionLaneId}
+        <section class="inspection-band" aria-labelledby="inspection-loading-lane-title">
+          <div class="inspection-heading">
+            <div>
+              <span class="section-kicker">Opening lane</span>
+              {#if pendingInspectionLane}
+                <span class={`status-label ${statusTone(pendingInspectionLane.phase_status)}`}>
+                  {statusLabel(pendingInspectionLane.phase_status)}
+                </span>
+              {/if}
+            </div>
+            <button
+              class="secondary-button"
+              type="button"
+              onclick={onCloseInspection}
+            >
+              <X size={15} aria-hidden="true" />
+              Back to current work
+            </button>
+          </div>
+          <h1 id="inspection-loading-lane-title">
+            Opening {pendingInspectionLane?.title ?? "selected lane"}
+          </h1>
+          <p class="lane-intent">
+            Loading this lane’s recorded project context.
+          </p>
+          <div class="lane-context">
+            <span>
+              <Activity size={15} aria-hidden="true" />
+              {pendingInspectionLane?.phase_title ?? "Lane plan"}
+            </span>
+            <span><Route size={15} aria-hidden="true" />Read-only lane view</span>
+          </div>
+        </section>
+
+        <section
+          class="inspection-plan"
+          aria-labelledby="inspection-loading-plan-title"
+          aria-busy="true"
+        >
+          <div class="section-heading">
+            <div>
+              <span class="section-kicker">Lane plan</span>
+              <h2 id="inspection-loading-plan-title">
+                Loading the selected lane
+              </h2>
+            </div>
+          </div>
+          <div class="inspection-empty">
+            <LoaderCircle class="spin" size={19} aria-hidden="true" />
+            Loading the recorded lane plan
+          </div>
         </section>
       {:else if projectOverview}
         <section class="project-dashboard" aria-labelledby="project-dashboard-title">
@@ -1651,9 +1830,11 @@
             </section>
           {/if}
 
-          <div class="goal-list">
-            {#each snapshot.phase.goals as goal (goal.id)}
-              <article class="goal">
+          {#snippet goalCard(goal: WorkbenchGoal)}
+              <article
+                class:current={goalProgressTone(goal) === "active"}
+                class="goal"
+              >
                 <div class="goal-heading">
                   <span class={`status-icon ${goalProgressTone(goal)}`} aria-hidden="true">
                     {#if goalProgressTone(goal) === "complete"}
@@ -1668,7 +1849,12 @@
                   </span>
                   <div class="goal-copy">
                     <h3>{goal.title}</h3>
-                    <span class="goal-progress">{goalProgressLabel(goal)}</span>
+                    <div class="goal-meta">
+                      {#if goalProgressTone(goal) === "active"}
+                        <span class="goal-current-label">Working now</span>
+                      {/if}
+                      <span class="goal-progress">{goalProgressLabel(goal)}</span>
+                    </div>
                   </div>
                   {#if goalAllowsPlanning(goal)}
                     <button
@@ -2048,7 +2234,28 @@
                   </ul>
                 {/if}
               </article>
+          {/snippet}
+
+          <div class="goal-list">
+            {#each currentGoals as goal (goal.id)}
+              {@render goalCard(goal)}
             {/each}
+
+            {#if completedGoals.length > 0}
+              <details class="completed-goals">
+                <summary>
+                  <span class="completed-goals-chevron">
+                    <ChevronDown size={15} aria-hidden="true" />
+                  </span>
+                  <span>{quantity(completedGoals.length, "completed goal")}</span>
+                </summary>
+                <div class="completed-goal-list">
+                  {#each completedGoals as goal (goal.id)}
+                    {@render goalCard(goal)}
+                  {/each}
+                </div>
+              </details>
+            {/if}
           </div>
 
           {#if pendingPlanningKind}
@@ -2585,18 +2792,6 @@
     color: #3f4b49;
   }
 
-  .inspection-loading {
-    min-height: 36px;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 0 18px;
-    border-bottom: 1px solid var(--line);
-    background: var(--surface);
-    color: var(--muted);
-    font-size: 0.76rem;
-  }
-
   .failure-banner button {
     border: 1px solid #ce858a;
     border-radius: 5px;
@@ -2714,6 +2909,51 @@
   }
 
   .lane-list {
+    display: grid;
+    gap: 4px;
+  }
+
+  .earlier-lanes {
+    margin-top: 4px;
+    padding-top: 5px;
+    border-top: 1px solid var(--line);
+  }
+
+  .earlier-lanes > summary {
+    min-height: 34px;
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 9px;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-align: left;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .earlier-lanes > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .earlier-lanes > summary:hover {
+    color: var(--ink);
+  }
+
+  .disclosure-chevron.expanded {
+    transform: rotate(180deg);
+  }
+
+  .disclosure-chevron {
+    display: grid;
+    place-items: center;
+    transition: transform 140ms ease;
+  }
+
+  .earlier-lane-list {
     display: grid;
     gap: 4px;
   }
@@ -3335,9 +3575,54 @@
     display: grid;
   }
 
+  .completed-goals {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .completed-goals > summary {
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .completed-goals > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .completed-goals > summary:hover {
+    color: var(--ink);
+  }
+
+  .completed-goals-chevron {
+    display: grid;
+    place-items: center;
+    transition: transform 140ms ease;
+  }
+
+  .completed-goals[open] .completed-goals-chevron {
+    transform: rotate(180deg);
+  }
+
+  .completed-goal-list .goal:last-child {
+    border-bottom: 0;
+  }
+
   .goal {
     padding: 22px 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .goal.current {
+    margin-left: -14px;
+    padding-left: 12px;
+    border-left: 2px solid var(--teal);
   }
 
   .goal-heading {
@@ -3380,9 +3665,23 @@
     text-wrap: balance;
   }
 
-  .goal-progress {
-    display: block;
+  .goal-meta {
+    min-height: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px 9px;
     margin-top: 4px;
+  }
+
+  .goal-current-label {
+    color: var(--teal);
+    font-size: 0.68rem;
+    font-weight: 800;
+    line-height: 1.35;
+  }
+
+  .goal-progress {
     color: var(--muted);
     font-size: 0.68rem;
     font-weight: 600;
@@ -4121,7 +4420,9 @@
     white-space: nowrap;
   }
 
-  .spin {
+  :global(svg.spin) {
+    transform-box: fill-box;
+    transform-origin: center;
     animation: spin 0.9s linear infinite;
   }
 
@@ -4327,7 +4628,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .spin {
+    :global(svg.spin) {
       animation: none;
     }
   }

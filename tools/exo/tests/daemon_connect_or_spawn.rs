@@ -2754,7 +2754,15 @@ async fn linked_worktrees_share_one_workbench_host_with_workspace_scoped_session
             response["result"]["kind"], "workbench.snapshot",
             "{response}"
         );
-        assert_eq!(response["result"]["schema_version"], 3, "{response}");
+        assert_eq!(response["result"]["schema_version"], 4, "{response}");
+        assert!(
+            response["result"]["lanes"]
+                .as_array()
+                .is_some_and(|lanes| lanes
+                    .iter()
+                    .all(|lane| lane["phase_completed_at"].is_null())),
+            "an in-progress phase must not synthesize completion evidence: {response}"
+        );
         assert_eq!(
             response["result"]["project_workspaces"]
                 .as_array()

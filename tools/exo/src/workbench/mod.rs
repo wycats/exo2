@@ -932,6 +932,7 @@ pub struct WorkbenchLaneSummary {
     pub phase_id: String,
     pub phase_title: String,
     pub phase_status: String,
+    pub phase_completed_at: Option<String>,
     pub focused_here: bool,
 }
 
