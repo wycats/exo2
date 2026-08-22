@@ -240,6 +240,15 @@ approved mutation completed, removed, or superseded that path, the strike can
 still finish, but automatic return becomes blocked pending an explicit user
 choice.
 
+At minimum, automatic return is blocked when the target task has completed,
+been removed, or moved to another campaign; when its goal or campaign is no
+longer executable; when the lane no longer contains that campaign; or when a
+current ownership, compatibility, approval, or safety condition forbids the
+return. Changes that leave the exact execution path intact, such as progress
+recorded on the target or work performed in a sibling task, do not by
+themselves make the resume point stale. Stage 2 must define the revision or
+generation evidence used to make this check without a race.
+
 ### Lifecycle
 
 #### Start
@@ -267,6 +276,12 @@ explicitly, before executing strike work. This avoids the current ambiguity in
 which a strike goal and campaign goal may both be active while unqualified task
 commands still resolve to the campaign.
 
+An authorized strike task selector is the exact identity of a task belonging
+to the active strike goal. Naming that task disambiguates routing; it does not
+grant authority. The request must still satisfy the same project, workspace,
+ownership, compatibility, approval, and safety checks that would apply to the
+operation outside a strike.
+
 The trigger and stopping condition remain visible throughout execution. New
 findings may refine the strike plan, but broadening the work beyond the stopping
 condition requires a deliberate change in scope rather than quiet task growth.
@@ -292,7 +307,14 @@ lane and campaign whose execution it interrupted.
 If the resume point is still valid, it becomes working now again in workspaces
 focused on the attached lane. If it is stale, Exo records that return requires
 attention and presents the relevant choices. It does not silently select the
-next pending task. Finishing does not rewrite sibling workspace focus.
+next pending task. The attached workspace's lane focus never moved, so return
+changes its working-now overlay rather than moving focus back. Finishing does
+not rewrite sibling workspace focus.
+
+Once the reviewed finish is recorded, the strike is no longer active and no
+longer occupies the project-wide singleton. A blocked return remains a visible
+attention item attached to the completed strike; it does not keep the project
+inside an otherwise finished interruption.
 
 #### Abort
 
@@ -303,6 +325,10 @@ return disposition remain part of project history.
 An abort may still return to the prior task when that target remains valid.
 When returning would ignore an unresolved safety or ownership condition, Exo
 holds the return for explicit resolution.
+
+Recording the abort ends the active strike and releases the project-wide
+singleton even when its return disposition still needs attention. Starting a
+later strike must not erase or implicitly resolve that earlier disposition.
 
 ### Cockpit semantics
 
@@ -350,6 +376,10 @@ focused on that lane route ambient work to the strike. Workspaces focused on
 another lane continue their own ambient work and may execute the strike only by
 explicitly joining or focusing the attached lane or naming an authorized strike
 task.
+
+Observation is presentation, not routing: seeing the strike in a project-level
+surface never changes a workspace's current lane, task resolution, or mutation
+authority.
 
 Starting and finishing the strike never rewrite sibling focus. A sibling that
 has explicitly joined the attached lane participates under ordinary lane and
@@ -412,9 +442,11 @@ workspaces, creating a noisy project surface that makes active work harder to
 see.
 
 The strike is not permission to prune locald. Its bounded outcome is to make
-Exo distinguish, suppress, or safely reconcile prunable registrations so that
-the workbench presents truthful project structure. The first implementation
-must not silently run `git worktree prune` or mutate locald metadata.
+Exo truthfully distinguish or collapse prunable registrations so that the
+workbench presents the two existing worktrees as the current project structure.
+The first implementation must not run `git worktree prune` or otherwise mutate
+locald metadata. Any later reconciliation command remains a separate,
+explicitly authorized operation.
 
 The proof succeeds when ordinary dogfooding shows all of the following:
 
@@ -495,8 +527,8 @@ truthful shared account.
 
 The detailed design still needs to resolve:
 
-- What exact event should make a valid resume point stale, and which changes
-  can be reconciled automatically?
+- Which additional state changes should block automatic return, and which can
+  be reconciled while preserving the exact execution path?
 - How should an authorized user deliberately broaden or narrow a stopping
   condition after the strike begins?
 - What retention and summarization policy keeps completed strikes useful as
