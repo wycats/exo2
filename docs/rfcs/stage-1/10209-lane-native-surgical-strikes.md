@@ -226,6 +226,13 @@ This constraint may later be revisited for genuinely independent agents and
 lanes. Such a change should be driven by observed concurrency needs rather than
 included speculatively in the first contract.
 
+While a strike is active, the attached campaign cannot complete or otherwise
+leave its executable lifecycle through ordinary campaign operations. Such an
+operation fails with a stable explanation that the strike must first finish or
+abort. This preserves the campaign authority required to record the strike's
+reviewed outcome and return disposition; it does not expand the strike's own
+mutation authority.
+
 ### Choosing the resume point
 
 Starting a strike records an exact resume context. Exo may infer the current
