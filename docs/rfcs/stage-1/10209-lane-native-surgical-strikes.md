@@ -15,7 +15,7 @@ foundation and adds the continuity that becomes necessary in a lane-centered
 workbench. A strike temporarily becomes the visible locus of execution while
 retaining an exact account of what it interrupted and where work should return.
 It has a concrete trigger, a small plan, a stopping condition, proof against
-that condition, an exact resume point, and an explicit return to the prior
+that condition, an exact resume context, and an explicit return to the prior
 work.
 
 The central distinction is:
@@ -89,14 +89,15 @@ In a workspace focused on the attached lane, the workbench presents the strike
 as **working now**. It names the observation that triggered it, the bounded
 outcome being pursued, and the condition that will permit return. The
 interrupted lane and campaign remain visible underneath as paused continuity.
-The exact prior task remains identifiable, but it is no longer presented as the
-action currently underway.
+When a task was active, that exact task remains identifiable, but it is no
+longer presented as the action currently underway.
 
 The strike is also visible project-wide as an exceptional shared priority.
 That visibility does not capture ambient execution in workspaces focused on
 other lanes. Those workspaces continue to present their own lane as working
-now, can inspect the strike, and can participate only through an explicit
-choice to join or focus the attached lane or to name an authorized strike task.
+now and can inspect the strike. To participate, a workspace must explicitly
+join or focus the attached lane and satisfy the attached campaign's ordinary
+ownership rules. Focusing the lane does not itself grant that ownership.
 
 The strike uses normal goals and tasks. Progress updates describe the
 correction as it happens. Completion requires a reviewed outcome that evaluates
@@ -104,11 +105,13 @@ the declared stopping condition rather than a generic assertion that the strike
 is done.
 
 When the strike finishes, Exo records its outcome in history and restores the
-prior task as working now in workspaces focused on the attached lane. Lane
-focus does not move away and then move back; the durable lane remained focused
-throughout, and sibling focus was never rewritten. If the prior task or
-campaign is no longer a valid resume target, Exo stops and asks for an explicit
-choice rather than guessing.
+prior execution context as working now in workspaces focused on the attached
+lane. When a task was active, that context identifies the exact task. Between
+tasks, it identifies the campaign and any current goal without nominating an
+unrelated pending task. Lane focus does not move away and then move back; the
+durable lane remained focused throughout, and sibling focus was never
+rewritten. If the prior task, goal, or campaign is no longer a valid resume
+target, Exo stops and asks for an explicit choice rather than guessing.
 
 The result should feel like a focused interruption inside one coherent stream
 of work, not like an invisible detour and not like a second project plan.
@@ -156,13 +159,14 @@ This matters for recovery: returning from a strike changes the working-now
 projection within the interrupted context. It does not rewrite workspace lane
 focus as a side effect.
 
-### RFC 10207: Cockpit project flow
+## Relationship to project-flow work
 
-RFC 10207 distinguishes durable lanes from bounded campaigns and treats the
-cockpit as a projection of the project's decision and delivery motion. This RFC
-extends that account with a bounded interruption. The campaign remains the
-planned delta; the strike records why execution temporarily departed from that
-plan and how it returned.
+The project-flow work currently under development distinguishes durable lanes
+from bounded campaigns and treats the cockpit as a projection of the project's
+decision and delivery motion. This proposal does not depend on that unpublished
+RFC as current authority. It states the smaller distinction it needs here: the
+campaign remains the planned delta, while the strike records why execution
+temporarily departed from that plan and how it returned.
 
 In the current compatibility model, a phase is the implemented campaign
 boundary. This RFC uses campaign for the product concept while preserving the
@@ -208,9 +212,9 @@ Project-wide priority does not mean project-wide ambient task routing. Ambient
 execution and the **working now** projection remain lane- and workspace-scoped.
 A workspace focused on the attached lane routes ambient work to the strike. A
 workspace focused on another lane continues to route ambient work to that lane.
-It may inspect the active strike, but it executes strike work only after
-explicitly joining or focusing the attached lane or by naming an authorized
-strike task.
+It may inspect the active strike, but it executes strike work only after an
+explicit workspace transition to the attached lane under valid campaign
+ownership. Lane focus alone does not transfer that ownership.
 
 Project-wide singleton behavior is intentionally conservative. A strike means
 that the project's normal execution priority has been interrupted. Allowing
@@ -224,10 +228,13 @@ included speculatively in the first contract.
 
 ### Choosing the resume point
 
-Starting a strike records an exact resume target. Exo may infer the current task
-only when there is exactly one valid task that the current workspace and lane
-would otherwise present as working now. If the active context is ambiguous, the
-caller must name the task explicitly.
+Starting a strike records an exact resume context. Exo may infer the current
+task only when there is exactly one valid task that the current workspace and
+lane would otherwise present as working now. If the active context is
+ambiguous, the caller must name the task explicitly. If no task is active, Exo
+records a taskless resume disposition anchored to the exact lane and campaign,
+and to the current goal when there is one. Return then restores that context and
+re-evaluates working now; it does not select an unrelated pending task.
 
 This rule keeps convenience from becoming guesswork. A branch name, recent
 timestamp, array position, or conversational mention is not sufficient
@@ -255,8 +262,9 @@ generation evidence used to make this check without a race.
 
 Starting a lane-native strike requires an active lane and campaign, a concrete
 trigger, a proposed outcome, a stopping condition, and an unambiguous resume
-point. Exo creates the strike goal and its interruption context as one
-authoritative operation. Lane focus remains unchanged.
+context. The context may be taskless when execution is between tasks. Exo
+creates the strike goal and its interruption context as one authoritative
+operation. Lane focus remains unchanged.
 
 Once started, the strike becomes the working-now locus for steering, task
 routing, status, and the cockpit in workspaces focused on its attached lane.
@@ -271,16 +279,14 @@ The strike receives a deliberately small task plan. In a workspace focused on
 the attached lane, commands that operate on the current work route to the
 strike only when the strike has supplied a unique current task; otherwise they
 require an explicit strike task selector. A workspace focused on another lane
-must join or focus the attached lane, or name an authorized strike task
-explicitly, before executing strike work. This avoids the current ambiguity in
-which a strike goal and campaign goal may both be active while unqualified task
-commands still resolve to the campaign.
+must first join or focus the attached lane under valid campaign ownership. This
+avoids the current ambiguity in which a strike goal and campaign goal may both
+be active while unqualified task commands still resolve to the campaign.
 
-An authorized strike task selector is the exact identity of a task belonging
-to the active strike goal. Naming that task disambiguates routing; it does not
-grant authority. The request must still satisfy the same project, workspace,
-ownership, compatibility, approval, and safety checks that would apply to the
-operation outside a strike.
+Within an authorized attached-lane workspace, an explicit strike task selector
+is the exact identity of a task belonging to the active strike goal. Naming the
+task disambiguates routing; it never substitutes for lane, campaign, workspace,
+or ownership authority.
 
 The trigger and stopping condition remain visible throughout execution. New
 findings may refine the strike plan, but broadening the work beyond the stopping
@@ -301,7 +307,7 @@ strike displaced approved work.
 
 Finishing uses the normal reviewed goal-outcome path. A successful outcome
 records the proof, closes the strike goal, and attempts to restore the exact
-resume point. The strike moves into history, where it remains attached to the
+resume context. The strike moves into history, where it remains attached to the
 lane and campaign whose execution it interrupted.
 
 If the resume point is still valid, it becomes working now again in workspaces
@@ -316,6 +322,12 @@ longer occupies the project-wide singleton. A blocked return remains a visible
 attention item attached to the completed strike; it does not keep the project
 inside an otherwise finished interruption.
 
+The reviewed outcome, inactive strike lifecycle, singleton release, and durable
+return disposition form one recoverable authority transition. An implementation
+may commit them atomically or use a durable intermediate state whose retry
+finishes the transition, but it must never expose a completed strike without a
+recorded return or blocked-return disposition.
+
 #### Abort
 
 Aborting records why the strike stopped without satisfying its stopping
@@ -329,6 +341,8 @@ holds the return for explicit resolution.
 Recording the abort ends the active strike and releases the project-wide
 singleton even when its return disposition still needs attention. Starting a
 later strike must not erase or implicitly resolve that earlier disposition.
+The abort state, singleton release, and return disposition follow the same
+recoverable transition rule as successful finish.
 
 ### Cockpit semantics
 
@@ -342,7 +356,8 @@ shows:
 - the trigger in the language of the observed product problem;
 - the strike's intended outcome and stopping condition;
 - its current task and bounded plan;
-- the interrupted lane, campaign, and resume task; and
+- the interrupted lane and campaign, plus the resume goal and task when they
+  exist; and
 - whether return is currently expected to be automatic or requires attention.
 
 Project-level surfaces expose the active strike as a globally visible priority,
@@ -373,9 +388,9 @@ strike and its goal are shared project state. The first model attaches the
 project-wide strike to the lane and campaign from the workspace that starts it.
 Every worktree can observe the strike as a project-level priority. Workspaces
 focused on that lane route ambient work to the strike. Workspaces focused on
-another lane continue their own ambient work and may execute the strike only by
-explicitly joining or focusing the attached lane or naming an authorized strike
-task.
+another lane continue their own ambient work and may execute the strike only
+after explicitly joining or focusing the attached lane under valid campaign
+ownership.
 
 Observation is presentation, not routing: seeing the strike in a project-level
 surface never changes a workspace's current lane, task resolution, or mutation
@@ -538,7 +553,7 @@ The detailed design still needs to resolve:
 
 These questions affect implementation precision. They do not change the
 proposal's central direction: a strike remains a goal, overlays one interrupted
-lane and campaign, and returns through an exact validated resume point.
+lane and campaign, and returns through an exact validated resume context.
 
 ## Proposal boundary
 
@@ -553,8 +568,11 @@ This RFC asks the project to adopt the following public contract:
   a project priority and attached to one lane and campaign;
 - ambient execution and working-now state remain lane- and workspace-scoped;
 - attached-lane workspaces route ambient work to the strike, while other
-  workspaces continue their lane and require an explicit join, focus, or
-  authorized strike-task selector to participate;
+  workspaces continue their lane and require an explicit transition to the
+  attached lane under valid campaign ownership to participate;
+- resume context always identifies the exact lane and campaign, includes the
+  goal and task when they exist, and never invents pending work when execution
+  is between tasks;
 - resume-task inference is allowed only when the answer is unique;
 - starting and finishing leave workspace lane focus, including sibling focus,
   unchanged;
