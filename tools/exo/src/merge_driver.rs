@@ -6,6 +6,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeDriverKind {
+    Sql,
     Toml,
 }
 
@@ -17,6 +18,7 @@ pub fn run(
     path: Option<&str>,
 ) -> i32 {
     let result = match kind {
+        MergeDriverKind::Sql => run_sql(base, current, other, path),
         MergeDriverKind::Toml => run_toml(base, current, other, path),
     };
 
@@ -29,10 +31,41 @@ pub fn run(
     }
 }
 
+fn run_sql(base: &Path, current: &Path, other: &Path, logical_path: Option<&str>) -> Result<i32> {
+    let is_epochs = logical_path
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("epochs.sql");
+    if !is_epochs {
+        return Ok(0);
+    }
+
+    let base_s = read_to_string_or_empty(base)?;
+    let current_s = read_to_string_or_empty(current)?;
+    let other_s = read_to_string_or_empty(other)?;
+    let generation = [&base_s, &current_s, &other_s]
+        .into_iter()
+        .map(|content| exosuit_storage::parse_projection_generation(content))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    exosuit_storage::ensure_projection_supported(generation)?;
+    let rendered = exosuit_storage::with_projection_generation(&current_s, generation)?;
+    fs::write(current, rendered).with_context(|| {
+        format!(
+            "Failed to retain SQL projection generation in {}",
+            current.display()
+        )
+    })?;
+    Ok(0)
+}
+
 fn run_toml(base: &Path, current: &Path, other: &Path, _logical_path: Option<&str>) -> Result<i32> {
-    let base_s = read_to_string_lossy(base).unwrap_or_default();
-    let current_s = read_to_string_lossy(current).unwrap_or_default();
-    let other_s = read_to_string_lossy(other).unwrap_or_default();
+    let base_s = read_to_string_or_empty(base)?;
+    let current_s = read_to_string_or_empty(current)?;
+    let other_s = read_to_string_or_empty(other)?;
 
     let base_v = parse_toml_or_empty(&base_s)?;
     let current_v = parse_toml_or_empty(&current_s)?;
@@ -64,9 +97,13 @@ fn run_toml(base: &Path, current: &Path, other: &Path, _logical_path: Option<&st
     Ok(1)
 }
 
-fn read_to_string_lossy(path: &Path) -> Option<String> {
+fn read_to_string_or_empty(path: &Path) -> Result<String> {
     // Git may pass a non-existent base (e.g. /dev/null-ish paths). Treat missing as empty.
-    fs::read_to_string(path).ok()
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
 }
 
 fn parse_toml_or_empty(input: &str) -> Result<toml::Value> {
@@ -464,5 +501,130 @@ value = 3
         let s = toml::to_string(&merged).unwrap();
         assert!(s.contains("id = \"b\""));
         assert!(s.contains("id = \"c\""));
+    }
+
+    #[test]
+    fn sql_merge_retains_maximum_epochs_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base.sql");
+        let current = temp.path().join("current.sql");
+        let other = temp.path().join("other.sql");
+        fs::write(&base, "-- exo:minimum-writer-generation=0\n").unwrap();
+        fs::write(
+            &current,
+            "-- exo:minimum-writer-generation=0\nINSERT INTO epochs_data(text_id) VALUES('current');\n",
+        )
+        .unwrap();
+        fs::write(&other, "-- exo:minimum-writer-generation=0\n").unwrap();
+
+        assert_eq!(
+            run(
+                MergeDriverKind::Sql,
+                &base,
+                &current,
+                &other,
+                Some("docs/agent-context/epochs.sql"),
+            ),
+            0
+        );
+        assert!(
+            fs::read_to_string(current)
+                .unwrap()
+                .starts_with("-- exo:minimum-writer-generation=0\n")
+        );
+    }
+
+    #[test]
+    fn sql_merge_rejects_an_unsupported_generation_without_rewriting_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base.sql");
+        let current = temp.path().join("current.sql");
+        let other = temp.path().join("other.sql");
+        fs::write(&base, "-- exo:minimum-writer-generation=0\n").unwrap();
+        let current_content = "-- exo:minimum-writer-generation=0\n";
+        fs::write(&current, current_content).unwrap();
+        fs::write(&other, "-- exo:minimum-writer-generation=1\n").unwrap();
+
+        assert_eq!(
+            run(
+                MergeDriverKind::Sql,
+                &base,
+                &current,
+                &other,
+                Some("docs/agent-context/epochs.sql"),
+            ),
+            2
+        );
+        assert_eq!(fs::read_to_string(current).unwrap(), current_content);
+    }
+
+    #[test]
+    fn sql_merge_accepts_a_missing_legacy_base_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("missing.sql");
+        let current = temp.path().join("current.sql");
+        let other = temp.path().join("other.sql");
+        fs::write(&current, "-- exo:minimum-writer-generation=0\n").unwrap();
+        fs::write(&other, "-- exo:minimum-writer-generation=0\n").unwrap();
+
+        assert_eq!(
+            run(
+                MergeDriverKind::Sql,
+                &base,
+                &current,
+                &other,
+                Some("docs/agent-context/epochs.sql"),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn sql_merge_rejects_invalid_utf8_without_rewriting_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base.sql");
+        let current = temp.path().join("current.sql");
+        let other = temp.path().join("other.sql");
+        fs::write(&base, [0xff, 0xfe]).unwrap();
+        let current_content = "-- exo:minimum-writer-generation=0\n";
+        fs::write(&current, current_content).unwrap();
+        fs::write(&other, current_content).unwrap();
+
+        assert_eq!(
+            run(
+                MergeDriverKind::Sql,
+                &base,
+                &current,
+                &other,
+                Some("docs/agent-context/epochs.sql"),
+            ),
+            2
+        );
+        assert_eq!(fs::read_to_string(current).unwrap(), current_content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sql_merge_propagates_non_not_found_io_without_rewriting_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base-directory");
+        let current = temp.path().join("current.sql");
+        let other = temp.path().join("other.sql");
+        fs::create_dir(&base).unwrap();
+        let current_content = "-- exo:minimum-writer-generation=0\n";
+        fs::write(&current, current_content).unwrap();
+        fs::write(&other, current_content).unwrap();
+
+        assert_eq!(
+            run(
+                MergeDriverKind::Sql,
+                &base,
+                &current,
+                &other,
+                Some("docs/agent-context/epochs.sql"),
+            ),
+            2
+        );
+        assert_eq!(fs::read_to_string(current).unwrap(), current_content);
     }
 }

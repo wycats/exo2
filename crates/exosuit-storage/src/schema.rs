@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::compatibility::{CompatibilityLease, WriterCompatibilityError};
 use crate::revisions::RevisionStore;
 use crate::vtab::register_reactive_module;
 
@@ -25,6 +26,9 @@ pub enum DatabaseError {
 
     #[error("Request database scope error: {0}")]
     RequestScope(String),
+
+    #[error(transparent)]
+    WriterCompatibility(#[from] WriterCompatibilityError),
 }
 
 /// Shadow tables that need reactive virtual table wrappers.
@@ -59,6 +63,9 @@ pub(crate) const REACTIVE_TABLES: &[(&str, &str)] = &[
 /// before any operations are performed.
 pub struct Database {
     conn: Connection,
+    // Dropped after `conn`; field order preserves the compatibility authority
+    // through the connection's final SQL-capable moment.
+    _compatibility_lease: Option<CompatibilityLease>,
     /// Revision store for tracking row and rowset revisions.
     /// Shared with virtual tables via Arc.
     revision_store: Arc<RevisionStore>,
@@ -80,7 +87,15 @@ impl Database {
     /// 1. Defensive mode to protect shadow tables
     /// 2. RevisionStore for tracking row/rowset revisions
     /// 3. Reactive virtual tables wrapping all shadow tables
+    #[cfg(test)]
     pub(crate) fn new(conn: Connection) -> Result<Self, DatabaseError> {
+        Self::new_with_lease(conn, None)
+    }
+
+    pub(crate) fn new_with_lease(
+        conn: Connection,
+        compatibility_lease: Option<CompatibilityLease>,
+    ) -> Result<Self, DatabaseError> {
         // Create revision store first (needs connection for persistence)
         let revision_store = Arc::new(RevisionStore::new(&conn)?);
 
@@ -126,6 +141,7 @@ impl Database {
 
         Ok(Self {
             conn,
+            _compatibility_lease: compatibility_lease,
             revision_store,
         })
     }

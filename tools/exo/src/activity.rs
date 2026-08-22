@@ -4,6 +4,7 @@
 //! used by steering and context commands to surface what the agent has
 //! been working on.
 
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use exosuit_storage::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -37,11 +38,11 @@ pub struct RecentFileArea {
 
 /// Returns the most frequently referenced (`entity_type`, `entity_id`) pair
 /// from the last 10 minutes, or `None` if there are no matching events.
-pub fn active_entity(root: &Path) -> Option<ActiveEntity> {
+pub fn active_entity(root: &Path) -> Result<Option<ActiveEntity>> {
     active_entity_from_db(&event_db_path(root))
 }
 
-pub fn active_entity_from_db(db_path: &Path) -> Option<ActiveEntity> {
+pub fn active_entity_from_db(db_path: &Path) -> Result<Option<ActiveEntity>> {
     let cutoff = (Utc::now() - Duration::minutes(10)).to_rfc3339();
     with_event_db(db_path, |conn| {
         conn.query_row(
@@ -62,18 +63,18 @@ pub fn active_entity_from_db(db_path: &Path) -> Option<ActiveEntity> {
         )
         .optional()
     })
-    .flatten()
+    .map(Option::flatten)
 }
 
 /// Returns the current session window, defined as all events after the
 /// most recent 30-minute inactivity gap (looking back up to 24 hours).
-pub fn session_window(root: &Path) -> Option<SessionWindow> {
+pub fn session_window(root: &Path) -> Result<Option<SessionWindow>> {
     session_window_from_db(&event_db_path(root))
 }
 
-pub fn session_window_from_db(db_path: &Path) -> Option<SessionWindow> {
+pub fn session_window_from_db(db_path: &Path) -> Result<Option<SessionWindow>> {
     let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
-    let raw_timestamps: Vec<String> = with_event_db(db_path, |conn| {
+    let Some(raw_timestamps): Option<Vec<String>> = with_event_db(db_path, |conn| {
         let mut stmt = conn.prepare(
             "SELECT timestamp FROM agent_events
              WHERE timestamp > ?1
@@ -83,7 +84,10 @@ pub fn session_window_from_db(db_path: &Path) -> Option<SessionWindow> {
             .query_map([&cutoff], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    })?;
+    })?
+    else {
+        return Ok(None);
+    };
 
     let timestamps: Vec<DateTime<Utc>> = raw_timestamps
         .into_iter()
@@ -95,7 +99,7 @@ pub fn session_window_from_db(db_path: &Path) -> Option<SessionWindow> {
         .collect();
 
     if timestamps.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Walk forward, resetting session_start at any gap > 30 min.
@@ -107,15 +111,19 @@ pub fn session_window_from_db(db_path: &Path) -> Option<SessionWindow> {
     }
 
     let session_start = timestamps[session_start_idx];
-    let last = *timestamps.last()?;
+    let Some(last) = timestamps.last().copied() else {
+        return Ok(None);
+    };
     let duration = (last - session_start).num_minutes();
-    let count = i64::try_from(timestamps.len() - session_start_idx).ok()?;
+    let Ok(count) = i64::try_from(timestamps.len() - session_start_idx) else {
+        return Ok(None);
+    };
 
-    Some(SessionWindow {
+    Ok(Some(SessionWindow {
         session_start: session_start.to_rfc3339(),
         duration_minutes: duration,
         event_count: count,
-    })
+    }))
 }
 
 /// Summary of the session before the current one (across a >30min gap).
@@ -133,11 +141,11 @@ pub struct PreviousSessionSummary {
 ///
 /// Looks back up to 24 hours. Returns `None` if there is no gap (single
 /// continuous session) or if there are too few events to form a previous session.
-pub fn previous_session_summary(root: &Path) -> Option<PreviousSessionSummary> {
+pub fn previous_session_summary(root: &Path) -> Result<Option<PreviousSessionSummary>> {
     previous_session_summary_from_db(&event_db_path(root))
 }
 
-pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessionSummary> {
+pub fn previous_session_summary_from_db(db_path: &Path) -> Result<Option<PreviousSessionSummary>> {
     let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
 
     struct EventRow {
@@ -147,7 +155,7 @@ pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessio
         summary: String,
     }
 
-    let raw_events: Vec<(String, Option<String>, Option<String>, String)> =
+    let Some(raw_events): Option<Vec<(String, Option<String>, Option<String>, String)>> =
         with_event_db(db_path, |conn| {
             let mut stmt = conn.prepare(
                 "SELECT timestamp, entity_type, entity_id, summary FROM agent_events
@@ -160,7 +168,10 @@ pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessio
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
-        })?;
+        })?
+    else {
+        return Ok(None);
+    };
 
     let events: Vec<EventRow> = raw_events
         .into_iter()
@@ -178,7 +189,7 @@ pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessio
         .collect();
 
     if events.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     // Find the last gap > 30 minutes (same logic as session_window).
@@ -190,15 +201,21 @@ pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessio
     }
 
     // No gap → no previous session.
-    let gap_idx = last_gap_idx?;
+    let Some(gap_idx) = last_gap_idx else {
+        return Ok(None);
+    };
 
     let prev_events = &events[..gap_idx];
     if prev_events.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let event_count = i64::try_from(prev_events.len()).ok()?;
-    let last_event = prev_events.last()?;
+    let Ok(event_count) = i64::try_from(prev_events.len()) else {
+        return Ok(None);
+    };
+    let Some(last_event) = prev_events.last() else {
+        return Ok(None);
+    };
     let duration_minutes = (last_event.timestamp - prev_events[0].timestamp).num_minutes();
 
     // Mode of (entity_type, entity_id).
@@ -215,21 +232,21 @@ pub fn previous_session_summary_from_db(db_path: &Path) -> Option<PreviousSessio
 
     let last_action = last_event.summary.clone();
 
-    Some(PreviousSessionSummary {
+    Ok(Some(PreviousSessionSummary {
         event_count,
         duration_minutes,
         primary_entity,
         last_action,
-    })
+    }))
 }
 
 /// Returns file paths from `file_save` events in the last 15 minutes,
 /// grouped by path with save counts, most frequent first (up to 10).
-pub fn recent_file_areas(root: &Path) -> Vec<RecentFileArea> {
+pub fn recent_file_areas(root: &Path) -> Result<Vec<RecentFileArea>> {
     recent_file_areas_from_db(&event_db_path(root))
 }
 
-pub fn recent_file_areas_from_db(db_path: &Path) -> Vec<RecentFileArea> {
+pub fn recent_file_areas_from_db(db_path: &Path) -> Result<Vec<RecentFileArea>> {
     let cutoff = (Utc::now() - Duration::minutes(15)).to_rfc3339();
     with_event_db(db_path, |conn| {
         let mut stmt = conn.prepare(
@@ -247,17 +264,19 @@ pub fn recent_file_areas_from_db(db_path: &Path) -> Vec<RecentFileArea> {
         Ok(rows)
     })
     .map(|rows| {
-        rows.into_iter()
-            .filter_map(|(summary, count)| {
-                let path = summary.strip_prefix("file saved: ")?;
-                Some(RecentFileArea {
-                    file_path: path.to_string(),
-                    save_count: count as usize,
+        rows.map(|rows| {
+            rows.into_iter()
+                .filter_map(|(summary, count)| {
+                    let path = summary.strip_prefix("file saved: ")?;
+                    Some(RecentFileArea {
+                        file_path: path.to_string(),
+                        save_count: count as usize,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .unwrap_or_default()
     })
-    .unwrap_or_default()
 }
 
 /// Extract the first path component (top-level directory) from a file path.
@@ -272,14 +291,14 @@ fn top_directory(path: &str) -> Option<&str> {
 ///
 /// Returns the top 3 directory prefixes by save count. If no session data or
 /// no file saves exist, returns an empty vec.
-pub fn infer_entity_scope(root: &Path) -> Vec<String> {
+pub fn infer_entity_scope(root: &Path) -> Result<Vec<String>> {
     infer_entity_scope_from_db(&event_db_path(root))
 }
 
-pub fn infer_entity_scope_from_db(db_path: &Path) -> Vec<String> {
-    let session = match session_window_from_db(db_path) {
+pub fn infer_entity_scope_from_db(db_path: &Path) -> Result<Vec<String>> {
+    let session = match session_window_from_db(db_path)? {
         Some(s) => s,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
 
     let summaries: Vec<String> = with_event_db(db_path, |conn| {
@@ -292,7 +311,7 @@ pub fn infer_entity_scope_from_db(db_path: &Path) -> Vec<String> {
             .query_map([&session.session_start], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    })
+    })?
     .unwrap_or_default();
 
     let mut dir_counts: HashMap<String, usize> = HashMap::new();
@@ -306,7 +325,7 @@ pub fn infer_entity_scope_from_db(db_path: &Path) -> Vec<String> {
 
     let mut dirs: Vec<(String, usize)> = dir_counts.into_iter().collect();
     dirs.sort_by_key(|dir| std::cmp::Reverse(dir.1));
-    dirs.into_iter().take(3).map(|(d, _)| d).collect()
+    Ok(dirs.into_iter().take(3).map(|(d, _)| d).collect())
 }
 
 /// Result of drift detection: files being edited outside the session's established scope.
@@ -367,16 +386,16 @@ pub struct ActivityContext {
 }
 
 impl ActivityContext {
-    pub fn collect(root: &Path) -> Self {
+    pub fn collect(root: &Path) -> Result<Self> {
         Self::collect_from_db(&event_db_path(root))
     }
 
-    pub fn collect_from_db(db_path: &Path) -> Self {
-        Self {
-            active_entity: active_entity_from_db(db_path),
-            session: session_window_from_db(db_path),
-            recent_files: recent_file_areas_from_db(db_path),
-        }
+    pub fn collect_from_db(db_path: &Path) -> Result<Self> {
+        Ok(Self {
+            active_entity: active_entity_from_db(db_path)?,
+            session: session_window_from_db(db_path)?,
+            recent_files: recent_file_areas_from_db(db_path)?,
+        })
     }
 }
 
@@ -804,8 +823,8 @@ mod tests {
             "s",
         );
         let result = active_entity(&root);
-        assert!(result.is_some());
-        let ae = result.unwrap();
+        assert!(result.as_ref().unwrap().is_some());
+        let ae = result.unwrap().unwrap();
         assert_eq!(ae.entity_type, "goal");
         assert_eq!(ae.entity_id, "g1");
         assert_eq!(ae.event_count, 2);
@@ -816,7 +835,7 @@ mod tests {
         let (_tmp, root) = setup_workspace();
         let old = (Utc::now() - Duration::minutes(20)).to_rfc3339();
         insert_event_at(&root, "e1", &old, "command", Some("goal"), Some("g1"), "s");
-        assert!(active_entity(&root).is_none());
+        assert!(active_entity(&root).unwrap().is_none());
     }
 
     #[test]
@@ -830,7 +849,9 @@ mod tests {
         insert_event_at(&root, "e1", &old, "command", None, None, "old");
         insert_event_at(&root, "e2", &recent1, "command", None, None, "r1");
         insert_event_at(&root, "e3", &recent2, "command", None, None, "r2");
-        let sw = session_window(&root).expect("should find session");
+        let sw = session_window(&root)
+            .expect("query session")
+            .expect("should find session");
         assert_eq!(sw.event_count, 2); // only events after the gap
     }
 
@@ -865,7 +886,7 @@ mod tests {
             None,
             "file saved: src/lib.rs",
         );
-        let areas = recent_file_areas(&root);
+        let areas = recent_file_areas(&root).expect("query recent files");
         assert_eq!(areas.len(), 2);
         assert_eq!(areas[0].file_path, "src/main.rs");
         assert_eq!(areas[0].save_count, 2);
@@ -999,7 +1020,7 @@ mod tests {
             "file saved: src/main.rs",
         );
 
-        let scope = infer_entity_scope(&root);
+        let scope = infer_entity_scope(&root).expect("infer entity scope");
         assert!(!scope.is_empty());
         assert!(scope.contains(&"crates".to_string()));
         assert!(scope.contains(&"src".to_string()));

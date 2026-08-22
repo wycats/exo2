@@ -388,9 +388,8 @@ pub fn install_gitattributes(root: &std::path::Path) -> Result<bool, std::io::Er
 
 /// Configure the repo-local merge driver for generated SQL dumps.
 ///
-/// The driver intentionally exits successfully without touching `%A`, which
-/// leaves the current branch version in place and marks generated dumps as
-/// resolved during merges.
+/// The driver keeps generated SQL from the current branch while preserving the
+/// maximum compatible writer generation in `epochs.sql`.
 pub fn configure_sql_dump_merge_driver(root: &std::path::Path) -> Result<bool, std::io::Error> {
     if !is_git_worktree(root)? {
         return Ok(false);
@@ -404,12 +403,14 @@ pub fn configure_sql_dump_merge_driver(root: &std::path::Path) -> Result<bool, s
     git_config_set(
         root,
         &name_key,
-        "Keep generated Exo SQL dump from current branch",
+        "Keep generated Exo SQL dump with writer compatibility metadata",
     )?;
-    git_config_set(root, &driver_key, "true")?;
+    let driver = "exo merge-driver sql %O %A %B %P";
+    git_config_set(root, &driver_key, driver)?;
 
-    Ok(before_driver.as_deref() != Some("true")
-        || before_name.as_deref() != Some("Keep generated Exo SQL dump from current branch"))
+    Ok(before_driver.as_deref() != Some(driver)
+        || before_name.as_deref()
+            != Some("Keep generated Exo SQL dump with writer compatibility metadata"))
 }
 
 /// Returns whether the repo-local SQL dump merge driver is configured.
@@ -421,7 +422,7 @@ pub fn sql_dump_merge_driver_configured(root: &std::path::Path) -> Result<bool, 
     let config = crate::git_config::read_repo_git_config(root, &git_common_dir.join("config"))?;
     Ok(
         crate::git_config::last_value(&config, "merge", Some(SQL_DUMP_MERGE_DRIVER), "driver")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            .is_some_and(|value| value == "exo merge-driver sql %O %A %B %P"),
     )
 }
 
@@ -498,9 +499,7 @@ mod tests {
 
         let config_path = repo.join(".git/config");
         let mut config = std::fs::read_to_string(&config_path).expect("read config");
-        config.push_str(
-            "\n[merge \"exo-sql-dump\"]\n\tdriver = false\n[merge \"exo-sql-dump\"]\n\tdriver = true\n",
-        );
+        config.push_str("\n[merge \"exo-sql-dump\"]\n\tdriver = false\n[merge \"exo-sql-dump\"]\n\tdriver = exo merge-driver sql %O %A %B %P\n");
         std::fs::write(&config_path, config).expect("write config");
 
         assert!(sql_dump_merge_driver_configured(repo).expect("read merge driver"));

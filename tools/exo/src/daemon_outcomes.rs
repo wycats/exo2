@@ -338,22 +338,31 @@ impl RequestOutcomeLedger {
     /// Return whether an atomic request may execute and therefore needs current
     /// project preparation. Completed, conflicting, and same-instance in-flight
     /// requests are resolved by the outcome ledger before mutable preparation.
+    #[cfg(test)]
     pub(crate) fn atomic_request_needs_preparation(
         &self,
         request: &RequestEnvelope,
         project_db_path: &Path,
         instance_id: &str,
     ) -> Result<bool> {
+        self.atomic_request_needs_preparation_after_compatibility_preflight(
+            request,
+            project_db_path,
+            instance_id,
+            || Ok(()),
+        )
+    }
+
+    pub(crate) fn atomic_request_needs_preparation_after_compatibility_preflight(
+        &self,
+        request: &RequestEnvelope,
+        project_db_path: &Path,
+        instance_id: &str,
+        preflight: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
         let request_hashes = request_hashes(request)?;
         let runtime_outcome = self.runtime_outcome_state(&request.id, &request_hashes);
         if matches!(runtime_outcome, Ok(RuntimeOutcomeState::Terminal))
-            || matches!(
-                &runtime_outcome,
-                Ok(RuntimeOutcomeState::InFlight {
-                    instance_id: owner,
-                    ..
-                }) if owner == instance_id
-            )
             || matches!(
                 &runtime_outcome,
                 Ok(RuntimeOutcomeState::InFlight {
@@ -369,6 +378,16 @@ impl RequestOutcomeLedger {
                 })
             )
         {
+            return Ok(false);
+        }
+        preflight()?;
+        if matches!(
+            &runtime_outcome,
+            Ok(RuntimeOutcomeState::InFlight {
+                instance_id: owner,
+                ..
+            }) if owner == instance_id
+        ) {
             return Ok(false);
         }
         let canonical_outcome = canonical_atomic_outcome_exists(project_db_path, &request.id);
@@ -796,6 +815,39 @@ impl RequestOutcomeLedger {
         F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
         G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
     {
+        self.execute_atomic_project_state_after_compatibility_preflight(
+            request,
+            effect,
+            instance_id,
+            in_flight_wait,
+            project_db_path,
+            || Ok(()),
+            execute,
+            finalize,
+        )
+    }
+
+    /// Execute an atomic request while fencing the canonical lookup used when
+    /// a same-instance reservation times out. The preflight runs immediately
+    /// before that lookup so a changed projection cannot bypass the writer
+    /// compatibility contract during recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_atomic_project_state_after_compatibility_preflight<F, G, P>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        instance_id: &str,
+        in_flight_wait: Duration,
+        project_db_path: &Path,
+        timeout_preflight: P,
+        execute: F,
+        finalize: G,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
+        P: FnOnce() -> Result<()>,
+    {
         let request_id = request.id.clone();
         let request_hashes = match request_hashes(&request) {
             Ok(hashes) => hashes,
@@ -846,6 +898,18 @@ impl RequestOutcomeLedger {
                         };
                     }
                     Ok(WaitForResponse::TimedOut) => {
+                        if let Err(error) = timeout_preflight() {
+                            return OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_lookup_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            };
+                        }
                         match canonical_atomic_outcome_exists(project_db_path, &request_id) {
                             Ok(true) => false,
                             Ok(false) => {
@@ -1121,6 +1185,28 @@ impl RequestOutcomeLedger {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn reserve_atomic_request_for_test(
+        &self,
+        request: &RequestEnvelope,
+        effect: Effect,
+        instance_id: &str,
+    ) -> Result<()> {
+        let request_hashes = request_hashes(request)?;
+        match self.reserve_compatible(
+            &request.id,
+            &request_hashes,
+            effect,
+            RecoveryClass::AtomicProjectState,
+            instance_id,
+        )? {
+            Reservation::Execute => Ok(()),
+            reservation => Err(anyhow!(
+                "expected a new atomic reservation, got {reservation:?}"
+            )),
+        }
+    }
+
     fn reserve_compatible(
         &self,
         request_id: &str,
@@ -1355,7 +1441,8 @@ impl RequestOutcomeLedger {
                 .collect::<std::result::Result<HashSet<_>, _>>()?
         };
 
-        let mut project_connection = Connection::open(project_db_path)
+        let mut project_connection = exosuit_storage::open_fenced_connection(project_db_path)
+            .map_err(crate::storage_compatibility::map_database_error)
             .with_context(|| format!("open project database {}", project_db_path.display()))?;
         project_connection.pragma_update(None, "busy_timeout", 0)?;
         let project_transaction =
@@ -1398,7 +1485,8 @@ fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> 
     if !project_db_path.exists() {
         return Ok(false);
     }
-    let connection = Connection::open_with_flags(project_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let connection = exosuit_storage::open_fenced_connection(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
         .with_context(|| {
             format!(
                 "open canonical atomic outcome database {}",
@@ -1569,8 +1657,9 @@ where
     H: FnOnce() -> Result<()>,
 {
     let request_id = request.id.clone();
-    let transaction =
-        RequestTransaction::begin(project_db_path).context("begin atomic request transaction")?;
+    let transaction = RequestTransaction::begin(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("begin atomic request transaction")?;
     let existing = transaction
         .database()
         .connection()
@@ -1635,7 +1724,9 @@ where
         ],
     )?;
     before_commit()?;
-    transaction.commit()?;
+    transaction
+        .commit()
+        .map_err(crate::storage_compatibility::map_database_error)?;
 
     Ok(AtomicCoreExecution {
         response,
@@ -1945,6 +2036,20 @@ fn ledger_error_response(
     error: anyhow::Error,
     mutation_may_have_completed: bool,
 ) -> ResponseEnvelope {
+    if let Some(failure) =
+        crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+    {
+        return response_error(
+            id,
+            effect,
+            failure.error.code,
+            failure.error.message,
+            failure
+                .error
+                .details
+                .unwrap_or_else(|| serde_json::json!({})),
+        );
+    }
     response_error(
         id.clone(),
         effect,
@@ -1969,6 +2074,32 @@ mod tests {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
+
+    #[test]
+    fn wrapped_writer_compatibility_error_survives_atomic_daemon_response() {
+        let error = crate::storage_compatibility::map_writer_compatibility_error(
+            exosuit_storage::WriterCompatibilityError::Busy {
+                lock_path: std::path::PathBuf::from("/tmp/exo.writer-compat.lock"),
+            },
+        )
+        .context("begin atomic request transaction");
+
+        let response = ledger_error_response(
+            "request-compat".to_string(),
+            Effect::Write,
+            "daemon.atomic_request_commit_failed",
+            error,
+            false,
+        );
+
+        let error = response.error.expect("structured error");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        let details = error.details.expect("compatibility details");
+        assert_eq!(details["kind"], "storage.compatibility_busy");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], true);
+    }
 
     fn request(id: &str, task_id: &str) -> RequestEnvelope {
         RequestEnvelope {

@@ -111,7 +111,7 @@ fn log_command_event(
         return Ok(true);
     }
 
-    Ok(crate::event_db::with_event_db(&db_path, insert).is_some())
+    Ok(crate::event_db::with_event_db(&db_path, insert)?.is_some())
 }
 
 /// Generate display metadata from a command result.
@@ -2409,6 +2409,33 @@ fn handle_call_with_namespace_operation(
 }
 
 fn command_construction_error_to_response(id: String, err: anyhow::Error) -> ResponseEnvelope {
+    if let Some(failure) =
+        crate::storage_compatibility::writer_compatibility_failure_from_error(&err)
+    {
+        let details = merge_error_details_with_sibling_steering(
+            failure.error.details.clone(),
+            json!(failure.steering.clone()),
+        );
+        return ResponseEnvelope {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            id,
+            status: failure.status,
+            result: None,
+            error: Some(ErrorBody {
+                code: failure.error.code,
+                message: failure.error.message.clone(),
+                details,
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: None,
+            trace: None,
+        };
+    }
+
     if let Some(failure) = err.downcast_ref::<ExoFailure>() {
         let details = merge_error_details(
             failure.error.details.clone(),
@@ -2804,6 +2831,23 @@ fn merge_error_details(
     }
 }
 
+fn merge_error_details_with_sibling_steering(
+    details: Option<JsonValue>,
+    steering: JsonValue,
+) -> Option<JsonValue> {
+    match details {
+        None => Some(json!({ "steering": steering })),
+        Some(JsonValue::Object(mut details)) => {
+            details.insert("steering".to_string(), steering);
+            Some(JsonValue::Object(details))
+        }
+        Some(details) => Some(json!({
+            "details": details,
+            "steering": steering,
+        })),
+    }
+}
+
 fn list_params_to_argv(params: &ListParams) -> Vec<String> {
     let mut argv = Vec::new();
     if let Address::Namespace { path } = &params.address {
@@ -3166,6 +3210,7 @@ mod tests {
                     },
                 )
             })
+            .expect("open event database")
             .expect("read logged launch event");
         assert_eq!(
             event,
@@ -3325,6 +3370,63 @@ mod tests {
                 .iter()
                 .any(|action| action["command"] == "exo sidecar checkpoint"),
             "{details:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_storage_compatibility_errors_preserve_mcp_response_contract() {
+        for (error, expected_kind, retryable) in [
+            (
+                exosuit_storage::WriterCompatibilityError::Incompatible {
+                    required_generation: 1,
+                    supported_generation: 0,
+                    surface: exosuit_storage::StateSurface::Database,
+                },
+                "storage.writer_incompatible",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::MetadataInvalid {
+                    surface: exosuit_storage::StateSurface::Projection,
+                    reason: "bad header".to_string(),
+                },
+                "storage.writer_metadata_invalid",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::Busy {
+                    lock_path: std::path::PathBuf::from("/tmp/exo.writer-compat.lock"),
+                },
+                "storage.compatibility_busy",
+                true,
+            ),
+        ] {
+            let wrapped = crate::storage_compatibility::map_writer_compatibility_error(error)
+                .context("MCP context preload")
+                .context("command construction");
+            let response =
+                command_construction_error_to_response("wrapped-storage".to_string(), wrapped);
+            let error = response.error.expect("error body");
+            assert_eq!(error.code, ErrorCode::PreconditionFailed);
+            let details = error.details.expect("error details");
+            assert_eq!(details["kind"], expected_kind);
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+            assert_eq!(details["retryable"], retryable);
+            assert!(details["steering"].is_object(), "{details:?}");
+            assert!(
+                details.get("details").is_none(),
+                "compatibility fields must not be nested: {details:?}"
+            );
+        }
+
+        let unrelated = command_construction_error_to_response(
+            "unrelated".to_string(),
+            anyhow::anyhow!("ordinary construction failure").context("wrapped"),
+        );
+        assert_eq!(
+            unrelated.error.expect("error body").code,
+            ErrorCode::Internal
         );
     }
 

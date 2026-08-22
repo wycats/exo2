@@ -20,7 +20,7 @@ use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
 use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
-use exosuit_storage::rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use exosuit_storage::rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
@@ -1994,7 +1994,8 @@ struct RepairPlanCandidate {
 
 impl RepairPlanCandidate {
     fn build(canonical_db_path: &Path, candidate: &SplitBrainCandidate) -> ExoResult<Self> {
-        let conn = Connection::open_with_flags(canonical_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let conn = exosuit_storage::open_fenced_connection(canonical_db_path)
+            .map_err(crate::storage_compatibility::map_database_error)
             .with_context(|| format!("Failed to open DB {}", canonical_db_path.display()))?;
         attach_legacy(&conn, &candidate.db_path)?;
 
@@ -2370,7 +2371,8 @@ fn apply_repair_plan(
     }
 
     let backup_path = backup_canonical_db(paths)?;
-    let mut conn = Connection::open(&paths.db_path)
+    let mut conn = exosuit_storage::open_fenced_connection(&paths.db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
         .with_context(|| format!("Failed to open DB {}", paths.db_path.display()))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
@@ -2966,7 +2968,8 @@ fn count_exo_rows(path: &Path) -> ExoResult<Vec<TableRows>> {
         ("agent_events", true),
     ];
 
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = exosuit_storage::open_fenced_connection(path)
+        .map_err(crate::storage_compatibility::map_database_error)
         .with_context(|| format!("Failed to open DB {}", path.display()))?;
     let mut rows = Vec::new();
 

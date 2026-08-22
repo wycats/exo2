@@ -1208,18 +1208,21 @@ pub(crate) fn init_sidecar_with_resolver(
         Some(root) => root,
         None => resolver.default_sidecar_root()?,
     };
-    let mut link =
-        link_sidecar_with_options_and_resolver(cwd, &key, &root, options.auto_push, resolver)?;
-    if options.seed_from_repo {
-        link.seeded_from_repo = seed_sidecar_projection_from_repo(cwd, &link.projection_dir)?;
-    }
-    if link.db_created {
-        import_sidecar_projection_to_db(&link.projection_dir, &link.db_path)?;
-    }
-    if options.init_git {
-        link.git_initialized = ensure_sidecar_root_git_repo(&root)?;
-    }
-    Ok(link)
+    let seed_projection = if options.seed_from_repo {
+        crate::context::preflight_sql_dumps(&cwd.join("docs/agent-context"))?
+    } else {
+        None
+    };
+    establish_sidecar_with_options_and_resolver(
+        cwd,
+        &key,
+        &root,
+        options.auto_push,
+        resolver,
+        seed_projection.as_ref(),
+        options.init_git,
+        || {},
+    )
 }
 
 pub fn resolve_sidecar_identity(
@@ -1269,9 +1272,41 @@ pub(crate) fn link_sidecar_with_options_and_resolver(
     auto_push: Option<SidecarAutoPushPolicy>,
     resolver: &ProjectResolver,
 ) -> ExoResult<SidecarLink> {
+    establish_sidecar_with_options_and_resolver(
+        cwd,
+        key,
+        root,
+        auto_push,
+        resolver,
+        None,
+        false,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn establish_sidecar_with_options_and_resolver(
+    cwd: &Path,
+    key: &str,
+    root: &Path,
+    auto_push: Option<SidecarAutoPushPolicy>,
+    resolver: &ProjectResolver,
+    seed_projection: Option<&crate::context::PreflightedSqlProjection>,
+    init_git: bool,
+    before_authority: impl FnOnce(),
+) -> ExoResult<SidecarLink> {
     if key.trim().is_empty() {
         anyhow::bail!("sidecar key must not be empty");
     }
+
+    let intended_db_path = root.join("projects").join(key).join("cache").join("exo.db");
+    exosuit_storage::preflight_database(&intended_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight existing sidecar database")?;
+    before_authority();
+    let authority = exosuit_storage::acquire_exclusive_compatibility_authority(&intended_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to acquire sidecar database compatibility authority")?;
 
     let project_before_policy = resolver.resolve(cwd)?;
     let config_path = resolver.local_projects_config_path()?;
@@ -1319,8 +1354,41 @@ pub(crate) fn link_sidecar_with_options_and_resolver(
             .with_context(|| format!("Failed to create DB directory {}", parent.display()))?;
     }
     let db_created = !db_path.exists();
-    let _db = exosuit_storage::open_database(&db_path)
-        .map_err(|error| anyhow!("Failed to create sidecar database: {error}"))?;
+    let seeded_from_repo = if let Some(projection) = seed_projection {
+        seed_sidecar_projection_from_repo(projection, &projection_dir)?
+    } else {
+        false
+    };
+
+    enum HeldSidecarDatabase {
+        Database {
+            _guard: exosuit_storage::Database,
+        },
+        Projection {
+            _guard: exosuit_storage::FencedConnection,
+        },
+    }
+    let held_database = if db_created && let Some(projection) = seed_projection {
+        HeldSidecarDatabase::Projection {
+            _guard: crate::context::import_preflighted_sql_dumps_with_authority(
+                projection.clone(),
+                authority,
+            )?,
+        }
+    } else {
+        HeldSidecarDatabase::Database {
+            _guard: exosuit_storage::open_database_with_exclusive_authority(authority)
+                .map_err(crate::storage_compatibility::map_database_error)
+                .context("Failed to create sidecar database")?,
+        }
+    };
+
+    let git_initialized = if init_git {
+        ensure_sidecar_root_git_repo(root)?
+    } else {
+        false
+    };
+    drop(held_database);
 
     Ok(SidecarLink {
         project,
@@ -1331,8 +1399,8 @@ pub(crate) fn link_sidecar_with_options_and_resolver(
         projection_dir,
         db_path,
         db_created,
-        git_initialized: false,
-        seeded_from_repo: false,
+        git_initialized,
+        seeded_from_repo,
     })
 }
 
@@ -1449,12 +1517,10 @@ fn ensure_sidecar_runtime_gitignore(root: &Path) -> ExoResult<()> {
     Ok(())
 }
 
-fn seed_sidecar_projection_from_repo(cwd: &Path, projection_dir: &Path) -> ExoResult<bool> {
-    let repo_projection = cwd.join("docs/agent-context");
-    if !repo_projection.exists() {
-        return Ok(false);
-    }
-
+fn seed_sidecar_projection_from_repo(
+    projection: &crate::context::PreflightedSqlProjection,
+    projection_dir: &Path,
+) -> ExoResult<bool> {
     std::fs::create_dir_all(projection_dir).with_context(|| {
         format!(
             "Failed to create sidecar projection directory {}",
@@ -1463,66 +1529,20 @@ fn seed_sidecar_projection_from_repo(cwd: &Path, projection_dir: &Path) -> ExoRe
     })?;
 
     let mut copied_any = false;
-    for entry in std::fs::read_dir(&repo_projection).with_context(|| {
-        format!(
-            "Failed to read repo projection directory {}",
-            repo_projection.display()
-        )
-    })? {
-        let entry = entry.with_context(|| {
-            format!(
-                "Failed to read repo projection entry in {}",
-                repo_projection.display()
-            )
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("sql") {
-            continue;
-        }
-        let dest = projection_dir.join(entry.file_name());
+    for ((file_stem, table_name), (dump_table, content)) in
+        exosuit_storage::TABLE_ORDER.iter().zip(&projection.dumps)
+    {
+        debug_assert_eq!(*table_name, dump_table);
+        let dest = projection_dir.join(format!("{file_stem}.sql"));
         if dest.exists() {
             continue;
         }
-        std::fs::copy(&path, &dest).with_context(|| {
-            format!(
-                "Failed to seed sidecar projection {} from {}",
-                dest.display(),
-                path.display()
-            )
-        })?;
+        std::fs::write(&dest, content)
+            .with_context(|| format!("Failed to seed sidecar projection {}", dest.display()))?;
         copied_any = true;
     }
 
     Ok(copied_any)
-}
-
-fn import_sidecar_projection_to_db(projection_dir: &Path, db_path: &Path) -> ExoResult<()> {
-    let has_any_dump = exosuit_storage::TABLE_ORDER.iter().any(|(file_stem, _)| {
-        projection_dir
-            .join(format!("{file_stem}.sql"))
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > 0)
-    });
-    if !has_any_dump {
-        return Ok(());
-    }
-
-    let db = exosuit_storage::open_database(db_path)
-        .map_err(|error| anyhow!("Failed to open sidecar database: {error}"))?;
-    let mut dumps = Vec::new();
-    for (file_stem, table_name) in exosuit_storage::TABLE_ORDER {
-        let path = projection_dir.join(format!("{file_stem}.sql"));
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => {
-                return Err(error).with_context(|| format!("Failed to read {}", path.display()));
-            }
-        };
-        dumps.push((table_name.to_string(), content));
-    }
-    exosuit_storage::import_tables(db.connection(), &dumps)
-        .map_err(|error| anyhow!("Failed to import sidecar projection: {error}"))
 }
 
 pub fn unlink_sidecar(cwd: &Path) -> ExoResult<Option<(ProjectId, PathBuf)>> {
@@ -2162,5 +2182,164 @@ mod tests {
                     .join("agent-context")
             )
         );
+    }
+
+    #[test]
+    fn sidecar_init_rejects_incompatible_seed_before_policy_or_target_creation() {
+        let (temp, repo) = init_primary_repo();
+        let projection = repo.join("docs/agent-context");
+        std::fs::create_dir_all(&projection).unwrap();
+        std::fs::write(
+            projection.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .unwrap();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let config_path = resolver.local_projects_config_path().unwrap();
+
+        let error = init_sidecar_with_resolver(
+            &repo,
+            SidecarLinkOptions {
+                key: Some("incompatible-seed".to_string()),
+                root: Some(sidecar_root.clone()),
+                seed_from_repo: true,
+                ..SidecarLinkOptions::default()
+            },
+            &resolver,
+        )
+        .unwrap_err();
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!config_path.exists());
+        assert!(!sidecar_root.exists());
+    }
+
+    #[test]
+    fn sidecar_link_rejects_incompatible_target_before_policy_or_manifest_mutation() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/incompatible-target");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let connection = exosuit_storage::Connection::open(&db_path).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
+            )
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&db_path).unwrap();
+        let config_path = resolver.local_projects_config_path().unwrap();
+
+        let error = link_sidecar_with_options_and_resolver(
+            &repo,
+            "incompatible-target",
+            &sidecar_root,
+            None,
+            &resolver,
+        )
+        .unwrap_err();
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        assert!(!config_path.exists());
+        assert!(!project_dir.join("sidecar.toml").exists());
+        assert!(!project_dir.join("agent-context").exists());
+        assert!(!db_path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[test]
+    fn sidecar_link_rechecks_generation_before_first_mutation() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/racing-link");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        drop(exosuit_storage::Connection::open(&db_path).unwrap());
+        let config_path = resolver.local_projects_config_path().unwrap();
+
+        let error = establish_sidecar_with_options_and_resolver(
+            &repo,
+            "racing-link",
+            &sidecar_root,
+            None,
+            &resolver,
+            None,
+            false,
+            || {
+                let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
+                advancing.pragma_update(None, "user_version", 1).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!config_path.exists());
+        assert!(!project_dir.join("sidecar.toml").exists());
+        assert!(!project_dir.join("agent-context").exists());
+        let connection = exosuit_storage::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sidecar_init_rechecks_generation_before_policy_projection_or_git_mutation() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/racing-init");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        drop(exosuit_storage::Connection::open(&db_path).unwrap());
+        let config_path = resolver.local_projects_config_path().unwrap();
+
+        let error = establish_sidecar_with_options_and_resolver(
+            &repo,
+            "racing-init",
+            &sidecar_root,
+            None,
+            &resolver,
+            None,
+            true,
+            || {
+                let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
+                advancing.pragma_update(None, "user_version", 1).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!config_path.exists());
+        assert!(!project_dir.join("sidecar.toml").exists());
+        assert!(!project_dir.join("agent-context").exists());
+        assert!(!sidecar_root.join(".git").exists());
     }
 }

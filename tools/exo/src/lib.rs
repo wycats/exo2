@@ -99,6 +99,7 @@ pub mod shell_ops;
 pub mod state_machine;
 pub mod status;
 pub mod steering;
+pub mod storage_compatibility;
 pub mod structured_io;
 pub(crate) mod task;
 pub mod templates;

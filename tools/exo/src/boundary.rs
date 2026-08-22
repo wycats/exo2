@@ -46,6 +46,10 @@ pub fn box_anyhow_error<F>(e: anyhow::Error, fallback: F) -> Box<dyn std::error:
 where
     F: FnOnce(anyhow::Error) -> ExoFailure,
 {
+    if let Some(failure) = crate::storage_compatibility::writer_compatibility_failure_from_error(&e)
+    {
+        return Box::new(failure);
+    }
     match e.downcast::<ExoFailure>() {
         Ok(f) => Box::new(f),
         Err(e) => Box::new(fallback(e)),
@@ -67,7 +71,7 @@ pub fn box_anyhow_internal_with_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::AnyhowBox;
+    use super::{AnyhowBox, box_anyhow_error};
     use crate::api::protocol::ErrorCode;
     use crate::failure::ExoFailure;
     use crate::steering::SteeringBlock;
@@ -106,5 +110,30 @@ mod tests {
         let boxed = AnyhowBox(e);
 
         assert!(causes_include_exo_failure(&boxed));
+    }
+
+    #[test]
+    fn boxed_cli_boundary_preserves_wrapped_storage_compatibility_failure() {
+        let error = crate::storage_compatibility::map_writer_compatibility_error(
+            exosuit_storage::WriterCompatibilityError::Busy {
+                lock_path: std::path::PathBuf::from("/tmp/exo.writer-compat.lock"),
+            },
+        )
+        .context("CLI command construction");
+
+        let boxed = box_anyhow_error(error, |_| {
+            panic!("wrapped storage compatibility must not use the internal fallback")
+        });
+        let failure = boxed
+            .downcast_ref::<ExoFailure>()
+            .expect("typed storage failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.compatibility_busy"
+        );
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["retry_with_same_request_id"],
+            true
+        );
     }
 }

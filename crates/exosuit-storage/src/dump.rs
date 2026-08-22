@@ -42,6 +42,10 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::compatibility::{
+    read_database_generation, with_projection_generation, WriterCompatibilityError,
+};
+
 /// A single table's SQL dump: (table_name, sql_content).
 pub type TableDump = (String, String);
 
@@ -84,6 +88,24 @@ pub const TABLE_ORDER: &[(&str, &str)] = &[
 ///
 /// The `id` (rowid) column is omitted from all output — it is reassigned on import.
 pub fn dump_tables(conn: &Connection) -> Result<Vec<TableDump>, DumpError> {
+    conn.execute_batch("SAVEPOINT exo_projection_snapshot")?;
+    let result = dump_tables_from_snapshot(conn);
+    match result {
+        Ok(dumps) => {
+            conn.execute_batch("RELEASE SAVEPOINT exo_projection_snapshot")?;
+            Ok(dumps)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT exo_projection_snapshot; \
+                 RELEASE SAVEPOINT exo_projection_snapshot",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn dump_tables_from_snapshot(conn: &Connection) -> Result<Vec<TableDump>, DumpError> {
     let mut results = Vec::new();
 
     // Build text_id lookup maps for FK resolution.
@@ -106,13 +128,16 @@ pub fn dump_tables(conn: &Connection) -> Result<Vec<TableDump>, DumpError> {
 
     // === Entity tables (sorted by text_id) ===
 
-    results.push(dump_entity_table(
+    let mut epochs = dump_entity_table(
         conn,
         "epochs_data",
         &["text_id", "title", "slug", "reviewed", "sort_key"],
         &[],
         &HashMap::new(),
-    )?);
+    )?;
+    let generation = read_database_generation(conn)?;
+    epochs.1 = with_projection_generation(&epochs.1, generation)?;
+    results.push(epochs);
 
     results.push(dump_entity_table(
         conn,
@@ -368,6 +393,9 @@ pub enum DumpError {
 
     #[error("Unknown entity type in entity_aliases: {0}")]
     UnknownEntityType(String),
+
+    #[error(transparent)]
+    WriterCompatibility(#[from] WriterCompatibilityError),
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────
@@ -750,6 +778,9 @@ pub enum ImportError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("Projection preflight database error: {0}")]
+    Database(#[from] crate::DatabaseError),
+
     #[error("Parse error in {table} line {line}: {message}")]
     Parse {
         table: String,
@@ -763,6 +794,17 @@ pub enum ImportError {
         column: String,
         text_id: String,
     },
+}
+
+/// Validate every portable SQL row without opening or mutating a database.
+///
+/// Import performs the same parsing again while resolving foreign keys. Keeping
+/// this preflight separate lets callers reject malformed projection input
+/// before creating the target directory or SQLite file.
+pub fn validate_tables(dumps: &[TableDump]) -> Result<(), ImportError> {
+    let conn = Connection::open_in_memory()?;
+    crate::run_migrations(&conn)?;
+    import_tables(&conn, dumps)
 }
 
 /// FK column mappings: (dump_column_name, real_column_name, lookup_table)
@@ -1418,17 +1460,18 @@ mod tests {
 
         // Should be sorted by text_id
         let lines: Vec<&str> = epochs_sql.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("'01EPOCH_AAA'"));
-        assert!(lines[1].contains("'01EPOCH_BBB'"));
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "-- exo:minimum-writer-generation=0");
+        assert!(lines[1].contains("'01EPOCH_AAA'"));
+        assert!(lines[2].contains("'01EPOCH_BBB'"));
 
         // Should NOT contain 'id' column
-        assert!(!lines[0].contains("INSERT INTO epochs_data(id,"));
+        assert!(!lines[1].contains("INSERT INTO epochs_data(id,"));
 
         // Should contain all expected columns
-        assert!(lines[0].contains("text_id"));
-        assert!(lines[0].contains("title"));
-        assert!(lines[0].contains("sort_key"));
+        assert!(lines[1].contains("text_id"));
+        assert!(lines[1].contains("title"));
+        assert!(lines[1].contains("sort_key"));
     }
 
     #[test]
@@ -1685,13 +1728,18 @@ mod tests {
 
         let dumps = dump_tables(conn).expect("dump should succeed");
 
-        // All registered projection tables should be present but empty.
+        // All registered projection tables should be present. epochs.sql keeps
+        // its required generation carrier even with no entity rows.
         assert_eq!(dumps.len(), TABLE_ORDER.len());
         for (name, sql) in &dumps {
-            assert!(
-                sql.is_empty(),
-                "table {name} should be empty but got: {sql}"
-            );
+            if name == "epochs_data" {
+                assert_eq!(sql, "-- exo:minimum-writer-generation=0\n");
+            } else {
+                assert!(
+                    sql.is_empty(),
+                    "table {name} should be empty but got: {sql}"
+                );
+            }
         }
     }
 
@@ -1848,8 +1896,13 @@ mod tests {
         dumps
             .into_iter()
             .map(|(name, sql)| {
-                let with_header =
-                    format!("-- Auto-generated by exo. Regenerate: exo status\n{sql}");
+                let generated = "-- Auto-generated by exo. Regenerate: exo status\n";
+                let with_header = if name == "epochs_data" {
+                    let (generation, body) = sql.split_once('\n').unwrap();
+                    format!("{generation}\n{generated}{body}")
+                } else {
+                    format!("{generated}{sql}")
+                };
                 (name, with_header)
             })
             .collect()
@@ -1958,7 +2011,11 @@ mod tests {
 
         let dumps2 = dump_tables(db2.connection()).expect("second dump should succeed");
         for (name, sql) in &dumps2 {
-            assert!(sql.is_empty(), "table {name} should still be empty");
+            if name == "epochs_data" {
+                assert_eq!(sql, "-- exo:minimum-writer-generation=0\n");
+            } else {
+                assert!(sql.is_empty(), "table {name} should still be empty");
+            }
         }
     }
 
@@ -1972,6 +2029,27 @@ mod tests {
             SqlValue::Text(s) => assert_eq!(s, "It's a test"),
             other => panic!("expected Text, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn validate_tables_rejects_a_malformed_later_projection_row() {
+        let dumps = vec![
+            (
+                "epochs_data".to_string(),
+                "-- exo:minimum-writer-generation=0\n".to_string(),
+            ),
+            ("phases_data".to_string(), "not sql\n".to_string()),
+        ];
+
+        let error = validate_tables(&dumps).expect_err("malformed row must fail preflight");
+        assert!(matches!(
+            error,
+            ImportError::Parse {
+                table,
+                line: 1,
+                ..
+            } if table == "phases_data"
+        ));
     }
 
     #[test]
@@ -2010,14 +2088,11 @@ mod tests {
         let dumps = dump_tables(conn).expect("dump should succeed");
         let (_, epochs_sql) = &dumps[0];
         let lines: Vec<&str> = epochs_sql.lines().collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "should be exactly one line (newlines escaped)"
-        );
-        assert!(lines[0].contains("\\n"), "should contain escaped newline");
+        assert_eq!(lines.len(), 2, "metadata plus one entity line expected");
+        assert_eq!(lines[0], "-- exo:minimum-writer-generation=0");
+        assert!(lines[1].contains("\\n"), "should contain escaped newline");
         assert!(
-            !lines[0].contains('\n'),
+            !lines[1].contains('\n'),
             "should not contain literal newline"
         );
 

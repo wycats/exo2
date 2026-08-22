@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use exosuit_storage::rusqlite::{Connection, ErrorCode, OpenFlags};
+use exosuit_storage::FencedConnection;
+use exosuit_storage::rusqlite::{Connection, ErrorCode};
 
 /// Per-path connections. The map lock is only held to look up or insert an
 /// entry; queries run under the per-connection lock so different DBs don't
 /// serialize each other and `f` can't deadlock against the map.
-static CONNECTIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<Connection>>>>> =
+static CONNECTIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<FencedConnection>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long a resolved root → DB path stays valid before re-resolving.
@@ -87,26 +88,21 @@ fn connection_is_broken(error: &exosuit_storage::rusqlite::Error) -> bool {
 pub fn with_event_db<T>(
     db_path: &Path,
     f: impl FnOnce(&Connection) -> exosuit_storage::rusqlite::Result<T>,
-) -> Option<T> {
+) -> anyhow::Result<Option<T>> {
     let entry = {
         let mut connections = lock_unpoisoned(&CONNECTIONS);
         match connections.get(db_path) {
             Some(entry) => Arc::clone(entry),
             None => {
                 if !db_path.exists() {
-                    return None;
+                    return Ok(None);
                 }
                 // No-create open: event access must never mint a fresh DB.
-                let conn = Connection::open_with_flags(
-                    db_path,
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-                )
-                .ok()?;
-                if conn.pragma_update(None, "journal_mode", "wal").is_err()
-                    || conn.pragma_update(None, "busy_timeout", 5000).is_err()
-                {
-                    return None;
-                }
+                let Some(conn) = exosuit_storage::open_fenced_existing_connection(db_path)
+                    .map_err(crate::storage_compatibility::map_database_error)?
+                else {
+                    return Ok(None);
+                };
                 let entry = Arc::new(Mutex::new(conn));
                 connections.insert(db_path.to_path_buf(), Arc::clone(&entry));
                 entry
@@ -117,12 +113,45 @@ pub fn with_event_db<T>(
 
     let conn = lock_unpoisoned(&entry);
     match f(&conn) {
-        Ok(value) => Some(value),
+        Ok(value) => Ok(Some(value)),
         Err(error) => {
             if connection_is_broken(&error) {
                 lock_unpoisoned(&CONNECTIONS).remove(db_path);
             }
-            None
+            Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_consumer_preserves_writer_compatibility_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("exo.db");
+        let connection = exosuit_storage::Connection::open(&path).expect("create database");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("raise writer generation");
+        drop(connection);
+
+        let error = with_event_db(&path, |_| Ok(())).expect_err("reject newer writer");
+        let failure = error
+            .downcast_ref::<crate::failure::ExoFailure>()
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["request_outcome_checked"],
+            false
+        );
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["retry_with_same_request_id"],
+            true
+        );
     }
 }

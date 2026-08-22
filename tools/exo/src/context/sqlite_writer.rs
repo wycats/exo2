@@ -89,6 +89,7 @@ impl SqliteWriter {
     /// Open a database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = open_request_database(path.as_ref())
+            .map_err(crate::storage_compatibility::map_database_error)
             .with_context(|| format!("Failed to open database at {}", path.as_ref().display()))?;
         Ok(Self { db })
     }

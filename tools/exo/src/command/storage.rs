@@ -10,11 +10,10 @@ use crate::api::protocol::Effect;
 use crate::steering::SuggestedAction;
 use anyhow::{Context, Result as ExoResult};
 use exosuit_storage::{
-    AutoVacuumMode, Connection, DEFAULT_INCREMENTAL_VACUUM_PAGE_BUDGET, StorageMaintenanceOptions,
-    StorageMaintenanceReport, StorageMaintenanceStats, WalCheckpointReport, maintain_database,
+    DEFAULT_INCREMENTAL_VACUUM_PAGE_BUDGET, StorageMaintenanceOptions, StorageMaintenanceReport,
+    StorageMaintenanceStats, WalCheckpointReport, maintain_database,
 };
 use serde::Serialize;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, exospec::ExoSpec)]
@@ -23,6 +22,11 @@ use std::path::{Path, PathBuf};
     description = "SQLite storage maintenance commands"
 )]
 pub enum StorageCommands {
+    #[exo(
+        effect = "pure",
+        description = "Report this Exo binary's storage writer compatibility"
+    )]
+    Compatibility,
     #[exo(
         effect = "exec",
         description = "Run bounded physical SQLite maintenance for the current project"
@@ -47,6 +51,7 @@ impl StorageCommands {
     #[allow(unused_variables)]
     pub fn to_command_box(self, root: &std::path::Path) -> anyhow::Result<CommandBox> {
         Ok(match self {
+            Self::Compatibility => CommandBox::pure(StorageCompatibility),
             Self::Maintain {
                 enable_incremental_vacuum,
                 vacuum_pages,
@@ -60,6 +65,60 @@ impl StorageCommands {
                 ))
             }
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StorageCompatibility;
+
+#[derive(Debug, Serialize)]
+struct StorageCompatibilityOutput {
+    kind: &'static str,
+    supported_writer_generation: i32,
+    projection_generation_header: &'static str,
+    database_generation_pragma: &'static str,
+    compatibility_lock_suffix: &'static str,
+}
+
+impl Command for StorageCompatibility {
+    fn namespace(&self) -> &'static str {
+        "storage"
+    }
+
+    fn operation(&self) -> &'static str {
+        "compatibility"
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Pure
+    }
+
+    fn description(&self) -> &'static str {
+        "Report this Exo binary's storage writer compatibility"
+    }
+
+    fn default_steering(&self) -> Vec<SuggestedAction> {
+        Vec::new()
+    }
+
+    fn execute(&self, ctx: &CommandContext) -> ExoResult<CommandOutput> {
+        let output = StorageCompatibilityOutput {
+            kind: "storage.compatibility",
+            supported_writer_generation: exosuit_storage::SUPPORTED_WRITER_GENERATION,
+            projection_generation_header: exosuit_storage::PROJECTION_GENERATION_PREFIX,
+            database_generation_pragma: "user_version",
+            compatibility_lock_suffix: "writer-compat.lock",
+        };
+        match ctx.format {
+            OutputFormat::Json => Ok(CommandOutput::data(output)),
+            OutputFormat::Human => Ok(CommandOutput::new(
+                output,
+                format!(
+                    "This Exo supports storage writer generation {}.",
+                    exosuit_storage::SUPPORTED_WRITER_GENERATION
+                ),
+            )),
+        }
     }
 }
 
@@ -228,32 +287,12 @@ impl MutableCommand for StorageMaintain {
     }
 }
 
-fn open_physical_maintenance_connection(db_path: &Path) -> ExoResult<Connection> {
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create SQLite database directory {}", parent.display()))?;
-    }
-
-    let should_enable_incremental_auto_vacuum = is_new_or_empty_database_file(db_path);
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open SQLite database at {}", db_path.display()))?;
-
-    if should_enable_incremental_auto_vacuum {
-        conn.pragma_update(None, "auto_vacuum", AutoVacuumMode::Incremental.as_i64())
-            .context("enable incremental auto-vacuum for new SQLite database")?;
-    }
-    conn.pragma_update(None, "busy_timeout", 5000)
-        .context("configure SQLite busy timeout")?;
-
-    Ok(conn)
-}
-
-fn is_new_or_empty_database_file(path: &Path) -> bool {
-    match path.metadata() {
-        Ok(metadata) => metadata.len() == 0,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
+fn open_physical_maintenance_connection(
+    db_path: &Path,
+) -> ExoResult<exosuit_storage::FencedConnection> {
+    exosuit_storage::open_fenced_physical_connection(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("open SQLite database at {}", db_path.display()))
 }
 
 #[cfg(test)]
@@ -262,6 +301,7 @@ mod tests {
     use crate::api::protocol::Effect;
     use crate::command::traits::OutputFormat;
     use exosuit_storage::AutoVacuumMode;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -270,6 +310,27 @@ mod tests {
         assert_eq!(cmd.namespace(), "storage");
         assert_eq!(cmd.operation(), "maintain");
         assert_eq!(cmd.effect(), Effect::Exec);
+    }
+
+    #[test]
+    fn storage_compatibility_reports_compiled_generation_without_opening_state() {
+        let temp = tempdir().expect("tempdir");
+        let ctx = CommandContext {
+            root: temp.path(),
+            project: None,
+            format: OutputFormat::Json,
+            agent_id: None,
+            workflow_confirmation: None,
+            input_content: None,
+            runtime_services: None,
+        };
+
+        let output = StorageCompatibility
+            .execute(&ctx)
+            .expect("report compatibility");
+        assert_eq!(output.data["kind"], "storage.compatibility");
+        assert_eq!(output.data["supported_writer_generation"], 0);
+        assert!(!temp.path().join(".cache").exists());
     }
 
     #[test]

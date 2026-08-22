@@ -17,6 +17,7 @@ pub use sqlite_loader::{SqliteLoader, WorkbenchLaneData, WorkspaceLaneFocusData}
 pub use sqlite_writer::SqliteWriter;
 
 use crate::ExoResult;
+use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, StatePolicy};
 use crate::ulid_util::{ExoUlid, UlidResolvable};
 use anyhow::Context;
@@ -24,6 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const DEPRECATED_SQL_PROJECTION_FILES: &[&str] = &["agent_events.sql"];
@@ -1249,13 +1251,11 @@ impl AgentContext {
 
     fn open_sqlite_loader(root: &Path, project: Option<&Project>) -> ExoResult<SqliteLoader> {
         let db_path = db_path(root, project);
+        let sql_dir = sql_projection_dir(root, project);
+        let compatibility = Self::preflight_storage_compatibility(root, project)?;
+        let has_sql_files = compatibility.projection_generation.is_some();
 
         if !db_path.exists() {
-            let sql_dir = sql_projection_dir(root, project);
-            let has_sql_files = sql_dir
-                .as_ref()
-                .is_some_and(|sql_dir| sql_dir.join("epochs.sql").exists());
-
             let exosuit_toml = root.join("exosuit.toml");
             if !exosuit_toml.exists() && !has_sql_files {
                 anyhow::bail!(
@@ -1265,9 +1265,19 @@ impl AgentContext {
                 );
             }
 
-            if let Some(sql_dir) = sql_dir.filter(|_| has_sql_files) {
+            if has_sql_files {
                 // Fresh clone: .sql files exist but no DB — import them
-                import_sql_dumps(&sql_dir, &db_path)?;
+                let preflight = preflight_sql_dumps(
+                    sql_dir
+                        .as_ref()
+                        .expect("available projection has a directory"),
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "canonical SQL projection disappeared after compatibility preflight"
+                    )
+                })?;
+                import_preflighted_sql_dumps(preflight, &db_path)?;
             } else {
                 // Neither .sql nor TOML — create empty DB
                 if let Some(parent) = db_path.parent() {
@@ -1280,6 +1290,28 @@ impl AgentContext {
 
         SqliteLoader::open(&db_path)
             .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))
+    }
+
+    pub(crate) fn preflight_storage_compatibility(
+        root: &Path,
+        project: Option<&Project>,
+    ) -> ExoResult<StorageCompatibilityPreflight> {
+        let projection_generation = if let Some(sql_dir) = sql_projection_dir(root, project) {
+            if canonical_projection_available(&sql_dir)? {
+                ensure_repo_projection_settled(root, project)?;
+                Some(preflight_projection_compatibility(&sql_dir)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        exosuit_storage::preflight_database(&db_path(root, project))
+            .map_err(crate::storage_compatibility::map_database_error)
+            .context("Failed to preflight SQLite writer compatibility")?;
+        Ok(StorageCompatibilityPreflight {
+            projection_generation,
+        })
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -1444,21 +1476,46 @@ pub fn write_sql_dump_with_project_result(
     let Some(dump_dir) = sql_projection_dir(root, project) else {
         return Ok(());
     };
-
-    std::fs::create_dir_all(&dump_dir).with_context(|| {
-        format!(
-            "Failed to create SQL projection directory {}",
-            dump_dir.display()
-        )
-    })?;
-    remove_deprecated_sql_projection_files(&dump_dir)?;
+    let existing_generation = AgentContext::preflight_storage_compatibility(root, project)?
+        .projection_generation
+        .unwrap_or(0);
 
     let db_path = db_path(root, project);
     let loader = SqliteLoader::open(&db_path)
         .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
 
-    let dumps = exosuit_storage::dump_tables(loader.database().connection())
+    let mut dumps = exosuit_storage::dump_tables(loader.database().connection())
         .context("Failed to dump SQLite tables")?;
+    if let Some((_, epochs_sql)) = dumps
+        .iter_mut()
+        .find(|(table_name, _)| table_name == "epochs_data")
+    {
+        let database_generation = exosuit_storage::parse_projection_generation(epochs_sql)
+            .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+            .context("Failed to read database writer generation from epochs dump")?;
+        *epochs_sql = exosuit_storage::with_projection_generation(
+            epochs_sql,
+            existing_generation.max(database_generation),
+        )
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+        .context("Failed to render epochs.sql writer generation")?;
+    }
+
+    publish_sql_projection(&dump_dir, &dumps, atomic_write_projection_file)
+}
+
+fn publish_sql_projection(
+    dump_dir: &Path,
+    dumps: &[exosuit_storage::dump::TableDump],
+    mut publish_file: impl FnMut(&Path, &[u8]) -> ExoResult<()>,
+) -> ExoResult<()> {
+    std::fs::create_dir_all(dump_dir).with_context(|| {
+        format!(
+            "Failed to create SQL projection directory {}",
+            dump_dir.display()
+        )
+    })?;
+    remove_deprecated_sql_projection_files(dump_dir)?;
 
     for (file_stem, table_name) in exosuit_storage::TABLE_ORDER {
         let Some((_, sql_content)) = dumps
@@ -1468,16 +1525,164 @@ pub fn write_sql_dump_with_project_result(
             continue;
         };
         let file_name = format!("{file_stem}.sql");
-        let path = dump_dir.join(&file_name);
-        // Prepend auto-generated header so agents treat these as infrastructure.
-        let header = "-- Auto-generated by exo. Regenerate: exo status\n";
-        let content = format!("{header}{sql_content}");
-        // Use std::fs::write directly — these are pure overwrites, not edits.
-        std::fs::write(&path, content.as_bytes())
-            .with_context(|| format!("Failed to write SQL projection {}", path.display()))?;
+        let path = dump_dir.join(file_name);
+        let generated_header = "-- Auto-generated by exo. Regenerate: exo status\n";
+        let content = if *file_stem == "epochs" {
+            let (generation_header, body) = sql_content.split_once('\n').ok_or_else(|| {
+                anyhow::anyhow!("epochs.sql dump omitted its writer generation header")
+            })?;
+            format!("{generation_header}\n{generated_header}{body}")
+        } else {
+            format!("{generated_header}{sql_content}")
+        };
+        publish_file(&path, content.as_bytes())?;
     }
 
     Ok(())
+}
+
+fn ensure_repo_projection_settled(root: &Path, project: Option<&Project>) -> ExoResult<()> {
+    if project.is_some_and(|project| project.policy != StatePolicy::Repo) {
+        return Ok(());
+    }
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output_guarded()
+        .context("Failed to inspect repo-policy projection repository")?;
+    if !inside.status.success() {
+        return Ok(());
+    }
+
+    let mut unsettled_markers = Vec::new();
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", marker])
+            .current_dir(root)
+            .output_guarded()
+            .with_context(|| format!("Failed to resolve Git state marker {marker}"))?;
+        if !output.status.success() {
+            anyhow::bail!("Failed to resolve Git state marker {marker}");
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        if path.exists() {
+            unsettled_markers.push(marker);
+        }
+    }
+
+    let conflicts = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(root)
+        .output_guarded()
+        .context("Failed to inspect repo-policy projection conflicts")?;
+    if !conflicts.status.success() {
+        anyhow::bail!("Failed to inspect repo-policy projection conflicts");
+    }
+    let has_conflicts = !conflicts.stdout.is_empty();
+    if !unsettled_markers.is_empty() || has_conflicts {
+        return Err(crate::storage_compatibility::projection_unsettled_error(
+            &unsettled_markers.join(","),
+            has_conflicts,
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_write_projection_file(path: &Path, content: &[u8]) -> ExoResult<()> {
+    atomic_write_projection_file_with_directory_sync(path, content, sync_projection_directory)
+}
+
+#[cfg(unix)]
+fn sync_projection_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_projection_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_projection_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+fn atomic_write_projection_file_with_directory_sync(
+    path: &Path,
+    content: &[u8],
+    sync_directory: impl Fn(&Path) -> std::io::Result<()>,
+) -> ExoResult<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("projection.sql");
+    let mut last_collision = None;
+    for attempt in 0..100_u32 {
+        let temporary = path.with_file_name(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            attempt
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to create temporary projection {}",
+                        temporary.display()
+                    )
+                });
+            }
+        };
+        let write_result = (|| -> std::io::Result<()> {
+            file.write_all(content)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error)
+                .with_context(|| format!("Failed to publish projection {}", path.display()));
+        }
+        return Ok(());
+    }
+    Err(last_collision.unwrap_or_else(|| std::io::Error::other("temporary name exhausted")))
+        .with_context(|| {
+            format!(
+                "Failed to allocate temporary projection for {}",
+                path.display()
+            )
+        })
 }
 
 fn remove_deprecated_sql_projection_files(dump_dir: &std::path::Path) -> ExoResult<()> {
@@ -1516,71 +1721,36 @@ pub(crate) fn import_sql_dumps(
     sql_dir: &std::path::Path,
     db_path: &std::path::Path,
 ) -> ExoResult<()> {
-    // Ensure .cache/ directory exists
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create .cache directory at {}", parent.display())
-        })?;
-    }
-
-    // Create DB with schema (open_database auto-creates + runs migrations)
-    let db = exosuit_storage::open_database(db_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create database: {e}"))?;
-
-    let has_any_dump = exosuit_storage::TABLE_ORDER.iter().any(|(file_stem, _)| {
-        sql_dir
-            .join(format!("{file_stem}.sql"))
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > 0)
-    });
-
-    if !has_any_dump {
+    let Some(preflight) = preflight_sql_dumps(sql_dir)? else {
         return Ok(());
-    }
+    };
+    import_preflighted_sql_dumps(preflight, db_path)
+}
 
-    let conn = db.connection();
-    conn.set_db_config(
-        exosuit_storage::rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE,
-        false,
-    )
-    .map_err(|error| anyhow::anyhow!("Failed to clear existing database rows: {error}"))?;
-    let clear_result = conn.execute_batch(
-        "DELETE FROM rfc_relations;
-         DELETE FROM idea_task_refs;
-         DELETE FROM idea_tags;
-         DELETE FROM entity_aliases;
-         DELETE FROM phase_rfcs_data;
-         DELETE FROM axiom_tags;
-         DELETE FROM axiom_implications;
-         DELETE FROM axioms;
-         DELETE FROM task_verifications;
-         DELETE FROM task_logs;
-         DELETE FROM rfcs_data;
-         DELETE FROM inbox_data;
-         DELETE FROM ideas_data;
-         DELETE FROM tasks_data;
-         DELETE FROM goals_data;
-         DELETE FROM workbench_lanes_data;
-         DELETE FROM phases_data;
-         DELETE FROM epochs_data;",
-    );
-    let restore_defensive = conn
-        .set_db_config(
-            exosuit_storage::rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE,
-            true,
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to restore database defensive mode: {error}"));
-    clear_result
-        .map_err(|error| anyhow::anyhow!("Failed to clear existing database rows: {error}"))?;
-    restore_defensive?;
+#[derive(Clone, Copy)]
+pub(crate) struct StorageCompatibilityPreflight {
+    projection_generation: Option<i32>,
+}
 
-    // Read .sql files in dependency order
+#[derive(Clone)]
+pub(crate) struct PreflightedSqlProjection {
+    pub(crate) dumps: Vec<exosuit_storage::dump::TableDump>,
+    pub(crate) generation: i32,
+}
+
+pub(crate) fn preflight_sql_dumps(
+    sql_dir: &std::path::Path,
+) -> ExoResult<Option<PreflightedSqlProjection>> {
     let mut dumps: Vec<exosuit_storage::dump::TableDump> = Vec::new();
+    let mut projection_available = false;
 
     for (file_stem, table_name) in exosuit_storage::TABLE_ORDER {
         let path = sql_dir.join(format!("{file_stem}.sql"));
         let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
+            Ok(content) => {
+                projection_available = true;
+                content
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
                 return Err(e).with_context(|| format!("Failed to read {}", path.display()));
@@ -1589,9 +1759,138 @@ pub(crate) fn import_sql_dumps(
         dumps.push((table_name.to_string(), content));
     }
 
-    // Import
-    exosuit_storage::import_tables(db.connection(), &dumps)
-        .map_err(|e| anyhow::anyhow!("Failed to import SQL dumps: {e}"))?;
+    if !projection_available {
+        return Ok(None);
+    }
+
+    let epochs_sql = dumps
+        .iter()
+        .find(|(table_name, _)| table_name == "epochs_data")
+        .map_or("", |(_, content)| content.as_str());
+    let projection_generation = exosuit_storage::parse_projection_generation(epochs_sql)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+        .context("Failed to preflight epochs.sql writer generation")?;
+    exosuit_storage::ensure_projection_supported(projection_generation)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+        .context("SQL projection requires a newer Exo writer")?;
+    exosuit_storage::validate_tables(&dumps)
+        .map_err(|error| anyhow::anyhow!("Failed to preflight SQL dumps: {error}"))?;
+
+    Ok(Some(PreflightedSqlProjection {
+        dumps,
+        generation: projection_generation,
+    }))
+}
+
+fn canonical_projection_available(sql_dir: &Path) -> ExoResult<bool> {
+    for (file_stem, _) in exosuit_storage::TABLE_ORDER {
+        match fs::metadata(sql_dir.join(format!("{file_stem}.sql"))) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect canonical SQL projection directory {}",
+                        sql_dir.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn preflight_projection_compatibility(sql_dir: &Path) -> ExoResult<i32> {
+    let epochs_sql = match fs::read_to_string(sql_dir.join("epochs.sql")) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("Failed to read epochs.sql writer generation"),
+    };
+    let generation = exosuit_storage::parse_projection_generation(&epochs_sql)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+        .context("Failed to preflight epochs.sql writer generation")?;
+    exosuit_storage::ensure_projection_supported(generation)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)
+        .context("SQL projection requires a newer Exo writer")?;
+    Ok(generation)
+}
+
+fn import_preflighted_sql_dumps(
+    preflight: PreflightedSqlProjection,
+    db_path: &std::path::Path,
+) -> ExoResult<()> {
+    let conn = exosuit_storage::open_fenced_connection_for_import(db_path, preflight.generation)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to create database for SQL projection")?;
+    import_preflighted_sql_dumps_with_connection(preflight, &conn)
+}
+
+pub(crate) fn import_preflighted_sql_dumps_with_authority(
+    preflight: PreflightedSqlProjection,
+    authority: exosuit_storage::ExclusiveCompatibilityAuthority,
+) -> ExoResult<exosuit_storage::FencedConnection> {
+    let conn = exosuit_storage::open_fenced_connection_for_import_with_authority(
+        authority,
+        preflight.generation,
+    )
+    .map_err(crate::storage_compatibility::map_database_error)
+    .context("Failed to create database for SQL projection")?;
+    import_preflighted_sql_dumps_with_connection(preflight, &conn)?;
+    Ok(conn)
+}
+
+fn import_preflighted_sql_dumps_with_connection(
+    preflight: PreflightedSqlProjection,
+    conn: &exosuit_storage::Connection,
+) -> ExoResult<()> {
+    let PreflightedSqlProjection {
+        dumps,
+        generation: _,
+    } = preflight;
+
+    conn.execute_batch("SAVEPOINT exo_projection_import")
+        .context("Failed to start projection import transaction")?;
+    let import_result = (|| -> ExoResult<()> {
+        conn.execute_batch(
+            "DELETE FROM rfc_relations;
+             DELETE FROM idea_task_refs;
+             DELETE FROM idea_tags;
+             DELETE FROM entity_aliases;
+             DELETE FROM phase_rfcs_data;
+             DELETE FROM axiom_tags;
+             DELETE FROM axiom_implications;
+             DELETE FROM axioms;
+             DELETE FROM task_verifications;
+             DELETE FROM task_logs;
+             DELETE FROM rfcs_data;
+             DELETE FROM inbox_data;
+             DELETE FROM ideas_data;
+             DELETE FROM tasks_data;
+             DELETE FROM goals_data;
+             DELETE FROM workbench_lanes_data;
+             DELETE FROM phases_data;
+             DELETE FROM epochs_data;",
+        )
+        .context("Failed to clear existing database rows")?;
+
+        exosuit_storage::import_tables(&conn, &dumps)
+            .map_err(|error| anyhow::anyhow!("Failed to import SQL dumps: {error}"))?;
+        Ok(())
+    })();
+
+    match import_result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT exo_projection_import")
+            .context("Failed to commit projection import"),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT exo_projection_import; \
+                 RELEASE SAVEPOINT exo_projection_import",
+            );
+            Err(error)
+        }
+    }?;
 
     Ok(())
 }
@@ -1599,7 +1898,6 @@ pub(crate) fn import_sql_dumps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_spawn::CommandSpawnExt as _;
     use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::process::{Child, Command, Stdio};
@@ -1991,6 +2289,353 @@ status = "pending"
     #[test]
     fn test_storage_backend_as_str() {
         assert_eq!(StorageBackend::Sqlite.as_str(), "sqlite");
+    }
+
+    #[test]
+    fn projection_preflight_rejects_newer_generation_without_creating_target() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let projection_dir = temp.path().join("projection");
+        std::fs::create_dir_all(&projection_dir).expect("create projection dir");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible projection");
+        let target = temp.path().join("new-state/.cache/exo.db");
+
+        let error = import_sql_dumps(&projection_dir, &target)
+            .expect_err("newer projection generation must be rejected");
+
+        assert!(error.to_string().contains("newer Exo writer"));
+        assert!(!target.exists(), "rejection must not create the database");
+        assert!(
+            !target.parent().expect("target parent").exists(),
+            "rejection must not create the target parent"
+        );
+        assert!(
+            !target.with_extension("writer-compat.lock").exists(),
+            "rejection must not create the compatibility lock"
+        );
+    }
+
+    #[test]
+    fn projection_syntax_preflight_does_not_create_target() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let projection_dir = temp.path().join("projection");
+        std::fs::create_dir_all(&projection_dir).expect("create projection dir");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write projection metadata");
+        std::fs::write(projection_dir.join("phases.sql"), "not portable SQL\n")
+            .expect("write malformed projection");
+        let target = temp.path().join("new-state/.cache/exo.db");
+
+        let error = import_sql_dumps(&projection_dir, &target)
+            .expect_err("malformed projection must fail preflight");
+
+        assert!(error.to_string().contains("preflight SQL dumps"));
+        assert!(!target.exists(), "rejection must not create the database");
+        assert!(
+            !target.parent().expect("target parent").exists(),
+            "rejection must not create the target parent"
+        );
+    }
+
+    #[test]
+    fn existing_cache_rejects_newer_canonical_projection_before_sqlite_open() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let target = db_path(root, None);
+        std::fs::create_dir_all(target.parent().expect("database parent"))
+            .expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&target).expect("create database");
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('unchanged');",
+            )
+            .expect("seed database");
+        drop(connection);
+        let before = std::fs::read(&target).expect("snapshot database");
+
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible projection");
+
+        let error = AgentContext::open_sqlite_loader(root, None)
+            .expect_err("newer canonical projection must reject cached SQLite");
+
+        assert!(error.to_string().contains("newer Exo writer"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&target).expect("read rejected database"),
+            before,
+            "projection rejection must precede semantic SQLite mutation"
+        );
+        assert!(
+            !target.with_extension("writer-compat.lock").exists(),
+            "projection rejection must precede compatibility-lock creation"
+        );
+    }
+
+    #[test]
+    fn projection_export_rejects_newer_canonical_projection_before_sqlite_open() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let target = db_path(root, None);
+        std::fs::create_dir_all(target.parent().expect("database parent"))
+            .expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&target).expect("create database");
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('unchanged');",
+            )
+            .expect("seed database");
+        drop(connection);
+        let before = std::fs::read(&target).expect("snapshot database");
+
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible projection");
+
+        let error = write_sql_dump_with_project_result(root, None)
+            .expect_err("newer canonical projection must reject export");
+
+        assert!(error.to_string().contains("newer Exo writer"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&target).expect("read rejected database"),
+            before,
+            "projection rejection must precede semantic SQLite mutation"
+        );
+        assert!(
+            !target.with_extension("writer-compat.lock").exists(),
+            "projection rejection must precede compatibility-lock creation"
+        );
+    }
+
+    #[test]
+    fn cached_open_treats_projection_without_epochs_as_legacy_metadata() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let target = db_path(root, None);
+        std::fs::create_dir_all(target.parent().expect("database parent"))
+            .expect("create database parent");
+        let writer = SqliteWriter::open(&target).expect("open sqlite writer");
+        writer
+            .add_epoch("Cached epoch", Some("cached-epoch"), &[])
+            .expect("add cached epoch");
+        drop(writer);
+
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("phases.sql"),
+            "materially incomplete projection body\n",
+        )
+        .expect("write projection without epochs");
+
+        let loader = AgentContext::open_sqlite_loader(root, None)
+            .expect("cached open uses legacy projection generation metadata");
+        assert_eq!(
+            loader.load_state().expect("load cached state").epochs.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_clone_without_epochs_validates_available_projection_before_target_creation() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let target = db_path(root, None);
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(projection_dir.join("phases.sql"), "not portable SQL\n")
+            .expect("write malformed projection without epochs");
+
+        let error = AgentContext::open_sqlite_loader(root, None)
+            .expect_err("fresh clone must validate a projection without epochs");
+        assert!(
+            error.to_string().contains("preflight SQL dumps"),
+            "{error:#}"
+        );
+        assert!(!target.exists(), "failed validation must not create SQLite");
+
+        std::fs::write(projection_dir.join("phases.sql"), "")
+            .expect("replace with valid empty legacy projection");
+        drop(
+            AgentContext::open_sqlite_loader(root, None)
+                .expect("valid legacy projection without epochs imports"),
+        );
+        assert!(
+            target.exists(),
+            "available legacy projection must be imported"
+        );
+    }
+
+    #[test]
+    fn compatible_export_repairs_over_fenced_mixed_projection() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".cache")).expect("create cache directory");
+        let target = db_path(root, None);
+        let writer = SqliteWriter::open(&target).expect("open sqlite writer");
+        let epoch_id = writer
+            .add_epoch("Canonical epoch", Some("canonical-epoch"), &[])
+            .expect("add canonical epoch");
+        writer
+            .add_phase(&epoch_id, "Canonical phase", "regular", None, &[])
+            .expect("add canonical phase");
+        drop(writer);
+        write_sql_dump_with_project_result(root, None).expect("write coherent projection");
+
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n-- interrupted parent publication\n",
+        )
+        .expect("remove parent rows while retaining dependent phases");
+        assert!(
+            preflight_sql_dumps(&projection_dir).is_err(),
+            "mixed parent and dependent tables must not be importable"
+        );
+
+        write_sql_dump_with_project_result(root, None)
+            .expect("compatible writer repairs from canonical SQLite");
+        let repaired = preflight_sql_dumps(&projection_dir)
+            .expect("validate repaired projection")
+            .expect("repaired projection remains available");
+        assert_eq!(repaired.generation, 0);
+        assert!(
+            repaired
+                .dumps
+                .iter()
+                .find(|(table, _)| table == "epochs_data")
+                .is_some_and(|(_, sql)| sql.contains("canonical-epoch")),
+            "repair must republish the canonical parent row"
+        );
+    }
+
+    #[test]
+    fn raised_projection_header_is_published_before_later_table_failure() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let projection_dir = temp.path().join("projection");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n-- old epochs\n",
+        )
+        .expect("write old epochs projection");
+        std::fs::write(projection_dir.join("phases.sql"), "-- old phases\n")
+            .expect("write old phases projection");
+
+        let dumps = vec![
+            (
+                "epochs_data".to_string(),
+                "-- exo:minimum-writer-generation=1\n-- new epochs\n".to_string(),
+            ),
+            ("phases_data".to_string(), "-- new phases\n".to_string()),
+        ];
+        let mut published = 0;
+        let error = publish_sql_projection(&projection_dir, &dumps, |path, content| {
+            published += 1;
+            if published == 2 {
+                anyhow::bail!("injected publication interruption");
+            }
+            atomic_write_projection_file(path, content)
+        })
+        .expect_err("later table publication should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected publication interruption")
+        );
+        assert!(
+            std::fs::read_to_string(projection_dir.join("epochs.sql"))
+                .expect("read raised epochs projection")
+                .starts_with("-- exo:minimum-writer-generation=1\n"),
+            "the raised compatibility header must be durable before later tables"
+        );
+        assert_eq!(
+            std::fs::read_to_string(projection_dir.join("phases.sql"))
+                .expect("read old phases projection"),
+            "-- old phases\n",
+            "a later failure may leave stale bodies but never an under-fenced header"
+        );
+    }
+
+    #[test]
+    fn atomic_projection_publish_syncs_parent_after_rename() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("epochs.sql");
+        let sync_observed = std::cell::Cell::new(false);
+
+        atomic_write_projection_file_with_directory_sync(
+            &path,
+            b"-- exo:minimum-writer-generation=0\n",
+            |directory| {
+                assert_eq!(directory, temp.path());
+                assert!(path.exists(), "directory sync must follow atomic rename");
+                sync_observed.set(true);
+                Ok(())
+            },
+        )
+        .expect("publish projection");
+
+        assert!(sync_observed.get());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "-- exo:minimum-writer-generation=0\n"
+        );
+    }
+
+    #[test]
+    fn production_projection_publish_syncs_platform_directory_handle() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("epochs.sql");
+
+        atomic_write_projection_file(&path, b"-- exo:minimum-writer-generation=0\n")
+            .expect("publish projection with production directory sync");
+
+        assert_eq!(
+            std::fs::read(path).expect("read projection"),
+            b"-- exo:minimum-writer-generation=0\n"
+        );
+    }
+
+    #[test]
+    fn repo_projection_is_quarantined_while_git_merge_is_unsettled() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status_guarded()
+            .expect("initialize repository");
+        assert!(status.success());
+        std::fs::write(
+            root.join(".git/MERGE_HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .expect("mark merge state");
+
+        let error = ensure_repo_projection_settled(root, None)
+            .expect_err("unsettled repo projection must be quarantined");
+        let failure = error
+            .downcast_ref::<crate::failure::ExoFailure>()
+            .expect("typed Exo failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.projection_unsettled"
+        );
     }
 
     #[test]

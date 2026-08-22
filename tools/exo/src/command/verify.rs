@@ -206,11 +206,15 @@ impl Command for VerifyDump {
 
         // Open the live database (read-only — dump_tables only reads)
         let live_db = exosuit_storage::open_database(&db_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open live database: {e}"))?;
+            .map_err(crate::storage_compatibility::map_database_error)?;
 
         // Step 1: Dump the live database
-        let dumps1 = dump_tables(live_db.connection())
-            .map_err(|e| anyhow::anyhow!("Failed to dump live database: {e}"))?;
+        let dumps1 = dump_tables(live_db.connection()).map_err(|error| match error {
+            exosuit_storage::DumpError::WriterCompatibility(error) => {
+                crate::storage_compatibility::map_writer_compatibility_error(error)
+            }
+            other => anyhow::Error::new(other),
+        })?;
 
         // Step 2: Import into a fresh in-memory database
         let fresh_db = open_memory_database()

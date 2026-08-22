@@ -2052,13 +2052,16 @@ pub fn observe_effective_rfc_by_number(
 ) -> Result<Option<EffectiveRfcRecord>> {
     with_reconcile_lock(root, project, || {
         let transaction =
-            exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))?;
+            exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))
+                .map_err(crate::storage_compatibility::map_database_error)?;
         let source = canonical_reconcile_source(root)?;
         reconcile_and_refresh_locked(root, project, &source, true)?;
         let view = compose_effective_rfc_view_locked(root, project, &source)?;
         let record = select_effective_rfc_by_number(view.records, rfc_number)?;
         if record.is_some() {
-            transaction.commit()?;
+            transaction
+                .commit()
+                .map_err(crate::storage_compatibility::map_database_error)?;
         }
         Ok(record)
     })

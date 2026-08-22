@@ -211,7 +211,7 @@ pub fn default_registry() -> CommandRegistry {
     use super::sidecar::{
         SidecarBootstrap, SidecarInit, SidecarLink, SidecarRepo, SidecarStatus, SidecarUnlink,
     };
-    use super::storage::StorageMaintain;
+    use super::storage::{StorageCompatibility, StorageMaintain};
     use super::toml::{TomlRead, TomlWrite};
     use super::update::UpdateCommand;
     use super::write::Write;
@@ -441,6 +441,7 @@ pub fn default_registry() -> CommandRegistry {
     registry.register(Box::new(SidecarUnlink::new()));
 
     // Storage namespace
+    registry.register(Box::new(StorageCompatibility));
     registry.register(Box::new(StorageMaintain::new(
         false,
         exosuit_storage::DEFAULT_INCREMENTAL_VACUUM_PAGE_BUDGET,
@@ -894,8 +895,11 @@ mod tests {
         // Check verify namespace (Wave 8)
         assert!(registry.find("verify", "run").is_some());
 
+        // Check storage compatibility reporting
+        assert!(registry.find("storage", "compatibility").is_some());
+
         // Verify total count: registry.len() gives actual count - update as commands are added
-        assert_eq!(registry.len(), 128);
+        assert_eq!(registry.len(), 129);
     }
 
     #[test]

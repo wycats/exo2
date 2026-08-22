@@ -890,6 +890,25 @@ fn context_load_error_response(
     original_command: &str,
     error: anyhow::Error,
 ) -> ResponseEnvelope {
+    if let Some(failure) =
+        crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+    {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id: request_id,
+            status: failure.status,
+            result: None,
+            error: Some(failure.error),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: None,
+            trace: None,
+        };
+    }
+
     if let Some(guidance) =
         crate::preload_guidance::classify_context_load_error(&error, original_command)
     {
@@ -1494,6 +1513,17 @@ fn compact_error_body(error: &ErrorBody) -> JsonValue {
     let Some(details) = &error.details else {
         return value;
     };
+
+    if details
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("storage.writer_") || kind == "storage.compatibility_busy"
+        })
+    {
+        value["details"] = details.clone();
+        return value;
+    }
 
     let mut compact_details = json!({});
     if let Some(workflow) = workflow_confirmation_from_details(Some(details)) {
@@ -2294,6 +2324,59 @@ mod tests {
         let steering = response.steering.as_ref().expect("steering");
         assert_eq!(steering.next_call.kind, NextCallKind::Call);
         assert_eq!(steering.next_call.params["address"]["path"][0], "update");
+    }
+
+    #[test]
+    fn mcp_workspace_preload_preserves_writer_compatibility_contract() {
+        use crate::process_spawn::CommandSpawnExt as _;
+
+        let temp = tempfile::tempdir().expect("create MCP preload workspace");
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .output_guarded()
+            .expect("initialize MCP preload repository");
+        assert!(
+            git.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&git.stderr)
+        );
+        let project = Project::resolve(temp.path()).expect("resolve MCP preload project");
+        let db_path = project.db_path();
+        std::fs::create_dir_all(db_path.parent().expect("database parent"))
+            .expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&db_path)
+            .expect("create incompatible project database");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("raise writer generation");
+        drop(connection);
+
+        let result = call_exo_run_tool_with_request_id(
+            temp.path(),
+            Some(&project),
+            input("status"),
+            "mcp-preload-writer-compatibility".to_string(),
+        );
+
+        assert!(result.is_error);
+        let structured = structured(&result);
+        assert_eq!(
+            structured["error"]["details"]["kind"],
+            "storage.writer_incompatible"
+        );
+        assert_eq!(
+            structured["error"]["details"]["request_outcome_checked"],
+            false
+        );
+        assert_eq!(
+            structured["error"]["details"]["retry_with_same_request_id"],
+            true
+        );
+        assert!(
+            structured["error"]["details"].get("details").is_none(),
+            "compatibility fields must remain canonical: {structured:?}"
+        );
     }
 
     #[test]

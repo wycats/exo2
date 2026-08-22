@@ -56,12 +56,14 @@ fn parse_output_format(s: &str) -> OutputFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MergeDriverKind {
+    Sql,
     Toml,
 }
 
 impl MergeDriverKind {
     fn parse(s: &str) -> Option<Self> {
         match s {
+            "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             _ => None,
         }
@@ -1470,6 +1472,8 @@ fn load_context_result_or_exit(
         Ok(context) => context,
         Err(e) => {
             let original_command = original_command_for_guidance();
+            let compatibility_failure =
+                exo::storage_compatibility::writer_compatibility_failure_from_error(&e);
             let preload_guidance =
                 exo::preload_guidance::classify_context_load_error(&e, &original_command);
 
@@ -1479,23 +1483,13 @@ fn load_context_result_or_exit(
                     id: "unknown".to_string(),
                     status: Status::Error,
                     result: None,
-                    error: Some(preload_guidance.as_ref().map_or_else(
-                        || ErrorBody {
-                            code: ErrorCode::Internal,
-                            message: format!("Failed to load agent context: {e}"),
-                            details: None,
-                        },
-                        |guidance| ErrorBody {
-                            code: guidance.error_code,
-                            message: guidance.message(),
-                            details: Some(guidance.details()),
-                        },
+                    error: Some(context_load_error_body(
+                        &e,
+                        compatibility_failure.as_ref(),
+                        preload_guidance.as_ref(),
                     )),
                     ticket: None,
-                    steering: Some(preload_guidance.as_ref().map_or_else(
-                        protocol_help_root_steering,
-                        exo::preload_guidance::PreloadGuidance::to_steering,
-                    )),
+                    steering: Some(context_load_steering(preload_guidance.as_ref())),
                     reminders: None,
                     display: None,
                     preview: None,
@@ -1518,23 +1512,13 @@ fn load_context_result_or_exit(
                     id: "cli".to_string(),
                     status: Status::Error,
                     result: None,
-                    error: Some(preload_guidance.as_ref().map_or_else(
-                        || ErrorBody {
-                            code: ErrorCode::Internal,
-                            message: format!("Failed to load agent context: {e}"),
-                            details: None,
-                        },
-                        |guidance| ErrorBody {
-                            code: guidance.error_code,
-                            message: guidance.message(),
-                            details: Some(guidance.details()),
-                        },
+                    error: Some(context_load_error_body(
+                        &e,
+                        compatibility_failure.as_ref(),
+                        preload_guidance.as_ref(),
                     )),
                     ticket: None,
-                    steering: Some(preload_guidance.as_ref().map_or_else(
-                        protocol_help_root_steering,
-                        exo::preload_guidance::PreloadGuidance::to_steering,
-                    )),
+                    steering: Some(context_load_steering(preload_guidance.as_ref())),
                     reminders: None,
                     display: None,
                     preview: None,
@@ -1560,6 +1544,37 @@ fn load_context_result_or_exit(
             std::process::exit(1);
         }
     }
+}
+
+fn context_load_error_body(
+    error: &anyhow::Error,
+    compatibility_failure: Option<&ExoFailure>,
+    preload_guidance: Option<&exo::preload_guidance::PreloadGuidance>,
+) -> ErrorBody {
+    if let Some(failure) = compatibility_failure {
+        return failure.error.clone();
+    }
+    preload_guidance.map_or_else(
+        || ErrorBody {
+            code: ErrorCode::Internal,
+            message: format!("Failed to load agent context: {error}"),
+            details: None,
+        },
+        |guidance| ErrorBody {
+            code: guidance.error_code,
+            message: guidance.message(),
+            details: Some(guidance.details()),
+        },
+    )
+}
+
+fn context_load_steering(
+    preload_guidance: Option<&exo::preload_guidance::PreloadGuidance>,
+) -> exo::api::protocol::Steering {
+    preload_guidance.map_or_else(
+        protocol_help_root_steering,
+        exo::preload_guidance::PreloadGuidance::to_steering,
+    )
 }
 
 fn original_command_for_guidance() -> String {
@@ -1939,7 +1954,7 @@ fn main() {
         Some("merge-driver") => {
             let kind = args.get(1).and_then(|value| MergeDriverKind::parse(value));
             let Some(kind) = kind else {
-                eprintln!("merge-driver requires a kind (toml)");
+                eprintln!("merge-driver requires a kind (sql or toml)");
                 std::process::exit(1);
             };
             let Some(base) = args.get(2) else {
@@ -1956,6 +1971,7 @@ fn main() {
             };
             let path = args.get(5).map(String::as_str);
             let kind = match kind {
+                MergeDriverKind::Sql => exo::merge_driver::MergeDriverKind::Sql,
                 MergeDriverKind::Toml => exo::merge_driver::MergeDriverKind::Toml,
             };
 
@@ -2606,6 +2622,50 @@ mod tests {
             entity_id: "goal::task".to_string(),
             decision: WorkflowConfirmationDecision::YesComplete,
             outcome: outcome.to_string(),
+        }
+    }
+
+    #[test]
+    fn cli_context_preload_preserves_wrapped_storage_compatibility_contract() {
+        for (error, expected_kind, retryable) in [
+            (
+                exosuit_storage::WriterCompatibilityError::Incompatible {
+                    required_generation: 1,
+                    supported_generation: 0,
+                    surface: exosuit_storage::StateSurface::Database,
+                },
+                "storage.writer_incompatible",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::MetadataInvalid {
+                    surface: exosuit_storage::StateSurface::Projection,
+                    reason: "bad header".to_string(),
+                },
+                "storage.writer_metadata_invalid",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::Busy {
+                    lock_path: PathBuf::from("/tmp/exo.writer-compat.lock"),
+                },
+                "storage.compatibility_busy",
+                true,
+            ),
+        ] {
+            let wrapped = exo::storage_compatibility::map_writer_compatibility_error(error)
+                .context("load command context")
+                .context("CLI preload");
+            let failure =
+                exo::storage_compatibility::writer_compatibility_failure_from_error(&wrapped)
+                    .expect("wrapped compatibility failure");
+            let body = context_load_error_body(&wrapped, Some(&failure), None);
+            assert_eq!(body.code, ErrorCode::PreconditionFailed);
+            let details = body.details.expect("compatibility details");
+            assert_eq!(details["kind"], expected_kind);
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+            assert_eq!(details["retryable"], retryable);
         }
     }
 

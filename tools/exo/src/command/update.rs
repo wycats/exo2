@@ -171,6 +171,7 @@ fn ensure_update_database(root: &Path, project: Option<&Project>) -> ExoResult<(
         })?;
     }
     let _db = exosuit_storage::open_database(&db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
         .with_context(|| format!("Failed to create SQLite database at {}", db_path.display()))?;
     Ok(())
 }
