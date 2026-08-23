@@ -33,7 +33,43 @@ fn setup_test_context() -> (TempDir, AgentContext) {
             .expect("verify SQL dump merge driver"),
         "test workspace should satisfy the critical upgrade contract"
     );
+    fs::write(root.join(".gitignore"), ".cache/\n").expect("ignore disposable database");
+    let add_status = Command::new("git")
+        .args(["add", ".gitattributes", ".gitignore"])
+        .current_dir(&root)
+        .status()
+        .expect("stage compatible workspace files");
+    assert!(add_status.success(), "stage compatible workspace files");
+    let commit_status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo-test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initialize upgraded workspace",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("commit compatible workspace files");
+    assert!(commit_status.success(), "commit compatible workspace files");
     exosuit_storage::open_database(root.join(".cache/exo.db")).unwrap();
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&root)
+        .output()
+        .expect("inspect test workspace status");
+    assert!(
+        status_output.status.success(),
+        "inspect test workspace status"
+    );
+    assert!(
+        status_output.stdout.is_empty(),
+        "test workspace should be clean after initialization: {}",
+        String::from_utf8_lossy(&status_output.stdout)
+    );
 
     let context = AgentContext {
         root,
