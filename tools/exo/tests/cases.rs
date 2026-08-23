@@ -31,19 +31,34 @@ fn repo_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn with_repo_root<T>(f: impl FnOnce(&Path) -> T) -> T {
+fn with_compatible_repo_clone<T>(f: impl FnOnce(&Path) -> T) -> T {
     let _guard = REPO_ROOT_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("repo-root test lock");
-    let root = repo_root();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let source = repo_root();
+    let temp = tempfile::tempdir().expect("repo clone tempdir");
+    let root = temp.path().join("repo");
+    let status = std::process::Command::new("git")
+        .args(["clone", "--quiet", "--local", "--no-hardlinks"])
+        .arg(&source)
+        .arg(&root)
+        .status()
+        .expect("clone repo fixture");
+    assert!(status.success(), "clone repo fixture");
+    exo::templates::configure_sql_dump_merge_driver(&root)
+        .expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(&root)
+            .expect("verify SQL dump merge driver"),
+        "repo fixture should have the compatible SQL dump merge driver"
+    );
     f(&root)
 }
 
-fn rel_to_repo_root(abs: &Path) -> String {
-    let root = repo_root();
-    let Ok(rel) = abs.strip_prefix(&root) else {
-        assert!(abs.starts_with(&root), "path under repo root");
+fn rel_to_repo_root(root: &Path, abs: &Path) -> String {
+    let Ok(rel) = abs.strip_prefix(root) else {
+        assert!(abs.starts_with(root), "path under repo root");
         return abs.to_string_lossy().replace('\\', "/");
     };
 
@@ -899,7 +914,7 @@ fn case_strike_abort_no_active_strike() -> Case {
 
 #[test]
 fn rfc_show_missing_runs_across_cli_protocol_and_machine_channel() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let case = case_rfc_show_missing();
         case.run_all(root);
     });
@@ -907,7 +922,7 @@ fn rfc_show_missing_runs_across_cli_protocol_and_machine_channel() {
 
 #[test]
 fn docs_links_check_ok_runs_across_protocol_and_machine_channel() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let case = case_docs_links_check_ok();
         case.run_all(root);
     });
@@ -915,7 +930,7 @@ fn docs_links_check_ok_runs_across_protocol_and_machine_channel() {
 
 #[test]
 fn docs_links_check_needs_fix_runs_across_protocol_and_machine_channel() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let case = case_docs_links_check_needs_fix();
         case.run_all(root);
     });
@@ -923,7 +938,7 @@ fn docs_links_check_needs_fix_runs_across_protocol_and_machine_channel() {
 
 #[test]
 fn docs_links_fix_runs_across_protocol_and_machine_channel() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let tmp = tempfile::Builder::new()
             .prefix("exo-docs-links-fix-case-")
             .tempdir_in(root)
@@ -932,7 +947,7 @@ fn docs_links_fix_runs_across_protocol_and_machine_channel() {
         let md_path = tmp.path().join("input.md");
         fs::write(&md_path, "See [RFC](exo:rfc/8) for details.\n").expect("write markdown");
 
-        let targets_path = rel_to_repo_root(tmp.path());
+        let targets_path = rel_to_repo_root(root, tmp.path());
         let req = req_call_op(
             "docs-links-fix",
             &["docs", "links", "fix"],
@@ -952,7 +967,7 @@ fn docs_links_fix_runs_across_protocol_and_machine_channel() {
 
 #[test]
 fn docs_links_check_warning_only_runs_across_protocol_and_machine_channel() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let tmp = tempfile::Builder::new()
             .prefix("exo-docs-links-warn-case-")
             .tempdir_in(root)
@@ -962,7 +977,7 @@ fn docs_links_check_warning_only_runs_across_protocol_and_machine_channel() {
         // Intentionally unresolved, and strict=false should downgrade to a warning.
         fs::write(&md_path, "See [Missing](exo:rfc/99999) for details.\n").expect("write markdown");
 
-        let targets_path = rel_to_repo_root(tmp.path());
+        let targets_path = rel_to_repo_root(root, tmp.path());
         let req = req_call_op(
             "docs-links-check-warning-only",
             &["docs", "links", "check"],
@@ -1099,6 +1114,7 @@ fn phase_finish_dirty_without_message_runs_across_cli_human_and_json(backend: &s
         .current_dir(root)
         .status()
         .expect("git config user.name");
+    exo::templates::configure_sql_dump_merge_driver(root).expect("configure SQL dump merge driver");
 
     let file_path = root.join("README.md");
     std::fs::write(&file_path, "hello\n").expect("write README.md");
@@ -1181,7 +1197,7 @@ fn task_list_json_is_single_value(backend: &str) {
 
 #[test]
 fn rfc_status_json_is_single_value() {
-    with_repo_root(|root| {
+    with_compatible_repo_clone(|root| {
         let case = case_rfc_status_json_is_single_value();
         case.run_all(root);
     });
