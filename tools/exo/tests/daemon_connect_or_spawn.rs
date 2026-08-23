@@ -741,16 +741,15 @@ fn future_writer_errors_match_between_direct_and_ready_daemon(backend: &str) {
     assert_eq!(routed.status.code(), Some(2), "routed response: {routed:?}");
     let routed = parse_cli_json(&routed);
 
-    let mut direct_error = direct["error"].clone();
-    let direct_steering = direct_error
-        .get_mut("details")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|details| details.remove("steering"));
+    let mut direct_protocol = direct.clone();
+    let direct_steering = direct_protocol
+        .as_object_mut()
+        .and_then(|protocol| protocol.remove("steering"));
     assert!(
         direct_steering.is_some(),
         "direct CLI should retain its presentation steering: {direct}"
     );
-    assert_eq!(routed["error"], direct_error);
+    assert_eq!(routed, direct_protocol);
     assert_eq!(routed["error"]["code"], "precondition_failed");
     assert_eq!(
         routed["error"]["details"]["kind"],
