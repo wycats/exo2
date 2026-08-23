@@ -1980,14 +1980,26 @@ fn dogfood_repair_apply_checkpoint_failure_preserves_retry_steering() {
     .expect("insert legacy goal");
     drop(legacy_db);
 
-    let projection_dir = sidecar_root
-        .join("projects")
-        .join("dogfood-test")
-        .join("agent-context");
-    if projection_dir.is_dir() {
-        std::fs::remove_dir_all(&projection_dir).expect("remove projection dir");
-    }
-    std::fs::write(&projection_dir, "not a directory\n").expect("replace projection dir with file");
+    let foreign_path = sidecar_root.join("projects/foreign/agent-context/manual.sql");
+    std::fs::create_dir_all(foreign_path.parent().expect("foreign projection parent"))
+        .expect("create foreign projection parent");
+    std::fs::write(&foreign_path, "-- staged foreign state\n").expect("write staged foreign state");
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                sidecar_root.to_str().unwrap(),
+                "add",
+                foreign_path
+                    .strip_prefix(&sidecar_root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            ])
+            .status()
+            .expect("stage foreign sidecar state")
+            .success()
+    );
 
     let output = exo_cmd_with_home(&repo, &home, &config_home)
         .args(["--format", "json", "dogfood", "repair", "--apply"])
