@@ -24,19 +24,23 @@ fn repo_root() -> PathBuf {
     p
 }
 
-fn run_channel(request_json: &str) -> JsonValue {
+fn run_channel_at(root: &Path, request_json: &str) -> JsonValue {
     let request: RequestEnvelope = ok_or_return!(
         serde_json::from_str(request_json),
         "expected valid request envelope";
         JsonValue::Null
     );
 
-    let resp = run_machine_channel_in_process(&repo_root(), &request);
+    let resp = run_machine_channel_in_process(root, &request);
     ok_or_return!(
         serde_json::to_value(resp),
         "expected response to serialize";
         JsonValue::Null
     )
+}
+
+fn run_channel(request_json: &str) -> JsonValue {
+    run_channel_at(&repo_root(), request_json)
 }
 
 fn run_channel_with_project(
@@ -87,15 +91,35 @@ fn git_common_dir(root: &Path) -> PathBuf {
         .expect("canonical git common dir")
 }
 
-fn rel_to_repo_root(abs: &Path) -> String {
-    let root = repo_root();
+fn rel_to_repo_root(root: &Path, abs: &Path) -> String {
     let rel = ok_or_return!(
-        abs.strip_prefix(&root),
+        abs.strip_prefix(root),
         "path under repo root";
         abs.to_string_lossy().replace('\\', "/")
     );
 
     rel.to_string_lossy().replace('\\', "/")
+}
+
+fn compatible_repo_clone() -> (tempfile::TempDir, PathBuf) {
+    let source = repo_root();
+    let temp = tempfile::tempdir().expect("repo clone tempdir");
+    let root = temp.path().join("repo");
+    let status = Command::new("git")
+        .args(["clone", "--quiet", "--local", "--no-hardlinks"])
+        .arg(&source)
+        .arg(&root)
+        .status()
+        .expect("clone repo fixture");
+    assert!(status.success(), "clone repo fixture");
+    exo::templates::configure_sql_dump_merge_driver(&root)
+        .expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(&root)
+            .expect("verify SQL dump merge driver"),
+        "repo fixture should have the compatible SQL dump merge driver"
+    );
+    (temp, root)
 }
 
 fn write_md(path: &Path, contents: &str) {
@@ -116,7 +140,8 @@ fn docs_links_check_returns_steering_to_fix_when_changes_exist() {
     let md_path = tmp.path().join("input.md");
     write_md(&md_path, "See [RFC](exo:rfc/8) for details.\n");
 
-    let targets_path = rel_to_repo_root(tmp.path());
+    let root = repo_root();
+    let targets_path = rel_to_repo_root(&root, tmp.path());
 
     let resp = run_channel(&format!(
         "{{\"protocol_version\":1,\"id\":\"t1\",\"op\":{{\"kind\":\"call\",\"params\":{{\"address\":{{\"kind\":\"operation\",\"path\":[\"docs\",\"links\",\"check\"]}},\"input\":{{\"targets\":{{\"paths\":[\"{targets_path}\"]}},\"options\":{{\"strict\":true}}}}}}}}}}"
@@ -150,21 +175,25 @@ fn docs_links_check_returns_steering_to_fix_when_changes_exist() {
 
 #[test]
 fn docs_links_fix_rewrites_exo_links_in_target_files() {
+    let (_repo_temp, root) = compatible_repo_clone();
     let tmp = ok_or_return!(
         tempfile::Builder::new()
             .prefix("exo-docs-links-")
-            .tempdir_in(repo_root()),
+            .tempdir_in(&root),
         "failed to create tempdir"
     );
 
     let md_path = tmp.path().join("input.md");
     write_md(&md_path, "See [RFC](exo:rfc/8) for details.\n");
 
-    let targets_path = rel_to_repo_root(tmp.path());
+    let targets_path = rel_to_repo_root(&root, tmp.path());
 
-    let resp = run_channel(&format!(
-        "{{\"protocol_version\":1,\"id\":\"t2\",\"op\":{{\"kind\":\"call\",\"params\":{{\"address\":{{\"kind\":\"operation\",\"path\":[\"docs\",\"links\",\"fix\"]}},\"input\":{{\"targets\":{{\"paths\":[\"{targets_path}\"]}},\"options\":{{\"strict\":true}}}}}}}}}}"
-    ));
+    let resp = run_channel_at(
+        &root,
+        &format!(
+            "{{\"protocol_version\":1,\"id\":\"t2\",\"op\":{{\"kind\":\"call\",\"params\":{{\"address\":{{\"kind\":\"operation\",\"path\":[\"docs\",\"links\",\"fix\"]}},\"input\":{{\"targets\":{{\"paths\":[\"{targets_path}\"]}},\"options\":{{\"strict\":true}}}}}}}}}}"
+        ),
+    );
 
     assert_eq!(resp.get("status").and_then(|v| v.as_str()), Some("ok"));
 
@@ -188,7 +217,8 @@ fn docs_links_check_ignores_placeholder_exo_ellipsis() {
     let md_path = tmp.path().join("input.md");
     write_md(&md_path, "Example: [Link](exo:...)\n");
 
-    let targets_path = rel_to_repo_root(tmp.path());
+    let root = repo_root();
+    let targets_path = rel_to_repo_root(&root, tmp.path());
 
     let resp = run_channel(&format!(
         "{{\"protocol_version\":1,\"id\":\"t3\",\"op\":{{\"kind\":\"call\",\"params\":{{\"address\":{{\"kind\":\"operation\",\"path\":[\"docs\",\"links\",\"check\"]}},\"input\":{{\"targets\":{{\"paths\":[\"{targets_path}\"]}},\"options\":{{\"strict\":true}}}}}}}}}}"
