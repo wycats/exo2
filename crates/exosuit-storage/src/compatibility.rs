@@ -475,6 +475,32 @@ pub fn open_fenced_existing_connection(
     }))
 }
 
+/// Open an existing canonical database read-only while retaining compatible
+/// shared writer authority. This path performs no migrations or journal-mode
+/// changes and never creates the database.
+pub fn open_fenced_read_only_connection(
+    path: impl AsRef<Path>,
+) -> Result<Option<FencedConnection>, DatabaseError> {
+    let path = normalize_database_identity(path.as_ref())?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let generation = probe_database_generation_at_identity(&path)?;
+    ensure_supported(generation, StateSurface::Database)?;
+    let lease = CompatibilityLease::acquire(&path, LeaseMode::Shared)?;
+    let generation = probe_database_generation_at_identity(&path)?;
+    ensure_supported(generation, StateSurface::Database)?;
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(Some(FencedConnection {
+        conn,
+        _compatibility_lease: lease,
+    }))
+}
+
 pub(crate) fn open_database_connection(
     path: &Path,
 ) -> Result<(Connection, CompatibilityLease), DatabaseError> {
@@ -922,6 +948,40 @@ mod tests {
             Duration::from_millis(50),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn read_only_fenced_connection_preserves_existing_journal_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "delete")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let read_only = open_fenced_read_only_connection(&path)
+            .unwrap()
+            .expect("existing database");
+        assert_eq!(
+            read_only
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            read_only
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "same"
+        );
+        assert!(!path.with_extension("db-wal").exists());
     }
 
     fn wait_for_test_marker(child: &mut std::process::Child, marker: &Path) {

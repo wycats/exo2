@@ -131,7 +131,7 @@ fn retention_cleanup_removes_old_events() {
 
     // Run cleanup
     drop(db);
-    exo::daemon::cleanup_old_events(root);
+    exo::daemon::cleanup_old_events(root).expect("clean up retained events");
 
     drop(
         exosuit_storage::acquire_exclusive_compatibility_authority(&db_path)
@@ -159,4 +159,47 @@ fn retention_cleanup_removes_old_events() {
         )
         .expect("count recent");
     assert_eq!(recent_count, 1, "recent event should survive cleanup");
+}
+
+#[test]
+fn retention_cleanup_rejects_incompatible_projection_before_deleting_events() {
+    let temp = TempDir::new().expect("create temp dir");
+    let root = temp.path();
+    exo_init_with_storage(root, "sqlite");
+
+    let db_path = root.join(".cache/exo.db");
+    let db = exosuit_storage::open_database(&db_path).expect("open db");
+    db.connection()
+        .execute(
+            "INSERT INTO agent_events (text_id, timestamp, event_type, namespace, operation, summary)\n             VALUES ('old-event', datetime('now', '-10 days'), 'command', 'test', 'old', 'old event')",
+            [],
+        )
+        .expect("insert old event");
+    drop(db);
+    std::fs::write(
+        root.join("docs/agent-context/epochs.sql"),
+        "-- exo:minimum-writer-generation=1\n",
+    )
+    .expect("raise projection generation");
+
+    let error = exo::daemon::cleanup_old_events(root)
+        .expect_err("incompatible projection must reject cleanup");
+    let failure = exo::storage_compatibility::writer_compatibility_failure_from_error(&error)
+        .expect("typed compatibility failure");
+    assert_eq!(
+        failure.error.details.as_ref().unwrap()["kind"],
+        "storage.writer_incompatible"
+    );
+
+    let connection = exosuit_storage::Connection::open(&db_path).expect("inspect db directly");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_events WHERE text_id = 'old-event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }

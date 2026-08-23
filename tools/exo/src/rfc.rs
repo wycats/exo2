@@ -17,7 +17,7 @@ use crate::api::protocol::ErrorCode;
 use crate::context::sqlite_loader::{
     RfcRecord, RfcWorkspaceDiagnostic, RfcWorkspaceObservation, RfcWorkspaceSnapshot,
 };
-use crate::context::{SqliteLoader, SqliteWriter};
+use crate::context::{AgentContext, SqliteLoader, SqliteWriter};
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::utils;
@@ -967,6 +967,7 @@ pub fn reconcile_rfcs_once_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<ReconcileResult> {
+    AgentContext::preflight_storage_compatibility(root, project)?;
     with_reconcile_lock(root, project, || {
         let source = canonical_reconcile_source(root)?;
         reconcile_and_refresh_locked(root, project, &source, true)
@@ -984,6 +985,7 @@ pub fn observe_effective_rfc_view_with_project(
     root: &Path,
     project: Option<&Project>,
 ) -> Result<(ReconcileResult, EffectiveRfcView)> {
+    AgentContext::preflight_storage_compatibility(root, project)?;
     observe_effective_rfc_view(root, project, true)
 }
 
@@ -2050,6 +2052,7 @@ pub fn observe_effective_rfc_by_number(
     project: Option<&Project>,
     rfc_number: i64,
 ) -> Result<Option<EffectiveRfcRecord>> {
+    AgentContext::preflight_storage_compatibility(root, project)?;
     with_reconcile_lock(root, project, || {
         let transaction =
             exosuit_storage::RequestTransaction::begin(crate::context::db_path(root, project))

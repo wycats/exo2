@@ -1395,6 +1395,16 @@ fn is_update_command(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("update"))
 }
 
+fn is_storage_compatibility_command(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("storage"), Some("compatibility"))
+    )
+}
+
 fn is_rfc_reconcile_read(args: &[String]) -> bool {
     matches!(
         (
@@ -1815,7 +1825,8 @@ fn main() {
     let is_direct = has_direct_flag
         || std::env::var_os(TASK_DIRECT_MODE_ENV).is_some()
         || is_project_bootstrap_read(&args)
-        || is_sidecar_bootstrap_context_command(&args);
+        || is_sidecar_bootstrap_context_command(&args)
+        || is_storage_compatibility_command(&args);
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("exo {}", env!("CARGO_PKG_VERSION"));
@@ -2055,6 +2066,7 @@ fn main() {
     } else if is_project_bootstrap_read(&args)
         || is_sidecar_bootstrap_context_command(&args)
         || is_update_command(&args)
+        || is_storage_compatibility_command(&args)
         || command_loads_request_context(&args)
     {
         let project = if is_update_command(&args) {
@@ -3162,5 +3174,11 @@ mod tests {
             "task".to_string(),
             "start".to_string(),
         ]));
+    }
+
+    #[test]
+    fn storage_compatibility_uses_lightweight_direct_context() {
+        let args = ["storage".to_string(), "compatibility".to_string()];
+        assert!(is_storage_compatibility_command(&args));
     }
 }

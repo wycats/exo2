@@ -2711,14 +2711,18 @@ async fn ensure_daemon_paths_with_report(
 
 /// Delete agent events older than 7 days (RFC 10183 retention policy).
 ///
-/// Best-effort: silently ignores errors if the database doesn't exist
-/// or the table hasn't been created yet.
-pub fn cleanup_old_events(workspace_root: &Path) {
+/// Deletion remains best-effort when the database or table is unavailable;
+/// compatibility failures are returned before any cleanup write is attempted.
+pub fn cleanup_old_events(workspace_root: &Path) -> crate::ExoResult<()> {
     let project = Project::resolve(workspace_root).ok();
-    cleanup_old_events_with_project(workspace_root, project.as_ref());
+    cleanup_old_events_with_project(workspace_root, project.as_ref())
 }
 
-pub fn cleanup_old_events_with_project(workspace_root: &Path, project: Option<&Project>) {
+pub fn cleanup_old_events_with_project(
+    workspace_root: &Path,
+    project: Option<&Project>,
+) -> crate::ExoResult<()> {
+    AgentContext::preflight_storage_compatibility(workspace_root, project)?;
     let db_path = crate::context::db_path(workspace_root, project);
     let _ = crate::event_db::with_uncached_existing_event_db(&db_path, |conn| {
         conn.execute(
@@ -2726,6 +2730,7 @@ pub fn cleanup_old_events_with_project(workspace_root: &Path, project: Option<&P
             [],
         )
     });
+    Ok(())
 }
 
 /// Run the daemon server for a workspace.
@@ -2752,6 +2757,12 @@ pub async fn run_daemon(
             return;
         }
     };
+    if let Err(error) =
+        AgentContext::preflight_storage_compatibility(&workspace_path, Some(project.as_ref()))
+    {
+        eprintln!("exo daemon: storage compatibility preflight failed: {error:#}");
+        return;
+    }
     let paths = LocalRuntimePaths::new(&workspace_path, &project);
     let diagnostics = DaemonDiagnostics::from_runtime_dir_with_config(
         &paths.runtime_dir(),
@@ -2823,7 +2834,15 @@ pub async fn run_daemon(
     // Startup maintenance is synchronous and one-shot. Its connection and
     // shared compatibility lease must be gone before health or socket
     // readiness allows a replacement writer to receive requests.
-    cleanup_old_events_with_project(workspace.as_ref(), Some(project.as_ref()));
+    if let Err(error) = cleanup_old_events_with_project(workspace.as_ref(), Some(project.as_ref()))
+    {
+        diagnostics.record(
+            "daemon.storage_preflight_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+        eprintln!("exo daemon: storage compatibility preflight failed: {error:#}");
+        return;
+    }
     let health = DaemonHealthWriter::new(&paths, &runtime_identity);
     let instance_id: Arc<str> = runtime_identity
         .instance_id

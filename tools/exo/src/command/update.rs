@@ -182,6 +182,7 @@ fn resolve_update_project(root: &Path, project: Option<&Project>) -> Option<Proj
 
 fn load_update_context(root: PathBuf, project: Option<&Project>) -> ExoResult<AgentContext> {
     let project = resolve_update_project(&root, project);
+    AgentContext::preflight_storage_compatibility(&root, project.as_ref())?;
     ensure_update_database(&root, project.as_ref())?;
     Ok(AgentContext {
         root,
@@ -249,6 +250,7 @@ pub fn run_update(context: &mut AgentContext) -> Result<(), Box<dyn std::error::
     if context.project.is_none() {
         context.project = Project::resolve(&context.root).ok();
     }
+    AgentContext::preflight_storage_compatibility(&context.root, context.project.as_ref())?;
     ensure_update_database(&context.root, context.project.as_ref())?;
     let summary = apply_upgrades(context)?;
     reload_after_upgrade(context)?;

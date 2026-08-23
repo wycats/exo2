@@ -1632,57 +1632,37 @@ fn atomic_write_projection_file_with_directory_sync(
     content: &[u8],
     sync_directory: impl Fn(&Path) -> std::io::Result<()>,
 ) -> ExoResult<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("projection.sql");
-    let mut last_collision = None;
-    for attempt in 0..100_u32 {
-        let temporary = path.with_file_name(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            attempt
-        ));
-        let file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary);
-        let mut file = match file {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_collision = Some(error);
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "Failed to create temporary projection {}",
-                        temporary.display()
-                    )
-                });
-            }
-        };
-        let write_result = (|| -> std::io::Result<()> {
-            file.write_all(content)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)?;
-            sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error)
-                .with_context(|| format!("Failed to publish projection {}", path.display()));
-        }
-        return Ok(());
-    }
-    Err(last_collision.unwrap_or_else(|| std::io::Error::other("temporary name exhausted")))
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}.exo-projection."))
+        .tempfile_in(parent)
         .with_context(|| {
             format!(
-                "Failed to allocate temporary projection for {}",
-                path.display()
+                "Failed to create temporary projection in {}",
+                parent.display()
             )
-        })
+        })?;
+    temporary.write_all(content).with_context(|| {
+        format!(
+            "Failed to write temporary projection for {}",
+            path.display()
+        )
+    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("Failed to sync temporary projection for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Failed to publish projection {}", path.display()))?;
+    sync_directory(parent)
+        .with_context(|| format!("Failed to sync projection directory {}", parent.display()))?;
+    Ok(())
 }
 
 fn remove_deprecated_sql_projection_files(dump_dir: &std::path::Path) -> ExoResult<()> {
@@ -2607,6 +2587,21 @@ status = "pending"
 
         assert_eq!(
             std::fs::read(path).expect("read projection"),
+            b"-- exo:minimum-writer-generation=0\n"
+        );
+    }
+
+    #[test]
+    fn atomic_projection_publish_replaces_existing_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("epochs.sql");
+        std::fs::write(&path, b"old\n").expect("write old projection");
+
+        atomic_write_projection_file(&path, b"-- exo:minimum-writer-generation=0\n")
+            .expect("replace projection atomically");
+
+        assert_eq!(
+            std::fs::read(path).expect("read replaced projection"),
             b"-- exo:minimum-writer-generation=0\n"
         );
     }

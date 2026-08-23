@@ -1299,7 +1299,11 @@ fn establish_sidecar_with_options_and_resolver(
         anyhow::bail!("sidecar key must not be empty");
     }
 
-    let intended_db_path = root.join("projects").join(key).join("cache").join("exo.db");
+    let intended_project_dir = root.join("projects").join(key);
+    let intended_projection_dir = intended_project_dir.join("agent-context");
+    let intended_db_path = intended_project_dir.join("cache").join("exo.db");
+    let retained_projection = crate::context::preflight_sql_dumps(&intended_projection_dir)
+        .context("Failed to preflight existing sidecar projection")?;
     exosuit_storage::preflight_database(&intended_db_path)
         .map_err(crate::storage_compatibility::map_database_error)
         .context("Failed to preflight existing sidecar database")?;
@@ -1354,11 +1358,14 @@ fn establish_sidecar_with_options_and_resolver(
             .with_context(|| format!("Failed to create DB directory {}", parent.display()))?;
     }
     let db_created = !db_path.exists();
-    let seeded_from_repo = if let Some(projection) = seed_projection {
+    let seeded_from_repo = if retained_projection.is_none()
+        && let Some(projection) = seed_projection
+    {
         seed_sidecar_projection_from_repo(projection, &projection_dir)?
     } else {
         false
     };
+    let projection_for_import = retained_projection.as_ref().or(seed_projection);
 
     enum HeldSidecarDatabase {
         Database {
@@ -1368,7 +1375,7 @@ fn establish_sidecar_with_options_and_resolver(
             _guard: exosuit_storage::FencedConnection,
         },
     }
-    let held_database = if db_created && let Some(projection) = seed_projection {
+    let held_database = if db_created && let Some(projection) = projection_for_import {
         HeldSidecarDatabase::Projection {
             _guard: crate::context::import_preflighted_sql_dumps_with_authority(
                 projection.clone(),
@@ -1908,6 +1915,25 @@ mod tests {
             .with_config_home(temp.path().join("xdg-config"))
     }
 
+    fn write_projection_with_epoch(projection_dir: &Path) -> String {
+        let scratch = tempfile::tempdir().unwrap();
+        let db_path = scratch.path().join("exo.db");
+        let writer = crate::context::SqliteWriter::open(&db_path).unwrap();
+        let text_id = writer
+            .add_epoch("Retained epoch", Some("retained-epoch"), &[])
+            .unwrap();
+        let dumps = exosuit_storage::dump_tables(writer.database().connection()).unwrap();
+        std::fs::create_dir_all(projection_dir).unwrap();
+        for (file_stem, table_name) in exosuit_storage::TABLE_ORDER {
+            let content = dumps
+                .iter()
+                .find(|(name, _)| name == table_name)
+                .map_or("", |(_, content)| content.as_str());
+            std::fs::write(projection_dir.join(format!("{file_stem}.sql")), content).unwrap();
+        }
+        text_id
+    }
+
     #[cfg(windows)]
     #[test]
     fn platform_home_dir_prefers_native_windows_profile_over_msys_home() {
@@ -2259,6 +2285,74 @@ mod tests {
         assert!(!project_dir.join("sidecar.toml").exists());
         assert!(!project_dir.join("agent-context").exists());
         assert!(!db_path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[test]
+    fn sidecar_link_rejects_incompatible_target_projection_before_policy_mutation() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/incompatible-projection");
+        let projection_dir = project_dir.join("agent-context");
+        std::fs::create_dir_all(&projection_dir).unwrap();
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .unwrap();
+        let config_path = resolver.local_projects_config_path().unwrap();
+
+        let error = link_sidecar_with_options_and_resolver(
+            &repo,
+            "incompatible-projection",
+            &sidecar_root,
+            None,
+            &resolver,
+        )
+        .unwrap_err();
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!config_path.exists());
+        assert!(!project_dir.join("sidecar.toml").exists());
+        assert!(!project_dir.join("cache/exo.db").exists());
+    }
+
+    #[test]
+    fn sidecar_link_hydrates_missing_database_from_retained_projection() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/retained-projection");
+        let epoch_id = write_projection_with_epoch(&project_dir.join("agent-context"));
+
+        let linked = link_sidecar_with_options_and_resolver(
+            &repo,
+            "retained-projection",
+            &sidecar_root,
+            None,
+            &resolver,
+        )
+        .expect("link retained sidecar projection");
+
+        assert!(linked.db_created);
+        assert!(!linked.seeded_from_repo);
+        let database = exosuit_storage::open_database(&linked.db_path).unwrap();
+        assert_eq!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT title FROM epochs_data WHERE text_id = ?1",
+                    [&epoch_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Retained epoch"
+        );
     }
 
     #[test]

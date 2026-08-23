@@ -412,7 +412,8 @@ fn test_bootstrap_scaffolding_upgrade_is_idempotent() {
     );
     assert!(
         merge_driver.status.success()
-            && String::from_utf8_lossy(&merge_driver.stdout).trim() == "true",
+            && String::from_utf8_lossy(&merge_driver.stdout).trim()
+                == "exo merge-driver sql %O %A %B %P",
         "first update should configure SQL dump merge driver\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&merge_driver.stdout),
         String::from_utf8_lossy(&merge_driver.stderr)

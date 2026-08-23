@@ -375,6 +375,12 @@ fn project_snapshot_output(
         .db_path
         .as_ref()
         .ok_or_else(|| anyhow!("Project {id} does not have a readable Exo state database"))?;
+    if let Some(sql_dir) = catalog_sql_projection_dir(root, &project) {
+        crate::context::preflight_sql_dumps(&sql_dir)?;
+    }
+    exosuit_storage::preflight_database(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight project snapshot database")?;
     if !db_path.exists() {
         let sql_dir = catalog_sql_projection_dir(root, &project)
             .filter(|sql_dir| sql_dir.join("epochs.sql").exists());
@@ -900,6 +906,7 @@ fn build_project_move_root_output(
     let manifest_path = sidecar_project_dir.join("sidecar.toml");
     let sidecar_project_id = read_sidecar_manifest_project_id(&manifest_path, key)?;
     let db_path = sidecar_project_dir.join("cache").join("exo.db");
+    preflight_project_move_root_storage(&sidecar_project_dir, &db_path)?;
 
     let db_roots = read_project_move_root_db_roots(&db_path)?;
     let marker = read_move_root_write_owner_marker(&binding.sidecar_root, key)?;
@@ -1210,6 +1217,7 @@ fn build_project_move_root_output(
 
 fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> {
     let db_path = output.sidecar_project_dir.join("cache").join("exo.db");
+    preflight_project_move_root_storage(&output.sidecar_project_dir, &db_path)?;
     let mut doc = read_local_projects_doc(&output.config_path)?;
     validate_policy_retarget_doc(
         &doc,
@@ -1705,6 +1713,22 @@ fn write_sidecar_manifest_project_id(
     })
 }
 
+fn preflight_project_move_root_storage(project_dir: &Path, db_path: &Path) -> ExoResult<()> {
+    crate::context::preflight_sql_dumps(&project_dir.join("agent-context"))?;
+    exosuit_storage::preflight_database(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight project move-root database")
+}
+
+fn open_project_move_root_read_connection(
+    db_path: &Path,
+) -> ExoResult<exosuit_storage::FencedConnection> {
+    exosuit_storage::open_fenced_read_only_connection(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?
+        .ok_or_else(|| anyhow!("Sidecar database {} disappeared", db_path.display()))
+}
+
 fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootDbRoots> {
     if !db_path.exists() {
         return Ok(ProjectMoveRootDbRoots {
@@ -1713,9 +1737,7 @@ fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootD
             phase_owner_workspace_roots: Vec::new(),
         });
     }
-    let conn = exosuit_storage::open_fenced_connection(db_path)
-        .map_err(crate::storage_compatibility::map_database_error)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     Ok(ProjectMoveRootDbRoots {
         workspace_active_phase_roots: read_distinct_text_values(
             &conn,
@@ -1739,9 +1761,7 @@ fn workspace_lane_focus_id(db_path: &Path, workspace_root: &str) -> ExoResult<Op
     if !db_path.exists() {
         return Ok(None);
     }
-    let conn = exosuit_storage::open_fenced_connection(db_path)
-        .map_err(crate::storage_compatibility::map_database_error)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "workspace_lane_focus_data")?
         || !sqlite_table_exists(&conn, "workbench_lanes_data")?
     {
@@ -1791,9 +1811,7 @@ fn count_project_move_root_rows(
     if !db_path.exists() {
         return Ok(0);
     }
-    let conn = exosuit_storage::open_fenced_connection(db_path)
-        .map_err(crate::storage_compatibility::map_database_error)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, table)? {
         return Ok(0);
     }
@@ -1808,9 +1826,7 @@ fn workspace_active_phase_statuses(db_path: &Path, workspace_root: &str) -> ExoR
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = exosuit_storage::open_fenced_connection(db_path)
-        .map_err(crate::storage_compatibility::map_database_error)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "workspace_active_phase_data")?
         || !sqlite_table_exists(&conn, "phases_data")?
     {
@@ -1834,9 +1850,7 @@ fn phase_owner_statuses(db_path: &Path, workspace_root: &str) -> ExoResult<Vec<S
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = exosuit_storage::open_fenced_connection(db_path)
-        .map_err(crate::storage_compatibility::map_database_error)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "phase_ownership_data")?
         || !sqlite_table_exists(&conn, "phases_data")?
     {

@@ -19,10 +19,11 @@ pub use compatibility::{
     acquire_exclusive_compatibility_authority, ensure_projection_supported,
     normalize_database_identity, open_fenced_connection, open_fenced_connection_for_import,
     open_fenced_connection_for_import_with_authority, open_fenced_existing_connection,
-    open_fenced_physical_connection, parse_projection_generation, preflight_database,
-    probe_database_generation, render_projection_generation_header, with_projection_generation,
-    ExclusiveCompatibilityAuthority, FencedConnection, StateSurface, WriterCompatibilityError,
-    MAX_WRITER_GENERATION, PROJECTION_GENERATION_PREFIX, SUPPORTED_WRITER_GENERATION,
+    open_fenced_physical_connection, open_fenced_read_only_connection, parse_projection_generation,
+    preflight_database, probe_database_generation, render_projection_generation_header,
+    with_projection_generation, ExclusiveCompatibilityAuthority, FencedConnection, StateSurface,
+    WriterCompatibilityError, MAX_WRITER_GENERATION, PROJECTION_GENERATION_PREFIX,
+    SUPPORTED_WRITER_GENERATION,
 };
 pub use dump::{dump_tables, import_tables, validate_tables, DumpError, ImportError, TABLE_ORDER};
 pub use exosuit_reactivity_core::{CellId, Revision, Trace, TraceEntry};

@@ -1109,6 +1109,7 @@ fn invocation_uses_lightweight_context(invocation: &Invocation) -> bool {
             true
         }
         ("rfc", "list" | "show" | "status") => true,
+        ("storage", "compatibility") => true,
         ("workbench", "launch" | "snapshot") => true,
         _ => false,
     }
@@ -2391,6 +2392,7 @@ mod tests {
             "rfc list",
             "rfc show 10196",
             "rfc status",
+            "storage compatibility",
             "task --help",
         ] {
             let compiled = compile_exo_run_input(input(command), "t1".to_string())

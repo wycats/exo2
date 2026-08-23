@@ -19,6 +19,7 @@ use crate::command::traits::{CommandInvokeResult, invoke_command_box_json};
 use crate::command::transport::{
     MachineChannelTransport, compatible_exec_ticket_request_id, ticket_for_exec_call,
 };
+use crate::context::AgentContext;
 use crate::daemon::DaemonEnsureState;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, effect_name, elapsed_ms, request_op_path, response_status,
@@ -57,6 +58,9 @@ fn log_command_event(
     duration_ms: u64,
     summary: &str,
 ) -> anyhow::Result<bool> {
+    if runtime != HandlerRuntime::AtomicStateWriter {
+        AgentContext::preflight_storage_compatibility(workspace_root, project)?;
+    }
     let db_path = crate::context::db_path(workspace_root, project);
 
     let text_id = if runtime == HandlerRuntime::AtomicStateWriter {
@@ -2185,6 +2189,14 @@ fn handle_call_with_namespace_operation(
                 );
             }
 
+            if runtime != HandlerRuntime::AtomicStateWriter
+                && crate::post_write::should_log_command_event(namespace, operation)
+                && let Err(error) =
+                    AgentContext::preflight_storage_compatibility(workspace_root, project)
+            {
+                return command_construction_error_to_response(id, error);
+            }
+
             if runtime == HandlerRuntime::SidecarWriter
                 && command_requires_database_hydration(namespace, operation)
                 && let Err(error) = crate::context::AgentContext::load_hydrated_with_project(
@@ -3261,6 +3273,44 @@ mod tests {
             daemon_writer_request_workspace(handler_workspace, None),
             handler_workspace
         );
+    }
+
+    #[test]
+    fn command_event_logging_preflights_projection_before_database_creation() {
+        let temp = tempfile::tempdir().expect("create event fixture");
+        let projection = temp.path().join("docs/agent-context");
+        std::fs::create_dir_all(&projection).expect("create projection directory");
+        std::fs::write(
+            projection.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible projection");
+        let db_path = crate::context::db_path(temp.path(), None);
+
+        let error = log_command_event(
+            temp.path(),
+            None,
+            "incompatible-event",
+            HandlerRuntime::External,
+            Some("agent-test"),
+            "project",
+            "snapshot",
+            &json!({}),
+            &json!({"ok": true}),
+            Effect::Pure,
+            1,
+            "Inspect project",
+        )
+        .expect_err("incompatible projection must reject event logging");
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!db_path.exists());
+        assert!(!db_path.with_extension("writer-compat.lock").exists());
     }
 
     #[test]
