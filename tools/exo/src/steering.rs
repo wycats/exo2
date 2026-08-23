@@ -2008,8 +2008,7 @@ fn add_concern_on_completed_repairs(
     agent_id: Option<&str>,
     repairs: &mut Vec<SuggestedAction>,
 ) {
-    let db_path = world.root.join(crate::context::SQLITE_DB_PATH);
-    let loader = match crate::context::sqlite_loader::SqliteLoader::open(&db_path) {
+    let loader = match crate::context::sqlite_loader::SqliteLoader::open(&world.db_path) {
         Ok(l) => l,
         Err(_) => return,
     };
