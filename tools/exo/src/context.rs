@@ -23,10 +23,13 @@ use crate::ulid_util::{ExoUlid, UlidResolvable};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const DEPRECATED_SQL_PROJECTION_FILES: &[&str] = &["agent_events.sql"];
 
@@ -1296,6 +1299,19 @@ impl AgentContext {
         root: &Path,
         project: Option<&Project>,
     ) -> ExoResult<StorageCompatibilityPreflight> {
+        let identity = StorageCompatibilityIdentity {
+            workspace_root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            database_path: db_path(root, project),
+        };
+        if let Some(preflight) = REQUEST_STORAGE_COMPATIBILITY.with(|scopes| {
+            scopes
+                .borrow()
+                .last()
+                .and_then(|scope| scope.get(&identity).copied())
+        }) {
+            return Ok(preflight);
+        }
+
         let projection_generation = if let Some(sql_dir) = sql_projection_dir(root, project) {
             if canonical_projection_available(&sql_dir)? {
                 ensure_repo_projection_settled(root, project)?;
@@ -1309,9 +1325,22 @@ impl AgentContext {
         exosuit_storage::preflight_database(&db_path(root, project))
             .map_err(crate::storage_compatibility::map_database_error)
             .context("Failed to preflight SQLite writer compatibility")?;
-        Ok(StorageCompatibilityPreflight {
+        let preflight = StorageCompatibilityPreflight {
             projection_generation,
-        })
+        };
+        REQUEST_STORAGE_COMPATIBILITY.with(|scopes| {
+            if let Some(scope) = scopes.borrow_mut().last_mut() {
+                scope.insert(identity, preflight);
+            }
+        });
+        Ok(preflight)
+    }
+
+    pub(crate) fn begin_storage_compatibility_request() -> StorageCompatibilityRequestScope {
+        REQUEST_STORAGE_COMPATIBILITY.with(|scopes| scopes.borrow_mut().push(HashMap::new()));
+        StorageCompatibilityRequestScope {
+            _not_send: PhantomData,
+        }
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -1548,14 +1577,9 @@ pub(crate) fn ensure_repo_projection_settled(
     if project.is_some_and(|project| project.policy != StatePolicy::Repo) {
         return Ok(());
     }
-    let inside = std::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(root)
-        .output_guarded()
-        .context("Failed to inspect repo-policy projection repository")?;
-    if !inside.status.success() {
+    let Some(git_dir) = crate::project::workspace_git_dir_from_filesystem(root) else {
         return Ok(());
-    }
+    };
 
     let mut unsettled_markers = Vec::new();
     for marker in [
@@ -1566,21 +1590,7 @@ pub(crate) fn ensure_repo_projection_settled(
         "rebase-merge",
         "rebase-apply",
     ] {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "--git-path", marker])
-            .current_dir(root)
-            .output_guarded()
-            .with_context(|| format!("Failed to resolve Git state marker {marker}"))?;
-        if !output.status.success() {
-            anyhow::bail!("Failed to resolve Git state marker {marker}");
-        }
-        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        let path = if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        };
-        if path.exists() {
+        if git_dir.join(marker).exists() {
             unsettled_markers.push(marker);
         }
     }
@@ -1713,6 +1723,31 @@ pub(crate) fn import_sql_dumps(
 #[derive(Clone, Copy)]
 pub(crate) struct StorageCompatibilityPreflight {
     projection_generation: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct StorageCompatibilityIdentity {
+    workspace_root: PathBuf,
+    database_path: PathBuf,
+}
+
+thread_local! {
+    static REQUEST_STORAGE_COMPATIBILITY: RefCell<Vec<HashMap<StorageCompatibilityIdentity, StorageCompatibilityPreflight>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct StorageCompatibilityRequestScope {
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for StorageCompatibilityRequestScope {
+    fn drop(&mut self) {
+        REQUEST_STORAGE_COMPATIBILITY.with(|scopes| {
+            scopes
+                .borrow_mut()
+                .pop()
+                .expect("storage compatibility request scope is active");
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -2627,6 +2662,47 @@ status = "pending"
 
         let error = ensure_repo_projection_settled(root, None)
             .expect_err("unsettled repo projection must be quarantined");
+        let failure = error
+            .downcast_ref::<crate::failure::ExoFailure>()
+            .expect("typed Exo failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.projection_unsettled"
+        );
+    }
+
+    #[test]
+    fn storage_compatibility_preflight_is_stable_within_one_request() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status_guarded()
+            .expect("initialize repository");
+        assert!(status.success());
+        let projection_dir = root.join("docs/agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write compatible projection");
+
+        let request = AgentContext::begin_storage_compatibility_request();
+        AgentContext::preflight_storage_compatibility(root, None)
+            .expect("initial request preflight");
+        std::fs::write(
+            root.join(".git/MERGE_HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .expect("mark merge state after request observation");
+        AgentContext::preflight_storage_compatibility(root, None)
+            .expect("request reuses its compatibility observation");
+        drop(request);
+
+        let error = AgentContext::preflight_storage_compatibility(root, None)
+            .expect_err("the next request must observe unsettled repository state");
         let failure = error
             .downcast_ref::<crate::failure::ExoFailure>()
             .expect("typed Exo failure");

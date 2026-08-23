@@ -1633,6 +1633,7 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
     runtime: HandlerRuntime,
     runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
+    let _storage_compatibility_scope = AgentContext::begin_storage_compatibility_request();
     let request_id = request.id.clone();
     let op_path = request_op_path(&request);
     let start = Instant::now();

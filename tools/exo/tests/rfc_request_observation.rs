@@ -175,7 +175,8 @@ fn status_and_task_list_reuse_one_rfc_observation_per_request() {
     let workspace = workspace(&temp);
     let mut direct_results = Vec::new();
 
-    for (args, max_git_processes) in [(&["status"][..], 7), (&["task", "list"][..], 5)] {
+    // Repo-policy requests add one compatibility check for unmerged index entries.
+    for (args, max_git_processes) in [(&["status"][..], 8), (&["task", "list"][..], 6)] {
         let trace_path = temp.path().join(format!("direct-{}.trace", args.join("-")));
         reset_trace(&trace_path);
         let (output, elapsed) = run_exo(&workspace, true, args, Some(&trace_path));

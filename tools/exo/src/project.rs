@@ -1728,6 +1728,11 @@ pub(crate) fn git_common_dir_from_filesystem(cwd: &Path) -> Option<PathBuf> {
     filesystem_git_layout(cwd).map(|(common_dir, _)| common_dir)
 }
 
+pub(crate) fn workspace_git_dir_from_filesystem(cwd: &Path) -> Option<PathBuf> {
+    let (_, workspace_root) = filesystem_git_layout(cwd)?;
+    workspace_git_dir(&workspace_root)
+}
+
 fn workspace_git_dir(workspace_root: &Path) -> Option<PathBuf> {
     let marker = workspace_root.join(".git");
     if marker.is_dir() {
