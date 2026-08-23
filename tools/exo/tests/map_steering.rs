@@ -7,6 +7,7 @@ use exo::context::{AgentContext, ExoState};
 use exo::map::build_map_json;
 use exo::steering::{SteeringBlock, WorkIntent};
 use std::fs::{self, File};
+use std::process::Command;
 use tempfile::TempDir;
 
 fn setup_test_context() -> (TempDir, AgentContext) {
@@ -18,6 +19,20 @@ fn setup_test_context() -> (TempDir, AgentContext) {
     fs::create_dir_all(root.join("docs/agent-context")).unwrap();
     fs::create_dir_all(root.join("docs/rfcs")).unwrap();
     fs::create_dir_all(root.join(".cache")).unwrap();
+    let git_status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .status()
+        .expect("initialize test repository");
+    assert!(git_status.success(), "initialize test repository");
+    exo::templates::install_gitattributes(&root).expect("install .gitattributes");
+    exo::templates::configure_sql_dump_merge_driver(&root)
+        .expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(&root)
+            .expect("verify SQL dump merge driver"),
+        "test workspace should satisfy the critical upgrade contract"
+    );
     exosuit_storage::open_database(root.join(".cache/exo.db")).unwrap();
 
     let context = AgentContext {
