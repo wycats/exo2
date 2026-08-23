@@ -158,6 +158,14 @@ fn human_rfc_status_surfaces_legacy_rfc_repair_debt() {
     let temp = ok_or_return!(tempfile::tempdir(), "failed to create tempdir");
     let root = temp.path();
 
+    git_init(root);
+    exo::templates::install_gitattributes(root).expect("install .gitattributes");
+    exo::templates::configure_sql_dump_merge_driver(root).expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(root)
+            .expect("verify SQL dump merge driver"),
+        "legacy RFC fixture should satisfy the critical repository upgrade contract"
+    );
     assert!(
         fs::write(
             root.join("exosuit.toml"),
