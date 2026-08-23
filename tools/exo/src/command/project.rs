@@ -375,17 +375,21 @@ fn project_snapshot_output(
         .db_path
         .as_ref()
         .ok_or_else(|| anyhow!("Project {id} does not have a readable Exo state database"))?;
-    if let Some(sql_dir) = catalog_sql_projection_dir(root, &project) {
-        crate::context::preflight_projection_compatibility(&sql_dir)?;
+    let sql_dir = catalog_sql_projection_dir(root, &project);
+    if let Some(sql_dir) = sql_dir.as_deref() {
+        crate::context::preflight_projection_compatibility(sql_dir)?;
     }
     exosuit_storage::preflight_database(db_path)
         .map_err(crate::storage_compatibility::map_database_error)
         .context("Failed to preflight project snapshot database")?;
     if !db_path.exists() {
-        let sql_dir = catalog_sql_projection_dir(root, &project)
-            .filter(|sql_dir| sql_dir.join("epochs.sql").exists());
-        if let Some(sql_dir) = sql_dir {
-            crate::context::import_sql_dumps(&sql_dir, db_path)?;
+        let projection = sql_dir
+            .as_deref()
+            .map(crate::context::preflight_sql_dumps)
+            .transpose()?
+            .flatten();
+        if let Some(projection) = projection {
+            crate::context::import_preflighted_sql_dumps(projection, db_path)?;
         } else {
             anyhow::bail!(
                 "Project {id} state database does not exist at {}",
@@ -1714,7 +1718,7 @@ fn write_sidecar_manifest_project_id(
 }
 
 fn preflight_project_move_root_storage(project_dir: &Path, db_path: &Path) -> ExoResult<()> {
-    crate::context::preflight_sql_dumps(&project_dir.join("agent-context"))?;
+    crate::context::preflight_projection_compatibility(&project_dir.join("agent-context"))?;
     exosuit_storage::preflight_database(db_path)
         .map_err(crate::storage_compatibility::map_database_error)
         .context("Failed to preflight project move-root database")?;
@@ -2273,4 +2277,33 @@ fn resolve_project(root: &std::path::Path) -> ExoResult<Project> {
             err
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_root_cached_preflight_checks_generation_without_importing_projection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let projection_dir = project_dir.join("agent-context");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create cache directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write generation carrier");
+        std::fs::write(
+            projection_dir.join("phases.sql"),
+            "this compatible interrupted projection is not importable",
+        )
+        .expect("write interrupted projection body");
+        drop(exosuit_storage::open_database(&db_path).expect("initialize database"));
+
+        preflight_project_move_root_storage(&project_dir, &db_path)
+            .expect("cached move-root should require only compatible generation metadata");
+    }
 }

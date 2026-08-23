@@ -4927,15 +4927,14 @@ fn semantic_merge_upstream_if_needed_with_hook(
         "git merge -s ours --no-commit",
     )?;
     restore_upstream_foreign_projects_for_merge(repo, &upstream)?;
-    for (relative_path, content) in merge.files {
-        let path = repo.sidecar_root.join(relative_path);
+    publish_merged_sql_projection(&repo.sidecar_root, merge.files, |path, content| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write merged SQL projection {}", path.display()))?;
-    }
+        crate::context::atomic_write_projection_file(path, content.as_bytes())
+            .with_context(|| format!("Failed to write merged SQL projection {}", path.display()))
+    })?;
     if let Some(projection_dir) = repo.project.sidecar_projection_dir() {
         let semantic_guard =
             if let Some(preflight) = crate::context::preflight_sql_dumps(&projection_dir)? {
@@ -4978,6 +4977,26 @@ fn semantic_merge_upstream_if_needed_with_hook(
 struct SqlProjectionMerge {
     files: BTreeMap<PathBuf, String>,
     conflicts: Vec<SqlProjectionConflict>,
+}
+
+fn publish_merged_sql_projection(
+    sidecar_root: &Path,
+    mut files: BTreeMap<PathBuf, String>,
+    mut publish_file: impl FnMut(&Path, &str) -> ExoResult<()>,
+) -> ExoResult<()> {
+    let epochs_path = files
+        .keys()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("epochs.sql"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Merged SQL projection is missing epochs.sql"))?;
+    let epochs = files
+        .remove(&epochs_path)
+        .expect("epochs path came from the projection map");
+    publish_file(&sidecar_root.join(&epochs_path), &epochs)?;
+    for (relative_path, content) in files {
+        publish_file(&sidecar_root.join(relative_path), &content)?;
+    }
+    Ok(())
 }
 
 fn merge_sql_projection_at_revisions(
@@ -5232,6 +5251,33 @@ mod sql_projection_merge_tests {
             merge_sql_projection_file(&base, &local, &remote).writer_generation,
             7
         );
+    }
+
+    #[test]
+    fn semantic_merge_publishes_generation_carrier_first() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            PathBuf::from("agent-context/axioms.sql"),
+            "axioms".to_string(),
+        );
+        files.insert(
+            PathBuf::from("agent-context/epochs.sql"),
+            "epochs".to_string(),
+        );
+        files.insert(
+            PathBuf::from("agent-context/phases.sql"),
+            "phases".to_string(),
+        );
+        let mut published = Vec::new();
+
+        publish_merged_sql_projection(Path::new("/sidecar"), files, |path, _| {
+            published.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            Ok(())
+        })
+        .expect("publish merged projection");
+
+        assert_eq!(published.first().map(String::as_str), Some("epochs.sql"));
+        assert_eq!(published.len(), 3);
     }
 
     #[test]

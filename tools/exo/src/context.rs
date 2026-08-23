@@ -1600,7 +1600,7 @@ fn ensure_repo_projection_settled(root: &Path, project: Option<&Project>) -> Exo
     Ok(())
 }
 
-fn atomic_write_projection_file(path: &Path, content: &[u8]) -> ExoResult<()> {
+pub(crate) fn atomic_write_projection_file(path: &Path, content: &[u8]) -> ExoResult<()> {
     atomic_write_projection_file_with_directory_sync(path, content, sync_projection_directory)
 }
 
@@ -1796,7 +1796,7 @@ pub(crate) fn preflight_projection_compatibility(sql_dir: &Path) -> ExoResult<i3
     Ok(generation)
 }
 
-fn import_preflighted_sql_dumps(
+pub(crate) fn import_preflighted_sql_dumps(
     preflight: PreflightedSqlProjection,
     db_path: &std::path::Path,
 ) -> ExoResult<()> {
