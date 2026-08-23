@@ -456,7 +456,7 @@ pub fn load_and_check_command_upgrade_gate(
     check_upgrade_gate(&context)
 }
 
-const fn command_requires_upgrade_gate(namespace: &str, operation: &str, effect: Effect) -> bool {
+fn command_requires_upgrade_gate(namespace: &str, operation: &str, effect: Effect) -> bool {
     if matches!(effect, Effect::Pure) {
         return false;
     }
