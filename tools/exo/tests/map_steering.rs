@@ -97,7 +97,17 @@ fn test_map_returns_empty_context_steering_when_no_epochs_exist() {
     assert_eq!(steering_block.next_actions.len(), 1);
     assert_eq!(steering_block.next_actions[0].command, "exo plan review");
     assert_eq!(steering_block.primary_intent, WorkIntent::Orient);
-    assert!(steering_block.repair_actions.is_empty());
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&context.root)
+        .output()
+        .expect("inspect test workspace after map rendering");
+    assert!(
+        steering_block.repair_actions.is_empty(),
+        "unexpected repair actions: {:#?}; post-map git status: {}",
+        steering_block.repair_actions,
+        String::from_utf8_lossy(&status_output.stdout)
+    );
 }
 
 #[test]
