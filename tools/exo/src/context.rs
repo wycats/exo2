@@ -1337,8 +1337,17 @@ impl AgentContext {
     }
 
     pub(crate) fn begin_storage_compatibility_request() -> StorageCompatibilityRequestScope {
-        REQUEST_STORAGE_COMPATIBILITY.with(|scopes| scopes.borrow_mut().push(HashMap::new()));
+        let owns_scope = REQUEST_STORAGE_COMPATIBILITY.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            if scopes.is_empty() {
+                scopes.push(HashMap::new());
+                true
+            } else {
+                false
+            }
+        });
         StorageCompatibilityRequestScope {
+            owns_scope,
             _not_send: PhantomData,
         }
     }
@@ -1736,11 +1745,15 @@ thread_local! {
 }
 
 pub(crate) struct StorageCompatibilityRequestScope {
+    owns_scope: bool,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl Drop for StorageCompatibilityRequestScope {
     fn drop(&mut self) {
+        if !self.owns_scope {
+            return;
+        }
         REQUEST_STORAGE_COMPATIBILITY.with(|scopes| {
             scopes
                 .borrow_mut()
@@ -2692,13 +2705,17 @@ status = "pending"
         let request = AgentContext::begin_storage_compatibility_request();
         AgentContext::preflight_storage_compatibility(root, None)
             .expect("initial request preflight");
+        let nested_request = AgentContext::begin_storage_compatibility_request();
         std::fs::write(
             root.join(".git/MERGE_HEAD"),
             "0000000000000000000000000000000000000000\n",
         )
         .expect("mark merge state after request observation");
         AgentContext::preflight_storage_compatibility(root, None)
-            .expect("request reuses its compatibility observation");
+            .expect("nested request scope reuses the outer compatibility observation");
+        drop(nested_request);
+        AgentContext::preflight_storage_compatibility(root, None)
+            .expect("outer request retains its compatibility observation");
         drop(request);
 
         let error = AgentContext::preflight_storage_compatibility(root, None)

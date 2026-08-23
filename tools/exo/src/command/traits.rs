@@ -13,6 +13,7 @@ use crate::command::transport::{
     CommandError, ConfirmResult, SteeringOutput, TransportContext, TransportOutput,
 };
 use crate::command::unified_diagnostics::IntoDiagnosticSteering;
+use crate::context::AgentContext;
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::steering::SuggestedAction;
@@ -470,6 +471,8 @@ pub fn invoke_command_box_json(
     cmd: &CommandBox,
     transport: &dyn TransportContext,
 ) -> Result<CommandInvokeResult, serde_json::Value> {
+    let _storage_compatibility_scope = AgentContext::begin_storage_compatibility_request();
+
     if cmd.effect() == Effect::Exec {
         let action = cmd.description();
 
