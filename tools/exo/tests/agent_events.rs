@@ -163,7 +163,7 @@ fn retention_cleanup_removes_old_events() {
 
 #[test]
 fn retention_cleanup_rejects_incompatible_projection_before_deleting_events() {
-    let temp = TempDir::new().expect("create temp dir");
+    let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path();
     exo_init_with_storage(root, "sqlite");
 
