@@ -2720,7 +2720,7 @@ pub fn cleanup_old_events(workspace_root: &Path) {
 
 pub fn cleanup_old_events_with_project(workspace_root: &Path, project: Option<&Project>) {
     let db_path = crate::context::db_path(workspace_root, project);
-    let _ = crate::event_db::with_event_db(&db_path, |conn| {
+    let _ = crate::event_db::with_uncached_existing_event_db(&db_path, |conn| {
         conn.execute(
             "DELETE FROM agent_events WHERE timestamp < datetime('now', '-7 days')",
             [],
@@ -2820,6 +2820,10 @@ pub async fn run_daemon(
             return;
         }
     };
+    // Startup maintenance is synchronous and one-shot. Its connection and
+    // shared compatibility lease must be gone before health or socket
+    // readiness allows a replacement writer to receive requests.
+    cleanup_old_events_with_project(workspace.as_ref(), Some(project.as_ref()));
     let health = DaemonHealthWriter::new(&paths, &runtime_identity);
     let instance_id: Arc<str> = runtime_identity
         .instance_id
@@ -3267,8 +3271,6 @@ pub async fn run_daemon(
     let diagnostics_clone = diagnostics.clone();
     let server_health = health.clone();
     let last_activity_clone = Arc::clone(&last_activity);
-    let cleanup_workspace = Arc::clone(&workspace);
-    let cleanup_project = Arc::clone(&project);
     let server_handle = tokio::spawn(async move {
         let _health_guard = DaemonServerTaskHealthGuard(server_health.clone());
         run_socket_server(
@@ -3288,12 +3290,6 @@ pub async fn run_daemon(
         )
         .await;
     });
-    if cleanup_project.db_path().exists() {
-        tokio::task::spawn_blocking(move || {
-            cleanup_old_events_with_project(&cleanup_workspace, Some(cleanup_project.as_ref()));
-        });
-    }
-
     // Idle timeout checker task.
     //
     // Polling strategy: We check every `timeout/2` seconds, capped at 30 seconds,

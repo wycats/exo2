@@ -133,6 +133,11 @@ fn retention_cleanup_removes_old_events() {
     drop(db);
     exo::daemon::cleanup_old_events(root);
 
+    drop(
+        exosuit_storage::acquire_exclusive_compatibility_authority(&db_path)
+            .expect("retention cleanup releases writer authority before returning"),
+    );
+
     // Reopen and verify
     let db = exosuit_storage::open_database(&db_path).expect("reopen db");
     let conn = db.connection();

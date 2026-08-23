@@ -123,9 +123,84 @@ pub fn with_event_db<T>(
     }
 }
 
+/// Run `f` once against an existing event database without retaining a cached
+/// connection or compatibility lease.
+///
+/// Startup maintenance uses this path before the daemon advertises readiness.
+/// The connection and its shared writer authority are dropped before this
+/// function returns, allowing a newer compatible writer to migrate the same
+/// database immediately afterward. Like [`with_event_db`], this never creates
+/// a missing database and treats event-query failures as best-effort misses.
+pub fn with_uncached_existing_event_db<T>(
+    db_path: &Path,
+    f: impl FnOnce(&Connection) -> exosuit_storage::rusqlite::Result<T>,
+) -> anyhow::Result<Option<T>> {
+    let Some(conn) = exosuit_storage::open_fenced_existing_connection(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)?
+    else {
+        return Ok(None);
+    };
+
+    match f(&conn) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncached_event_access_does_not_create_or_retain_a_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("exo.db");
+
+        assert_eq!(
+            with_uncached_existing_event_db(&path, |_| Ok(())).expect("missing database"),
+            None
+        );
+        assert!(!path.exists(), "one-shot access must not create a database");
+
+        drop(exosuit_storage::open_database(&path).expect("create compatible database"));
+        assert_eq!(
+            with_uncached_existing_event_db(&path, |conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            })
+            .expect("read existing database"),
+            Some(1)
+        );
+        assert!(
+            !lock_unpoisoned(&CONNECTIONS).contains_key(&path),
+            "one-shot access must not populate the shared connection cache"
+        );
+
+        drop(
+            exosuit_storage::acquire_exclusive_compatibility_authority(&path)
+                .expect("one-shot access releases writer authority before returning"),
+        );
+    }
+
+    #[test]
+    fn normal_event_access_retains_its_cached_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("exo.db");
+        drop(exosuit_storage::open_database(&path).expect("create compatible database"));
+
+        assert_eq!(
+            with_event_db(&path, |conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            })
+            .expect("read through event cache"),
+            Some(1)
+        );
+        assert!(
+            lock_unpoisoned(&CONNECTIONS).contains_key(&path),
+            "normal event access keeps the shared connection cache"
+        );
+
+        lock_unpoisoned(&CONNECTIONS).remove(&path);
+    }
 
     #[test]
     fn event_consumer_preserves_writer_compatibility_failure() {
