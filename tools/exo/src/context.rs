@@ -1781,7 +1781,7 @@ fn canonical_projection_available(sql_dir: &Path) -> ExoResult<bool> {
     Ok(false)
 }
 
-fn preflight_projection_compatibility(sql_dir: &Path) -> ExoResult<i32> {
+pub(crate) fn preflight_projection_compatibility(sql_dir: &Path) -> ExoResult<i32> {
     let epochs_sql = match fs::read_to_string(sql_dir.join("epochs.sql")) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),

@@ -376,7 +376,7 @@ fn project_snapshot_output(
         .as_ref()
         .ok_or_else(|| anyhow!("Project {id} does not have a readable Exo state database"))?;
     if let Some(sql_dir) = catalog_sql_projection_dir(root, &project) {
-        crate::context::preflight_sql_dumps(&sql_dir)?;
+        crate::context::preflight_projection_compatibility(&sql_dir)?;
     }
     exosuit_storage::preflight_database(db_path)
         .map_err(crate::storage_compatibility::map_database_error)

@@ -1302,8 +1302,14 @@ fn establish_sidecar_with_options_and_resolver(
     let intended_project_dir = root.join("projects").join(key);
     let intended_projection_dir = intended_project_dir.join("agent-context");
     let intended_db_path = intended_project_dir.join("cache").join("exo.db");
-    let retained_projection = crate::context::preflight_sql_dumps(&intended_projection_dir)
-        .context("Failed to preflight existing sidecar projection")?;
+    let mut retained_projection = if intended_db_path.exists() {
+        crate::context::preflight_projection_compatibility(&intended_projection_dir)
+            .context("Failed to preflight existing sidecar projection")?;
+        None
+    } else {
+        crate::context::preflight_sql_dumps(&intended_projection_dir)
+            .context("Failed to preflight existing sidecar projection")?
+    };
     exosuit_storage::preflight_database(&intended_db_path)
         .map_err(crate::storage_compatibility::map_database_error)
         .context("Failed to preflight existing sidecar database")?;
@@ -1311,6 +1317,11 @@ fn establish_sidecar_with_options_and_resolver(
     let authority = exosuit_storage::acquire_exclusive_compatibility_authority(&intended_db_path)
         .map_err(crate::storage_compatibility::map_database_error)
         .context("Failed to acquire sidecar database compatibility authority")?;
+    let db_created = !intended_db_path.exists();
+    if db_created && retained_projection.is_none() {
+        retained_projection = crate::context::preflight_sql_dumps(&intended_projection_dir)
+            .context("Failed to preflight existing sidecar projection")?;
+    }
 
     let project_before_policy = resolver.resolve(cwd)?;
     let config_path = resolver.local_projects_config_path()?;
@@ -1357,8 +1368,8 @@ fn establish_sidecar_with_options_and_resolver(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create DB directory {}", parent.display()))?;
     }
-    let db_created = !db_path.exists();
-    let seeded_from_repo = if retained_projection.is_none()
+    let seeded_from_repo = if db_created
+        && retained_projection.is_none()
         && let Some(projection) = seed_projection
     {
         seed_sidecar_projection_from_repo(projection, &projection_dir)?
@@ -2352,6 +2363,62 @@ mod tests {
                 )
                 .unwrap(),
             "Retained epoch"
+        );
+    }
+
+    #[test]
+    fn sidecar_link_existing_cache_repairs_interrupted_projection() {
+        let (temp, repo) = init_primary_repo();
+        let resolver = resolver_with_test_home(&temp);
+        let sidecar_root = temp.path().join("sidecars");
+        let project_dir = sidecar_root.join("projects/existing-cache");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let database = exosuit_storage::open_database(&db_path).unwrap();
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
+            )
+            .unwrap();
+        drop(database);
+
+        let projection_dir = project_dir.join("agent-context");
+        std::fs::create_dir_all(&projection_dir).unwrap();
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            projection_dir.join("phases.sql"),
+            "not portable SQL from an interrupted export\n",
+        )
+        .unwrap();
+
+        let linked = link_sidecar_with_options_and_resolver(
+            &repo,
+            "existing-cache",
+            &sidecar_root,
+            None,
+            &resolver,
+        )
+        .expect("link sidecar with authoritative existing cache");
+
+        assert!(!linked.db_created);
+        assert!(!linked.seeded_from_repo);
+        let database = exosuit_storage::open_database(&linked.db_path).unwrap();
+        assert_eq!(
+            database
+                .connection()
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "same"
+        );
+        assert_ne!(
+            std::fs::read_to_string(projection_dir.join("phases.sql")).unwrap(),
+            "not portable SQL from an interrupted export\n"
         );
     }
 

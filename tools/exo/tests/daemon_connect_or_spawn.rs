@@ -714,6 +714,14 @@ fn future_writer_errors_match_between_direct_and_ready_daemon(backend: &str) {
     let dir = TempDir::new().unwrap();
     let workspace = create_test_workspace(&dir, backend);
     let _guard = DaemonGuard::new(&workspace);
+    let ensure = run_exo_daemon_ensure(&workspace, true);
+    assert!(
+        ensure.status.success(),
+        "daemon must become ready before the future writer advances storage: stdout={}; stderr={}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
     let project = exo::project::Project::resolve(&workspace).expect("resolve project");
     let connection =
         exosuit_storage::Connection::open(project.db_path()).expect("open future-writer fixture");
@@ -728,14 +736,6 @@ fn future_writer_errors_match_between_direct_and_ready_daemon(backend: &str) {
     );
     assert_eq!(direct.status.code(), Some(2), "direct response: {direct:?}");
     let direct = parse_cli_json(&direct);
-
-    let ensure = run_exo_daemon_ensure(&workspace, true);
-    assert!(
-        ensure.status.success(),
-        "future-writer daemon must become ready: stdout={}; stderr={}",
-        String::from_utf8_lossy(&ensure.stdout),
-        String::from_utf8_lossy(&ensure.stderr)
-    );
 
     let routed = run_exo_json_command(&workspace, &["idea", "show", "future-writer-sentinel"]);
     assert_eq!(routed.status.code(), Some(2), "routed response: {routed:?}");

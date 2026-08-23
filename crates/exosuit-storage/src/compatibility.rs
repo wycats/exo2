@@ -418,16 +418,9 @@ pub fn open_fenced_connection_for_import(
     run_migrations(&conn)?;
     let resulting_generation = read_database_generation(&conn)?.max(projection_generation);
     set_database_generation(&conn, resulting_generation)?;
-    drop(conn);
-    drop(exclusive);
-
-    let shared = CompatibilityLease::acquire(&path, LeaseMode::Shared)?;
-    let generation = probe_database_generation_at_identity(&path)?;
-    ensure_supported(generation, StateSurface::Database)?;
-    let conn = open_configured_connection(&path)?;
     Ok(FencedConnection {
         conn,
-        _compatibility_lease: shared,
+        _compatibility_lease: exclusive,
     })
 }
 
@@ -945,6 +938,29 @@ mod tests {
         CompatibilityLease::acquire_with_timeout(
             &normalize_database_identity(&path).unwrap(),
             LeaseMode::Exclusive,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn import_connection_retains_exclusive_authority_until_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let importing = open_fenced_connection_for_import(&path, 0).unwrap();
+
+        let error = CompatibilityLease::acquire_with_timeout(
+            &normalize_database_identity(&path).unwrap(),
+            LeaseMode::Shared,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(error, WriterCompatibilityError::Busy { .. }));
+
+        drop(importing);
+        CompatibilityLease::acquire_with_timeout(
+            &normalize_database_identity(&path).unwrap(),
+            LeaseMode::Shared,
             Duration::from_millis(50),
         )
         .unwrap();
