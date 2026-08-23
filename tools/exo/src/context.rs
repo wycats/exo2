@@ -1720,7 +1720,7 @@ pub(crate) fn import_sql_dumps(
     import_preflighted_sql_dumps(preflight, db_path)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StorageCompatibilityPreflight {
     projection_generation: Option<i32>,
 }
