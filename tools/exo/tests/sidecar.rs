@@ -2055,8 +2055,6 @@ fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     )
     .expect("write legacy axiom dump");
     link_sidecar(&repo, &home, &config_home, &sidecar_root);
-    let sidecar_agent_context =
-        project_state_path(&sidecar_root, "external-test", &["agent-context"]);
     let _guard = DaemonPathGuard::new(&repo);
 
     exo_cmd(&repo, &home, &config_home)
@@ -2073,7 +2071,7 @@ fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     .expect("read sidecar daemon pid");
     let daemon_pid = daemon_pid.trim().parse::<u64>().expect("daemon pid is u64");
     std::fs::write(
-        sidecar_agent_context.join("plan.toml"),
+        repo.join("docs/agent-context/plan.toml"),
         r#"[[epochs]]
 id = "legacy-epoch"
 title = "Legacy Epoch"
