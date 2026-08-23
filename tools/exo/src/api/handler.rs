@@ -2772,10 +2772,17 @@ fn command_error_to_response(
         .unwrap_or("Command invocation failed")
         .to_string();
 
-    let details = merge_error_details(
-        error_object.and_then(|err| err.get("details")).cloned(),
-        error_response.get("steering").cloned(),
-    );
+    let source_details = error_object.and_then(|err| err.get("details"));
+    let details = if source_details
+        .is_some_and(crate::storage_compatibility::is_writer_compatibility_details)
+    {
+        source_details.cloned()
+    } else {
+        merge_error_details(
+            source_details.cloned(),
+            error_response.get("steering").cloned(),
+        )
+    };
 
     ResponseEnvelope {
         protocol_version: protocol::PROTOCOL_VERSION,
@@ -3427,6 +3434,106 @@ mod tests {
         assert_eq!(
             unrelated.error.expect("error body").code,
             ErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn daemon_storage_compatibility_errors_match_direct_error_objects() {
+        for (details, expected_kind) in [
+            (
+                json!({
+                    "kind": "storage.writer_incompatible",
+                    "required_generation": 1,
+                    "supported_generation": 0,
+                    "state_surface": "database",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": false,
+                }),
+                "storage.writer_incompatible",
+            ),
+            (
+                json!({
+                    "kind": "storage.writer_metadata_invalid",
+                    "state_surface": "projection",
+                    "reason": "bad header",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": false,
+                }),
+                "storage.writer_metadata_invalid",
+            ),
+            (
+                json!({
+                    "kind": "storage.compatibility_busy",
+                    "lock_path": "/tmp/exo.writer-compat.lock",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": true,
+                }),
+                "storage.compatibility_busy",
+            ),
+        ] {
+            let direct_error = json!({
+                "code": "precondition_failed",
+                "message": "storage writer compatibility check failed",
+                "details": details,
+            });
+            let response = command_error_to_response(
+                Path::new("/workspace"),
+                "storage-error".to_string(),
+                json!({
+                    "status": "error",
+                    "error": direct_error,
+                    "steering": {
+                        "next_actions": [{ "command": "exo status" }],
+                    },
+                }),
+                &Address::Root,
+                &json!({}),
+            );
+
+            let daemon_error = serde_json::to_value(response.error.expect("error body"))
+                .expect("serialize daemon error");
+            assert_eq!(daemon_error, direct_error);
+            assert_eq!(daemon_error["details"]["kind"], expected_kind);
+            assert!(daemon_error["details"].get("details").is_none());
+            assert!(daemon_error["details"].get("steering").is_none());
+        }
+    }
+
+    #[test]
+    fn daemon_unrelated_errors_preserve_recovery_steering() {
+        let response = command_error_to_response(
+            Path::new("/workspace"),
+            "checkpoint-error".to_string(),
+            json!({
+                "status": "error",
+                "error": {
+                    "code": "precondition_failed",
+                    "message": "checkpoint failed",
+                    "details": {
+                        "kind": "sidecar.local_checkpoint",
+                        "ok": false,
+                    },
+                },
+                "steering": {
+                    "next_actions": [{ "command": "exo sidecar checkpoint" }],
+                },
+            }),
+            &Address::Root,
+            &json!({}),
+        );
+
+        let details = response
+            .error
+            .expect("error body")
+            .details
+            .expect("error details");
+        assert_eq!(details["details"]["kind"], "sidecar.local_checkpoint");
+        assert_eq!(
+            details["steering"]["next_actions"][0]["command"],
+            "exo sidecar checkpoint"
         );
     }
 

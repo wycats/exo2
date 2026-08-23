@@ -19,14 +19,11 @@ pub fn map_writer_compatibility_error(error: WriterCompatibilityError) -> anyhow
 pub fn writer_compatibility_failure_from_error(error: &anyhow::Error) -> Option<ExoFailure> {
     for cause in error.chain() {
         if let Some(failure) = cause.downcast_ref::<ExoFailure>()
-            && failure.error.details.as_ref().is_some_and(|details| {
-                details
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| {
-                        kind.starts_with("storage.writer_") || kind == "storage.compatibility_busy"
-                    })
-            })
+            && failure
+                .error
+                .details
+                .as_ref()
+                .is_some_and(is_writer_compatibility_details)
         {
             return Some(failure.clone());
         }
@@ -43,6 +40,15 @@ pub fn writer_compatibility_failure_from_error(error: &anyhow::Error) -> Option<
         }
     }
     None
+}
+
+pub fn is_writer_compatibility_details(details: &serde_json::Value) -> bool {
+    details
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("storage.writer_") || kind == "storage.compatibility_busy"
+        })
 }
 
 fn writer_compatibility_failure(error: &WriterCompatibilityError) -> Option<ExoFailure> {
