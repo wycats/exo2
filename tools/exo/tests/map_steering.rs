@@ -33,7 +33,7 @@ fn setup_test_context() -> (TempDir, AgentContext) {
             .expect("verify SQL dump merge driver"),
         "test workspace should satisfy the critical upgrade contract"
     );
-    fs::write(root.join(".gitignore"), ".cache/\n").expect("ignore disposable database");
+    exo::templates::install_gitignore(&root).expect("install standard .gitignore");
     let add_status = Command::new("git")
         .args(["add", ".gitattributes", ".gitignore"])
         .current_dir(&root)
