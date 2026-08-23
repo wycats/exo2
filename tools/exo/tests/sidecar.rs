@@ -2057,21 +2057,6 @@ fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     link_sidecar(&repo, &home, &config_home, &sidecar_root);
     let sidecar_agent_context =
         project_state_path(&sidecar_root, "external-test", &["agent-context"]);
-    std::fs::write(
-        sidecar_agent_context.join("plan.toml"),
-        r#"[[epochs]]
-id = "legacy-epoch"
-title = "Legacy Epoch"
-status = "active"
-
-[[epochs.phases]]
-id = "legacy-phase"
-title = "Legacy Phase"
-status = "active"
-tasks = ["Legacy Goal"]
-"#,
-    )
-    .expect("write legacy plan");
     let _guard = DaemonPathGuard::new(&repo);
 
     exo_cmd(&repo, &home, &config_home)
@@ -2087,6 +2072,21 @@ tasks = ["Legacy Goal"]
     ))
     .expect("read sidecar daemon pid");
     let daemon_pid = daemon_pid.trim().parse::<u64>().expect("daemon pid is u64");
+    std::fs::write(
+        sidecar_agent_context.join("plan.toml"),
+        r#"[[epochs]]
+id = "legacy-epoch"
+title = "Legacy Epoch"
+status = "active"
+
+[[epochs.phases]]
+id = "legacy-phase"
+title = "Legacy Phase"
+status = "active"
+tasks = ["Legacy Goal"]
+"#,
+    )
+    .expect("write legacy plan");
 
     let update_output = exo_cmd(&repo, &caller_home, &config_home)
         .env("EXO_DAEMON_DIAGNOSTICS", "1")
