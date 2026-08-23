@@ -1717,7 +1717,8 @@ fn preflight_project_move_root_storage(project_dir: &Path, db_path: &Path) -> Ex
     crate::context::preflight_sql_dumps(&project_dir.join("agent-context"))?;
     exosuit_storage::preflight_database(db_path)
         .map_err(crate::storage_compatibility::map_database_error)
-        .context("Failed to preflight project move-root database")
+        .context("Failed to preflight project move-root database")?;
+    Ok(())
 }
 
 fn open_project_move_root_read_connection(
