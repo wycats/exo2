@@ -2205,6 +2205,16 @@ fn handle_call_with_namespace_operation(
                 None
             };
 
+            if let Err(error) = crate::state_machine::load_and_check_command_upgrade_gate(
+                workspace_root,
+                project,
+                namespace,
+                operation,
+                effect,
+            ) {
+                return command_construction_error_to_response(id, error);
+            }
+
             if runtime == HandlerRuntime::SidecarWriter
                 && command_requires_database_hydration(namespace, operation)
                 && let Err(error) = crate::context::AgentContext::load_hydrated_with_project(

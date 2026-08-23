@@ -135,7 +135,8 @@ fn test_detect_active_strike_from_goal() {
 // Upgrade Gate Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-use exo::state_machine::check_upgrade_gate;
+use exo::api::protocol::Effect;
+use exo::state_machine::{check_command_upgrade_gate, check_upgrade_gate};
 
 #[test]
 fn test_upgrade_gate_passes_when_no_deprecated_files() {
@@ -188,4 +189,51 @@ fn test_upgrade_gate_passes_during_active_strike() {
     .unwrap();
     // Strike is active, so upgrade gate should pass (strike bypasses it)
     assert!(check_upgrade_gate(&context).is_ok());
+}
+
+#[test]
+fn ordinary_mutations_require_the_configured_merge_driver() {
+    let (temp_dir, _phase_id) = setup_test_workspace();
+    let status = std::process::Command::new("git")
+        .args(["config", "--local", "merge.exo-sql-dump.driver", "true"])
+        .current_dir(temp_dir.path())
+        .status()
+        .expect("replace merge driver with legacy value");
+    assert!(status.success());
+
+    let context = AgentContext::load_with_backend(
+        temp_dir.path().to_path_buf(),
+        exo::context::StorageBackend::Sqlite,
+    )
+    .unwrap();
+
+    let error = check_command_upgrade_gate(&context, "task", "add", Effect::Write)
+        .expect_err("ordinary mutation must be blocked");
+    assert!(
+        error
+            .to_string()
+            .contains("SQL dump merge driver is not configured")
+    );
+}
+
+#[test]
+fn upgrade_gate_keeps_reads_and_update_available() {
+    let (temp_dir, _phase_id) = setup_test_workspace();
+    let status = std::process::Command::new("git")
+        .args(["config", "--local", "merge.exo-sql-dump.driver", "true"])
+        .current_dir(temp_dir.path())
+        .status()
+        .expect("replace merge driver with legacy value");
+    assert!(status.success());
+
+    let context = AgentContext::load_with_backend(
+        temp_dir.path().to_path_buf(),
+        exo::context::StorageBackend::Sqlite,
+    )
+    .unwrap();
+
+    check_command_upgrade_gate(&context, "status", "", Effect::Pure)
+        .expect("read remains available");
+    check_command_upgrade_gate(&context, "update", "", Effect::Write)
+        .expect("update remains available");
 }

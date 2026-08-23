@@ -2122,6 +2122,16 @@ fn main() {
         let namespace = args.first().map_or("", String::as_str);
         let operation = args.get(1).map_or("", String::as_str);
         let effect = command_box.effect();
+        if let Err(err) =
+            exo::state_machine::check_command_upgrade_gate(&context, namespace, operation, effect)
+        {
+            render_fatal_error(format, Some(&context), err.as_ref());
+            std::process::exit(if cmd_format == exo::command::traits::OutputFormat::Json {
+                2
+            } else {
+                1
+            });
+        }
         if let Err(err) = exo::post_write::preflight_sidecar_post_write(
             context.project.as_ref(),
             namespace,
