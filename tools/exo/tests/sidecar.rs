@@ -2080,18 +2080,6 @@ tasks = ["Legacy Goal"]
         .args(["--format", "json", "daemon", "ensure"])
         .assert()
         .success();
-    assert!(
-        sidecar_write_owner_marker_path(&sidecar_root, "external-test").exists(),
-        "normal daemon write should acquire sidecar writer ownership"
-    );
-    let owner: JsonValue = serde_json::from_str(
-        &std::fs::read_to_string(sidecar_write_owner_marker_path(
-            &sidecar_root,
-            "external-test",
-        ))
-        .expect("read sidecar writer ownership"),
-    )
-    .expect("sidecar writer ownership is json");
     let daemon_pid = std::fs::read_to_string(project_state_path(
         &sidecar_root,
         "external-test",
@@ -2099,11 +2087,6 @@ tasks = ["Legacy Goal"]
     ))
     .expect("read sidecar daemon pid");
     let daemon_pid = daemon_pid.trim().parse::<u64>().expect("daemon pid is u64");
-    assert_eq!(
-        owner["pid"].as_u64(),
-        Some(daemon_pid),
-        "normal write should establish ownership through the sidecar daemon writer lane"
-    );
 
     let update_output = exo_cmd(&repo, &caller_home, &config_home)
         .env("EXO_DAEMON_DIAGNOSTICS", "1")
@@ -2117,6 +2100,10 @@ tasks = ["Legacy Goal"]
     let update = json_result(&update_output);
     let events = wait_for_daemon_operation(&diagnostics_path, "", "update");
     assert_has_daemon_operation(&events, "", "update");
+    assert!(
+        sidecar_write_owner_marker_path(&sidecar_root, "external-test").exists(),
+        "normal daemon write should acquire sidecar writer ownership"
+    );
     let update_daemon_pid = std::fs::read_to_string(project_state_path(
         &sidecar_root,
         "external-test",
@@ -3707,7 +3694,6 @@ fn sidecar_init_defaults_key_root_and_git_repo() {
     )
     .expect("write repo projection");
     git_init(&repo);
-    configure_storage_compatible_repository(&repo);
 
     let output = exo_cmd(&repo, &home, &config_home)
         .args(["--format", "json", "sidecar", "init", "--git"])

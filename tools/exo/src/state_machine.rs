@@ -418,8 +418,10 @@ pub fn check_upgrade_gate(context: &AgentContext) -> ExoResult<()> {
 
 /// Check critical upgrades before a command that can mutate project state.
 ///
-/// The update command is the recovery path for a blocked project, and a
-/// workspace without existing Exo state has nothing to migrate yet.
+/// The update command is the recovery path for a blocked project. Sidecar init
+/// owns its source-projection and target-database compatibility preflights, so
+/// it must also remain available before the repository upgrade is complete.
+/// A workspace without existing Exo state has nothing to migrate yet.
 pub fn check_command_upgrade_gate(
     context: &AgentContext,
     namespace: &str,
@@ -462,7 +464,8 @@ fn command_requires_upgrade_gate(namespace: &str, operation: &str, effect: Effec
     }
 
     !((namespace.is_empty() && operation == "update")
-        || (namespace == "update" && operation.is_empty()))
+        || (namespace == "update" && operation.is_empty())
+        || (namespace == "sidecar" && operation == "init"))
 }
 
 /// Check if an operation is allowed given the current state.
@@ -569,6 +572,20 @@ mod tests {
         assert!(!is_operation_allowed(
             &PrimaryState::ActivePhaseExecuting,
             Operation::UpgradeMigrate
+        ));
+    }
+
+    #[test]
+    fn sidecar_init_remains_available_as_a_storage_recovery_path() {
+        assert!(!command_requires_upgrade_gate(
+            "sidecar",
+            "init",
+            Effect::Write
+        ));
+        assert!(command_requires_upgrade_gate(
+            "sidecar",
+            "repo",
+            Effect::Write
         ));
     }
 
