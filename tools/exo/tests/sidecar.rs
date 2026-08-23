@@ -46,6 +46,16 @@ fn git_init(root: &Path) {
     git_success(root, &["branch", "-M", "main"]);
 }
 
+fn configure_storage_compatible_repository(root: &Path) {
+    exo::templates::install_gitattributes(root).expect("install .gitattributes");
+    exo::templates::configure_sql_dump_merge_driver(root).expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(root)
+            .expect("verify SQL dump merge driver"),
+        "fixture should satisfy the critical repository upgrade contract"
+    );
+}
+
 #[cfg(unix)]
 fn create_primary_and_linked_worktree(temp: &Path) -> (PathBuf, PathBuf) {
     let primary = temp.join("primary");
@@ -2034,12 +2044,21 @@ fn ordinary_update_uses_daemon_writer_lane_for_sidecar_state() {
     std::fs::create_dir_all(repo.join("docs/agent-context")).expect("create agent-context dir");
     std::fs::create_dir_all(&sidecar_root).expect("create sidecar root");
     git_init(&repo);
+    configure_storage_compatible_repository(&repo);
     git_init(&sidecar_root);
     std::fs::write(sidecar_root.join("README.md"), "sidecar\n").expect("write readme");
     git_success(&sidecar_root, &["add", "README.md"]);
     git_success(&sidecar_root, &["commit", "-m", "Initial sidecar"]);
     std::fs::write(
-        repo.join("docs/agent-context/plan.toml"),
+        repo.join("docs/agent-context/axioms.sql"),
+        "-- legacy axiom dump\n",
+    )
+    .expect("write legacy axiom dump");
+    link_sidecar(&repo, &home, &config_home, &sidecar_root);
+    let sidecar_agent_context =
+        project_state_path(&sidecar_root, "external-test", &["agent-context"]);
+    std::fs::write(
+        sidecar_agent_context.join("plan.toml"),
         r#"[[epochs]]
 id = "legacy-epoch"
 title = "Legacy Epoch"
@@ -2053,18 +2072,12 @@ tasks = ["Legacy Goal"]
 "#,
     )
     .expect("write legacy plan");
-    std::fs::write(
-        repo.join("docs/agent-context/axioms.sql"),
-        "-- legacy axiom dump\n",
-    )
-    .expect("write legacy axiom dump");
-    link_sidecar(&repo, &home, &config_home, &sidecar_root);
     let _guard = DaemonPathGuard::new(&repo);
 
     exo_cmd(&repo, &home, &config_home)
         .env("EXO_DAEMON_DIAGNOSTICS", "1")
         .env("EXO_DAEMON_DIAG_PATH", &diagnostics_path)
-        .args(["--format", "json", "idea", "add", "Acquire Sidecar Writer"])
+        .args(["--format", "json", "daemon", "ensure"])
         .assert()
         .success();
     assert!(
@@ -3694,6 +3707,7 @@ fn sidecar_init_defaults_key_root_and_git_repo() {
     )
     .expect("write repo projection");
     git_init(&repo);
+    configure_storage_compatible_repository(&repo);
 
     let output = exo_cmd(&repo, &home, &config_home)
         .args(["--format", "json", "sidecar", "init", "--git"])
@@ -6772,6 +6786,7 @@ fn sidecar_bootstrap_seeds_existing_projection() {
     )
     .expect("write repo projection");
     git_init(&repo);
+    configure_storage_compatible_repository(&repo);
 
     let output = exo_cmd(&repo, &home, &config_home)
         .args(["--format", "json", "sidecar", "bootstrap"])
