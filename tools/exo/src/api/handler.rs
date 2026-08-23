@@ -19,7 +19,7 @@ use crate::command::traits::{CommandInvokeResult, invoke_command_box_json};
 use crate::command::transport::{
     MachineChannelTransport, compatible_exec_ticket_request_id, ticket_for_exec_call,
 };
-use crate::context::AgentContext;
+use crate::context::{AgentContext, StorageCompatibilityPreflight};
 use crate::daemon::DaemonEnsureState;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, effect_name, elapsed_ms, request_op_path, response_status,
@@ -49,6 +49,7 @@ fn log_command_event(
     project: Option<&Project>,
     request_id: &str,
     runtime: HandlerRuntime,
+    storage_preflight: Option<&StorageCompatibilityPreflight>,
     agent_id: Option<&str>,
     namespace: &str,
     operation: &str,
@@ -58,7 +59,7 @@ fn log_command_event(
     duration_ms: u64,
     summary: &str,
 ) -> anyhow::Result<bool> {
-    if runtime != HandlerRuntime::AtomicStateWriter {
+    if runtime != HandlerRuntime::AtomicStateWriter && storage_preflight.is_none() {
         AgentContext::preflight_storage_compatibility(workspace_root, project)?;
     }
     let db_path = crate::context::db_path(workspace_root, project);
@@ -116,6 +117,10 @@ fn log_command_event(
     }
 
     Ok(crate::event_db::with_event_db(&db_path, insert)?.is_some())
+}
+
+fn command_requires_storage_preflight(namespace: &str, operation: &str) -> bool {
+    namespace != "storage" || operation != "compatibility"
 }
 
 /// Generate display metadata from a command result.
@@ -2189,13 +2194,16 @@ fn handle_call_with_namespace_operation(
                 );
             }
 
-            if runtime != HandlerRuntime::AtomicStateWriter
-                && crate::post_write::should_log_command_event(namespace, operation)
-                && let Err(error) =
-                    AgentContext::preflight_storage_compatibility(workspace_root, project)
+            let storage_preflight = if runtime != HandlerRuntime::AtomicStateWriter
+                && command_requires_storage_preflight(namespace, operation)
             {
-                return command_construction_error_to_response(id, error);
-            }
+                match AgentContext::preflight_storage_compatibility(workspace_root, project) {
+                    Ok(preflight) => Some(preflight),
+                    Err(error) => return command_construction_error_to_response(id, error),
+                }
+            } else {
+                None
+            };
 
             if runtime == HandlerRuntime::SidecarWriter
                 && command_requires_database_hydration(namespace, operation)
@@ -2310,6 +2318,7 @@ fn handle_call_with_namespace_operation(
                             project,
                             &id,
                             runtime,
+                            storage_preflight.as_ref(),
                             agent_id_for_log.as_deref(),
                             namespace,
                             operation,
@@ -3195,6 +3204,7 @@ mod tests {
                 None,
                 "workbench-launch-event",
                 HandlerRuntime::External,
+                None,
                 Some("agent-test"),
                 "workbench",
                 "launch",
@@ -3292,6 +3302,7 @@ mod tests {
             None,
             "incompatible-event",
             HandlerRuntime::External,
+            None,
             Some("agent-test"),
             "project",
             "snapshot",
@@ -3311,6 +3322,17 @@ mod tests {
         );
         assert!(!db_path.exists());
         assert!(!db_path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[test]
+    fn semantic_commands_preflight_independently_of_event_logging() {
+        assert!(command_requires_storage_preflight("project", "resolve"));
+        assert!(command_requires_storage_preflight("dogfood", "verify"));
+        assert!(command_requires_storage_preflight("dogfood", "repair"));
+        assert!(!command_requires_storage_preflight(
+            "storage",
+            "compatibility"
+        ));
     }
 
     #[test]

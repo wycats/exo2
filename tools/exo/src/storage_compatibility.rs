@@ -42,6 +42,22 @@ pub fn writer_compatibility_failure_from_error(error: &anyhow::Error) -> Option<
     None
 }
 
+pub fn storage_failure_from_error(error: &anyhow::Error) -> Option<ExoFailure> {
+    writer_compatibility_failure_from_error(error).or_else(|| {
+        error.chain().find_map(|cause| {
+            let failure = cause.downcast_ref::<ExoFailure>()?;
+            failure
+                .error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.starts_with("storage."))
+                .then(|| failure.clone())
+        })
+    })
+}
+
 pub fn is_writer_compatibility_details(details: &serde_json::Value) -> bool {
     details
         .get("kind")
@@ -186,5 +202,19 @@ mod tests {
         ))
         .context("wrapped database failure");
         assert!(writer_compatibility_failure_from_error(&error).is_none());
+    }
+
+    #[test]
+    fn wrapped_projection_quarantine_is_a_storage_failure() {
+        let error = projection_unsettled_error("MERGE_HEAD", true)
+            .context("Failed to preflight canonical projection")
+            .context("workspace preload");
+        let failure = storage_failure_from_error(&error).expect("wrapped storage failure");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        let details = failure.error.details.expect("storage details");
+        assert_eq!(details["kind"], "storage.projection_unsettled");
+        assert_eq!(details["repository_state"], "MERGE_HEAD");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
     }
 }

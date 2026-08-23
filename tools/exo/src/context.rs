@@ -1541,7 +1541,10 @@ fn publish_sql_projection(
     Ok(())
 }
 
-fn ensure_repo_projection_settled(root: &Path, project: Option<&Project>) -> ExoResult<()> {
+pub(crate) fn ensure_repo_projection_settled(
+    root: &Path,
+    project: Option<&Project>,
+) -> ExoResult<()> {
     if project.is_some_and(|project| project.policy != StatePolicy::Repo) {
         return Ok(());
     }

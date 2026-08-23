@@ -375,6 +375,7 @@ fn project_snapshot_output(
         .db_path
         .as_ref()
         .ok_or_else(|| anyhow!("Project {id} does not have a readable Exo state database"))?;
+    preflight_catalog_project_projection(root, &project)?;
     let sql_dir = catalog_sql_projection_dir(root, &project);
     if let Some(sql_dir) = sql_dir.as_deref() {
         crate::context::preflight_projection_compatibility(sql_dir)?;
@@ -525,6 +526,21 @@ fn project_snapshot_output(
     })
 }
 
+fn preflight_catalog_project_projection(
+    root: &Path,
+    project: &ProjectCatalogEntry,
+) -> ExoResult<()> {
+    if project.state != "repo" {
+        return Ok(());
+    }
+    let repository_root = project
+        .workspace_root
+        .as_deref()
+        .or_else(|| project.state_root.as_deref().and_then(Path::parent))
+        .unwrap_or(root);
+    crate::context::ensure_repo_projection_settled(repository_root, None)
+}
+
 fn status_root_for_project(
     project: &ProjectCatalogEntry,
     workspace_key: Option<&str>,
@@ -633,6 +649,7 @@ fn catalog_sql_projection_dir(root: &Path, project: &ProjectCatalogEntry) -> Opt
             project
                 .workspace_root
                 .as_deref()
+                .or_else(|| project.state_root.as_deref().and_then(Path::parent))
                 .unwrap_or(root)
                 .join("docs/agent-context"),
         ),
@@ -2282,6 +2299,54 @@ fn resolve_project(root: &std::path::Path) -> ExoResult<Project> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_snapshot_preflights_the_selected_repo_quarantine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let caller = temp.path().join("caller");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(&caller).expect("create caller");
+        std::fs::create_dir_all(&target).expect("create target");
+        for root in [&caller, &target] {
+            let output = ProcessCommand::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root)
+                .output_guarded()
+                .expect("initialize repository");
+            assert!(output.status.success());
+        }
+        std::fs::write(target.join(".git/MERGE_HEAD"), "deadbeef\n")
+            .expect("write target merge marker");
+        let project = ProjectCatalogEntry {
+            id: "target".to_string(),
+            display_name: "target".to_string(),
+            source: "test",
+            state: "repo",
+            workspace_root: Some(target.clone()),
+            git_common_dir: Some(target.join(".git")),
+            state_root: Some(target.join(".exo")),
+            db_path: Some(target.join(".cache/exo.db")),
+            runtime_dir: Some(target.join(".runtime")),
+            sidecar_key: None,
+            sidecar_root: None,
+            state_readable: true,
+            workspace_available: true,
+            commands_available: true,
+            write_available: true,
+            selectable: true,
+            current: false,
+            diagnostics: Vec::new(),
+        };
+
+        let error = preflight_catalog_project_projection(&caller, &project)
+            .expect_err("target merge quarantine must block snapshot");
+        let failure = crate::storage_compatibility::storage_failure_from_error(&error)
+            .expect("typed storage failure");
+        assert_eq!(
+            failure.error.details.expect("details")["kind"],
+            "storage.projection_unsettled"
+        );
+    }
 
     #[test]
     fn move_root_cached_preflight_checks_generation_without_importing_projection() {

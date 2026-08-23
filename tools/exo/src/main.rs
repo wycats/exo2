@@ -1482,8 +1482,7 @@ fn load_context_result_or_exit(
         Ok(context) => context,
         Err(e) => {
             let original_command = original_command_for_guidance();
-            let compatibility_failure =
-                exo::storage_compatibility::writer_compatibility_failure_from_error(&e);
+            let compatibility_failure = exo::storage_compatibility::storage_failure_from_error(&e);
             let preload_guidance =
                 exo::preload_guidance::classify_context_load_error(&e, &original_command);
 
@@ -2679,6 +2678,21 @@ mod tests {
             assert_eq!(details["retry_with_same_request_id"], true);
             assert_eq!(details["retryable"], retryable);
         }
+    }
+
+    #[test]
+    fn cli_context_preload_preserves_wrapped_projection_quarantine() {
+        let wrapped = exo::storage_compatibility::projection_unsettled_error("MERGE_HEAD", true)
+            .context("load command context")
+            .context("CLI preload");
+        let failure = exo::storage_compatibility::storage_failure_from_error(&wrapped)
+            .expect("wrapped storage failure");
+        let body = context_load_error_body(&wrapped, Some(&failure), None);
+        assert_eq!(body.code, ErrorCode::PreconditionFailed);
+        let details = body.details.expect("storage details");
+        assert_eq!(details["kind"], "storage.projection_unsettled");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
     }
 
     fn test_completion_review(outcome: &str) -> CliCompletionReview {

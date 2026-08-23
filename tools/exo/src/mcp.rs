@@ -890,9 +890,7 @@ fn context_load_error_response(
     original_command: &str,
     error: anyhow::Error,
 ) -> ResponseEnvelope {
-    if let Some(failure) =
-        crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
-    {
+    if let Some(failure) = crate::storage_compatibility::storage_failure_from_error(&error) {
         return ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             id: request_id,
@@ -2325,6 +2323,26 @@ mod tests {
         let steering = response.steering.as_ref().expect("steering");
         assert_eq!(steering.next_call.kind, NextCallKind::Call);
         assert_eq!(steering.next_call.params["address"]["path"][0], "update");
+    }
+
+    #[test]
+    fn context_load_error_response_preserves_projection_quarantine() {
+        let error = crate::storage_compatibility::projection_unsettled_error("MERGE_HEAD", true)
+            .context("Failed to load workspace context");
+        let response = context_load_error_response(
+            Path::new("/workspace/demo"),
+            "mcp.exo-run.quarantine".to_string(),
+            "status",
+            error,
+        );
+
+        assert_eq!(response.status, Status::Error);
+        let error = response.error.expect("error body");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        let details = error.details.expect("storage details");
+        assert_eq!(details["kind"], "storage.projection_unsettled");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
     }
 
     #[test]
