@@ -4867,12 +4867,21 @@ struct SqlRowKey {
 
 #[derive(Debug, Default)]
 struct SqlProjectionFile {
+    writer_generation: i32,
     rows: BTreeMap<SqlRowKey, String>,
 }
 
 fn semantic_merge_upstream_if_needed(
     repo: &ResolvedSidecarRepo,
     branch: &str,
+) -> ExoResult<SemanticMergeReport> {
+    semantic_merge_upstream_if_needed_with_hook(repo, branch, || {})
+}
+
+fn semantic_merge_upstream_if_needed_with_hook(
+    repo: &ResolvedSidecarRepo,
+    branch: &str,
+    before_authority: impl FnOnce(),
 ) -> ExoResult<SemanticMergeReport> {
     let Some(upstream) = upstream_ref_for_branch(&repo.sidecar_root, branch, None)? else {
         return Ok(SemanticMergeReport::default());
@@ -4902,6 +4911,15 @@ fn semantic_merge_upstream_if_needed(
         });
     }
 
+    exosuit_storage::preflight_database(&repo.project.db_path())
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight sidecar database before semantic merge")?;
+    before_authority();
+    let authority =
+        exosuit_storage::acquire_exclusive_compatibility_authority(repo.project.db_path())
+            .map_err(crate::storage_compatibility::map_database_error)
+            .context("Failed to acquire semantic-merge compatibility authority")?;
+
     ensure_no_unowned_staged_sidecar_paths(repo)?;
     run_git_checked(
         &repo.sidecar_root,
@@ -4909,17 +4927,28 @@ fn semantic_merge_upstream_if_needed(
         "git merge -s ours --no-commit",
     )?;
     restore_upstream_foreign_projects_for_merge(repo, &upstream)?;
-    for (relative_path, content) in merge.files {
-        let path = repo.sidecar_root.join(relative_path);
+    publish_merged_sql_projection(&repo.sidecar_root, merge.files, |path, content| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write merged SQL projection {}", path.display()))?;
-    }
+        crate::context::atomic_write_projection_file(path, content.as_bytes())
+            .with_context(|| format!("Failed to write merged SQL projection {}", path.display()))
+    })?;
     if let Some(projection_dir) = repo.project.sidecar_projection_dir() {
-        crate::context::import_sql_dumps(&projection_dir, &repo.project.db_path())?;
+        let semantic_guard =
+            if let Some(preflight) = crate::context::preflight_sql_dumps(&projection_dir)? {
+                Some(crate::context::import_preflighted_sql_dumps_with_authority(
+                    preflight, authority,
+                )?)
+            } else {
+                drop(
+                    exosuit_storage::open_database_with_exclusive_authority(authority)
+                        .map_err(crate::storage_compatibility::map_database_error)?,
+                );
+                None
+            };
+        drop(semantic_guard);
         crate::context::write_sql_dump_with_project_result(
             &repo.project_workspace_root(),
             Some(&repo.project),
@@ -4950,37 +4979,115 @@ struct SqlProjectionMerge {
     conflicts: Vec<SqlProjectionConflict>,
 }
 
+fn publish_merged_sql_projection(
+    sidecar_root: &Path,
+    mut files: BTreeMap<PathBuf, String>,
+    mut publish_file: impl FnMut(&Path, &str) -> ExoResult<()>,
+) -> ExoResult<()> {
+    let epochs_path = files
+        .keys()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("epochs.sql"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Merged SQL projection is missing epochs.sql"))?;
+    let epochs = files
+        .remove(&epochs_path)
+        .expect("epochs path came from the projection map");
+    publish_file(&sidecar_root.join(&epochs_path), &epochs)?;
+    for (relative_path, content) in files {
+        publish_file(&sidecar_root.join(relative_path), &content)?;
+    }
+    Ok(())
+}
+
 fn merge_sql_projection_at_revisions(
     repo: &ResolvedSidecarRepo,
     base_rev: &str,
     local_rev: &str,
     remote_rev: &str,
 ) -> ExoResult<SqlProjectionMerge> {
+    let relative_paths = projection_relative_paths(repo)?;
+    let mut base_contents = Vec::with_capacity(relative_paths.len());
+    let mut local_contents = Vec::with_capacity(relative_paths.len());
+    let mut remote_contents = Vec::with_capacity(relative_paths.len());
+    for relative_path in &relative_paths {
+        base_contents.push(git_show_or_empty(
+            &repo.sidecar_root,
+            base_rev,
+            relative_path,
+        )?);
+        local_contents.push(git_show_or_empty(
+            &repo.sidecar_root,
+            local_rev,
+            relative_path,
+        )?);
+        remote_contents.push(git_show_or_empty(
+            &repo.sidecar_root,
+            remote_rev,
+            relative_path,
+        )?);
+    }
+    preflight_sql_projection_contents(&relative_paths, &base_contents)?;
+    preflight_sql_projection_contents(&relative_paths, &local_contents)?;
+    preflight_sql_projection_contents(&relative_paths, &remote_contents)?;
+
     let mut files = BTreeMap::new();
     let mut conflicts = Vec::new();
 
-    for relative_path in projection_relative_paths(repo)? {
-        let base = parse_sql_projection_file(
-            &relative_path,
-            &git_show_or_empty(&repo.sidecar_root, base_rev, &relative_path)?,
-        );
-        let local = parse_sql_projection_file(
-            &relative_path,
-            &git_show_or_empty(&repo.sidecar_root, local_rev, &relative_path)?,
-        );
-        let remote = parse_sql_projection_file(
-            &relative_path,
-            &git_show_or_empty(&repo.sidecar_root, remote_rev, &relative_path)?,
-        );
+    for (((relative_path, base_content), local_content), remote_content) in relative_paths
+        .iter()
+        .zip(&base_contents)
+        .zip(&local_contents)
+        .zip(&remote_contents)
+    {
+        let base = parse_sql_projection_file(relative_path, base_content)?;
+        let local = parse_sql_projection_file(relative_path, local_content)?;
+        let remote = parse_sql_projection_file(relative_path, remote_content)?;
         let merged = merge_sql_projection_file(&base, &local, &remote);
         conflicts.extend(merged.conflicts);
-        files.insert(relative_path, render_sql_projection_rows(merged.rows));
+        let content =
+            render_sql_projection_rows(relative_path, merged.writer_generation, merged.rows)?;
+        files.insert(relative_path.clone(), content);
     }
+
+    let merged_contents = relative_paths
+        .iter()
+        .map(|path| files.get(path).cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    preflight_sql_projection_contents(&relative_paths, &merged_contents)?;
 
     Ok(SqlProjectionMerge { files, conflicts })
 }
 
+fn preflight_sql_projection_contents(
+    relative_paths: &[PathBuf],
+    contents: &[String],
+) -> ExoResult<()> {
+    let dumps = exosuit_storage::TABLE_ORDER
+        .iter()
+        .zip(relative_paths)
+        .zip(contents)
+        .map(|(((file_stem, table_name), relative_path), content)| {
+            debug_assert_eq!(
+                relative_path.file_stem().and_then(|stem| stem.to_str()),
+                Some(*file_stem)
+            );
+            ((*table_name).to_string(), content.clone())
+        })
+        .collect::<Vec<_>>();
+    let epochs_sql = dumps
+        .iter()
+        .find(|(table_name, _)| table_name == "epochs_data")
+        .map_or("", |(_, content)| content.as_str());
+    let generation = exosuit_storage::parse_projection_generation(epochs_sql)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)?;
+    exosuit_storage::ensure_projection_supported(generation)
+        .map_err(crate::storage_compatibility::map_writer_compatibility_error)?;
+    exosuit_storage::validate_tables(&dumps)
+        .map_err(|error| anyhow::anyhow!("Failed to preflight semantic-merge projection: {error}"))
+}
+
 struct SqlProjectionFileMerge {
+    writer_generation: i32,
     rows: BTreeMap<SqlRowKey, String>,
     conflicts: Vec<SqlProjectionConflict>,
 }
@@ -5027,7 +5134,14 @@ fn merge_sql_projection_file(
         }
     }
 
-    SqlProjectionFileMerge { rows, conflicts }
+    SqlProjectionFileMerge {
+        writer_generation: base
+            .writer_generation
+            .max(local.writer_generation)
+            .max(remote.writer_generation),
+        rows,
+        conflicts,
+    }
 }
 
 fn projection_relative_paths(repo: &ResolvedSidecarRepo) -> ExoResult<Vec<PathBuf>> {
@@ -5051,8 +5165,18 @@ fn projection_relative_paths(repo: &ResolvedSidecarRepo) -> ExoResult<Vec<PathBu
         .collect())
 }
 
-fn parse_sql_projection_file(relative_path: &Path, content: &str) -> SqlProjectionFile {
+fn parse_sql_projection_file(relative_path: &Path, content: &str) -> ExoResult<SqlProjectionFile> {
     let file = git_relative_path(relative_path);
+    let writer_generation =
+        if relative_path.file_name().and_then(|name| name.to_str()) == Some("epochs.sql") {
+            let generation = exosuit_storage::parse_projection_generation(content)
+                .map_err(crate::storage_compatibility::map_writer_compatibility_error)?;
+            exosuit_storage::ensure_projection_supported(generation)
+                .map_err(crate::storage_compatibility::map_writer_compatibility_error)?;
+            generation
+        } else {
+            0
+        };
     let mut rows = BTreeMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -5062,16 +5186,345 @@ fn parse_sql_projection_file(relative_path: &Path, content: &str) -> SqlProjecti
         let key = sql_row_key(&file, line);
         rows.insert(key, line.to_string());
     }
-    SqlProjectionFile { rows }
+    Ok(SqlProjectionFile {
+        writer_generation,
+        rows,
+    })
 }
 
-fn render_sql_projection_rows(rows: BTreeMap<SqlRowKey, String>) -> String {
-    let mut rendered = String::from("-- Auto-generated by exo. Regenerate: exo status\n");
+fn render_sql_projection_rows(
+    relative_path: &Path,
+    writer_generation: i32,
+    rows: BTreeMap<SqlRowKey, String>,
+) -> ExoResult<String> {
+    let mut rendered = String::new();
+    if relative_path.file_name().and_then(|name| name.to_str()) == Some("epochs.sql") {
+        rendered.push_str(
+            &exosuit_storage::render_projection_generation_header(writer_generation)
+                .map_err(crate::storage_compatibility::map_writer_compatibility_error)?,
+        );
+        rendered.push('\n');
+    }
+    rendered.push_str("-- Auto-generated by exo. Regenerate: exo status\n");
     for row in rows.into_values() {
         rendered.push_str(&row);
         rendered.push('\n');
     }
-    rendered
+    Ok(rendered)
+}
+
+#[cfg(test)]
+mod sql_projection_merge_tests {
+    use super::*;
+
+    fn run_git_test(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output_guarded()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn semantic_merge_retains_the_maximum_writer_generation() {
+        let base = SqlProjectionFile {
+            writer_generation: 2,
+            rows: BTreeMap::new(),
+        };
+        let local = SqlProjectionFile {
+            writer_generation: 7,
+            rows: BTreeMap::new(),
+        };
+        let remote = SqlProjectionFile {
+            writer_generation: 4,
+            rows: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            merge_sql_projection_file(&base, &local, &remote).writer_generation,
+            7
+        );
+    }
+
+    #[test]
+    fn semantic_merge_publishes_generation_carrier_first() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            PathBuf::from("agent-context/axioms.sql"),
+            "axioms".to_string(),
+        );
+        files.insert(
+            PathBuf::from("agent-context/epochs.sql"),
+            "epochs".to_string(),
+        );
+        files.insert(
+            PathBuf::from("agent-context/phases.sql"),
+            "phases".to_string(),
+        );
+        let mut published = Vec::new();
+
+        publish_merged_sql_projection(Path::new("/sidecar"), files, |path, _| {
+            published.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            Ok(())
+        })
+        .expect("publish merged projection");
+
+        assert_eq!(published.first().map(String::as_str), Some("epochs.sql"));
+        assert_eq!(published.len(), 3);
+    }
+
+    #[test]
+    fn semantic_merge_rejects_incompatible_revision_before_git_or_database_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        run_git_test(root, &["init", "--quiet"]);
+        run_git_test(root, &["config", "user.name", "Exo Test"]);
+        run_git_test(root, &["config", "user.email", "exo@example.invalid"]);
+        let branch = run_git_test(root, &["branch", "--show-current"]);
+        let project_dir = root.join("projects/project-a");
+        let projection_dir = project_dir.join("agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write base projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "base"]);
+        let base = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        run_git_test(root, &["checkout", "--quiet", "-b", "remote-change"]);
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible remote projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "remote"]);
+        let remote = run_git_test(root, &["rev-parse", "HEAD"]);
+        run_git_test(root, &["checkout", "--quiet", &branch]);
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git_test(root, &["update-ref", &remote_ref, &remote]);
+        run_git_test(
+            root,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        run_git_test(
+            root,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+
+        let git_common_dir = root.join(".git").canonicalize().expect("git dir");
+        let repo = ResolvedSidecarRepo {
+            project: Project {
+                id: crate::project::ProjectId::from_git_common_dir(&git_common_dir),
+                git_common_dir,
+                workspace_root: Some(root.to_path_buf()),
+                policy: StatePolicy::Sidecar,
+                projects_config_path: None,
+                state_root: project_dir.clone(),
+                sidecar_key: Some("project-a".to_string()),
+                sidecar_root: Some(root.to_path_buf()),
+                sidecar_auto_commit: true,
+                sidecar_auto_push: SidecarAutoPushPolicy::Never,
+            },
+            sidecar_root: root.to_path_buf(),
+        };
+
+        let error = semantic_merge_upstream_if_needed(&repo, &branch)
+            .expect_err("incompatible remote projection must fail before merge");
+        assert!(error.to_string().contains("writer generation 1"));
+        assert_eq!(run_git_test(root, &["rev-parse", "HEAD"]), base);
+        assert!(!root.join(".git/MERGE_HEAD").exists());
+        assert!(!repo.project.db_path().exists());
+        assert!(!repo.project.db_path().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn semantic_merge_rejects_incompatible_target_before_git_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        run_git_test(root, &["init", "--quiet"]);
+        run_git_test(root, &["config", "user.name", "Exo Test"]);
+        run_git_test(root, &["config", "user.email", "exo@example.invalid"]);
+        let branch = run_git_test(root, &["branch", "--show-current"]);
+        let project_dir = root.join("projects/project-a");
+        let projection_dir = project_dir.join("agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write base projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "base"]);
+        let base = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        run_git_test(root, &["checkout", "--quiet", "-b", "remote-change"]);
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n-- remote change\n",
+        )
+        .expect("write remote projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "remote"]);
+        let remote = run_git_test(root, &["rev-parse", "HEAD"]);
+        run_git_test(root, &["checkout", "--quiet", &branch]);
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git_test(root, &["update-ref", &remote_ref, &remote]);
+        run_git_test(
+            root,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        run_git_test(
+            root,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+
+        let git_common_dir = root.join(".git").canonicalize().expect("git dir");
+        let repo = ResolvedSidecarRepo {
+            project: Project {
+                id: crate::project::ProjectId::from_git_common_dir(&git_common_dir),
+                git_common_dir,
+                workspace_root: Some(root.to_path_buf()),
+                policy: StatePolicy::Sidecar,
+                projects_config_path: None,
+                state_root: project_dir,
+                sidecar_key: Some("project-a".to_string()),
+                sidecar_root: Some(root.to_path_buf()),
+                sidecar_auto_commit: true,
+                sidecar_auto_push: SidecarAutoPushPolicy::Never,
+            },
+            sidecar_root: root.to_path_buf(),
+        };
+        let db_path = repo.project.db_path();
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&db_path).expect("create database");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("raise generation");
+        drop(connection);
+        let before_database = std::fs::read(&db_path).expect("read database");
+        let before_status = run_git_test(root, &["status", "--porcelain"]);
+
+        let error = semantic_merge_upstream_if_needed(&repo, &branch)
+            .expect_err("incompatible target must fail before merge");
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert_eq!(run_git_test(root, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            run_git_test(root, &["status", "--porcelain"]),
+            before_status
+        );
+        assert!(!root.join(".git/MERGE_HEAD").exists());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before_database);
+        assert!(!db_path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[test]
+    fn semantic_merge_rechecks_generation_before_first_git_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        run_git_test(root, &["init", "--quiet"]);
+        run_git_test(root, &["config", "user.name", "Exo Test"]);
+        run_git_test(root, &["config", "user.email", "exo@example.invalid"]);
+        let branch = run_git_test(root, &["branch", "--show-current"]);
+        let project_dir = root.join("projects/project-a");
+        let projection_dir = project_dir.join("agent-context");
+        std::fs::create_dir_all(&projection_dir).expect("create projection");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write base projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "base"]);
+        let base = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        run_git_test(root, &["checkout", "--quiet", "-b", "remote-change"]);
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n-- remote change\n",
+        )
+        .expect("write remote projection");
+        run_git_test(root, &["add", "."]);
+        run_git_test(root, &["commit", "--quiet", "-m", "remote"]);
+        let remote = run_git_test(root, &["rev-parse", "HEAD"]);
+        run_git_test(root, &["checkout", "--quiet", &branch]);
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        run_git_test(root, &["update-ref", &remote_ref, &remote]);
+        run_git_test(
+            root,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        run_git_test(
+            root,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+
+        let git_common_dir = root.join(".git").canonicalize().expect("git dir");
+        let repo = ResolvedSidecarRepo {
+            project: Project {
+                id: crate::project::ProjectId::from_git_common_dir(&git_common_dir),
+                git_common_dir,
+                workspace_root: Some(root.to_path_buf()),
+                policy: StatePolicy::Sidecar,
+                projects_config_path: None,
+                state_root: project_dir,
+                sidecar_key: Some("project-a".to_string()),
+                sidecar_root: Some(root.to_path_buf()),
+                sidecar_auto_commit: true,
+                sidecar_auto_push: SidecarAutoPushPolicy::Never,
+            },
+            sidecar_root: root.to_path_buf(),
+        };
+        let db_path = repo.project.db_path();
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create database parent");
+        drop(exosuit_storage::Connection::open(&db_path).expect("create database"));
+        let before_status = run_git_test(root, &["status", "--porcelain"]);
+
+        let error = semantic_merge_upstream_if_needed_with_hook(&repo, &branch, || {
+            let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
+            advancing.pragma_update(None, "user_version", 1).unwrap();
+        })
+        .expect_err("generation advance must be rejected before merge");
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert_eq!(run_git_test(root, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            run_git_test(root, &["status", "--porcelain"]),
+            before_status
+        );
+        assert!(!root.join(".git/MERGE_HEAD").exists());
+    }
 }
 
 fn sql_row_key(file: &str, line: &str) -> SqlRowKey {

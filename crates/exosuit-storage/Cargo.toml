@@ -13,6 +13,5 @@ libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 thiserror = "1.0"
 blake3 = "1"
 hex = "0.4"
-
-[dev-dependencies]
+fs2 = "0.4.3"
 tempfile = "3"

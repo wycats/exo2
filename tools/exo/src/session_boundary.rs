@@ -95,7 +95,8 @@ pub fn detect_boundary(world: &WorldState) -> BoundaryDetection {
                 rationale: format!(
                     "No agent activity for {gap_minutes} minutes — likely a new session."
                 ),
-                previous_session: crate::activity::previous_session_summary_from_db(&world.db_path),
+                previous_session: crate::activity::previous_session_summary_from_db(&world.db_path)
+                    .unwrap_or_default(),
             };
         }
 
@@ -136,6 +137,8 @@ fn last_event_at(db_path: &Path) -> Option<DateTime<Utc>> {
             row.get::<_, Option<String>>(0)
         })
     })
+    .ok()
+    .flatten()
     .flatten()?;
     DateTime::parse_from_rfc3339(&ts)
         .ok()

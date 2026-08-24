@@ -16,9 +16,12 @@
 //! Additionally, **`StrikeActive`** is an overlay state for surgical strikes.
 
 use crate::ExoResult;
+use crate::api::protocol::Effect;
 use crate::context::AgentContext;
+use crate::project::Project;
 use crate::steering::{SuggestedAction, WorkIntent};
 use serde::Serialize;
+use std::path::Path;
 /// The primary states of the phase state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -413,6 +416,58 @@ pub fn check_upgrade_gate(context: &AgentContext) -> ExoResult<()> {
     Ok(())
 }
 
+/// Check critical upgrades before a command that can mutate project state.
+///
+/// The update command is the recovery path for a blocked project. Sidecar init
+/// owns its source-projection and target-database compatibility preflights, so
+/// it must also remain available before the repository upgrade is complete.
+/// A workspace without existing Exo state has nothing to migrate yet.
+pub fn check_command_upgrade_gate(
+    context: &AgentContext,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+) -> ExoResult<()> {
+    if !command_requires_upgrade_gate(namespace, operation, effect)
+        || !crate::command::update::is_update_workspace(&context.root, context.project.as_ref())
+    {
+        return Ok(());
+    }
+
+    check_upgrade_gate(context)
+}
+
+/// Load the authoritative project context and apply the command upgrade gate.
+///
+/// Daemon dispatch uses this entry point because it resolves project identity
+/// before it loads command-specific state.
+pub fn load_and_check_command_upgrade_gate(
+    root: &Path,
+    project: Option<&Project>,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+) -> ExoResult<()> {
+    if !command_requires_upgrade_gate(namespace, operation, effect)
+        || !crate::command::update::is_update_workspace(root, project)
+    {
+        return Ok(());
+    }
+
+    let context = AgentContext::load_with_project(root.to_path_buf(), project.cloned())?;
+    check_upgrade_gate(&context)
+}
+
+fn command_requires_upgrade_gate(namespace: &str, operation: &str, effect: Effect) -> bool {
+    if matches!(effect, Effect::Pure) {
+        return false;
+    }
+
+    !((namespace.is_empty() && operation == "update")
+        || (namespace == "update" && operation.is_empty())
+        || (namespace == "sidecar" && operation == "init"))
+}
+
 /// Check if an operation is allowed given the current state.
 ///
 /// This is a higher-level check that combines state resolution and operation gating.
@@ -517,6 +572,20 @@ mod tests {
         assert!(!is_operation_allowed(
             &PrimaryState::ActivePhaseExecuting,
             Operation::UpgradeMigrate
+        ));
+    }
+
+    #[test]
+    fn sidecar_init_remains_available_as_a_storage_recovery_path() {
+        assert!(!command_requires_upgrade_gate(
+            "sidecar",
+            "init",
+            Effect::Write
+        ));
+        assert!(command_requires_upgrade_gate(
+            "sidecar",
+            "repo",
+            Effect::Write
         ));
     }
 

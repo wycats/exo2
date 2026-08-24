@@ -4,7 +4,7 @@
 //! scope lets every loader and writer opened by that request reuse one
 //! connection and therefore participate in one SQLite transaction.
 
-use crate::{open_database, Database, DatabaseError};
+use crate::{normalize_database_identity, open_database, Database, DatabaseError};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -146,27 +146,7 @@ pub fn active_request_database(
 }
 
 fn normalized_database_path(path: &Path) -> Result<PathBuf, DatabaseError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| DatabaseError::RequestScope(error.to_string()))?
-            .join(path)
-    };
-
-    if let Ok(canonical) = absolute.canonicalize() {
-        return Ok(canonical);
-    }
-
-    let Some(parent) = absolute.parent() else {
-        return Ok(absolute);
-    };
-    let canonical_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
-    Ok(absolute
-        .file_name()
-        .map_or(canonical_parent.clone(), |name| canonical_parent.join(name)))
+    normalize_database_identity(path).map_err(DatabaseError::from)
 }
 
 #[cfg(test)]

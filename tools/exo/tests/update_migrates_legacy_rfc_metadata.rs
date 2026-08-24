@@ -199,6 +199,7 @@ fn update_imports_sql_projection_before_upgrades() {
     assert!(fs::create_dir_all(db_path.parent().unwrap()).is_ok());
     let writer = ok_or_return!(SqliteWriter::open(&db_path), "failed to create source db");
     assert!(writer.add_epoch("Dump Projection Epoch", None, &[]).is_ok());
+    drop(writer);
     exo::context::write_sql_dump_with_project(root, None);
     assert!(fs::metadata(root.join("docs/agent-context/epochs.sql")).is_ok());
     assert!(std::fs::remove_file(&db_path).is_ok());

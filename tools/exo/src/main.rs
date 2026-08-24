@@ -56,12 +56,14 @@ fn parse_output_format(s: &str) -> OutputFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MergeDriverKind {
+    Sql,
     Toml,
 }
 
 impl MergeDriverKind {
     fn parse(s: &str) -> Option<Self> {
         match s {
+            "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             _ => None,
         }
@@ -1393,6 +1395,24 @@ fn is_update_command(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("update"))
 }
 
+fn is_storage_compatibility_command(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("storage"), Some("compatibility"))
+    )
+}
+
+fn should_run_global_verifiers(format: OutputFormat, args: &[String]) -> bool {
+    format != OutputFormat::Json && !is_storage_compatibility_command(args)
+}
+
+fn should_reexec_workspace_binary(args: &[String]) -> bool {
+    !is_storage_compatibility_command(args)
+}
+
 fn is_rfc_reconcile_read(args: &[String]) -> bool {
     matches!(
         (
@@ -1470,6 +1490,7 @@ fn load_context_result_or_exit(
         Ok(context) => context,
         Err(e) => {
             let original_command = original_command_for_guidance();
+            let compatibility_failure = exo::storage_compatibility::storage_failure_from_error(&e);
             let preload_guidance =
                 exo::preload_guidance::classify_context_load_error(&e, &original_command);
 
@@ -1479,23 +1500,13 @@ fn load_context_result_or_exit(
                     id: "unknown".to_string(),
                     status: Status::Error,
                     result: None,
-                    error: Some(preload_guidance.as_ref().map_or_else(
-                        || ErrorBody {
-                            code: ErrorCode::Internal,
-                            message: format!("Failed to load agent context: {e}"),
-                            details: None,
-                        },
-                        |guidance| ErrorBody {
-                            code: guidance.error_code,
-                            message: guidance.message(),
-                            details: Some(guidance.details()),
-                        },
+                    error: Some(context_load_error_body(
+                        &e,
+                        compatibility_failure.as_ref(),
+                        preload_guidance.as_ref(),
                     )),
                     ticket: None,
-                    steering: Some(preload_guidance.as_ref().map_or_else(
-                        protocol_help_root_steering,
-                        exo::preload_guidance::PreloadGuidance::to_steering,
-                    )),
+                    steering: Some(context_load_steering(preload_guidance.as_ref())),
                     reminders: None,
                     display: None,
                     preview: None,
@@ -1518,23 +1529,13 @@ fn load_context_result_or_exit(
                     id: "cli".to_string(),
                     status: Status::Error,
                     result: None,
-                    error: Some(preload_guidance.as_ref().map_or_else(
-                        || ErrorBody {
-                            code: ErrorCode::Internal,
-                            message: format!("Failed to load agent context: {e}"),
-                            details: None,
-                        },
-                        |guidance| ErrorBody {
-                            code: guidance.error_code,
-                            message: guidance.message(),
-                            details: Some(guidance.details()),
-                        },
+                    error: Some(context_load_error_body(
+                        &e,
+                        compatibility_failure.as_ref(),
+                        preload_guidance.as_ref(),
                     )),
                     ticket: None,
-                    steering: Some(preload_guidance.as_ref().map_or_else(
-                        protocol_help_root_steering,
-                        exo::preload_guidance::PreloadGuidance::to_steering,
-                    )),
+                    steering: Some(context_load_steering(preload_guidance.as_ref())),
                     reminders: None,
                     display: None,
                     preview: None,
@@ -1560,6 +1561,37 @@ fn load_context_result_or_exit(
             std::process::exit(1);
         }
     }
+}
+
+fn context_load_error_body(
+    error: &anyhow::Error,
+    compatibility_failure: Option<&ExoFailure>,
+    preload_guidance: Option<&exo::preload_guidance::PreloadGuidance>,
+) -> ErrorBody {
+    if let Some(failure) = compatibility_failure {
+        return failure.error.clone();
+    }
+    preload_guidance.map_or_else(
+        || ErrorBody {
+            code: ErrorCode::Internal,
+            message: format!("Failed to load agent context: {error}"),
+            details: None,
+        },
+        |guidance| ErrorBody {
+            code: guidance.error_code,
+            message: guidance.message(),
+            details: Some(guidance.details()),
+        },
+    )
+}
+
+fn context_load_steering(
+    preload_guidance: Option<&exo::preload_guidance::PreloadGuidance>,
+) -> exo::api::protocol::Steering {
+    preload_guidance.map_or_else(
+        protocol_help_root_steering,
+        exo::preload_guidance::PreloadGuidance::to_steering,
+    )
 }
 
 fn original_command_for_guidance() -> String {
@@ -1767,8 +1799,6 @@ fn render_daemon_status_report(
 }
 
 fn main() {
-    exo_reexec::maybe_reexec();
-
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let (mut format, args_after_format) = extract_format(&raw_args);
     let (mut workflow_confirmation, args_after_workflow_confirmation) =
@@ -1797,10 +1827,14 @@ fn main() {
         };
     let (has_direct_flag, mut args) = extract_direct_flag(&args_after_workflow_confirmation);
     normalize_project_repair_apply_shorthand(&mut args);
+    if should_reexec_workspace_binary(&args) {
+        exo_reexec::maybe_reexec();
+    }
     let is_direct = has_direct_flag
         || std::env::var_os(TASK_DIRECT_MODE_ENV).is_some()
         || is_project_bootstrap_read(&args)
-        || is_sidecar_bootstrap_context_command(&args);
+        || is_sidecar_bootstrap_context_command(&args)
+        || is_storage_compatibility_command(&args);
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("exo {}", env!("CARGO_PKG_VERSION"));
@@ -1939,7 +1973,7 @@ fn main() {
         Some("merge-driver") => {
             let kind = args.get(1).and_then(|value| MergeDriverKind::parse(value));
             let Some(kind) = kind else {
-                eprintln!("merge-driver requires a kind (toml)");
+                eprintln!("merge-driver requires a kind (sql or toml)");
                 std::process::exit(1);
             };
             let Some(base) = args.get(2) else {
@@ -1956,6 +1990,7 @@ fn main() {
             };
             let path = args.get(5).map(String::as_str);
             let kind = match kind {
+                MergeDriverKind::Sql => exo::merge_driver::MergeDriverKind::Sql,
                 MergeDriverKind::Toml => exo::merge_driver::MergeDriverKind::Toml,
             };
 
@@ -2039,6 +2074,7 @@ fn main() {
     } else if is_project_bootstrap_read(&args)
         || is_sidecar_bootstrap_context_command(&args)
         || is_update_command(&args)
+        || is_storage_compatibility_command(&args)
         || command_loads_request_context(&args)
     {
         let project = if is_update_command(&args) {
@@ -2058,7 +2094,7 @@ fn main() {
         load_context_or_exit(format, false, cwd)
     };
 
-    if format != OutputFormat::Json {
+    if should_run_global_verifiers(format, &args) {
         let reminders = exo::verifiers::run_global_verifiers(&context.root);
         emit_verifier_reminders(&reminders);
     }
@@ -2095,6 +2131,16 @@ fn main() {
         let namespace = args.first().map_or("", String::as_str);
         let operation = args.get(1).map_or("", String::as_str);
         let effect = command_box.effect();
+        if let Err(err) =
+            exo::state_machine::check_command_upgrade_gate(&context, namespace, operation, effect)
+        {
+            render_fatal_error(format, Some(&context), err.as_ref());
+            std::process::exit(if cmd_format == exo::command::traits::OutputFormat::Json {
+                2
+            } else {
+                1
+            });
+        }
         if let Err(err) = exo::post_write::preflight_sidecar_post_write(
             context.project.as_ref(),
             namespace,
@@ -2520,59 +2566,67 @@ fn handle_json_server(
             continue;
         }
 
-        let reminders = exo::verifiers::run_global_verifiers(&context.root);
+        let parsed_request = serde_json::from_str::<api::protocol::RequestEnvelope>(&input);
+        let reminders = if parsed_request
+            .as_ref()
+            .is_ok_and(|request| !exo::command::storage::request_is_storage_compatibility(request))
+            || parsed_request.is_err()
+        {
+            exo::verifiers::run_global_verifiers(&context.root)
+        } else {
+            Vec::new()
+        };
 
-        let mut response: ResponseEnvelope =
-            match serde_json::from_str::<api::protocol::RequestEnvelope>(&input) {
-                Ok(request) if is_direct => {
-                    api::handler::handle_request_with_project_and_diagnostics_as_writer(
-                        &context.root,
-                        project,
-                        request,
-                        &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
-                    )
-                }
-                Ok(request) => {
-                    api::handler::handle_request_with_project(&context.root, project, request)
-                }
-                Err(e) => {
-                    let id = serde_json::from_str::<serde_json::Value>(&input)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("id")
-                                .and_then(|x| x.as_str())
-                                .map(std::string::ToString::to_string)
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
+        let mut response: ResponseEnvelope = match parsed_request {
+            Ok(request) if is_direct => {
+                api::handler::handle_request_with_project_and_diagnostics_as_writer(
+                    &context.root,
+                    project,
+                    request,
+                    &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
+                )
+            }
+            Ok(request) => {
+                api::handler::handle_request_with_project(&context.root, project, request)
+            }
+            Err(e) => {
+                let id = serde_json::from_str::<serde_json::Value>(&input)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("id")
+                            .and_then(|x| x.as_str())
+                            .map(std::string::ToString::to_string)
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
 
-                    ResponseEnvelope {
-                        protocol_version: PROTOCOL_VERSION,
-                        id,
-                        status: Status::Error,
-                        result: None,
-                        error: Some(ErrorBody {
-                            code: ErrorCode::InvalidInput,
-                            message: format!("Failed to parse request envelope: {e}"),
-                            details: None,
-                        }),
-                        ticket: None,
-                        steering: Some(exo::api::protocol::Steering {
-                            next_call: exo::api::protocol::NextCall {
-                                kind: exo::api::protocol::NextCallKind::Help,
-                                params: serde_json::json!({ "address": { "kind": "root" } }),
-                            },
-                            priority: None,
-                            confidence: None,
-                            context_note: None,
-                        }),
-                        reminders: None,
-                        display: None,
-                        preview: None,
-                        effect: None,
-                        trace: None,
-                    }
+                ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    id,
+                    status: Status::Error,
+                    result: None,
+                    error: Some(ErrorBody {
+                        code: ErrorCode::InvalidInput,
+                        message: format!("Failed to parse request envelope: {e}"),
+                        details: None,
+                    }),
+                    ticket: None,
+                    steering: Some(exo::api::protocol::Steering {
+                        next_call: exo::api::protocol::NextCall {
+                            kind: exo::api::protocol::NextCallKind::Help,
+                            params: serde_json::json!({ "address": { "kind": "root" } }),
+                        },
+                        priority: None,
+                        confidence: None,
+                        context_note: None,
+                    }),
+                    reminders: None,
+                    display: None,
+                    preview: None,
+                    effect: None,
+                    trace: None,
                 }
-            };
+            }
+        };
 
         if !reminders.is_empty() {
             response.reminders = Some(reminders);
@@ -2607,6 +2661,65 @@ mod tests {
             decision: WorkflowConfirmationDecision::YesComplete,
             outcome: outcome.to_string(),
         }
+    }
+
+    #[test]
+    fn cli_context_preload_preserves_wrapped_storage_compatibility_contract() {
+        for (error, expected_kind, retryable) in [
+            (
+                exosuit_storage::WriterCompatibilityError::Incompatible {
+                    required_generation: 1,
+                    supported_generation: 0,
+                    surface: exosuit_storage::StateSurface::Database,
+                },
+                "storage.writer_incompatible",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::MetadataInvalid {
+                    surface: exosuit_storage::StateSurface::Projection,
+                    reason: "bad header".to_string(),
+                },
+                "storage.writer_metadata_invalid",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::Busy {
+                    lock_path: PathBuf::from("/tmp/exo.writer-compat.lock"),
+                },
+                "storage.compatibility_busy",
+                true,
+            ),
+        ] {
+            let wrapped = exo::storage_compatibility::map_writer_compatibility_error(error)
+                .context("load command context")
+                .context("CLI preload");
+            let failure =
+                exo::storage_compatibility::writer_compatibility_failure_from_error(&wrapped)
+                    .expect("wrapped compatibility failure");
+            let body = context_load_error_body(&wrapped, Some(&failure), None);
+            assert_eq!(body.code, ErrorCode::PreconditionFailed);
+            let details = body.details.expect("compatibility details");
+            assert_eq!(details["kind"], expected_kind);
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+            assert_eq!(details["retryable"], retryable);
+        }
+    }
+
+    #[test]
+    fn cli_context_preload_preserves_wrapped_projection_quarantine() {
+        let wrapped = exo::storage_compatibility::projection_unsettled_error("MERGE_HEAD", true)
+            .context("load command context")
+            .context("CLI preload");
+        let failure = exo::storage_compatibility::storage_failure_from_error(&wrapped)
+            .expect("wrapped storage failure");
+        let body = context_load_error_body(&wrapped, Some(&failure), None);
+        assert_eq!(body.code, ErrorCode::PreconditionFailed);
+        let details = body.details.expect("storage details");
+        assert_eq!(details["kind"], "storage.projection_unsettled");
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
     }
 
     fn test_completion_review(outcome: &str) -> CliCompletionReview {
@@ -3102,5 +3215,19 @@ mod tests {
             "task".to_string(),
             "start".to_string(),
         ]));
+    }
+
+    #[test]
+    fn storage_compatibility_uses_lightweight_direct_context() {
+        let args = ["storage".to_string(), "compatibility".to_string()];
+        assert!(is_storage_compatibility_command(&args));
+        assert!(!should_run_global_verifiers(OutputFormat::Human, &args));
+        assert!(!should_run_global_verifiers(OutputFormat::Json, &args));
+        assert!(!should_reexec_workspace_binary(&args));
+        assert!(should_run_global_verifiers(
+            OutputFormat::Human,
+            &["status".to_string()]
+        ));
+        assert!(should_reexec_workspace_binary(&["status".to_string()]));
     }
 }

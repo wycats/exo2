@@ -7,6 +7,7 @@ use exo::context::{AgentContext, ExoState};
 use exo::map::build_map_json;
 use exo::steering::{SteeringBlock, WorkIntent};
 use std::fs::{self, File};
+use std::process::Command;
 use tempfile::TempDir;
 
 fn setup_test_context() -> (TempDir, AgentContext) {
@@ -18,7 +19,57 @@ fn setup_test_context() -> (TempDir, AgentContext) {
     fs::create_dir_all(root.join("docs/agent-context")).unwrap();
     fs::create_dir_all(root.join("docs/rfcs")).unwrap();
     fs::create_dir_all(root.join(".cache")).unwrap();
+    let git_status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .status()
+        .expect("initialize test repository");
+    assert!(git_status.success(), "initialize test repository");
+    exo::templates::install_gitattributes(&root).expect("install .gitattributes");
+    exo::templates::configure_sql_dump_merge_driver(&root)
+        .expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(&root)
+            .expect("verify SQL dump merge driver"),
+        "test workspace should satisfy the critical upgrade contract"
+    );
+    exo::templates::install_gitignore(&root).expect("install standard .gitignore");
+    let add_status = Command::new("git")
+        .args(["add", ".gitattributes", ".gitignore"])
+        .current_dir(&root)
+        .status()
+        .expect("stage compatible workspace files");
+    assert!(add_status.success(), "stage compatible workspace files");
+    let commit_status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Exo Test",
+            "-c",
+            "user.email=exo-test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initialize upgraded workspace",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("commit compatible workspace files");
+    assert!(commit_status.success(), "commit compatible workspace files");
     exosuit_storage::open_database(root.join(".cache/exo.db")).unwrap();
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&root)
+        .output()
+        .expect("inspect test workspace status");
+    assert!(
+        status_output.status.success(),
+        "inspect test workspace status"
+    );
+    assert!(
+        status_output.stdout.is_empty(),
+        "test workspace should be clean after initialization: {}",
+        String::from_utf8_lossy(&status_output.stdout)
+    );
 
     let context = AgentContext {
         root,
@@ -46,7 +97,17 @@ fn test_map_returns_empty_context_steering_when_no_epochs_exist() {
     assert_eq!(steering_block.next_actions.len(), 1);
     assert_eq!(steering_block.next_actions[0].command, "exo plan review");
     assert_eq!(steering_block.primary_intent, WorkIntent::Orient);
-    assert!(steering_block.repair_actions.is_empty());
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&context.root)
+        .output()
+        .expect("inspect test workspace after map rendering");
+    assert!(
+        steering_block.repair_actions.is_empty(),
+        "unexpected repair actions: {:#?}; post-map git status: {}",
+        steering_block.repair_actions,
+        String::from_utf8_lossy(&status_output.stdout)
+    );
 }
 
 #[test]

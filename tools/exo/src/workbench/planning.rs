@@ -206,6 +206,7 @@ pub(crate) struct WorkbenchPlanningError {
     message: &'static str,
     code: ErrorCode,
     retry_with_same_request_id: bool,
+    forwarded_error: Option<ErrorBody>,
 }
 
 impl WorkbenchPlanningError {
@@ -301,23 +302,35 @@ impl WorkbenchPlanningError {
             message,
             code,
             retry_with_same_request_id,
+            forwarded_error: None,
+        }
+    }
+
+    pub(crate) fn from_error_body(error: ErrorBody) -> Self {
+        Self {
+            kind: "workbench.command_failed",
+            message: "The workbench planning request could not be completed",
+            code: error.code,
+            retry_with_same_request_id: true,
+            forwarded_error: Some(error),
         }
     }
 
     pub(crate) fn response(&self, id: String) -> ResponseEnvelope {
+        let error = self.forwarded_error.clone().unwrap_or_else(|| ErrorBody {
+            code: self.code,
+            message: self.message.to_string(),
+            details: Some(json!({
+                "kind": self.kind,
+                "retry_with_same_request_id": self.retry_with_same_request_id,
+            })),
+        });
         ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             id,
             status: Status::Error,
             result: None,
-            error: Some(ErrorBody {
-                code: self.code,
-                message: self.message.to_string(),
-                details: Some(json!({
-                    "kind": self.kind,
-                    "retry_with_same_request_id": self.retry_with_same_request_id,
-                })),
-            }),
+            error: Some(error),
             ticket: None,
             steering: None,
             reminders: None,

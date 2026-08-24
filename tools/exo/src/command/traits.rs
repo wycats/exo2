@@ -13,6 +13,7 @@ use crate::command::transport::{
     CommandError, ConfirmResult, SteeringOutput, TransportContext, TransportOutput,
 };
 use crate::command::unified_diagnostics::IntoDiagnosticSteering;
+use crate::context::AgentContext;
 use crate::failure::ExoFailure;
 use crate::project::Project;
 use crate::steering::SuggestedAction;
@@ -272,6 +273,36 @@ fn find_exo_failure<'a>(mut e: &'a (dyn std::error::Error + 'static)) -> Option<
     }
 }
 
+fn format_storage_compatibility_response(
+    transport: &dyn TransportContext,
+    error: &anyhow::Error,
+    steering: Vec<SuggestedAction>,
+) -> Option<serde_json::Value> {
+    let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(error)?;
+    let command_error = CommandError::with_code(failure.error.code, failure.error.message.clone());
+    let mut response = format_error_response(transport, command_error, steering);
+    if let Some(details) = failure.error.details
+        && let Some(object) = response.as_object_mut()
+    {
+        if let Some(error_object) = object
+            .get_mut("error")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            error_object.insert("details".to_string(), details);
+        } else {
+            object.insert(
+                "error".to_string(),
+                serde_json::json!({
+                    "code": failure.error.code,
+                    "message": failure.error.message,
+                    "details": details,
+                }),
+            );
+        }
+    }
+    Some(response)
+}
+
 fn is_cli_json_completion_confirmation_failure(
     transport: &dyn TransportContext,
     failure: &ExoFailure,
@@ -440,6 +471,8 @@ pub fn invoke_command_box_json(
     cmd: &CommandBox,
     transport: &dyn TransportContext,
 ) -> Result<CommandInvokeResult, serde_json::Value> {
+    let _storage_compatibility_scope = AgentContext::begin_storage_compatibility_request();
+
     if cmd.effect() == Effect::Exec {
         let action = cmd.description();
 
@@ -651,6 +684,11 @@ pub trait Command: Send + Sync {
             Ok(Some(cmd)) => return invoke_command_box_json(&cmd, transport).map(|r| r.data),
             Ok(None) => {}
             Err(err) => {
+                if let Some(response) =
+                    format_storage_compatibility_response(transport, &err, self.default_steering())
+                {
+                    return Err(response);
+                }
                 let error = CommandError::with_code(ErrorCode::InvalidInput, err.to_string());
                 return Err(format_error_response(
                     transport,
@@ -695,6 +733,11 @@ pub trait Command: Send + Sync {
         let output = match self.execute(&ctx) {
             Ok(output) => output,
             Err(err) => {
+                if let Some(response) =
+                    format_storage_compatibility_response(transport, &err, self.default_steering())
+                {
+                    return Err(response);
+                }
                 let error = CommandError::with_code(ErrorCode::Internal, err.to_string());
                 return Err(format_error_response(
                     transport,

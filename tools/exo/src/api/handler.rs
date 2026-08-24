@@ -19,6 +19,7 @@ use crate::command::traits::{CommandInvokeResult, invoke_command_box_json};
 use crate::command::transport::{
     MachineChannelTransport, compatible_exec_ticket_request_id, ticket_for_exec_call,
 };
+use crate::context::{AgentContext, StorageCompatibilityPreflight};
 use crate::daemon::DaemonEnsureState;
 use crate::daemon_diagnostics::{
     DaemonDiagnostics, effect_name, elapsed_ms, request_op_path, response_status,
@@ -48,6 +49,7 @@ fn log_command_event(
     project: Option<&Project>,
     request_id: &str,
     runtime: HandlerRuntime,
+    storage_preflight: Option<&StorageCompatibilityPreflight>,
     agent_id: Option<&str>,
     namespace: &str,
     operation: &str,
@@ -57,6 +59,9 @@ fn log_command_event(
     duration_ms: u64,
     summary: &str,
 ) -> anyhow::Result<bool> {
+    if runtime != HandlerRuntime::AtomicStateWriter && storage_preflight.is_none() {
+        AgentContext::preflight_storage_compatibility(workspace_root, project)?;
+    }
     let db_path = crate::context::db_path(workspace_root, project);
 
     let text_id = if runtime == HandlerRuntime::AtomicStateWriter {
@@ -111,7 +116,11 @@ fn log_command_event(
         return Ok(true);
     }
 
-    Ok(crate::event_db::with_event_db(&db_path, insert).is_some())
+    Ok(crate::event_db::with_event_db(&db_path, insert)?.is_some())
+}
+
+fn command_requires_storage_preflight(namespace: &str, operation: &str) -> bool {
+    namespace != "storage" || operation != "compatibility"
 }
 
 /// Generate display metadata from a command result.
@@ -1624,6 +1633,7 @@ fn handle_request_with_project_and_diagnostics_in_runtime(
     runtime: HandlerRuntime,
     runtime_services: Option<&DaemonRuntimeServices>,
 ) -> ResponseEnvelope {
+    let _storage_compatibility_scope = AgentContext::begin_storage_compatibility_request();
     let request_id = request.id.clone();
     let op_path = request_op_path(&request);
     let start = Instant::now();
@@ -2185,6 +2195,27 @@ fn handle_call_with_namespace_operation(
                 );
             }
 
+            let storage_preflight = if runtime != HandlerRuntime::AtomicStateWriter
+                && command_requires_storage_preflight(namespace, operation)
+            {
+                match AgentContext::preflight_storage_compatibility(workspace_root, project) {
+                    Ok(preflight) => Some(preflight),
+                    Err(error) => return command_construction_error_to_response(id, error),
+                }
+            } else {
+                None
+            };
+
+            if let Err(error) = crate::state_machine::load_and_check_command_upgrade_gate(
+                workspace_root,
+                project,
+                namespace,
+                operation,
+                effect,
+            ) {
+                return command_construction_error_to_response(id, error);
+            }
+
             if runtime == HandlerRuntime::SidecarWriter
                 && command_requires_database_hydration(namespace, operation)
                 && let Err(error) = crate::context::AgentContext::load_hydrated_with_project(
@@ -2298,6 +2329,7 @@ fn handle_call_with_namespace_operation(
                             project,
                             &id,
                             runtime,
+                            storage_preflight.as_ref(),
                             agent_id_for_log.as_deref(),
                             namespace,
                             operation,
@@ -2409,6 +2441,33 @@ fn handle_call_with_namespace_operation(
 }
 
 fn command_construction_error_to_response(id: String, err: anyhow::Error) -> ResponseEnvelope {
+    if let Some(failure) =
+        crate::storage_compatibility::writer_compatibility_failure_from_error(&err)
+    {
+        let details = merge_error_details_with_sibling_steering(
+            failure.error.details.clone(),
+            json!(failure.steering.clone()),
+        );
+        return ResponseEnvelope {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            id,
+            status: failure.status,
+            result: None,
+            error: Some(ErrorBody {
+                code: failure.error.code,
+                message: failure.error.message.clone(),
+                details,
+            }),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: None,
+            trace: None,
+        };
+    }
+
     if let Some(failure) = err.downcast_ref::<ExoFailure>() {
         let details = merge_error_details(
             failure.error.details.clone(),
@@ -2745,10 +2804,17 @@ fn command_error_to_response(
         .unwrap_or("Command invocation failed")
         .to_string();
 
-    let details = merge_error_details(
-        error_object.and_then(|err| err.get("details")).cloned(),
-        error_response.get("steering").cloned(),
-    );
+    let source_details = error_object.and_then(|err| err.get("details"));
+    let details = if source_details
+        .is_some_and(crate::storage_compatibility::is_writer_compatibility_details)
+    {
+        source_details.cloned()
+    } else {
+        merge_error_details(
+            source_details.cloned(),
+            error_response.get("steering").cloned(),
+        )
+    };
 
     ResponseEnvelope {
         protocol_version: protocol::PROTOCOL_VERSION,
@@ -2798,6 +2864,23 @@ fn merge_error_details(
         (Some(details), None) => Some(details),
         (None, Some(steering)) => Some(json!({ "steering": steering })),
         (Some(details), Some(steering)) => Some(json!({
+            "details": details,
+            "steering": steering,
+        })),
+    }
+}
+
+fn merge_error_details_with_sibling_steering(
+    details: Option<JsonValue>,
+    steering: JsonValue,
+) -> Option<JsonValue> {
+    match details {
+        None => Some(json!({ "steering": steering })),
+        Some(JsonValue::Object(mut details)) => {
+            details.insert("steering".to_string(), steering);
+            Some(JsonValue::Object(details))
+        }
+        Some(details) => Some(json!({
             "details": details,
             "steering": steering,
         })),
@@ -3132,6 +3215,7 @@ mod tests {
                 None,
                 "workbench-launch-event",
                 HandlerRuntime::External,
+                None,
                 Some("agent-test"),
                 "workbench",
                 "launch",
@@ -3166,6 +3250,7 @@ mod tests {
                     },
                 )
             })
+            .expect("open event database")
             .expect("read logged launch event");
         assert_eq!(
             event,
@@ -3209,6 +3294,56 @@ mod tests {
             daemon_writer_request_workspace(handler_workspace, None),
             handler_workspace
         );
+    }
+
+    #[test]
+    fn command_event_logging_preflights_projection_before_database_creation() {
+        let temp = tempfile::tempdir().expect("create event fixture");
+        let projection = temp.path().join("docs/agent-context");
+        std::fs::create_dir_all(&projection).expect("create projection directory");
+        std::fs::write(
+            projection.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write incompatible projection");
+        let db_path = crate::context::db_path(temp.path(), None);
+
+        let error = log_command_event(
+            temp.path(),
+            None,
+            "incompatible-event",
+            HandlerRuntime::External,
+            None,
+            Some("agent-test"),
+            "project",
+            "snapshot",
+            &json!({}),
+            &json!({"ok": true}),
+            Effect::Pure,
+            1,
+            "Inspect project",
+        )
+        .expect_err("incompatible projection must reject event logging");
+
+        let failure = crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+            .expect("typed compatibility failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.writer_incompatible"
+        );
+        assert!(!db_path.exists());
+        assert!(!db_path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[test]
+    fn semantic_commands_preflight_independently_of_event_logging() {
+        assert!(command_requires_storage_preflight("project", "resolve"));
+        assert!(command_requires_storage_preflight("dogfood", "verify"));
+        assert!(command_requires_storage_preflight("dogfood", "repair"));
+        assert!(!command_requires_storage_preflight(
+            "storage",
+            "compatibility"
+        ));
     }
 
     #[test]
@@ -3325,6 +3460,163 @@ mod tests {
                 .iter()
                 .any(|action| action["command"] == "exo sidecar checkpoint"),
             "{details:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_storage_compatibility_errors_preserve_mcp_response_contract() {
+        for (error, expected_kind, retryable) in [
+            (
+                exosuit_storage::WriterCompatibilityError::Incompatible {
+                    required_generation: 1,
+                    supported_generation: 0,
+                    surface: exosuit_storage::StateSurface::Database,
+                },
+                "storage.writer_incompatible",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::MetadataInvalid {
+                    surface: exosuit_storage::StateSurface::Projection,
+                    reason: "bad header".to_string(),
+                },
+                "storage.writer_metadata_invalid",
+                false,
+            ),
+            (
+                exosuit_storage::WriterCompatibilityError::Busy {
+                    lock_path: std::path::PathBuf::from("/tmp/exo.writer-compat.lock"),
+                },
+                "storage.compatibility_busy",
+                true,
+            ),
+        ] {
+            let wrapped = crate::storage_compatibility::map_writer_compatibility_error(error)
+                .context("MCP context preload")
+                .context("command construction");
+            let response =
+                command_construction_error_to_response("wrapped-storage".to_string(), wrapped);
+            let error = response.error.expect("error body");
+            assert_eq!(error.code, ErrorCode::PreconditionFailed);
+            let details = error.details.expect("error details");
+            assert_eq!(details["kind"], expected_kind);
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+            assert_eq!(details["retryable"], retryable);
+            assert!(details["steering"].is_object(), "{details:?}");
+            assert!(
+                details.get("details").is_none(),
+                "compatibility fields must not be nested: {details:?}"
+            );
+        }
+
+        let unrelated = command_construction_error_to_response(
+            "unrelated".to_string(),
+            anyhow::anyhow!("ordinary construction failure").context("wrapped"),
+        );
+        assert_eq!(
+            unrelated.error.expect("error body").code,
+            ErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn daemon_storage_compatibility_errors_match_direct_error_objects() {
+        for (details, expected_kind) in [
+            (
+                json!({
+                    "kind": "storage.writer_incompatible",
+                    "required_generation": 1,
+                    "supported_generation": 0,
+                    "state_surface": "database",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": false,
+                }),
+                "storage.writer_incompatible",
+            ),
+            (
+                json!({
+                    "kind": "storage.writer_metadata_invalid",
+                    "state_surface": "projection",
+                    "reason": "bad header",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": false,
+                }),
+                "storage.writer_metadata_invalid",
+            ),
+            (
+                json!({
+                    "kind": "storage.compatibility_busy",
+                    "lock_path": "/tmp/exo.writer-compat.lock",
+                    "request_outcome_checked": false,
+                    "retry_with_same_request_id": true,
+                    "retryable": true,
+                }),
+                "storage.compatibility_busy",
+            ),
+        ] {
+            let direct_error = json!({
+                "code": "precondition_failed",
+                "message": "storage writer compatibility check failed",
+                "details": details,
+            });
+            let response = command_error_to_response(
+                Path::new("/workspace"),
+                "storage-error".to_string(),
+                json!({
+                    "status": "error",
+                    "error": direct_error,
+                    "steering": {
+                        "next_actions": [{ "command": "exo status" }],
+                    },
+                }),
+                &Address::Root,
+                &json!({}),
+            );
+
+            let daemon_error = serde_json::to_value(response.error.expect("error body"))
+                .expect("serialize daemon error");
+            assert_eq!(daemon_error, direct_error);
+            assert_eq!(daemon_error["details"]["kind"], expected_kind);
+            assert!(daemon_error["details"].get("details").is_none());
+            assert!(daemon_error["details"].get("steering").is_none());
+        }
+    }
+
+    #[test]
+    fn daemon_unrelated_errors_preserve_recovery_steering() {
+        let response = command_error_to_response(
+            Path::new("/workspace"),
+            "checkpoint-error".to_string(),
+            json!({
+                "status": "error",
+                "error": {
+                    "code": "precondition_failed",
+                    "message": "checkpoint failed",
+                    "details": {
+                        "kind": "sidecar.local_checkpoint",
+                        "ok": false,
+                    },
+                },
+                "steering": {
+                    "next_actions": [{ "command": "exo sidecar checkpoint" }],
+                },
+            }),
+            &Address::Root,
+            &json!({}),
+        );
+
+        let details = response
+            .error
+            .expect("error body")
+            .details
+            .expect("error details");
+        assert_eq!(details["details"]["kind"], "sidecar.local_checkpoint");
+        assert_eq!(
+            details["steering"]["next_actions"][0]["command"],
+            "exo sidecar checkpoint"
         );
     }
 

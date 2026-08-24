@@ -20,7 +20,7 @@ use crate::mcp::MCP_WORKER_PROTOCOL_VERSION;
 use crate::process_spawn::CommandSpawnExt as _;
 use crate::project::{Project, StatePolicy};
 use anyhow::{Context, Result as ExoResult, anyhow, bail};
-use exosuit_storage::rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use exosuit_storage::rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashSet};
@@ -1994,8 +1994,15 @@ struct RepairPlanCandidate {
 
 impl RepairPlanCandidate {
     fn build(canonical_db_path: &Path, candidate: &SplitBrainCandidate) -> ExoResult<Self> {
-        let conn = Connection::open_with_flags(canonical_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("Failed to open DB {}", canonical_db_path.display()))?;
+        let conn = exosuit_storage::open_fenced_read_only_connection(canonical_db_path)
+            .map_err(crate::storage_compatibility::map_database_error)
+            .with_context(|| format!("Failed to open DB {}", canonical_db_path.display()))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "DB {} disappeared during repair inspection",
+                    canonical_db_path.display()
+                )
+            })?;
         attach_legacy(&conn, &candidate.db_path)?;
 
         let missing_goals = query_missing_goals(&conn)?;
@@ -2370,7 +2377,8 @@ fn apply_repair_plan(
     }
 
     let backup_path = backup_canonical_db(paths)?;
-    let mut conn = Connection::open(&paths.db_path)
+    let mut conn = exosuit_storage::open_fenced_connection(&paths.db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
         .with_context(|| format!("Failed to open DB {}", paths.db_path.display()))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
@@ -2966,8 +2974,10 @@ fn count_exo_rows(path: &Path) -> ExoResult<Vec<TableRows>> {
         ("agent_events", true),
     ];
 
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open DB {}", path.display()))?;
+    let conn = exosuit_storage::open_fenced_read_only_connection(path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("Failed to open DB {}", path.display()))?
+        .ok_or_else(|| anyhow!("DB {} disappeared during inspection", path.display()))?;
     let mut rows = Vec::new();
 
     for &(table, ignored_for_split_brain) in TABLES {
@@ -3151,6 +3161,72 @@ fn compare_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_inspection_preserves_existing_journal_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("exo.db");
+        let connection = Connection::open(&path).expect("open fixture database");
+        connection
+            .pragma_update(None, "journal_mode", "delete")
+            .expect("set delete journal mode");
+        connection
+            .execute_batch(
+                "CREATE TABLE epochs_data(text_id TEXT); INSERT INTO epochs_data VALUES ('one');",
+            )
+            .expect("seed fixture rows");
+        drop(connection);
+
+        let rows = count_exo_rows(&path).expect("inspect rows");
+        assert_eq!(
+            rows.iter()
+                .find(|table| table.table == "epochs_data")
+                .map(|table| table.rows),
+            Some(1)
+        );
+
+        let connection = Connection::open(&path).expect("reopen fixture database");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert!(!path.with_extension("db-wal").exists());
+    }
+
+    #[test]
+    fn repair_plan_inspection_preserves_canonical_journal_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical_path = temp.path().join("canonical.db");
+        let legacy_path = temp.path().join("legacy.db");
+        for path in [&canonical_path, &legacy_path] {
+            let database = exosuit_storage::open_database(path).expect("initialize database");
+            database
+                .connection()
+                .pragma_update(None, "journal_mode", "delete")
+                .expect("set delete journal mode");
+        }
+
+        let candidate = SplitBrainCandidate {
+            kind: "legacy-home-sidecar",
+            state_root: temp.path().join("legacy"),
+            db_path: legacy_path,
+            db: DbSummary::inspect(&temp.path().join("legacy.db")).expect("inspect legacy DB"),
+            severity: SplitBrainSeverity::Error,
+            reason: "fixture".to_string(),
+        };
+        RepairPlanCandidate::build(&canonical_path, &candidate).expect("build repair preview");
+
+        let connection = Connection::open(&canonical_path).expect("reopen canonical database");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert!(!canonical_path.with_extension("db-wal").exists());
+    }
 
     #[test]
     fn pinned_plugin_config_must_launch_with_the_recorded_activation() {

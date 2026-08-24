@@ -808,12 +808,43 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[derive(Debug)]
+struct RequestPreparationError(anyhow::Error);
+
+impl std::fmt::Display for RequestPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RequestPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 fn to_request_preparation_io_error(error: anyhow::Error) -> io::Error {
     if crate::rfc::is_reconcile_lock_busy(&error) {
         io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
     } else {
-        to_io_error(error)
+        let kind = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<io::Error>())
+            .map_or(io::ErrorKind::Other, io::Error::kind);
+        io::Error::new(kind, RequestPreparationError(error))
     }
+}
+
+fn request_preparation_storage_failure(error: &io::Error) -> Option<crate::failure::ExoFailure> {
+    let error = error.get_ref()?.downcast_ref::<RequestPreparationError>()?;
+    crate::storage_compatibility::storage_failure_from_error(&error.0)
+}
+
+fn workbench_request_preparation_error(error: anyhow::Error) -> planning::WorkbenchPlanningError {
+    crate::storage_compatibility::storage_failure_from_error(&error)
+        .map_or_else(planning::WorkbenchPlanningError::internal, |failure| {
+            planning::WorkbenchPlanningError::from_error_body(failure.error)
+        })
 }
 
 fn read_pid_file(pid_path: &Path) -> Option<u32> {
@@ -1668,6 +1699,22 @@ fn validated_request_workspace(
 }
 
 fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
+    if let Some(failure) = request_preparation_storage_failure(error) {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            id,
+            status: failure.status,
+            result: None,
+            error: Some(failure.error),
+            ticket: None,
+            steering: None,
+            reminders: None,
+            display: None,
+            preview: None,
+            effect: None,
+            trace: None,
+        };
+    }
     if error.kind() == io::ErrorKind::WouldBlock {
         return daemon_reconcile_busy_response(id);
     }
@@ -1799,6 +1846,16 @@ fn replay_request_context(
     })
 }
 
+fn preflight_daemon_request_storage(
+    startup_workspace: &Path,
+    startup_project: &Project,
+    request: &RequestEnvelope,
+) -> anyhow::Result<DaemonRequestContext> {
+    let context = replay_request_context(startup_workspace, startup_project, request)?;
+    AgentContext::preflight_storage_compatibility(&context.workspace_root, Some(&context.project))?;
+    Ok(context)
+}
+
 fn compatible_protocol_v1_approval_request_id(
     startup_workspace: &Path,
     startup_project: &Project,
@@ -1827,11 +1884,27 @@ fn atomic_request_context(
     request: &RequestEnvelope,
     instance_id: &str,
 ) -> io::Result<DaemonRequestContext> {
+    let mut preflighted_context = None;
     if !outcome_ledger
-        .atomic_request_needs_preparation(request, &startup_project.db_path(), instance_id)
-        .map_err(to_io_error)?
+        .atomic_request_needs_preparation_after_compatibility_preflight(
+            request,
+            &startup_project.db_path(),
+            instance_id,
+            || {
+                preflighted_context = Some(preflight_daemon_request_storage(
+                    startup_workspace,
+                    startup_project,
+                    request,
+                )?);
+                Ok(())
+            },
+        )
+        .map_err(to_request_preparation_io_error)?
     {
-        return replay_request_context(startup_workspace, startup_project, request);
+        return preflighted_context.map_or_else(
+            || replay_request_context(startup_workspace, startup_project, request),
+            Ok,
+        );
     }
 
     let context = daemon_request_context(startup_workspace, startup_project, request)?;
@@ -2636,21 +2709,26 @@ async fn ensure_daemon_paths_with_report(
 
 /// Delete agent events older than 7 days (RFC 10183 retention policy).
 ///
-/// Best-effort: silently ignores errors if the database doesn't exist
-/// or the table hasn't been created yet.
-pub fn cleanup_old_events(workspace_root: &Path) {
+/// Deletion remains best-effort when the database or table is unavailable;
+/// compatibility failures are returned before any cleanup write is attempted.
+pub fn cleanup_old_events(workspace_root: &Path) -> crate::ExoResult<()> {
     let project = Project::resolve(workspace_root).ok();
-    cleanup_old_events_with_project(workspace_root, project.as_ref());
+    cleanup_old_events_with_project(workspace_root, project.as_ref())
 }
 
-pub fn cleanup_old_events_with_project(workspace_root: &Path, project: Option<&Project>) {
+pub fn cleanup_old_events_with_project(
+    workspace_root: &Path,
+    project: Option<&Project>,
+) -> crate::ExoResult<()> {
+    AgentContext::preflight_storage_compatibility(workspace_root, project)?;
     let db_path = crate::context::db_path(workspace_root, project);
-    let _ = crate::event_db::with_event_db(&db_path, |conn| {
+    let _ = crate::event_db::with_uncached_existing_event_db(&db_path, |conn| {
         conn.execute(
             "DELETE FROM agent_events WHERE timestamp < datetime('now', '-7 days')",
             [],
         )
     });
+    Ok(())
 }
 
 /// Run the daemon server for a workspace.
@@ -2677,6 +2755,12 @@ pub async fn run_daemon(
             return;
         }
     };
+    if let Err(error) =
+        AgentContext::preflight_storage_compatibility(&workspace_path, Some(project.as_ref()))
+    {
+        eprintln!("exo daemon: storage compatibility preflight failed: {error:#}");
+        return;
+    }
     let paths = LocalRuntimePaths::new(&workspace_path, &project);
     let diagnostics = DaemonDiagnostics::from_runtime_dir_with_config(
         &paths.runtime_dir(),
@@ -2745,6 +2829,18 @@ pub async fn run_daemon(
             return;
         }
     };
+    // Startup maintenance is synchronous and one-shot. Its connection and
+    // shared compatibility lease must be gone before health or socket
+    // readiness allows a replacement writer to receive requests.
+    if let Err(error) = cleanup_old_events_with_project(workspace.as_ref(), Some(project.as_ref()))
+    {
+        diagnostics.record(
+            "daemon.storage_preflight_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+        eprintln!("exo daemon: storage compatibility preflight failed: {error:#}");
+        return;
+    }
     let health = DaemonHealthWriter::new(&paths, &runtime_identity);
     let instance_id: Arc<str> = runtime_identity
         .instance_id
@@ -2841,6 +2937,7 @@ pub async fn run_daemon(
     let preparation_probe_request_admission = Arc::clone(&request_admission);
     let replay_outcome_ledger = Arc::clone(&outcome_ledger);
     let preparation_probe_outcome_ledger = Arc::clone(&outcome_ledger);
+    let preparation_probe_workspace = Arc::clone(&workspace);
     let preparation_probe_project = Arc::clone(&project);
     let preparation_probe_instance_id = Arc::clone(&instance_id);
     let dispatcher = DaemonRequestDispatcher::new(move |req: RequestEnvelope| {
@@ -2907,16 +3004,34 @@ pub async fn run_daemon(
                         .reserved_request_recovery_before_preparation(recovery_request)
                         .ok()
                         .flatten();
-                    let canonical_atomic_replay = declared_recovery.is_some_and(|recovery| {
+                    let canonical_atomic_replay = if declared_recovery.is_some_and(|recovery| {
                         recovery.recovery_class == RecoveryClass::AtomicProjectState
-                            && outcome_ledger
-                                .atomic_request_needs_preparation(
-                                    &req,
-                                    &project.db_path(),
-                                    &instance_id,
-                                )
-                                .is_ok_and(|needs_preparation| !needs_preparation)
-                    });
+                    }) {
+                        match outcome_ledger
+                            .atomic_request_needs_preparation_after_compatibility_preflight(
+                                &req,
+                                &project.db_path(),
+                                &instance_id,
+                                || {
+                                    preflight_daemon_request_storage(
+                                        &workspace,
+                                        project.as_ref(),
+                                        &req,
+                                    )?;
+                                    Ok(())
+                                },
+                            ) {
+                            Ok(needs_preparation) => !needs_preparation,
+                            Err(error) => {
+                                return daemon_workspace_error_response(
+                                    handler_request_id,
+                                    &to_request_preparation_io_error(error),
+                                );
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     let recovery = if canonical_atomic_replay {
                         declared_recovery
                     } else if reserved_recovery.is_some() {
@@ -3008,33 +3123,41 @@ pub async fn run_daemon(
                             };
                             let request_workspace = request_context.workspace_root;
                             let request_project = request_context.project;
-                            let outcome = outcome_ledger.execute_atomic_project_state(
-                                req,
-                                recovery.effect,
-                                &instance_id,
-                                Duration::from_secs(30),
-                                &request_project.db_path(),
-                                |req| {
-                                    let request = planning::request_without_context(&req);
-                                    handle_request_with_project_and_diagnostics_as_atomic_writer(
-                                        &request_workspace,
-                                        Some(&request_project),
-                                        request,
-                                        &diagnostics,
-                                    )
-                                },
-                                |response| {
-                                    finalize_atomic_response_after_commit(
-                                        &request_workspace,
-                                        Some(&request_project),
-                                        &namespace,
-                                        &operation,
-                                        recovery.effect,
-                                        response,
-                                        &diagnostics,
-                                    )
-                                },
-                            );
+                            let outcome = outcome_ledger
+                                .execute_atomic_project_state_after_compatibility_preflight(
+                                    req,
+                                    recovery.effect,
+                                    &instance_id,
+                                    Duration::from_secs(30),
+                                    &request_project.db_path(),
+                                    || {
+                                        AgentContext::preflight_storage_compatibility(
+                                            &request_workspace,
+                                            Some(&request_project),
+                                        )
+                                        .map(|_| ())
+                                    },
+                                    |req| {
+                                        let request = planning::request_without_context(&req);
+                                        handle_request_with_project_and_diagnostics_as_atomic_writer(
+                                            &request_workspace,
+                                            Some(&request_project),
+                                            request,
+                                            &diagnostics,
+                                        )
+                                    },
+                                    |response| {
+                                        finalize_atomic_response_after_commit(
+                                            &request_workspace,
+                                            Some(&request_project),
+                                            &namespace,
+                                            &operation,
+                                            recovery.effect,
+                                            response,
+                                            &diagnostics,
+                                        )
+                                    },
+                                );
                             let advances_revision =
                                 !outcome.replayed && response_committed_write(&outcome.response);
                             (outcome.response, advances_revision)
@@ -3125,6 +3248,7 @@ pub async fn run_daemon(
     })
     .with_atomic_preparation_probe(move |request: RequestEnvelope| {
         let outcome_ledger = Arc::clone(&preparation_probe_outcome_ledger);
+        let workspace = Arc::clone(&preparation_probe_workspace);
         let project = Arc::clone(&preparation_probe_project);
         let instance_id = Arc::clone(&preparation_probe_instance_id);
         let request_admission = Arc::clone(&preparation_probe_request_admission);
@@ -3135,8 +3259,20 @@ pub async fn run_daemon(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 outcome_ledger
-                    .atomic_request_needs_preparation(&request, &project.db_path(), &instance_id)
-                    .map_err(|_| planning::WorkbenchPlanningError::internal())
+                    .atomic_request_needs_preparation_after_compatibility_preflight(
+                        &request,
+                        &project.db_path(),
+                        &instance_id,
+                        || {
+                            preflight_daemon_request_storage(
+                                &workspace,
+                                project.as_ref(),
+                                &request,
+                            )?;
+                            Ok(())
+                        },
+                    )
+                    .map_err(workbench_request_preparation_error)
             })
             .await
             .map_err(|_| planning::WorkbenchPlanningError::internal())?
@@ -3152,8 +3288,6 @@ pub async fn run_daemon(
     let diagnostics_clone = diagnostics.clone();
     let server_health = health.clone();
     let last_activity_clone = Arc::clone(&last_activity);
-    let cleanup_workspace = Arc::clone(&workspace);
-    let cleanup_project = Arc::clone(&project);
     let server_handle = tokio::spawn(async move {
         let _health_guard = DaemonServerTaskHealthGuard(server_health.clone());
         run_socket_server(
@@ -3173,12 +3307,6 @@ pub async fn run_daemon(
         )
         .await;
     });
-    if cleanup_project.db_path().exists() {
-        tokio::task::spawn_blocking(move || {
-            cleanup_old_events_with_project(&cleanup_workspace, Some(cleanup_project.as_ref()));
-        });
-    }
-
     // Idle timeout checker task.
     //
     // Polling strategy: We check every `timeout/2` seconds, capped at 30 seconds,
@@ -3308,6 +3436,9 @@ fn log_file_save_event(
     agent_id: Option<&str>,
     summary: &str,
 ) {
+    if AgentContext::preflight_storage_compatibility(workspace_root, project).is_err() {
+        return;
+    }
     let db_path = crate::context::db_path(workspace_root, project);
 
     let text_id = ulid::Ulid::new().to_string().to_lowercase();
@@ -3636,6 +3767,20 @@ mod tests {
             }
         }))
         .expect("operation request")
+    }
+
+    fn assert_writer_incompatible_response(response: &ResponseEnvelope) {
+        assert_eq!(response.status, Status::Error);
+        let error = response.error.as_ref().expect("typed compatibility error");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        let details = error.details.as_ref().expect("compatibility details");
+        assert_eq!(details["kind"], "storage.writer_incompatible");
+        assert_eq!(details["state_surface"], "projection");
+        assert_eq!(details["required_generation"], 1);
+        assert_eq!(details["supported_generation"], 0);
+        assert_eq!(details["request_outcome_checked"], false);
+        assert_eq!(details["retry_with_same_request_id"], true);
+        assert_eq!(details["retryable"], false);
     }
 
     #[test]
@@ -4006,6 +4151,30 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::InvalidInput)
         );
+    }
+
+    #[test]
+    fn daemon_request_preparation_preserves_projection_quarantine_failure() {
+        let daemon_error = to_request_preparation_io_error(
+            crate::storage_compatibility::projection_unsettled_error("sequencer", false),
+        );
+        let responses = [
+            daemon_workspace_error_response("daemon-quarantine".to_string(), &daemon_error),
+            workbench_request_preparation_error(
+                crate::storage_compatibility::projection_unsettled_error("sequencer", false),
+            )
+            .response("workbench-quarantine".to_string()),
+        ];
+
+        for response in responses {
+            let error = response.error.expect("stable storage failure");
+            assert_eq!(error.code, ErrorCode::PreconditionFailed);
+            let details = error.details.expect("storage failure details");
+            assert_eq!(details["kind"], "storage.projection_unsettled");
+            assert_eq!(details["repository_state"], "sequencer");
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+        }
     }
 
     #[test]
@@ -4477,6 +4646,217 @@ mod tests {
         );
         assert!(!execution.replayed);
         (ledger, request)
+    }
+
+    #[test]
+    fn canonical_outcome_probe_preflights_root_projection_before_database_open() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(workspace.join("docs/agent-context"))
+            .expect("create projection directory");
+        let project = test_project(&workspace, workspace.join(".exo"));
+        let database_path = project.db_path();
+        std::fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&database_path)
+            .expect("create generation-zero database");
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('unchanged');",
+            )
+            .expect("seed generation-zero database");
+        drop(connection);
+        let before = std::fs::read(&database_path).expect("snapshot database");
+        std::fs::write(
+            workspace.join("docs/agent-context/epochs.sql"),
+            "-- exo:minimum-writer-generation=1\n",
+        )
+        .expect("write newer canonical projection");
+
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let request = request_for_operation(&["epoch", "add"]);
+        let error = atomic_request_context(&workspace, &project, &ledger, &request, "instance-a")
+            .expect_err("daemon entry must reject before canonical outcome lookup");
+
+        assert!(error.to_string().contains("newer Exo writer"), "{error}");
+        assert_writer_incompatible_response(&daemon_workspace_error_response(
+            request.id.clone(),
+            &error,
+        ));
+        let workbench_error = preflight_daemon_request_storage(&workspace, &project, &request)
+            .expect_err("workbench probe fixture must reject the newer projection");
+        assert_writer_incompatible_response(
+            &workbench_request_preparation_error(workbench_error).response(request.id.clone()),
+        );
+        assert_eq!(
+            std::fs::read(&database_path).expect("read rejected database"),
+            before,
+            "daemon compatibility rejection must precede migration"
+        );
+        assert!(
+            !database_path.with_extension("writer-compat.lock").exists(),
+            "daemon compatibility rejection must precede lock creation"
+        );
+    }
+
+    #[test]
+    fn file_save_event_preflights_projection_before_event_write() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let projection_path = workspace.join("docs/agent-context/epochs.sql");
+        std::fs::create_dir_all(projection_path.parent().expect("projection parent"))
+            .expect("create projection directory");
+        let project = test_project(&workspace, workspace.join(".exo"));
+        let database_path = project.db_path();
+        std::fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database parent");
+        drop(exosuit_storage::open_database(&database_path).expect("create event database"));
+        std::fs::write(
+            &projection_path,
+            "-- exo:minimum-writer-generation=1\n-- newer canonical projection\n",
+        )
+        .expect("write newer canonical projection");
+
+        log_file_save_event(
+            &workspace,
+            Some(&project),
+            Some("codex"),
+            "must stay unrecorded",
+        );
+
+        let connection = exosuit_storage::Connection::open_with_flags(
+            &database_path,
+            exosuit_storage::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open event database read-only");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_events WHERE summary = 'must stay unrecorded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rejected file-save events");
+        assert_eq!(
+            count, 0,
+            "incompatible file-save events must not be recorded"
+        );
+    }
+
+    #[test]
+    fn same_instance_timeout_rechecks_projection_before_canonical_lookup() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let projection_path = workspace.join("docs/agent-context/epochs.sql");
+        std::fs::create_dir_all(projection_path.parent().expect("projection parent"))
+            .expect("create projection directory");
+        let project = test_project(&workspace, workspace.join(".exo"));
+        let database_path = project.db_path();
+        std::fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database parent");
+        let connection = exosuit_storage::Connection::open(&database_path)
+            .expect("create generation-zero database");
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('unchanged');",
+            )
+            .expect("seed generation-zero database");
+        drop(connection);
+        std::fs::write(
+            &projection_path,
+            "-- exo:minimum-writer-generation=1\n-- retained projection\n",
+        )
+        .expect("write newer canonical projection");
+        let database_before = std::fs::read(&database_path).expect("snapshot database");
+        let projection_before = std::fs::read(&projection_path).expect("snapshot projection");
+
+        let ledger = RequestOutcomeLedger::open(temp.path().join("runtime-outcomes.sqlite3"))
+            .expect("open runtime ledger");
+        let mut request = request_for_operation(&["epoch", "add"]);
+        request.id = "same-instance-timeout-compatibility".to_string();
+        ledger
+            .reserve_atomic_request_for_test(&request, Effect::Write, "instance-a")
+            .expect("reserve same-instance atomic request");
+        let preparation_error = ledger
+            .atomic_request_needs_preparation_after_compatibility_preflight(
+                &request,
+                &database_path,
+                "instance-a",
+                || {
+                    AgentContext::preflight_storage_compatibility(&workspace, Some(&project))
+                        .map(|_| ())
+                },
+            )
+            .expect_err("same-instance preparation must retain the compatibility fence");
+        let preparation_failure =
+            crate::storage_compatibility::writer_compatibility_failure_from_error(
+                &preparation_error,
+            )
+            .expect("typed preparation compatibility failure");
+        assert_eq!(
+            preparation_failure.error.details.as_ref().expect("details")["kind"],
+            "storage.writer_incompatible"
+        );
+        let executions = std::cell::Cell::new(0);
+
+        for _ in 0..2 {
+            let outcome = ledger.execute_atomic_project_state_after_compatibility_preflight(
+                request.clone(),
+                Effect::Write,
+                "instance-a",
+                Duration::ZERO,
+                &database_path,
+                || {
+                    AgentContext::preflight_storage_compatibility(&workspace, Some(&project))
+                        .map(|_| ())
+                },
+                |request| {
+                    executions.set(executions.get() + 1);
+                    daemon_handler_error_response(
+                        request.id,
+                        ErrorCode::Internal,
+                        "must not execute".to_string(),
+                    )
+                },
+                Ok,
+            );
+
+            assert!(!outcome.replayed);
+            assert_eq!(outcome.response.id, request.id);
+            assert_writer_incompatible_response(&outcome.response);
+        }
+
+        assert_eq!(executions.get(), 0, "same-ID retries must not execute");
+        assert_eq!(
+            std::fs::read(&database_path).expect("read rejected database"),
+            database_before,
+            "timeout compatibility rejection must precede database open or migration"
+        );
+        assert_eq!(
+            std::fs::read(&projection_path).expect("read retained projection"),
+            projection_before,
+            "timeout compatibility rejection must not rewrite the projection"
+        );
+        assert!(
+            !database_path.with_extension("writer-compat.lock").exists(),
+            "timeout compatibility rejection must precede lock creation"
+        );
+        let connection = exosuit_storage::Connection::open_with_flags(
+            &database_path,
+            exosuit_storage::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open rejected database read-only");
+        let history_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '__schema_history'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect schema history");
+        assert_eq!(
+            history_tables, 0,
+            "rejection must not create migration history"
+        );
     }
 
     #[test]

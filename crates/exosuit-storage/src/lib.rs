@@ -4,6 +4,7 @@
 //! It implements the schema defined in RFC 10176 (Project State Model) with reactive
 //! tracing support from RFC 10165.
 
+pub mod compatibility;
 pub mod dump;
 mod functions;
 pub mod maintenance;
@@ -14,7 +15,17 @@ mod schema;
 mod trace;
 mod vtab;
 
-pub use dump::{dump_tables, import_tables, DumpError, ImportError, TABLE_ORDER};
+pub use compatibility::{
+    acquire_exclusive_compatibility_authority, ensure_projection_supported,
+    normalize_database_identity, open_fenced_connection, open_fenced_connection_for_import,
+    open_fenced_connection_for_import_with_authority, open_fenced_existing_connection,
+    open_fenced_physical_connection, open_fenced_read_only_connection, parse_projection_generation,
+    preflight_database, probe_database_generation, render_projection_generation_header,
+    with_projection_generation, ExclusiveCompatibilityAuthority, FencedConnection, StateSurface,
+    WriterCompatibilityError, MAX_WRITER_GENERATION, PROJECTION_GENERATION_PREFIX,
+    SUPPORTED_WRITER_GENERATION,
+};
+pub use dump::{dump_tables, import_tables, validate_tables, DumpError, ImportError, TABLE_ORDER};
 pub use exosuit_reactivity_core::{CellId, Revision, Trace, TraceEntry};
 pub use functions::register_functions;
 pub use maintenance::{
@@ -41,32 +52,25 @@ use std::path::Path;
 /// and sets a 5-second busy timeout so transient lock contention doesn't
 /// cause immediate failures.
 pub fn open_database(path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
-    let path = path.as_ref();
-    let should_enable_incremental_auto_vacuum = is_new_or_empty_database_file(path);
-
-    let conn = Connection::open(path)?;
-    if should_enable_incremental_auto_vacuum {
-        conn.pragma_update(None, "auto_vacuum", AutoVacuumMode::Incremental.as_i64())?;
-    }
-    conn.pragma_update(None, "journal_mode", "wal")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    run_migrations(&conn)?;
-    Database::new(conn)
+    let (conn, lease) = compatibility::open_database_connection(path.as_ref())?;
+    Database::new_with_lease(conn, Some(lease))
 }
 
-fn is_new_or_empty_database_file(path: &Path) -> bool {
-    match path.metadata() {
-        Ok(metadata) => metadata.len() == 0,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
+/// Open a database by transferring an already-serialized exclusive authority
+/// into its complete semantic lifetime.
+pub fn open_database_with_exclusive_authority(
+    authority: ExclusiveCompatibilityAuthority,
+) -> Result<Database, DatabaseError> {
+    let (conn, lease) =
+        compatibility::open_database_connection_with_exclusive_authority(authority)?;
+    Database::new_with_lease(conn, Some(lease))
 }
 
 /// Create an in-memory database for testing.
 pub fn open_memory_database() -> Result<Database, DatabaseError> {
     let conn = Connection::open_in_memory()?;
     run_migrations(&conn)?;
-    Database::new(conn)
+    Database::new_with_lease(conn, None)
 }
 
 #[cfg(test)]

@@ -1021,7 +1021,7 @@ fn derive_entity_steering_inner(
         }
 
         // Drift detection: compare recent file areas against session scope
-        let scope = crate::activity::infer_entity_scope_from_db(db_path);
+        let scope = crate::activity::infer_entity_scope_from_db(db_path).unwrap_or_default();
         if let Some(drift) = crate::activity::detect_drift(&ctx.recent_files, &scope) {
             repair_actions.push(SuggestedAction::human_action(
                 "Review: file edits outside usual scope",
@@ -1242,8 +1242,9 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
 
     // Implicit entity scoping: if the event log shows recent activity on a
     // specific entity, merge entity-scoped perception into world steering.
-    if let Some(ae) = crate::activity::active_entity_from_db(&world.db_path) {
-        let activity = crate::activity::ActivityContext::collect_from_db(&world.db_path);
+    if let Ok(Some(ae)) = crate::activity::active_entity_from_db(&world.db_path)
+        && let Ok(activity) = crate::activity::ActivityContext::collect_from_db(&world.db_path)
+    {
         let entity_steering = derive_entity_steering_from_db(
             &world.db_path,
             &ae.entity_type,
@@ -2007,8 +2008,7 @@ fn add_concern_on_completed_repairs(
     agent_id: Option<&str>,
     repairs: &mut Vec<SuggestedAction>,
 ) {
-    let db_path = world.root.join(crate::context::SQLITE_DB_PATH);
-    let loader = match crate::context::sqlite_loader::SqliteLoader::open(&db_path) {
+    let loader = match crate::context::sqlite_loader::SqliteLoader::open(&world.db_path) {
         Ok(l) => l,
         Err(_) => return,
     };

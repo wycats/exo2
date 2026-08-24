@@ -656,6 +656,118 @@ fn create_test_workspace(dir: &TempDir, backend: &str) -> PathBuf {
 }
 
 #[test_matrix(["sqlite"])]
+#[cfg(unix)]
+fn daemon_readiness_follows_retention_authority_release(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let connection = exosuit_storage::Connection::open(project.db_path())
+        .expect("open retention fixture database");
+    connection
+        .execute(
+            "INSERT INTO agent_events (text_id, timestamp, event_type, namespace, operation, summary)
+             VALUES ('startup-old-event', datetime('now', '-10 days'), 'command', 'test', 'old', 'old event')",
+            [],
+        )
+        .expect("insert old event");
+    drop(connection);
+
+    let ensure = run_exo_daemon_ensure(&workspace, true);
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+    let ensure = parse_cli_json(&ensure);
+    assert_eq!(ensure["result"]["connected"], true, "{ensure}");
+
+    let paths = exo::daemon::paths_for_workspace(&workspace).expect("daemon paths");
+    let health: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(paths.health_path()).expect("read ready daemon health"),
+    )
+    .expect("parse ready daemon health");
+    assert_eq!(health["server_task_alive"], true, "{health}");
+
+    let connection = exosuit_storage::Connection::open(project.db_path())
+        .expect("inspect retention result without writer authority");
+    let old_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_events WHERE text_id = 'startup-old-event'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count retained events");
+    drop(connection);
+    assert_eq!(old_events, 0, "startup cleanup completes before readiness");
+
+    drop(
+        exosuit_storage::acquire_exclusive_compatibility_authority(project.db_path())
+            .expect("ready daemon does not retain startup cleanup authority"),
+    );
+}
+
+#[test_matrix(["sqlite"])]
+#[cfg(unix)]
+fn future_writer_errors_match_between_direct_and_ready_daemon(backend: &str) {
+    let dir = TempDir::new().unwrap();
+    let workspace = create_test_workspace(&dir, backend);
+    let _guard = DaemonGuard::new(&workspace);
+    let ensure = run_exo_daemon_ensure(&workspace, true);
+    assert!(
+        ensure.status.success(),
+        "daemon must become ready before the future writer advances storage: stdout={}; stderr={}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let project = exo::project::Project::resolve(&workspace).expect("resolve project");
+    let connection =
+        exosuit_storage::Connection::open(project.db_path()).expect("open future-writer fixture");
+    connection
+        .pragma_update(None, "user_version", 1)
+        .expect("raise writer generation");
+    drop(connection);
+
+    let direct = run_exo_json_command(
+        &workspace,
+        &["--direct", "idea", "show", "future-writer-sentinel"],
+    );
+    assert_eq!(direct.status.code(), Some(2), "direct response: {direct:?}");
+    let direct = parse_cli_json(&direct);
+
+    let routed = run_exo_json_command(&workspace, &["idea", "show", "future-writer-sentinel"]);
+    assert_eq!(routed.status.code(), Some(2), "routed response: {routed:?}");
+    let routed = parse_cli_json(&routed);
+
+    let mut direct_protocol = direct.clone();
+    let direct_steering = direct_protocol
+        .as_object_mut()
+        .and_then(|protocol| protocol.remove("steering"));
+    assert!(
+        direct_steering.is_some(),
+        "direct CLI should retain its presentation steering: {direct}"
+    );
+    let mut routed_error = routed["error"].clone();
+    let routed_steering = routed_error
+        .get_mut("details")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|details| details.remove("steering"));
+    assert!(
+        routed_steering.is_some(),
+        "routed response should retain its presentation steering: {routed}"
+    );
+    assert_eq!(routed_error, direct_protocol["error"]);
+    assert_eq!(routed["error"]["code"], "precondition_failed");
+    assert_eq!(
+        routed["error"]["details"]["kind"],
+        "storage.writer_incompatible"
+    );
+    assert_eq!(routed["error"]["details"]["state_surface"], "database");
+}
+
+#[test_matrix(["sqlite"])]
 fn daemon_routed_write_forwards_cli_stdin(backend: &str) {
     let dir = TempDir::new().unwrap();
     let workspace = create_test_workspace(&dir, backend);

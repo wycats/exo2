@@ -22,7 +22,7 @@ use crate::project::{
 };
 use crate::steering::{SuggestedAction, WorkIntent};
 use anyhow::{Context, Result as ExoResult, anyhow};
-use exosuit_storage::rusqlite::{Connection, OpenFlags, OptionalExtension};
+use exosuit_storage::rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -375,11 +375,22 @@ fn project_snapshot_output(
         .db_path
         .as_ref()
         .ok_or_else(|| anyhow!("Project {id} does not have a readable Exo state database"))?;
+    preflight_catalog_project_projection(root, &project)?;
+    let sql_dir = catalog_sql_projection_dir(root, &project);
+    if let Some(sql_dir) = sql_dir.as_deref() {
+        crate::context::preflight_projection_compatibility(sql_dir)?;
+    }
+    exosuit_storage::preflight_database(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight project snapshot database")?;
     if !db_path.exists() {
-        let sql_dir = catalog_sql_projection_dir(root, &project)
-            .filter(|sql_dir| sql_dir.join("epochs.sql").exists());
-        if let Some(sql_dir) = sql_dir {
-            crate::context::import_sql_dumps(&sql_dir, db_path)?;
+        let projection = sql_dir
+            .as_deref()
+            .map(crate::context::preflight_sql_dumps)
+            .transpose()?
+            .flatten();
+        if let Some(projection) = projection {
+            crate::context::import_preflighted_sql_dumps(projection, db_path)?;
         } else {
             anyhow::bail!(
                 "Project {id} state database does not exist at {}",
@@ -515,6 +526,21 @@ fn project_snapshot_output(
     })
 }
 
+fn preflight_catalog_project_projection(
+    root: &Path,
+    project: &ProjectCatalogEntry,
+) -> ExoResult<()> {
+    if project.state != "repo" {
+        return Ok(());
+    }
+    let repository_root = project
+        .workspace_root
+        .as_deref()
+        .or_else(|| project.state_root.as_deref().and_then(Path::parent))
+        .unwrap_or(root);
+    crate::context::ensure_repo_projection_settled(repository_root, None)
+}
+
 fn status_root_for_project(
     project: &ProjectCatalogEntry,
     workspace_key: Option<&str>,
@@ -623,6 +649,7 @@ fn catalog_sql_projection_dir(root: &Path, project: &ProjectCatalogEntry) -> Opt
             project
                 .workspace_root
                 .as_deref()
+                .or_else(|| project.state_root.as_deref().and_then(Path::parent))
                 .unwrap_or(root)
                 .join("docs/agent-context"),
         ),
@@ -900,6 +927,7 @@ fn build_project_move_root_output(
     let manifest_path = sidecar_project_dir.join("sidecar.toml");
     let sidecar_project_id = read_sidecar_manifest_project_id(&manifest_path, key)?;
     let db_path = sidecar_project_dir.join("cache").join("exo.db");
+    preflight_project_move_root_storage(&sidecar_project_dir, &db_path)?;
 
     let db_roots = read_project_move_root_db_roots(&db_path)?;
     let marker = read_move_root_write_owner_marker(&binding.sidecar_root, key)?;
@@ -1210,6 +1238,7 @@ fn build_project_move_root_output(
 
 fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> {
     let db_path = output.sidecar_project_dir.join("cache").join("exo.db");
+    preflight_project_move_root_storage(&output.sidecar_project_dir, &db_path)?;
     let mut doc = read_local_projects_doc(&output.config_path)?;
     validate_policy_retarget_doc(
         &doc,
@@ -1225,6 +1254,7 @@ fn apply_project_move_root(output: &mut ProjectMoveRootOutput) -> ExoResult<()> 
         && let Some(old_root) = output.old_workspace_root.as_deref()
     {
         let db = exosuit_storage::open_database(&db_path)
+            .map_err(crate::storage_compatibility::map_database_error)
             .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
         let conn = db.connection();
         let result: ExoResult<(usize, usize, usize)> = (|| {
@@ -1704,6 +1734,23 @@ fn write_sidecar_manifest_project_id(
     })
 }
 
+fn preflight_project_move_root_storage(project_dir: &Path, db_path: &Path) -> ExoResult<()> {
+    crate::context::preflight_projection_compatibility(&project_dir.join("agent-context"))?;
+    exosuit_storage::preflight_database(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("Failed to preflight project move-root database")?;
+    Ok(())
+}
+
+fn open_project_move_root_read_connection(
+    db_path: &Path,
+) -> ExoResult<exosuit_storage::FencedConnection> {
+    exosuit_storage::open_fenced_read_only_connection(db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?
+        .ok_or_else(|| anyhow!("Sidecar database {} disappeared", db_path.display()))
+}
+
 fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootDbRoots> {
     if !db_path.exists() {
         return Ok(ProjectMoveRootDbRoots {
@@ -1712,8 +1759,7 @@ fn read_project_move_root_db_roots(db_path: &Path) -> ExoResult<ProjectMoveRootD
             phase_owner_workspace_roots: Vec::new(),
         });
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     Ok(ProjectMoveRootDbRoots {
         workspace_active_phase_roots: read_distinct_text_values(
             &conn,
@@ -1737,8 +1783,7 @@ fn workspace_lane_focus_id(db_path: &Path, workspace_root: &str) -> ExoResult<Op
     if !db_path.exists() {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "workspace_lane_focus_data")?
         || !sqlite_table_exists(&conn, "workbench_lanes_data")?
     {
@@ -1788,8 +1833,7 @@ fn count_project_move_root_rows(
     if !db_path.exists() {
         return Ok(0);
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, table)? {
         return Ok(0);
     }
@@ -1804,8 +1848,7 @@ fn workspace_active_phase_statuses(db_path: &Path, workspace_root: &str) -> ExoR
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "workspace_active_phase_data")?
         || !sqlite_table_exists(&conn, "phases_data")?
     {
@@ -1829,8 +1872,7 @@ fn phase_owner_statuses(db_path: &Path, workspace_root: &str) -> ExoResult<Vec<S
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open sidecar database {}", db_path.display()))?;
+    let conn = open_project_move_root_read_connection(db_path)?;
     if !sqlite_table_exists(&conn, "phase_ownership_data")?
         || !sqlite_table_exists(&conn, "phases_data")?
     {
@@ -2252,4 +2294,81 @@ fn resolve_project(root: &std::path::Path) -> ExoResult<Project> {
             err
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_snapshot_preflights_the_selected_repo_quarantine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let caller = temp.path().join("caller");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(&caller).expect("create caller");
+        std::fs::create_dir_all(&target).expect("create target");
+        for root in [&caller, &target] {
+            let output = ProcessCommand::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root)
+                .output_guarded()
+                .expect("initialize repository");
+            assert!(output.status.success());
+        }
+        std::fs::write(target.join(".git/MERGE_HEAD"), "deadbeef\n")
+            .expect("write target merge marker");
+        let project = ProjectCatalogEntry {
+            id: "target".to_string(),
+            display_name: "target".to_string(),
+            source: "test",
+            state: "repo",
+            workspace_root: Some(target.clone()),
+            git_common_dir: Some(target.join(".git")),
+            state_root: Some(target.join(".exo")),
+            db_path: Some(target.join(".cache/exo.db")),
+            runtime_dir: Some(target.join(".runtime")),
+            sidecar_key: None,
+            sidecar_root: None,
+            state_readable: true,
+            workspace_available: true,
+            commands_available: true,
+            write_available: true,
+            selectable: true,
+            current: false,
+            diagnostics: Vec::new(),
+        };
+
+        let error = preflight_catalog_project_projection(&caller, &project)
+            .expect_err("target merge quarantine must block snapshot");
+        let failure = crate::storage_compatibility::storage_failure_from_error(&error)
+            .expect("typed storage failure");
+        assert_eq!(
+            failure.error.details.expect("details")["kind"],
+            "storage.projection_unsettled"
+        );
+    }
+
+    #[test]
+    fn move_root_cached_preflight_checks_generation_without_importing_projection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let projection_dir = project_dir.join("agent-context");
+        let db_path = project_dir.join("cache/exo.db");
+        std::fs::create_dir_all(&projection_dir).expect("create projection directory");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create cache directory");
+        std::fs::write(
+            projection_dir.join("epochs.sql"),
+            "-- exo:minimum-writer-generation=0\n",
+        )
+        .expect("write generation carrier");
+        std::fs::write(
+            projection_dir.join("phases.sql"),
+            "this compatible interrupted projection is not importable",
+        )
+        .expect("write interrupted projection body");
+        drop(exosuit_storage::open_database(&db_path).expect("initialize database"));
+
+        preflight_project_move_root_storage(&project_dir, &db_path)
+            .expect("cached move-root should require only compatible generation metadata");
+    }
 }

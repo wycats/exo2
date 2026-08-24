@@ -40,6 +40,12 @@ fn init_git_repo(path: &Path) {
         .current_dir(path)
         .status()
         .expect("git config commit.gpgsign");
+    exo::templates::configure_sql_dump_merge_driver(path).expect("configure SQL dump merge driver");
+    assert!(
+        exo::templates::sql_dump_merge_driver_configured(path)
+            .expect("verify SQL dump merge driver"),
+        "test workspace should satisfy the critical upgrade contract"
+    );
 
     // Create and commit a file so we have a clean working tree
     std::fs::write(path.join("README.md"), "# Test\n").expect("write README");
