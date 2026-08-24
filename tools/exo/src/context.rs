@@ -1313,8 +1313,8 @@ impl AgentContext {
         }
 
         let projection_generation = if let Some(sql_dir) = sql_projection_dir(root, project) {
+            ensure_repo_projection_settled(root, project)?;
             if canonical_projection_available(&sql_dir)? {
-                ensure_repo_projection_settled(root, project)?;
                 Some(preflight_projection_compatibility(&sql_dir)?)
             } else {
                 None
@@ -1598,6 +1598,7 @@ pub(crate) fn ensure_repo_projection_settled(
         "REBASE_HEAD",
         "rebase-merge",
         "rebase-apply",
+        "sequencer",
     ] {
         if git_dir.join(marker).exists() {
             unsettled_markers.push(marker);
@@ -2682,6 +2683,55 @@ status = "pending"
             failure.error.details.as_ref().unwrap()["kind"],
             "storage.projection_unsettled"
         );
+    }
+
+    #[test]
+    fn storage_preflight_quarantines_unsettled_repo_without_projection_files() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status_guarded()
+            .expect("initialize repository");
+        assert!(status.success());
+        std::fs::write(
+            root.join(".git/MERGE_HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .expect("mark merge state");
+
+        let error = AgentContext::preflight_storage_compatibility(root, None)
+            .expect_err("missing projection files must not bypass Git quarantine");
+        let failure = error
+            .downcast_ref::<crate::failure::ExoFailure>()
+            .expect("typed Exo failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "storage.projection_unsettled"
+        );
+    }
+
+    #[test]
+    fn repo_projection_is_quarantined_during_git_sequence() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status_guarded()
+            .expect("initialize repository");
+        assert!(status.success());
+        std::fs::create_dir(root.join(".git/sequencer")).expect("mark sequencer state");
+
+        let error = ensure_repo_projection_settled(root, None)
+            .expect_err("an active Git sequence must quarantine repo projection access");
+        let failure = error
+            .downcast_ref::<crate::failure::ExoFailure>()
+            .expect("typed Exo failure");
+        let details = failure.error.details.as_ref().unwrap();
+        assert_eq!(details["kind"], "storage.projection_unsettled");
+        assert_eq!(details["repository_state"], "sequencer");
     }
 
     #[test]

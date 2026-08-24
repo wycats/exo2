@@ -1,10 +1,12 @@
-//! Shared connection cache for the `agent_events` table.
+//! Shared active-connection registry for the `agent_events` table.
 //!
 //! Event logging and activity projections run inside the daemon request
-//! path. Opening a fresh connection per call (with WAL pragma + migrations)
-//! caused lock contention under concurrent requests: one open wedged inside
-//! SQLite while every other request queued behind it until clients timed
-//! out. All `agent_events` access goes through this cache instead.
+//! path. Opening independent connections for concurrent calls (with WAL pragma
+//! + migrations) caused lock contention: one open wedged inside SQLite while
+//! every other request queued behind it until clients timed out. Concurrent
+//! `agent_events` access therefore shares a per-path connection, while the
+//! registry retains only a weak reference so an idle daemon releases its
+//! storage compatibility lease between calls.
 //!
 //! The cache never creates database files. If the DB doesn't exist yet
 //! (init hasn't run), callers get `None` — schema creation belongs to
@@ -12,16 +14,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use exosuit_storage::FencedConnection;
 use exosuit_storage::rusqlite::{Connection, ErrorCode};
 
-/// Per-path connections. The map lock is only held to look up or insert an
-/// entry; queries run under the per-connection lock so different DBs don't
-/// serialize each other and `f` can't deadlock against the map.
-static CONNECTIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<FencedConnection>>>>> =
+/// Per-path active connections. The map lock is only held to look up or insert
+/// a weak entry; queries run under the per-connection lock so different DBs
+/// don't serialize each other and `f` can't deadlock against the map. Once the
+/// final active caller returns, the connection and its compatibility lease are
+/// released.
+static CONNECTIONS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<FencedConnection>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long a resolved root → DB path stays valid before re-resolving.
@@ -79,20 +83,19 @@ fn connection_is_broken(error: &exosuit_storage::rusqlite::Error) -> bool {
     )
 }
 
-/// Run `f` with the cached connection for `db_path`, opening it if needed.
+/// Run `f` with the active connection for `db_path`, opening it if needed.
 ///
 /// Returns `None` if the DB file doesn't exist, the connection can't be
-/// opened, or `f` fails. The connection is evicted only when the error
-/// indicates the DB file itself is broken or replaced — ordinary SQL errors
-/// keep it cached so persistent failures don't reintroduce per-call opens.
+/// opened, or `f` fails. Concurrent callers share a connection, but the
+/// registry does not keep it alive after the final active call returns.
 pub fn with_event_db<T>(
     db_path: &Path,
     f: impl FnOnce(&Connection) -> exosuit_storage::rusqlite::Result<T>,
 ) -> anyhow::Result<Option<T>> {
     let entry = {
         let mut connections = lock_unpoisoned(&CONNECTIONS);
-        match connections.get(db_path) {
-            Some(entry) => Arc::clone(entry),
+        match connections.get(db_path).and_then(Weak::upgrade) {
+            Some(entry) => entry,
             None => {
                 if !db_path.exists() {
                     return Ok(None);
@@ -104,7 +107,7 @@ pub fn with_event_db<T>(
                     return Ok(None);
                 };
                 let entry = Arc::new(Mutex::new(conn));
-                connections.insert(db_path.to_path_buf(), Arc::clone(&entry));
+                connections.insert(db_path.to_path_buf(), Arc::downgrade(&entry));
                 entry
             }
         }
@@ -182,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_event_access_retains_its_cached_connection() {
+    fn normal_event_access_releases_its_compatibility_lease_after_use() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("exo.db");
         drop(exosuit_storage::open_database(&path).expect("create compatible database"));
@@ -194,12 +197,19 @@ mod tests {
             .expect("read through event cache"),
             Some(1)
         );
+        let connections = lock_unpoisoned(&CONNECTIONS);
+        let cached = connections.get(&path).expect("active registry entry");
         assert!(
-            lock_unpoisoned(&CONNECTIONS).contains_key(&path),
-            "normal event access keeps the shared connection cache"
+            cached.upgrade().is_none(),
+            "normal event access must not retain an idle connection"
         );
+        drop(connections);
 
         lock_unpoisoned(&CONNECTIONS).remove(&path);
+        drop(
+            exosuit_storage::acquire_exclusive_compatibility_authority(&path)
+                .expect("event access releases writer authority before returning"),
+        );
     }
 
     #[test]

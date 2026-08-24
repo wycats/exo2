@@ -835,15 +835,13 @@ fn to_request_preparation_io_error(error: anyhow::Error) -> io::Error {
     }
 }
 
-fn request_preparation_compatibility_failure(
-    error: &io::Error,
-) -> Option<crate::failure::ExoFailure> {
+fn request_preparation_storage_failure(error: &io::Error) -> Option<crate::failure::ExoFailure> {
     let error = error.get_ref()?.downcast_ref::<RequestPreparationError>()?;
-    crate::storage_compatibility::writer_compatibility_failure_from_error(&error.0)
+    crate::storage_compatibility::storage_failure_from_error(&error.0)
 }
 
 fn workbench_request_preparation_error(error: anyhow::Error) -> planning::WorkbenchPlanningError {
-    crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
+    crate::storage_compatibility::storage_failure_from_error(&error)
         .map_or_else(planning::WorkbenchPlanningError::internal, |failure| {
             planning::WorkbenchPlanningError::from_error_body(failure.error)
         })
@@ -1701,7 +1699,7 @@ fn validated_request_workspace(
 }
 
 fn daemon_workspace_error_response(id: String, error: &io::Error) -> ResponseEnvelope {
-    if let Some(failure) = request_preparation_compatibility_failure(error) {
+    if let Some(failure) = request_preparation_storage_failure(error) {
         return ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             id,
@@ -4150,6 +4148,30 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::InvalidInput)
         );
+    }
+
+    #[test]
+    fn daemon_request_preparation_preserves_projection_quarantine_failure() {
+        let daemon_error = to_request_preparation_io_error(
+            crate::storage_compatibility::projection_unsettled_error("sequencer", false),
+        );
+        let responses = [
+            daemon_workspace_error_response("daemon-quarantine".to_string(), &daemon_error),
+            workbench_request_preparation_error(
+                crate::storage_compatibility::projection_unsettled_error("sequencer", false),
+            )
+            .response("workbench-quarantine".to_string()),
+        ];
+
+        for response in responses {
+            let error = response.error.expect("stable storage failure");
+            assert_eq!(error.code, ErrorCode::PreconditionFailed);
+            let details = error.details.expect("storage failure details");
+            assert_eq!(details["kind"], "storage.projection_unsettled");
+            assert_eq!(details["repository_state"], "sequencer");
+            assert_eq!(details["request_outcome_checked"], false);
+            assert_eq!(details["retry_with_same_request_id"], true);
+        }
     }
 
     #[test]
