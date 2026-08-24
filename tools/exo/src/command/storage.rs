@@ -142,41 +142,6 @@ impl Command for StorageCompatibility {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn request(path: &[&str]) -> RequestEnvelope {
-        RequestEnvelope {
-            protocol_version: crate::api::protocol::PROTOCOL_VERSION,
-            id: "storage-compatibility-test".to_string(),
-            op: Op::Call(CallParams {
-                address: Address::Operation {
-                    path: path.iter().map(|segment| (*segment).to_string()).collect(),
-                },
-                input: json!({}),
-            }),
-            workspace_root: None,
-            auth: None,
-            workflow_confirmation: None,
-            agent_id: None,
-        }
-    }
-
-    #[test]
-    fn compatibility_request_is_state_independent_on_machine_transports() {
-        assert!(request_is_storage_compatibility(&request(&[
-            "storage",
-            "compatibility",
-        ])));
-        assert!(!request_is_storage_compatibility(&request(&[
-            "storage", "maintain",
-        ])));
-        assert!(!request_is_storage_compatibility(&request(&["status"])));
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct StorageMaintain {
     enable_incremental_vacuum: bool,
@@ -356,8 +321,38 @@ mod tests {
     use crate::api::protocol::Effect;
     use crate::command::traits::OutputFormat;
     use exosuit_storage::AutoVacuumMode;
+    use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    fn request(path: &[&str]) -> RequestEnvelope {
+        RequestEnvelope {
+            protocol_version: crate::api::protocol::PROTOCOL_VERSION,
+            id: "storage-compatibility-test".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: path.iter().map(|segment| (*segment).to_string()).collect(),
+                },
+                input: json!({}),
+            }),
+            workspace_root: None,
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        }
+    }
+
+    #[test]
+    fn compatibility_request_is_state_independent_on_machine_transports() {
+        assert!(request_is_storage_compatibility(&request(&[
+            "storage",
+            "compatibility",
+        ])));
+        assert!(!request_is_storage_compatibility(&request(&[
+            "storage", "maintain",
+        ])));
+        assert!(!request_is_storage_compatibility(&request(&["status"])));
+    }
 
     #[test]
     fn storage_maintain_metadata() {
