@@ -51,6 +51,20 @@ fn set_phase_active(temp_dir: &TempDir, phase_id: &str) {
     exo_plan_update_status(temp_dir.path(), phase_id, "in-progress");
 }
 
+fn configure_legacy_merge_driver(root: &std::path::Path) {
+    for args in [
+        &["init"][..],
+        &["config", "--local", "merge.exo-sql-dump.driver", "true"][..],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("configure legacy merge driver fixture");
+        assert!(status.success(), "git {args:?} should succeed");
+    }
+}
+
 #[test]
 fn test_resolve_no_active_phase() {
     let (temp_dir, _phase_id) = setup_test_workspace();
@@ -194,12 +208,7 @@ fn test_upgrade_gate_passes_during_active_strike() {
 #[test]
 fn ordinary_mutations_require_the_configured_merge_driver() {
     let (temp_dir, _phase_id) = setup_test_workspace();
-    let status = std::process::Command::new("git")
-        .args(["config", "--local", "merge.exo-sql-dump.driver", "true"])
-        .current_dir(temp_dir.path())
-        .status()
-        .expect("replace merge driver with legacy value");
-    assert!(status.success());
+    configure_legacy_merge_driver(temp_dir.path());
 
     let context = AgentContext::load_with_backend(
         temp_dir.path().to_path_buf(),
@@ -219,12 +228,7 @@ fn ordinary_mutations_require_the_configured_merge_driver() {
 #[test]
 fn upgrade_gate_keeps_reads_and_update_available() {
     let (temp_dir, _phase_id) = setup_test_workspace();
-    let status = std::process::Command::new("git")
-        .args(["config", "--local", "merge.exo-sql-dump.driver", "true"])
-        .current_dir(temp_dir.path())
-        .status()
-        .expect("replace merge driver with legacy value");
-    assert!(status.success());
+    configure_legacy_merge_driver(temp_dir.path());
 
     let context = AgentContext::load_with_backend(
         temp_dir.path().to_path_buf(),
