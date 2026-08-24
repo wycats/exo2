@@ -1405,6 +1405,10 @@ fn is_storage_compatibility_command(args: &[String]) -> bool {
     )
 }
 
+fn should_run_global_verifiers(format: OutputFormat, args: &[String]) -> bool {
+    format != OutputFormat::Json && !is_storage_compatibility_command(args)
+}
+
 fn is_rfc_reconcile_read(args: &[String]) -> bool {
     matches!(
         (
@@ -2085,7 +2089,7 @@ fn main() {
         load_context_or_exit(format, false, cwd)
     };
 
-    if format != OutputFormat::Json {
+    if should_run_global_verifiers(format, &args) {
         let reminders = exo::verifiers::run_global_verifiers(&context.root);
         emit_verifier_reminders(&reminders);
     }
@@ -3204,5 +3208,11 @@ mod tests {
     fn storage_compatibility_uses_lightweight_direct_context() {
         let args = ["storage".to_string(), "compatibility".to_string()];
         assert!(is_storage_compatibility_command(&args));
+        assert!(!should_run_global_verifiers(OutputFormat::Human, &args));
+        assert!(!should_run_global_verifiers(OutputFormat::Json, &args));
+        assert!(should_run_global_verifiers(
+            OutputFormat::Human,
+            &["status".to_string()]
+        ));
     }
 }
