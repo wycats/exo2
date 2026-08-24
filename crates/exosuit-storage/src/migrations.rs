@@ -183,10 +183,11 @@ fn run_migrations_with_hook(
     let current_generation = read_database_generation(conn)?;
     let required_generation = migrations
         .iter()
-        .filter(|migration| !applied.contains(&migration.version))
         .map(|migration| migration.required_writer_generation)
         .max()
-        .unwrap_or(current_generation);
+        .map_or(current_generation, |required_generation| {
+            required_generation.max(current_generation)
+        });
     if required_generation > supported_writer_generation {
         return Err(WriterCompatibilityError::Incompatible {
             required_generation,
@@ -343,6 +344,38 @@ mod tests {
         run_migrations_with_hook(&reopened, GENERATION_ONE_MIGRATION, 1, |_| Ok(()))
             .expect("compatible writer resumes interrupted migration");
         assert!(test_table_exists(&reopened, "generation_one_state"));
+    }
+
+    #[test]
+    fn applied_migration_history_restores_a_missing_generation_fence() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE generation_one_state(value TEXT NOT NULL);
+             CREATE TABLE __schema_history (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO __schema_history (version, name)
+             VALUES (1001, 'generation_one_fixture');",
+        )
+        .expect("restore generation-one schema and history without user_version");
+        assert_eq!(read_database_generation(&conn).unwrap(), 0);
+
+        run_migrations_with_hook(&conn, GENERATION_ONE_MIGRATION, 1, |_| Ok(()))
+            .expect("compatible writer restores the generation fence");
+
+        assert_eq!(read_database_generation(&conn).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 1001",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the applied migration must not execute or record twice"
+        );
     }
 
     #[test]

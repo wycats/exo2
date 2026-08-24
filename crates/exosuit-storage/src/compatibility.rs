@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -18,6 +19,7 @@ pub const PROJECTION_GENERATION_PREFIX: &str = "-- exo:minimum-writer-generation
 
 const COMPATIBILITY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPATIBILITY_LOCK_POLL: Duration = Duration::from_millis(25);
+static PROBE_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateSurface {
@@ -297,8 +299,78 @@ fn probe_database_generation_at_identity(path: &Path) -> Result<i32, DatabaseErr
         }
     }
 
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    let shm_path = sqlite_sidecar_path(path, "-shm");
+    if wal_path.exists() && !shm_path.exists() {
+        return probe_database_generation_from_copy(path, &wal_path);
+    }
+
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     read_database_generation(&conn).map_err(Into::into)
+}
+
+fn probe_database_generation_from_copy(
+    database_path: &Path,
+    wal_path: &Path,
+) -> Result<i32, DatabaseError> {
+    let copy = ProbeCopy::create()?;
+    let copied_database = copy.path.join("exo.db");
+    let copied_wal = sqlite_sidecar_path(&copied_database, "-wal");
+    std::fs::copy(database_path, &copied_database).map_err(|source| {
+        WriterCompatibilityError::Io {
+            path: database_path.to_path_buf(),
+            source,
+        }
+    })?;
+    std::fs::copy(wal_path, &copied_wal).map_err(|source| WriterCompatibilityError::Io {
+        path: wal_path.to_path_buf(),
+        source,
+    })?;
+
+    let conn = Connection::open_with_flags(&copied_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    read_database_generation(&conn).map_err(Into::into)
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+struct ProbeCopy {
+    path: PathBuf,
+}
+
+impl ProbeCopy {
+    fn create() -> Result<Self, WriterCompatibilityError> {
+        let root = std::env::temp_dir();
+        for _ in 0..32 {
+            let sequence = PROBE_COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!(
+                "exo-storage-probe-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(WriterCompatibilityError::Io { path, source }),
+            }
+        }
+        let path = root.join(format!("exo-storage-probe-{}", std::process::id()));
+        Err(WriterCompatibilityError::Io {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique compatibility probe directory",
+            ),
+        })
+    }
+}
+
+impl Drop for ProbeCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// Read and validate database writer metadata without creating or migrating it.
@@ -763,6 +835,38 @@ mod tests {
         );
         assert_eq!(read_database_generation(&conn).unwrap(), 1);
         assert!(!path.with_extension("writer-compat.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_probe_reconstructs_missing_shm_only_in_an_isolated_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "wal").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch("CREATE TABLE sentinel(value TEXT);")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+        std::fs::remove_file(&shm_path).unwrap();
+
+        let error = preflight_database(&path).expect_err("generation one must be rejected");
+
+        assert!(matches!(
+            error,
+            DatabaseError::WriterCompatibility(WriterCompatibilityError::Incompatible {
+                required_generation: 1,
+                supported_generation: 0,
+                surface: StateSurface::Database,
+            })
+        ));
+        assert!(!shm_path.exists(), "canonical SHM must remain absent");
+        assert!(!path.with_extension("writer-compat.lock").exists());
+        drop(conn);
     }
 
     #[test]
