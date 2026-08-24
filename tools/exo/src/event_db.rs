@@ -92,26 +92,42 @@ pub fn with_event_db<T>(
     db_path: &Path,
     f: impl FnOnce(&Connection) -> exosuit_storage::rusqlite::Result<T>,
 ) -> anyhow::Result<Option<T>> {
-    let entry = {
-        let mut connections = lock_unpoisoned(&CONNECTIONS);
-        match connections.get(db_path).and_then(Weak::upgrade) {
-            Some(entry) => entry,
-            None => {
-                if !db_path.exists() {
-                    return Ok(None);
+    with_event_db_before_open(db_path, || {}, f)
+}
+
+fn with_event_db_before_open<T>(
+    db_path: &Path,
+    before_open: impl FnOnce(),
+    f: impl FnOnce(&Connection) -> exosuit_storage::rusqlite::Result<T>,
+) -> anyhow::Result<Option<T>> {
+    let cached = lock_unpoisoned(&CONNECTIONS)
+        .get(db_path)
+        .and_then(Weak::upgrade);
+    let entry = match cached {
+        Some(entry) => entry,
+        None => {
+            if !db_path.exists() {
+                return Ok(None);
+            }
+            before_open();
+            // No-create open: event access must never mint a fresh DB. This
+            // may wait on per-database writer authority, so it remains outside
+            // the process-global registry lock.
+            let Some(conn) = exosuit_storage::open_fenced_existing_connection(db_path)
+                .map_err(crate::storage_compatibility::map_database_error)?
+            else {
+                return Ok(None);
+            };
+            let candidate = Arc::new(Mutex::new(conn));
+            let mut connections = lock_unpoisoned(&CONNECTIONS);
+            match connections.get(db_path).and_then(Weak::upgrade) {
+                Some(entry) => entry,
+                None => {
+                    connections.insert(db_path.to_path_buf(), Arc::downgrade(&candidate));
+                    candidate
                 }
-                // No-create open: event access must never mint a fresh DB.
-                let Some(conn) = exosuit_storage::open_fenced_existing_connection(db_path)
-                    .map_err(crate::storage_compatibility::map_database_error)?
-                else {
-                    return Ok(None);
-                };
-                let entry = Arc::new(Mutex::new(conn));
-                connections.insert(db_path.to_path_buf(), Arc::downgrade(&entry));
-                entry
             }
         }
-        // Map lock released here; only the per-connection lock is held below.
     };
 
     let conn = lock_unpoisoned(&entry);
@@ -210,6 +226,30 @@ mod tests {
             exosuit_storage::acquire_exclusive_compatibility_authority(&path)
                 .expect("event access releases writer authority before returning"),
         );
+    }
+
+    #[test]
+    fn event_open_does_not_hold_the_global_registry_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("exo.db");
+        drop(exosuit_storage::open_database(&path).expect("create compatible database"));
+        lock_unpoisoned(&CONNECTIONS).remove(&path);
+
+        assert_eq!(
+            with_event_db_before_open(
+                &path,
+                || {
+                    assert!(
+                        CONNECTIONS.try_lock().is_ok(),
+                        "a per-database compatibility wait must not hold the global registry"
+                    );
+                },
+                |conn| conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)),
+            )
+            .expect("read through event cache"),
+            Some(1)
+        );
+        lock_unpoisoned(&CONNECTIONS).remove(&path);
     }
 
     #[test]

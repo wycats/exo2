@@ -1528,9 +1528,7 @@ fn compact_error_body(error: &ErrorBody) -> JsonValue {
     if details
         .get("kind")
         .and_then(JsonValue::as_str)
-        .is_some_and(|kind| {
-            kind.starts_with("storage.writer_") || kind == "storage.compatibility_busy"
-        })
+        .is_some_and(|kind| kind.starts_with("storage."))
     {
         value["details"] = details.clone();
         return value;
@@ -2349,6 +2347,17 @@ mod tests {
         );
 
         assert_eq!(response.status, Status::Error);
+        let tool_result = machine_response_to_tool_result(&response);
+        let structured = structured(&tool_result);
+        assert_eq!(
+            structured["error"]["details"]["kind"],
+            "storage.projection_unsettled"
+        );
+        assert_eq!(structured["error"]["details"]["retryable"], true);
+        assert_eq!(
+            structured["error"]["details"]["retry_with_same_request_id"],
+            true
+        );
         let error = response.error.expect("error body");
         assert_eq!(error.code, ErrorCode::PreconditionFailed);
         let details = error.details.expect("storage details");
