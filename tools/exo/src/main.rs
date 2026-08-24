@@ -1409,6 +1409,10 @@ fn should_run_global_verifiers(format: OutputFormat, args: &[String]) -> bool {
     format != OutputFormat::Json && !is_storage_compatibility_command(args)
 }
 
+fn should_reexec_workspace_binary(args: &[String]) -> bool {
+    !is_storage_compatibility_command(args)
+}
+
 fn is_rfc_reconcile_read(args: &[String]) -> bool {
     matches!(
         (
@@ -1795,8 +1799,6 @@ fn render_daemon_status_report(
 }
 
 fn main() {
-    exo_reexec::maybe_reexec();
-
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let (mut format, args_after_format) = extract_format(&raw_args);
     let (mut workflow_confirmation, args_after_workflow_confirmation) =
@@ -1825,6 +1827,9 @@ fn main() {
         };
     let (has_direct_flag, mut args) = extract_direct_flag(&args_after_workflow_confirmation);
     normalize_project_repair_apply_shorthand(&mut args);
+    if should_reexec_workspace_binary(&args) {
+        exo_reexec::maybe_reexec();
+    }
     let is_direct = has_direct_flag
         || std::env::var_os(TASK_DIRECT_MODE_ENV).is_some()
         || is_project_bootstrap_read(&args)
@@ -2561,59 +2566,67 @@ fn handle_json_server(
             continue;
         }
 
-        let reminders = exo::verifiers::run_global_verifiers(&context.root);
+        let parsed_request = serde_json::from_str::<api::protocol::RequestEnvelope>(&input);
+        let reminders = if parsed_request
+            .as_ref()
+            .is_ok_and(|request| !exo::command::storage::request_is_storage_compatibility(request))
+            || parsed_request.is_err()
+        {
+            exo::verifiers::run_global_verifiers(&context.root)
+        } else {
+            Vec::new()
+        };
 
-        let mut response: ResponseEnvelope =
-            match serde_json::from_str::<api::protocol::RequestEnvelope>(&input) {
-                Ok(request) if is_direct => {
-                    api::handler::handle_request_with_project_and_diagnostics_as_writer(
-                        &context.root,
-                        project,
-                        request,
-                        &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
-                    )
-                }
-                Ok(request) => {
-                    api::handler::handle_request_with_project(&context.root, project, request)
-                }
-                Err(e) => {
-                    let id = serde_json::from_str::<serde_json::Value>(&input)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("id")
-                                .and_then(|x| x.as_str())
-                                .map(std::string::ToString::to_string)
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
+        let mut response: ResponseEnvelope = match parsed_request {
+            Ok(request) if is_direct => {
+                api::handler::handle_request_with_project_and_diagnostics_as_writer(
+                    &context.root,
+                    project,
+                    request,
+                    &exo::daemon_diagnostics::DaemonDiagnostics::disabled(),
+                )
+            }
+            Ok(request) => {
+                api::handler::handle_request_with_project(&context.root, project, request)
+            }
+            Err(e) => {
+                let id = serde_json::from_str::<serde_json::Value>(&input)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("id")
+                            .and_then(|x| x.as_str())
+                            .map(std::string::ToString::to_string)
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
 
-                    ResponseEnvelope {
-                        protocol_version: PROTOCOL_VERSION,
-                        id,
-                        status: Status::Error,
-                        result: None,
-                        error: Some(ErrorBody {
-                            code: ErrorCode::InvalidInput,
-                            message: format!("Failed to parse request envelope: {e}"),
-                            details: None,
-                        }),
-                        ticket: None,
-                        steering: Some(exo::api::protocol::Steering {
-                            next_call: exo::api::protocol::NextCall {
-                                kind: exo::api::protocol::NextCallKind::Help,
-                                params: serde_json::json!({ "address": { "kind": "root" } }),
-                            },
-                            priority: None,
-                            confidence: None,
-                            context_note: None,
-                        }),
-                        reminders: None,
-                        display: None,
-                        preview: None,
-                        effect: None,
-                        trace: None,
-                    }
+                ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    id,
+                    status: Status::Error,
+                    result: None,
+                    error: Some(ErrorBody {
+                        code: ErrorCode::InvalidInput,
+                        message: format!("Failed to parse request envelope: {e}"),
+                        details: None,
+                    }),
+                    ticket: None,
+                    steering: Some(exo::api::protocol::Steering {
+                        next_call: exo::api::protocol::NextCall {
+                            kind: exo::api::protocol::NextCallKind::Help,
+                            params: serde_json::json!({ "address": { "kind": "root" } }),
+                        },
+                        priority: None,
+                        confidence: None,
+                        context_note: None,
+                    }),
+                    reminders: None,
+                    display: None,
+                    preview: None,
+                    effect: None,
+                    trace: None,
                 }
-            };
+            }
+        };
 
         if !reminders.is_empty() {
             response.reminders = Some(reminders);
@@ -3210,9 +3223,11 @@ mod tests {
         assert!(is_storage_compatibility_command(&args));
         assert!(!should_run_global_verifiers(OutputFormat::Human, &args));
         assert!(!should_run_global_verifiers(OutputFormat::Json, &args));
+        assert!(!should_reexec_workspace_binary(&args));
         assert!(should_run_global_verifiers(
             OutputFormat::Human,
             &["status".to_string()]
         ));
+        assert!(should_reexec_workspace_binary(&["status".to_string()]));
     }
 }

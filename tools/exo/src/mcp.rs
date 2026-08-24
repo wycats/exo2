@@ -1036,8 +1036,14 @@ fn call_exo_run_tool_with_request_id(
         return machine_response_to_tool_result(&response);
     }
 
+    let run_verifiers =
+        !crate::command::storage::request_is_storage_compatibility(&compiled.request);
     let mut response = dispatch_exo_run_request(workspace_root, project, compiled.request);
-    let reminders = crate::verifiers::run_global_verifiers(workspace_root);
+    let reminders = if run_verifiers {
+        crate::verifiers::run_global_verifiers(workspace_root)
+    } else {
+        Vec::new()
+    };
     if !reminders.is_empty() {
         response.reminders = Some(reminders);
     }
@@ -1060,8 +1066,14 @@ fn call_prepared_exo_run_tool(
         return machine_response_to_tool_result(&response);
     }
 
+    let run_verifiers =
+        !crate::command::storage::request_is_storage_compatibility(&prepared.request);
     let mut response = dispatch_exo_run_request(workspace_root, project, prepared.request);
-    let reminders = crate::verifiers::run_global_verifiers(workspace_root);
+    let reminders = if run_verifiers {
+        crate::verifiers::run_global_verifiers(workspace_root)
+    } else {
+        Vec::new()
+    };
     if !reminders.is_empty() {
         response.reminders = Some(reminders);
     }

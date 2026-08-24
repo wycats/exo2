@@ -6,7 +6,7 @@ use super::traits::{
     Command, CommandBox, CommandContext, CommandOutput, MutableCommand, MutableCommandContext,
     OutputFormat,
 };
-use crate::api::protocol::Effect;
+use crate::api::protocol::{Address, CallParams, Effect, Op, RequestEnvelope};
 use crate::steering::SuggestedAction;
 use anyhow::{Context, Result as ExoResult};
 use exosuit_storage::{
@@ -71,6 +71,26 @@ impl StorageCommands {
 #[derive(Debug, Clone, Copy)]
 pub struct StorageCompatibility;
 
+/// Whether a machine request reports the invoked binary's storage compatibility.
+///
+/// This diagnostic is state-independent and must stay free of workspace verifier
+/// side effects on every transport.
+pub fn request_is_storage_compatibility(request: &RequestEnvelope) -> bool {
+    matches!(
+        &request.op,
+        Op::Call(CallParams {
+            address: Address::Operation { path },
+            ..
+        }) | Op::Preview(CallParams {
+            address: Address::Operation { path },
+            ..
+        }) if matches!(
+            (path.first().map(String::as_str), path.get(1).map(String::as_str), path.len()),
+            (Some("storage"), Some("compatibility"), 2)
+        )
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct StorageCompatibilityOutput {
     kind: &'static str,
@@ -119,6 +139,41 @@ impl Command for StorageCompatibility {
                 ),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(path: &[&str]) -> RequestEnvelope {
+        RequestEnvelope {
+            protocol_version: crate::api::protocol::PROTOCOL_VERSION,
+            id: "storage-compatibility-test".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: path.iter().map(|segment| (*segment).to_string()).collect(),
+                },
+                input: json!({}),
+            }),
+            workspace_root: None,
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        }
+    }
+
+    #[test]
+    fn compatibility_request_is_state_independent_on_machine_transports() {
+        assert!(request_is_storage_compatibility(&request(&[
+            "storage",
+            "compatibility",
+        ])));
+        assert!(!request_is_storage_compatibility(&request(&[
+            "storage", "maintain",
+        ])));
+        assert!(!request_is_storage_compatibility(&request(&["status"])));
     }
 }
 

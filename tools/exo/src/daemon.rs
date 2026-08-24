@@ -3436,6 +3436,9 @@ fn log_file_save_event(
     agent_id: Option<&str>,
     summary: &str,
 ) {
+    if AgentContext::preflight_storage_compatibility(workspace_root, project).is_err() {
+        return;
+    }
     let db_path = crate::context::db_path(workspace_root, project);
 
     let text_id = ulid::Ulid::new().to_string().to_lowercase();
@@ -4694,6 +4697,49 @@ mod tests {
         assert!(
             !database_path.with_extension("writer-compat.lock").exists(),
             "daemon compatibility rejection must precede lock creation"
+        );
+    }
+
+    #[test]
+    fn file_save_event_preflights_projection_before_event_write() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let workspace = temp.path().join("repo");
+        let projection_path = workspace.join("docs/agent-context/epochs.sql");
+        std::fs::create_dir_all(projection_path.parent().expect("projection parent"))
+            .expect("create projection directory");
+        let project = test_project(&workspace, workspace.join(".exo"));
+        let database_path = project.db_path();
+        std::fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database parent");
+        drop(exosuit_storage::open_database(&database_path).expect("create event database"));
+        std::fs::write(
+            &projection_path,
+            "-- exo:minimum-writer-generation=1\n-- newer canonical projection\n",
+        )
+        .expect("write newer canonical projection");
+
+        log_file_save_event(
+            &workspace,
+            Some(&project),
+            Some("codex"),
+            "must stay unrecorded",
+        );
+
+        let connection = exosuit_storage::Connection::open_with_flags(
+            &database_path,
+            exosuit_storage::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open event database read-only");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_events WHERE summary = 'must stay unrecorded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rejected file-save events");
+        assert_eq!(
+            count, 0,
+            "incompatible file-save events must not be recorded"
         );
     }
 
