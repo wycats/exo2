@@ -148,24 +148,24 @@ fn task_nested_status_command(exo_bin: &Path) -> String {
 fn write_blocking_task_command(script_dir: &Path, started: &Path, release: &Path) -> String {
     #[cfg(windows)]
     {
-        let script = script_dir.join("blocking-task.cmd");
+        let script = script_dir.join("blocking-task.ps1");
+        let started = started.display().to_string().replace('\'', "''");
+        let release = release.display().to_string().replace('\'', "''");
         std::fs::write(
             &script,
             format!(
-                "@echo off\r\n\
-                 >\"{}\" echo started\r\n\
-                 :wait\r\n\
-                 if exist \"{}\" goto done\r\n\
-                 ping -n 2 127.0.0.1 >NUL\r\n\
-                 goto wait\r\n\
-                 :done\r\n\
-                 <NUL set /p dummy=done\r\n",
-                started.display(),
-                release.display()
+                "[System.IO.File]::WriteAllText('{started}', 'started')\r\n\
+                 while (-not (Test-Path -LiteralPath '{release}')) {{\r\n\
+                     Start-Sleep -Milliseconds 50\r\n\
+                 }}\r\n\
+                 [Console]::Out.Write('done')\r\n"
             ),
         )
-        .expect("write blocking Windows task");
-        format!(r#"call "{}""#, script.display())
+        .expect("write blocking Windows PowerShell task");
+        format!(
+            r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}""#,
+            script.display()
+        )
     }
 
     #[cfg(not(windows))]
