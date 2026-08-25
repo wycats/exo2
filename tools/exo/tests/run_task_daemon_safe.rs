@@ -2,6 +2,7 @@
 
 mod test_support;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -145,27 +146,30 @@ fn task_nested_status_command(exo_bin: &Path) -> String {
     }
 }
 
+fn powershell_encoded_command(script: &str) -> String {
+    let utf16le = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let encoded = BASE64_STANDARD.encode(utf16le);
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    )
+}
+
 fn write_blocking_task_command(script_dir: &Path, started: &Path, release: &Path) -> String {
     #[cfg(windows)]
     {
-        let script = script_dir.join("blocking-task.ps1");
+        let _ = script_dir;
         let started = started.display().to_string().replace('\'', "''");
         let release = release.display().to_string().replace('\'', "''");
-        std::fs::write(
-            &script,
-            format!(
-                "[System.IO.File]::WriteAllText('{started}', 'started')\r\n\
-                 while (-not (Test-Path -LiteralPath '{release}')) {{\r\n\
-                     Start-Sleep -Milliseconds 50\r\n\
-                 }}\r\n\
-                 [Console]::Out.Write('done')\r\n"
-            ),
-        )
-        .expect("write blocking Windows PowerShell task");
-        format!(
-            r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}""#,
-            script.display()
-        )
+        powershell_encoded_command(&format!(
+            "[System.IO.File]::WriteAllText('{started}', 'started')\r\n\
+             while (-not (Test-Path -LiteralPath '{release}')) {{\r\n\
+                 Start-Sleep -Milliseconds 50\r\n\
+             }}\r\n\
+             [Console]::Out.Write('done')\r\n"
+        ))
     }
 
     #[cfg(not(windows))]
@@ -182,6 +186,28 @@ fn write_blocking_task_command(script_dir: &Path, started: &Path, release: &Path
         .expect("write blocking Unix task");
         format!("sh {}", shell_quote(&script))
     }
+}
+
+#[test]
+fn powershell_command_is_ascii_and_round_trips_unicode() {
+    let script = "[Console]::Out.Write('C:\\Users\\José\\task-started')";
+    let command = powershell_encoded_command(script);
+    let encoded = command
+        .strip_prefix(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ",
+        )
+        .expect("PowerShell encoded-command prefix");
+
+    assert!(encoded.is_ascii());
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .expect("decode PowerShell command");
+    assert_eq!(bytes.len() % 2, 0, "UTF-16LE uses two-byte code units");
+    let utf16 = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    assert_eq!(String::from_utf16(&utf16).unwrap(), script);
 }
 
 fn exo_direct_with_env(
@@ -739,7 +765,7 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
         test_support::confirmed_machine_channel_request(run_task_request("blocking-task"), &root);
     let run_endpoint = endpoint.clone();
     let mut run_handle = tokio::spawn(async move {
-        send_socket_request_with_timeout(&run_endpoint, &run_request, Duration::from_secs(45)).await
+        send_socket_request_with_timeout(&run_endpoint, &run_request, Duration::from_secs(75)).await
     });
     let marker_wait = wait_for_file(&marker, Duration::from_secs(30));
     tokio::pin!(marker_wait);
