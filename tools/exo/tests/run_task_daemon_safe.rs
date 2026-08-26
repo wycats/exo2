@@ -2,6 +2,7 @@
 
 mod test_support;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -145,22 +146,68 @@ fn task_nested_status_command(exo_bin: &Path) -> String {
     }
 }
 
-fn task_slow_build_command(marker: &Path) -> String {
+fn powershell_encoded_command(script: &str) -> String {
+    let utf16le = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let encoded = BASE64_STANDARD.encode(utf16le);
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    )
+}
+
+fn write_blocking_task_command(script_dir: &Path, started: &Path, release: &Path) -> String {
     #[cfg(windows)]
     {
-        format!(
-            r#"echo started>{} & ping -n 11 127.0.0.1 >NUL & echo|set /p dummy=done"#,
-            marker.display()
-        )
+        let _ = script_dir;
+        let started = started.display().to_string().replace('\'', "''");
+        let release = release.display().to_string().replace('\'', "''");
+        powershell_encoded_command(&format!(
+            "[System.IO.File]::WriteAllText('{started}', 'started')\r\n\
+             while (-not (Test-Path -LiteralPath '{release}')) {{\r\n\
+                 Start-Sleep -Milliseconds 50\r\n\
+             }}\r\n\
+             [Console]::Out.Write('done')\r\n"
+        ))
     }
 
     #[cfg(not(windows))]
     {
-        format!(
-            "printf started > {}; sleep 5; printf done",
-            shell_quote(marker)
+        let script = script_dir.join("blocking-task.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "printf started > {}\nwhile [ ! -e {} ]; do sleep 0.05; done\nprintf done\n",
+                shell_quote(started),
+                shell_quote(release)
+            ),
         )
+        .expect("write blocking Unix task");
+        format!("sh {}", shell_quote(&script))
     }
+}
+
+#[test]
+fn powershell_command_is_ascii_and_round_trips_unicode() {
+    let script = "[Console]::Out.Write('C:\\Users\\José\\task-started')";
+    let command = powershell_encoded_command(script);
+    let encoded = command
+        .strip_prefix(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ",
+        )
+        .expect("PowerShell encoded-command prefix");
+
+    assert!(encoded.is_ascii());
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .expect("decode PowerShell command");
+    assert_eq!(bytes.len() % 2, 0, "UTF-16LE uses two-byte code units");
+    let utf16 = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    assert_eq!(String::from_utf16(&utf16).unwrap(), script);
 }
 
 fn exo_direct_with_env(
@@ -256,6 +303,28 @@ struct DaemonGuard {
     root: PathBuf,
 }
 
+struct MarkerReleaseGuard {
+    path: PathBuf,
+}
+
+impl MarkerReleaseGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.path, b"release").expect("release blocking task");
+    }
+}
+
+impl Drop for MarkerReleaseGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, b"release");
+    }
+}
+
 impl DaemonGuard {
     fn new(root: &Path) -> Self {
         Self {
@@ -287,10 +356,10 @@ fn run_task_request(task_id: &str) -> RequestEnvelope {
     }
 }
 
-fn status_request() -> RequestEnvelope {
+fn status_request(id: &str) -> RequestEnvelope {
     RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
-        id: "status-while-task-runs".to_string(),
+        id: id.to_string(),
         op: Op::Call(CallParams {
             address: Address::Operation {
                 path: vec!["status".to_string()],
@@ -349,21 +418,32 @@ async fn send_socket_request_with_timeout(
     serde_json::from_str(&response).expect("daemon JSON response")
 }
 
-async fn wait_for_file(path: &Path, timeout: Duration) {
+async fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if path.exists() {
-            return;
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("timed out waiting for {}", path.display());
+    false
 }
 
-async fn wait_for_daemon_endpoint(child: &mut Child, endpoint: &DaemonEndpoint) {
+async fn wait_for_daemon_ready(child: &mut Child, endpoint: &DaemonEndpoint) {
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(10) {
         if endpoint.connect().await.is_ok() {
+            let response = send_socket_request_with_timeout(
+                endpoint,
+                &status_request("daemon-readiness"),
+                Duration::from_secs(30),
+            )
+            .await;
+            assert_eq!(
+                response.get("status").and_then(serde_json::Value::as_str),
+                Some("ok"),
+                "daemon readiness request failed: {response:?}"
+            );
             return;
         }
         if let Some(status) = child.try_wait().expect("check daemon status") {
@@ -376,7 +456,7 @@ async fn wait_for_daemon_endpoint(child: &mut Child, endpoint: &DaemonEndpoint) 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!(
-        "timed out waiting for daemon endpoint {}",
+        "timed out waiting for daemon readiness at {}",
         endpoint.display()
     );
 }
@@ -535,9 +615,9 @@ async fn sidecar_parallel_reads_do_not_wait_for_auto_persist() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     apply_test_home_env(&mut daemon, &home, &config_home);
-    let mut daemon = daemon.spawn().expect("spawn daemon");
-    wait_for_daemon_endpoint(&mut daemon, &endpoint).await;
-    let _guard = DaemonProcessGuard::new(daemon);
+    let daemon = daemon.spawn().expect("spawn daemon");
+    let mut guard = DaemonProcessGuard::new(daemon);
+    wait_for_daemon_ready(&mut guard.child, &endpoint).await;
 
     let head_before = git_output(&sidecar_root, &["rev-parse", "HEAD"]);
     let auto_persist_commits_before = git_output(
@@ -624,6 +704,7 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
     let config_home = dir.path().join("c");
     let sidecar_root = dir.path().join("s");
     let marker = dir.path().join("task-started");
+    let release = dir.path().join("task-release");
     create_test_workspace_at(&root);
 
     let init = exo_direct_with_env(
@@ -649,7 +730,8 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
     );
     git_config_identity(&sidecar_root);
 
-    append_task(&root, "slow-build", &task_slow_build_command(&marker));
+    let blocking_task = write_blocking_task_command(dir.path(), &marker, &release);
+    append_task(&root, "blocking-task", &blocking_task);
 
     let project = ProjectResolver::default()
         .with_home_dir(&home)
@@ -674,21 +756,37 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     apply_test_home_env(&mut daemon, &home, &config_home);
-    let mut daemon = daemon.spawn().expect("spawn daemon");
-    wait_for_daemon_endpoint(&mut daemon, &endpoint).await;
-    let _guard = DaemonProcessGuard::new(daemon);
+    let daemon = daemon.spawn().expect("spawn daemon");
+    let mut guard = DaemonProcessGuard::new(daemon);
+    wait_for_daemon_ready(&mut guard.child, &endpoint).await;
+    let release_guard = MarkerReleaseGuard::new(&release);
 
     let run_request =
-        test_support::confirmed_machine_channel_request(run_task_request("slow-build"), &root);
+        test_support::confirmed_machine_channel_request(run_task_request("blocking-task"), &root);
     let run_endpoint = endpoint.clone();
-    let run_handle = tokio::spawn(async move {
-        send_socket_request_with_timeout(&run_endpoint, &run_request, Duration::from_secs(45)).await
+    let mut run_handle = tokio::spawn(async move {
+        send_socket_request_with_timeout(&run_endpoint, &run_request, Duration::from_secs(75)).await
     });
-    wait_for_file(&marker, Duration::from_secs(5)).await;
+    let marker_wait = wait_for_file(&marker, Duration::from_secs(30));
+    tokio::pin!(marker_wait);
+    tokio::select! {
+        started = &mut marker_wait => assert!(
+            started,
+            "timed out waiting for {} while the run-task request remained pending",
+            marker.display()
+        ),
+        response = &mut run_handle => panic!(
+            "run-task request completed before creating {}: {response:?}",
+            marker.display()
+        ),
+    }
 
-    let status_response =
-        send_socket_request_with_timeout(&endpoint, &status_request(), Duration::from_secs(30))
-            .await;
+    let status_response = send_socket_request_with_timeout(
+        &endpoint,
+        &status_request("status-while-task-runs"),
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(
         !run_handle.is_finished(),
         "status should answer before run task completes"
@@ -701,6 +799,7 @@ async fn sidecar_run_task_does_not_block_concurrent_daemon_reads() {
         "status should answer while run task is still executing: {status_response:?}"
     );
 
+    release_guard.release();
     let run_response = run_handle.await.expect("join run task request");
     assert_eq!(
         run_response
