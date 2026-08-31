@@ -3372,6 +3372,11 @@ async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
         .collect::<Vec<_>>();
     let oldest_selector = selectors[0].clone();
     let survivor_selectors = selectors[1..].to_vec();
+    let terminal_request_id = "r".repeat(43);
+    let outcome_key = WorkbenchResumeOutcomeKey {
+        pairing_selector: oldest_selector.clone(),
+        request_id: terminal_request_id.clone(),
+    };
 
     let store = {
         let mut state = manager.inner.state.lock().expect("workbench state");
@@ -3386,10 +3391,6 @@ async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
             );
             state.pairing_grants.insert(selector.clone(), pairing);
         }
-        let outcome_key = WorkbenchResumeOutcomeKey {
-            pairing_selector: oldest_selector.clone(),
-            request_id: "r".repeat(43),
-        };
         state.resume_outcomes.insert(
             outcome_key.clone(),
             terminal_resume_outcome(&outcome_key, WorkbenchResumeTerminalErrorV1::Invalid, now),
@@ -3426,10 +3427,20 @@ async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
         .expect("enrolled pairing selector");
     let state = manager.inner.state.lock().expect("workbench state");
     assert_eq!(
-        state.pairing_grants.len(),
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
         MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
     );
-    assert!(!state.pairing_grants.contains_key(&oldest_selector));
+    assert_eq!(
+        state
+            .pairing_grants
+            .get(&oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
     assert!(state.pairing_grants.contains_key(enrolled_selector));
     assert!(
         survivor_selectors
@@ -3437,11 +3448,12 @@ async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
             .all(|selector| state.pairing_grants.contains_key(selector)),
         "newer inactive pairings remain retained"
     );
-    assert!(
+    assert_eq!(
         state
             .resume_outcomes
-            .keys()
-            .all(|key| key.pairing_selector != oldest_selector)
+            .get(&outcome_key)
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
     );
     assert!(
         state.sessions.values().all(|session| {
@@ -3455,18 +3467,41 @@ async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
         &fs::read(&manager.inner.authorization_store_path).expect("read authorization store"),
     )
     .expect("decode authorization store");
-    assert_eq!(persisted.pairings.len(), MAX_ACTIVE_PAIRINGS_PER_WORKSPACE);
-    assert!(
+    assert_eq!(
         persisted
             .pairings
             .iter()
-            .all(|pairing| pairing.selector != oldest_selector)
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
+        MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
     );
-    assert!(
+    assert_eq!(
+        persisted
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
+    assert_eq!(
         persisted
             .resume_outcomes
             .iter()
-            .all(|outcome| outcome.pairing_selector != oldest_selector)
+            .find(|outcome| outcome.pairing_selector == oldest_selector)
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
+    );
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &oldest_selector,
+                &format!("{oldest_selector}-secret"),
+                &terminal_request_id,
+                &request_entry,
+            )
+            .expect_err("evicted pairing replays its terminal resume result"),
+        PairingExchangeError::Invalid
     );
     manager.shutdown().await;
 }
@@ -3735,14 +3770,25 @@ async fn published_enrollment_preserves_active_pairings_and_retries_after_inacti
         .enroll_pairing(ticket, None, &request_entry)
         .expect("retry after oldest pairing becomes inactive");
     let state = manager.inner.state.lock().expect("workbench state");
-    assert!(!state.pairing_grants.contains_key(&oldest_selector));
-    assert!(
-        selectors[1..]
-            .iter()
-            .all(|selector| state.pairing_grants.contains_key(selector))
-    );
     assert_eq!(
-        state.pairing_grants.len(),
+        state
+            .pairing_grants
+            .get(&oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
+    assert!(selectors[1..].iter().all(|selector| {
+        state
+            .pairing_grants
+            .get(selector)
+            .is_some_and(|pairing| pairing.is_live(now))
+    }));
+    assert_eq!(
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
         MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
     );
     drop(state);

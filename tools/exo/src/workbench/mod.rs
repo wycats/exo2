@@ -3582,8 +3582,13 @@ impl WorkbenchHostInner {
         if let Some(evicted_selector) = evicted_pairing_selector.as_deref() {
             candidate_sessions
                 .retain(|_, session| session.pairing_selector.as_deref() != Some(evicted_selector));
-            candidate_pairings.remove(evicted_selector);
-            candidate_outcomes.retain(|key, _| key.pairing_selector.as_str() != evicted_selector);
+            candidate_pairings
+                .get_mut(evicted_selector)
+                .expect("evicted pairing exists")
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
+            candidate_outcomes.retain(|key, outcome| {
+                key.pairing_selector.as_str() != evicted_selector || outcome.is_terminal()
+            });
         }
         if let Some(replaced_selector) = replaced_pairing_selector.as_deref() {
             candidate_sessions.retain(|_, session| {

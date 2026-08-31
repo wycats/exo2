@@ -190,6 +190,7 @@
     let liveUpdatesStarted = false;
     let bootstrapGeneration = 0;
     let pairingEnrollmentRecoveryQueued = false;
+    let pairingEnrollmentRecoveryPending = false;
     const pairingEvents = publishedEntry
       ? new BroadcastChannel(PAIRING_EVENTS_CHANNEL)
       : null;
@@ -651,22 +652,9 @@
         }
       }
     };
-    const resumeAfterPairingEnrollment = (event: MessageEvent<unknown>) => {
-      if (
-        !publishedEntry ||
-        pairingEnrollmentRecoveryQueued ||
-        (screen !== "loading" &&
-          screen !== "session_required" &&
-          screen !== "session_expired" &&
-          sessionRecovery !== "needs_launch" &&
-          sessionRecovery !== "reconnecting") ||
-        typeof event.data !== "object" ||
-        event.data === null ||
-        (event.data as Record<string, unknown>).kind !==
-          PAIRING_ENROLLED_NOTICE.kind ||
-        (event.data as Record<string, unknown>).version !==
-          PAIRING_ENROLLED_NOTICE.version
-      ) {
+    const queuePairingEnrollmentRecovery = () => {
+      if (pairingEnrollmentRecoveryQueued) {
+        pairingEnrollmentRecoveryPending = true;
         return;
       }
 
@@ -676,9 +664,39 @@
         `${location.pathname}${location.search}`,
         prepareWorkbenchTicketExchange(history.state),
       );
-      void bootstrap(undefined, null).finally(() => {
+      const recovery = bootstrap(undefined, null);
+      const recoveryGeneration = bootstrapGeneration;
+      void recovery.finally(() => {
+        const recoveryIsCurrent = recoveryGeneration === bootstrapGeneration;
         pairingEnrollmentRecoveryQueued = false;
+        if (pairingEnrollmentRecoveryPending && recoveryIsCurrent) {
+          pairingEnrollmentRecoveryPending = false;
+          queuePairingEnrollmentRecovery();
+        } else if (!recoveryIsCurrent) {
+          pairingEnrollmentRecoveryPending = false;
+        }
       });
+    };
+    const resumeAfterPairingEnrollment = (event: MessageEvent<unknown>) => {
+      if (
+        !publishedEntry ||
+        typeof event.data !== "object" ||
+        event.data === null ||
+        (event.data as Record<string, unknown>).kind !==
+          PAIRING_ENROLLED_NOTICE.kind ||
+        (event.data as Record<string, unknown>).version !==
+          PAIRING_ENROLLED_NOTICE.version ||
+        (!pairingEnrollmentRecoveryQueued &&
+          screen !== "loading" &&
+          screen !== "session_required" &&
+          screen !== "session_expired" &&
+          sessionRecovery !== "needs_launch" &&
+          sessionRecovery !== "reconnecting")
+      ) {
+        return;
+      }
+
+      queuePairingEnrollmentRecovery();
     };
     if (pairingEvents) {
       pairingEvents.onmessage = resumeAfterPairingEnrollment;

@@ -1612,6 +1612,88 @@ describe("cockpit page", () => {
     enrollingTab.close();
   });
 
+  it("retains the latest enrollment notice during pairing recovery", async () => {
+    stubPublishedLocation();
+    const staleRecoverySnapshot = deferred<Response>();
+    let resumeReads = 0;
+    let snapshotReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          resumeReads += 1;
+          if (resumeReads === 1) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.pairing_expired",
+                ok: false,
+                message: "The browser pairing expired",
+              }),
+              { status: 401 },
+            );
+          }
+          return sessionResponse(
+            resumeReads === 2 ? "stale-recovery-session" : "fresh-session",
+          );
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse(
+            resumeReads === 2 ? "stale-recovery-session" : "fresh-session",
+          );
+        }
+        if (path === "/api/command") {
+          snapshotReads += 1;
+          if (snapshotReads === 1) {
+            return staleRecoverySnapshot.promise;
+          }
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Session expired" });
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+    await waitFor(() => {
+      expect(resumeReads).toBe(2);
+      expect(snapshotReads).toBe(1);
+    });
+
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+    staleRecoverySnapshot.resolve(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.session_invalid",
+          ok: false,
+          message: "The recovery session was replaced",
+        }),
+        { status: 401 },
+      ),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(resumeReads).toBe(3);
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "fresh-session",
+    );
+    enrollingTab.close();
+  });
+
   it("restarts pairing recovery when enrollment arrives during reconnection", async () => {
     stubPublishedLocation();
     const staleRecoverySnapshot = deferred<Response>();
