@@ -133,6 +133,27 @@ class TestBroadcastChannel {
   }
 }
 
+class TestLockManager {
+  private tails = new Map<string, Promise<void>>();
+
+  request<T>(
+    name: string,
+    _options: LockOptions,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const previous = this.tails.get(name) ?? Promise.resolve();
+    const result = previous.then(operation);
+    this.tails.set(
+      name,
+      result.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return result;
+  }
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -217,6 +238,7 @@ beforeEach(() => {
   TestBroadcastChannel.instances = [];
   vi.stubGlobal("EventSource", TestEventSource);
   vi.stubGlobal("BroadcastChannel", TestBroadcastChannel);
+  vi.stubGlobal("navigator", { locks: new TestLockManager() });
 });
 
 afterEach(() => {
@@ -1531,6 +1553,65 @@ describe("cockpit page", () => {
     enrollingTab.close();
   });
 
+  it("retries an enrollment notice received while pairing resume is loading", async () => {
+    stubPublishedLocation();
+    const initialResume = deferred<Response>();
+    const resumeRequestIds: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          const request = JSON.parse(String(init?.body));
+          resumeRequestIds.push(request.request_id);
+          if (resumeRequestIds.length === 1) {
+            return initialResume.promise;
+          }
+          return sessionResponse("recovered-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("recovered-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await waitFor(() => expect(resumeRequestIds).toHaveLength(1));
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+    initialResume.resolve(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.pairing_expired",
+          ok: false,
+          message: "The browser pairing expired",
+        }),
+        { status: 401 },
+      ),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(resumeRequestIds).toHaveLength(2);
+    expect(resumeRequestIds[1]).not.toBe(resumeRequestIds[0]);
+    enrollingTab.close();
+  });
+
   it("ignores pairing enrollment notices while a published tab is healthy", async () => {
     stubPublishedLocation();
     let resumeReads = 0;
@@ -1587,12 +1668,15 @@ describe("cockpit page", () => {
     );
     const delayedResume = deferred<Response>();
     let resumeReads = 0;
+    let enrollmentReads = 0;
+    const pairingOperations: string[] = [];
     const commandSessionKeys: string[] = [];
     const fetcher = vi
       .fn<typeof fetch>()
       .mockImplementation(async (path, init) => {
         if (path === "/api/pairing/resume") {
           resumeReads += 1;
+          pairingOperations.push(`resume-${resumeReads}`);
           if (resumeReads === 1) {
             return new Response(
               JSON.stringify({
@@ -1606,6 +1690,8 @@ describe("cockpit page", () => {
           return delayedResume.promise;
         }
         if (path === "/api/pairing/enroll") {
+          enrollmentReads += 1;
+          pairingOperations.push("enroll");
           return sessionResponse("ticket-session");
         }
         if (path === "/api/command") {
@@ -1636,8 +1722,11 @@ describe("cockpit page", () => {
 
     location.hash = "#ticket=v2.newer-ticket";
     window.dispatchEvent(new HashChangeEvent("hashchange"));
-    await screen.findByRole("heading", { name: "Local workbench host" });
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(enrollmentReads).toBe(0);
     delayedResume.resolve(sessionResponse("late-resume-session"));
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
 
     await waitFor(() => {
       expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
@@ -1646,6 +1735,8 @@ describe("cockpit page", () => {
       expect(commandSessionKeys).toEqual(["ticket-session"]);
     });
     expect(resumeReads).toBe(2);
+    expect(enrollmentReads).toBe(1);
+    expect(pairingOperations).toEqual(["resume-1", "resume-2", "enroll"]);
     enrollingTab.close();
   });
 

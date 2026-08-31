@@ -66,6 +66,7 @@
   const PROJECT_OVERVIEW_HISTORY_KEY = "exoWorkbenchProjectOverview";
   const TAB_RESUME_STATE_KEY = "exoWorkbenchResumeState";
   const PAIRING_EVENTS_CHANNEL = "exo-workbench-pairing-events-v1";
+  const PAIRING_AUTH_LOCK = "exo-workbench-pairing-auth-v1";
   const PAIRING_ENROLLED_NOTICE = {
     kind: "pairing-enrolled",
     version: 1,
@@ -188,9 +189,14 @@
     let recoveryInFlight = false;
     let liveUpdatesStarted = false;
     let bootstrapGeneration = 0;
+    let pairingEnrollmentRecoveryQueued = false;
     const pairingEvents = publishedEntry
       ? new BroadcastChannel(PAIRING_EVENTS_CHANNEL)
       : null;
+    const withPairingAuthLock = <T,>(operation: () => Promise<T>): Promise<T> =>
+      navigator.locks
+        .request(PAIRING_AUTH_LOCK, { mode: "exclusive" }, operation)
+        .then((result) => result);
 
     const refreshForVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -330,7 +336,9 @@
         pendingState,
       );
       retainTabResumeState(pendingState);
-      const session = await resumeWorkbenchPairing(requestId);
+      const session = await withPairingAuthLock(() =>
+        resumeWorkbenchPairing(requestId),
+      );
       if (!isCurrent()) {
         throw new Error("A newer workbench bootstrap replaced this pairing resume");
       }
@@ -508,7 +516,9 @@
             `${location.pathname}${location.search}`,
             prepareWorkbenchTicketExchange(history.state),
           );
-          const session = await exchangeWorkbenchTicket(ticket);
+          const session = await (publishedEntry
+            ? withPairingAuthLock(() => exchangeWorkbenchTicket(ticket))
+            : exchangeWorkbenchTicket(ticket));
           if (!isCurrent()) {
             return;
           }
@@ -644,7 +654,9 @@
     const resumeAfterPairingEnrollment = (event: MessageEvent<unknown>) => {
       if (
         !publishedEntry ||
-        (screen !== "session_required" &&
+        pairingEnrollmentRecoveryQueued ||
+        (screen !== "loading" &&
+          screen !== "session_required" &&
           screen !== "session_expired" &&
           sessionRecovery !== "needs_launch") ||
         typeof event.data !== "object" ||
@@ -657,12 +669,15 @@
         return;
       }
 
+      pairingEnrollmentRecoveryQueued = true;
       clearTabResumeState();
       replacePageState(
         `${location.pathname}${location.search}`,
         prepareWorkbenchTicketExchange(history.state),
       );
-      void bootstrap(undefined, null);
+      void bootstrap(undefined, null).finally(() => {
+        pairingEnrollmentRecoveryQueued = false;
+      });
     };
     if (pairingEvents) {
       pairingEvents.onmessage = resumeAfterPairingEnrollment;
