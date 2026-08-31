@@ -658,7 +658,8 @@
         (screen !== "loading" &&
           screen !== "session_required" &&
           screen !== "session_expired" &&
-          sessionRecovery !== "needs_launch") ||
+          sessionRecovery !== "needs_launch" &&
+          sessionRecovery !== "reconnecting") ||
         typeof event.data !== "object" ||
         event.data === null ||
         (event.data as Record<string, unknown>).kind !==

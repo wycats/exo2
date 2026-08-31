@@ -1612,6 +1612,112 @@ describe("cockpit page", () => {
     enrollingTab.close();
   });
 
+  it("restarts pairing recovery when enrollment arrives during reconnection", async () => {
+    stubPublishedLocation();
+    const staleRecoverySnapshot = deferred<Response>();
+    let resumeReads = 0;
+    let renewalReads = 0;
+    let snapshotReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          resumeReads += 1;
+          return sessionResponse(
+            resumeReads === 1
+              ? "initial-session"
+              : resumeReads === 2
+                ? "reconnected-session"
+                : "fresh-session",
+          );
+        }
+        if (path === "/api/session/renew") {
+          renewalReads += 1;
+          if (renewalReads === 2) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.session_invalid",
+                ok: false,
+                message: "The workbench session is invalid",
+              }),
+              { status: 401 },
+            );
+          }
+          return sessionResponse(
+            renewalReads === 1 ? "initial-session" : "fresh-session",
+          );
+        }
+        if (path === "/api/command") {
+          snapshotReads += 1;
+          const request = JSON.parse(String(init?.body));
+          if (snapshotReads === 2) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.session_invalid",
+                ok: false,
+                message: "The workbench session is invalid",
+              }),
+              { status: 401 },
+            );
+          }
+          if (snapshotReads === 3) {
+            return staleRecoverySnapshot.promise;
+          }
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh workbench" }),
+    );
+    await screen.findByText("Reconnecting to Exo.");
+    await waitFor(() => expect(snapshotReads).toBe(3));
+    expect(resumeReads).toBe(2);
+
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+
+    await waitFor(() => {
+      expect(resumeReads).toBe(3);
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "fresh-session",
+      );
+    });
+    staleRecoverySnapshot.resolve(
+      new Response(
+        JSON.stringify({
+          kind: "workbench.session_invalid",
+          ok: false,
+          message: "The reconnected session was replaced",
+        }),
+        { status: 401 },
+      ),
+    );
+
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "fresh-session",
+    );
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    enrollingTab.close();
+  });
+
   it("ignores pairing enrollment notices while a published tab is healthy", async () => {
     stubPublishedLocation();
     let resumeReads = 0;
