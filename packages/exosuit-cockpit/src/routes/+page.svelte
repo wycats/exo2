@@ -520,6 +520,9 @@
           const session = await (publishedEntry
             ? withPairingAuthLock(() => exchangeWorkbenchTicket(ticket))
             : exchangeWorkbenchTicket(ticket));
+          if (publishedEntry) {
+            pairingEvents?.postMessage(PAIRING_ENROLLED_NOTICE);
+          }
           if (!isCurrent()) {
             return;
           }
@@ -529,9 +532,6 @@
             retainSessionSelector(history.state, sessionKey),
           );
           retainTabResumeState(workbenchHistoryState(history.state));
-          if (publishedEntry) {
-            pairingEvents?.postMessage(PAIRING_ENROLLED_NOTICE);
-          }
         }
         if (!isCurrent()) {
           return;

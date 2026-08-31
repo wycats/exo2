@@ -3350,7 +3350,7 @@ async fn published_enrollment_and_resume_are_durable_exact_and_origin_bound() {
 
 #[cfg(feature = "ui")]
 #[tokio::test(flavor = "multi_thread")]
-async fn published_enrollment_evicts_the_oldest_inactive_workspace_pairing() {
+async fn published_enrollment_evicts_the_oldest_pairing_without_a_live_session() {
     let fixture = fixture();
     let manager = test_manager(Arc::clone(&fixture.project));
     use_test_published_entries(&manager);
@@ -3797,7 +3797,7 @@ async fn published_enrollment_preserves_active_pairings_and_retries_after_inacti
 
 #[cfg(feature = "ui")]
 #[test]
-fn inactive_pairing_lru_uses_creation_time_then_selector_as_tie_breakers() {
+fn session_inactive_pairing_lru_uses_creation_time_then_selector_as_tie_breakers() {
     let now = 1_000;
     let payload = WorkbenchTicketV2 {
         version: 2,
@@ -3840,7 +3840,7 @@ fn inactive_pairing_lru_uses_creation_time_then_selector_as_tie_breakers() {
         ),
     ]);
     assert_eq!(
-        least_recently_used_inactive_pairing(
+        least_recently_used_pairing_without_live_session(
             &pairings,
             &HashMap::new(),
             &payload.workspace_key,
@@ -3856,7 +3856,7 @@ fn inactive_pairing_lru_uses_creation_time_then_selector_as_tie_breakers() {
         .expect("later lexical pairing")
         .created_at = 101;
     assert_eq!(
-        least_recently_used_inactive_pairing(
+        least_recently_used_pairing_without_live_session(
             &pairings,
             &HashMap::new(),
             &payload.workspace_key,

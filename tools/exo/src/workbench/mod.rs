@@ -3508,7 +3508,7 @@ impl WorkbenchHostInner {
                 })
                 .count();
             if workspace_pairings >= MAX_ACTIVE_PAIRINGS_PER_WORKSPACE {
-                evicted_pairing_selector = least_recently_used_inactive_pairing(
+                evicted_pairing_selector = least_recently_used_pairing_without_live_session(
                     &state.pairing_grants,
                     &state.session_grants,
                     &payload.workspace_key,
@@ -4875,7 +4875,7 @@ fn retain_live_authorizations(state: &mut WorkbenchState, now: u64) {
     });
 }
 
-fn least_recently_used_inactive_pairing(
+fn least_recently_used_pairing_without_live_session(
     pairings: &HashMap<String, WorkbenchPairingGrantV1>,
     sessions: &HashMap<String, WorkbenchSessionGrantV1>,
     workspace_key: &str,

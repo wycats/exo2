@@ -1467,14 +1467,79 @@ describe("cockpit page", () => {
     expect(channel.messages).toEqual([
       { kind: "pairing-enrolled", version: 1 },
     ]);
-    expect(channel.postedHistoryStates).toEqual([
-      expect.objectContaining({ exoWorkbenchSessionKey: "fresh-session" }),
-    ]);
+    expect(channel.postedHistoryStates[0]).not.toHaveProperty(
+      "exoWorkbenchSessionKey",
+    );
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "fresh-session",
+    );
     expect(JSON.stringify(channel.messages)).not.toContain("fresh-session");
     expect(JSON.stringify(channel.messages)).not.toContain("fresh-ticket");
 
     view.unmount();
     expect(channel.closed).toBe(true);
+  });
+
+  it("broadcasts a committed enrollment after navigation supersedes local rendering", async () => {
+    stubPublishedLocation("#ticket=v2.stale-ticket");
+    const staleEnrollment = deferred<Response>();
+    const freshEnrollment = deferred<Response>();
+    let enrollmentReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/enroll") {
+          enrollmentReads += 1;
+          return enrollmentReads === 1
+            ? staleEnrollment.promise
+            : freshEnrollment.promise;
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await waitFor(() => expect(enrollmentReads).toBe(1));
+    const channel = TestBroadcastChannel.instances[0]!;
+    location.hash = "#ticket=v2.fresh-ticket";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    staleEnrollment.resolve(sessionResponse("stale-session"));
+
+    await waitFor(() =>
+      expect(channel.messages).toEqual([
+        { kind: "pairing-enrolled", version: 1 },
+      ]),
+    );
+    expect(enrollmentReads).toBe(2);
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).not.toBe(
+      "stale-session",
+    );
+
+    freshEnrollment.resolve(sessionResponse("fresh-session"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(channel.messages).toEqual([
+      { kind: "pairing-enrolled", version: 1 },
+      { kind: "pairing-enrolled", version: 1 },
+    ]);
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "fresh-session",
+    );
   });
 
   it("resumes an expired published tab after another tab enrolls", async () => {
