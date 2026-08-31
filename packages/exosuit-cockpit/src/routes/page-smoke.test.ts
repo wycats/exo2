@@ -99,6 +99,40 @@ class TestEventSource {
   close(): void {}
 }
 
+class TestBroadcastChannel {
+  static instances: TestBroadcastChannel[] = [];
+
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  readonly messages: unknown[] = [];
+  readonly postedHistoryStates: Record<string, unknown>[] = [];
+  closed = false;
+
+  constructor(readonly name: string) {
+    TestBroadcastChannel.instances.push(this);
+  }
+
+  postMessage(message: unknown): void {
+    const cloned = structuredClone(message);
+    this.messages.push(cloned);
+    this.postedHistoryStates.push(workbenchHistoryState(history.state));
+    for (const channel of TestBroadcastChannel.instances) {
+      if (channel !== this && channel.name === this.name && !channel.closed) {
+        queueMicrotask(() => {
+          if (!channel.closed) {
+            channel.onmessage?.(
+              new MessageEvent("message", { data: structuredClone(cloned) }),
+            );
+          }
+        });
+      }
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -126,6 +160,17 @@ function sessionResponse(sessionKey: string): Response {
     }),
     { status: 200 },
   );
+}
+
+function stubPublishedLocation(hash = ""): void {
+  vi.stubGlobal("location", {
+    hash,
+    href: `https://workbench.example.test/${hash}`,
+    pathname: "/",
+    protocol: "https:",
+    reload: vi.fn(),
+    search: "",
+  });
 }
 
 function laneInspection(
@@ -169,7 +214,9 @@ beforeEach(() => {
   history.replaceState({}, "", "/");
   sessionStorage.clear();
   TestEventSource.instances = [];
+  TestBroadcastChannel.instances = [];
   vi.stubGlobal("EventSource", TestEventSource);
+  vi.stubGlobal("BroadcastChannel", TestBroadcastChannel);
 });
 
 afterEach(() => {
@@ -1357,6 +1404,249 @@ describe("cockpit page", () => {
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("broadcasts a credential-free notice after published enrollment is retained", async () => {
+    stubPublishedLocation("#ticket=v2.fresh-ticket");
+    const enrollment = deferred<Response>();
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/enroll") {
+          return enrollment.promise;
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    const view = render(Page);
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const channel = TestBroadcastChannel.instances[0]!;
+    expect(channel.name).toBe("exo-workbench-pairing-events-v1");
+    expect(channel.messages).toEqual([]);
+
+    enrollment.resolve(sessionResponse("fresh-session"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(channel.messages).toEqual([
+      { kind: "pairing-enrolled", version: 1 },
+    ]);
+    expect(channel.postedHistoryStates).toEqual([
+      expect.objectContaining({ exoWorkbenchSessionKey: "fresh-session" }),
+    ]);
+    expect(JSON.stringify(channel.messages)).not.toContain("fresh-session");
+    expect(JSON.stringify(channel.messages)).not.toContain("fresh-ticket");
+
+    view.unmount();
+    expect(channel.closed).toBe(true);
+  });
+
+  it("resumes an expired published tab after another tab enrolls", async () => {
+    stubPublishedLocation();
+    const staleRequestId = "s".repeat(43);
+    history.replaceState(
+      { exoWorkbenchPairingResumeRequestId: staleRequestId },
+      "",
+      "/",
+    );
+    sessionStorage.setItem(
+      "exoWorkbenchResumeState",
+      JSON.stringify({ exoWorkbenchPairingResumeRequestId: staleRequestId }),
+    );
+    const resumeRequestIds: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          const request = JSON.parse(String(init?.body));
+          resumeRequestIds.push(request.request_id);
+          if (resumeRequestIds.length === 1) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.pairing_expired",
+                ok: false,
+                message: "The browser pairing expired",
+              }),
+              { status: 401 },
+            );
+          }
+          return sessionResponse("resumed-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("resumed-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    expect(
+      await screen.findByRole("heading", { name: "Session expired" }),
+    ).toBeTruthy();
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+
+    expect(
+      await screen.findByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(resumeRequestIds).toHaveLength(2);
+    expect(resumeRequestIds[0]).toBe(staleRequestId);
+    expect(resumeRequestIds[1]).not.toBe(staleRequestId);
+    expect(resumeRequestIds[1]).toHaveLength(43);
+    expect(pairingResumeRequestIdFromHistory(history.state)).toBeNull();
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "resumed-session",
+    );
+    expect(sessionStorage.getItem("exoWorkbenchResumeState")).not.toContain(
+      staleRequestId,
+    );
+    enrollingTab.close();
+  });
+
+  it("ignores pairing enrollment notices while a published tab is healthy", async () => {
+    stubPublishedLocation();
+    let resumeReads = 0;
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          resumeReads += 1;
+          return sessionResponse("healthy-session");
+        }
+        if (path === "/api/session/renew") {
+          return sessionResponse("healthy-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+
+    await waitFor(() => expect(resumeReads).toBe(1));
+    expect(
+      screen.getByRole("heading", { name: "Local workbench host" }),
+    ).toBeTruthy();
+    expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+      "healthy-session",
+    );
+    enrollingTab.close();
+  });
+
+  it("keeps a newer ticket authoritative over duplicate and late pairing recovery", async () => {
+    stubPublishedLocation();
+    const staleRequestId = "s".repeat(43);
+    history.replaceState(
+      { exoWorkbenchPairingResumeRequestId: staleRequestId },
+      "",
+      "/",
+    );
+    const delayedResume = deferred<Response>();
+    let resumeReads = 0;
+    const commandSessionKeys: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          resumeReads += 1;
+          if (resumeReads === 1) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.pairing_expired",
+                ok: false,
+                message: "The browser pairing expired",
+              }),
+              { status: 401 },
+            );
+          }
+          return delayedResume.promise;
+        }
+        if (path === "/api/pairing/enroll") {
+          return sessionResponse("ticket-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          commandSessionKeys.push(request.session_key);
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Session expired" });
+    const enrollingTab = new BroadcastChannel(
+      "exo-workbench-pairing-events-v1",
+    );
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+    enrollingTab.postMessage({ kind: "pairing-enrolled", version: 1 });
+    await waitFor(() => expect(resumeReads).toBe(2));
+
+    location.hash = "#ticket=v2.newer-ticket";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    delayedResume.resolve(sessionResponse("late-resume-session"));
+
+    await waitFor(() => {
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "ticket-session",
+      );
+      expect(commandSessionKeys).toEqual(["ticket-session"]);
+    });
+    expect(resumeReads).toBe(2);
+    enrollingTab.close();
   });
 
   it("exchanges a fresh ticket delivered through same-tab fragment navigation", async () => {
