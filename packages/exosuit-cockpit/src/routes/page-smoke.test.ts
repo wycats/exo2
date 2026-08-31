@@ -1993,6 +1993,99 @@ describe("cockpit page", () => {
     enrollingTab.close();
   });
 
+  it("keeps a newer ticket authoritative over event-stream session recovery", async () => {
+    stubPublishedLocation();
+    const delayedResume = deferred<Response>();
+    let resumeReads = 0;
+    let renewalReads = 0;
+    let enrollmentReads = 0;
+    let snapshotReads = 0;
+    const pairingOperations: string[] = [];
+    const commandSessionKeys: string[] = [];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (path, init) => {
+        if (path === "/api/pairing/resume") {
+          resumeReads += 1;
+          pairingOperations.push(`resume-${resumeReads}`);
+          return resumeReads === 1
+            ? sessionResponse("initial-session")
+            : delayedResume.promise;
+        }
+        if (path === "/api/session/renew") {
+          renewalReads += 1;
+          return renewalReads === 1
+            ? sessionResponse("initial-session")
+            : new Response(
+              JSON.stringify({
+                kind: "workbench.session_invalid",
+                ok: false,
+                message: "The session expired",
+              }),
+              { status: 401 },
+            );
+        }
+        if (path === "/api/pairing/enroll") {
+          enrollmentReads += 1;
+          pairingOperations.push("enroll");
+          return sessionResponse("ticket-session");
+        }
+        if (path === "/api/command") {
+          const request = JSON.parse(String(init?.body));
+          snapshotReads += 1;
+          commandSessionKeys.push(request.session_key);
+          if (snapshotReads === 2) {
+            return new Response(
+              JSON.stringify({
+                kind: "workbench.session_invalid",
+                ok: false,
+                message: "The workbench session is invalid",
+              }),
+              { status: 401 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              protocol_version: 1,
+              id: request.id,
+              status: "ok",
+              result: snapshotFixture,
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected request: ${String(path)}`);
+      });
+    vi.stubGlobal("fetch", fetcher);
+    render(Page);
+
+    await screen.findByRole("heading", { name: "Local workbench host" });
+    await waitFor(() => {
+      expect(renewalReads).toBe(1);
+      expect(TestEventSource.instances).toHaveLength(1);
+    });
+    TestEventSource.instances[0]!.emit("invalidate");
+    await waitFor(() => expect(resumeReads).toBe(2));
+
+    location.hash = "#ticket=v2.newer-ticket";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(enrollmentReads).toBe(0);
+
+    delayedResume.resolve(sessionResponse("stale-recovery-session"));
+
+    await waitFor(() => {
+      expect(workbenchHistoryState(history.state).exoWorkbenchSessionKey).toBe(
+        "ticket-session",
+      );
+      expect(commandSessionKeys.at(-1)).toBe("ticket-session");
+    });
+    expect(resumeReads).toBe(2);
+    expect(enrollmentReads).toBe(1);
+    expect(pairingOperations).toEqual(["resume-1", "resume-2", "enroll"]);
+    expect(commandSessionKeys).not.toContain("stale-recovery-session");
+  });
+
   it("exchanges a fresh ticket delivered through same-tab fragment navigation", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (path, init) => {
       if (path === "/api/session") {

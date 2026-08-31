@@ -359,6 +359,10 @@
       if (!activeClient || snapshot === null || recoveryInFlight) {
         return;
       }
+      const recoveryBootstrapGeneration = bootstrapGeneration;
+      const recoveryIsCurrent = () =>
+        recoveryBootstrapGeneration === bootstrapGeneration &&
+        client === activeClient;
       recoveryInFlight = true;
       snapshotRefreshGeneration += 1;
       clearRecoveryTimer();
@@ -374,7 +378,7 @@
             error instanceof WorkbenchClientError &&
             error.kind === "session_expired"
           ) {
-            activeClient = await resumePublishedSession();
+            activeClient = await resumePublishedSession(recoveryIsCurrent);
             client = activeClient;
           } else {
             throw error;
