@@ -264,13 +264,24 @@ corresponding resume outcome commit in one store replacement before success is
 reported. Failure before that replacement leaves no committed authority.
 
 At most 64 active pairings exist per project and at most 8 per workspace.
-Expired active records are removed before enforcing those limits. A full active
-set returns `workbench.pairing_limit` without eviction or partial mutation.
+Expired active records are removed before enforcing those limits. The
+project-wide limit remains a hard boundary and returns
+`workbench.pairing_limit` without eviction or partial mutation.
+
+At the workspace limit, enrollment may replace the least recently used pairing
+that has no live session. The presented pairing is excluded from this selection,
+as are pairings backed by a live session. If every pairing is in active session
+use, enrollment returns `workbench.pairing_limit` without mutation. Replacement
+revokes the selected durable authority atomically with the new pairing and
+session; retained terminal resume outcomes continue to replay for their normal
+retention window.
 
 Revoked records use a separate retention bound of 64 per project and 8 per
 workspace. When that bound is exceeded, Exo removes the oldest revoked records;
-active authority is never evicted to make room for history. A nickname is
-optional, is at most 80 Unicode scalar values, and carries no authority.
+active authority is never evicted to make room for history. Same-workspace
+capacity replacement is governed by the enrollment rule above, independently of
+history retention. A nickname is optional, is at most 80 Unicode scalar values,
+and carries no authority.
 
 ### Enrollment protocol
 

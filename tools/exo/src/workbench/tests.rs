@@ -1611,6 +1611,58 @@ fn published_ticket_payload(ticket: &str) -> WorkbenchTicketV2 {
 }
 
 #[cfg(feature = "ui")]
+fn test_pairing_grant(
+    selector: String,
+    payload: &WorkbenchTicketV2,
+    workspace_root: &Path,
+    capabilities: &[String],
+    created_at: u64,
+    last_used_at: u64,
+) -> WorkbenchPairingGrantV1 {
+    WorkbenchPairingGrantV1 {
+        credential_digest: session_credential_digest(&format!("{selector}-secret")),
+        selector,
+        project_id: payload.project_id.clone(),
+        workspace_key: payload.workspace_key.clone(),
+        workspace_root: workspace_root.to_path_buf(),
+        launch_mode: WorkbenchLaunchMode::Published,
+        project_instance_id: payload.project_instance_id.clone(),
+        canonical_origin: payload.canonical_origin.clone(),
+        capabilities: capabilities.to_vec(),
+        created_at,
+        last_used_at,
+        idle_expires_at: last_used_at.saturating_add(PAIRING_IDLE_LIFETIME.as_secs()),
+        absolute_expires_at: created_at.saturating_add(PAIRING_ABSOLUTE_LIFETIME.as_secs()),
+        nickname: None,
+        revoked_at: None,
+        revocation_cause: None,
+    }
+}
+
+#[cfg(feature = "ui")]
+fn test_pairing_session(
+    pairing: &WorkbenchPairingGrantV1,
+    workspace_root: &Path,
+    now: u64,
+) -> WorkbenchSession {
+    let secret = random_token().expect("session secret");
+    WorkbenchSession {
+        id: session_credential_digest(&secret),
+        selector: random_token().expect("session selector"),
+        project_id: pairing.project_id.clone(),
+        workspace_key: pairing.workspace_key.clone(),
+        workspace_root: workspace_root.to_path_buf(),
+        capabilities: pairing.capabilities.clone(),
+        entry: pairing.entry(),
+        pairing_selector: Some(pairing.selector.clone()),
+        created_at: now,
+        last_activity: now,
+        expires_at: now.saturating_add(SESSION_RENEWAL_LIFETIME.as_secs()),
+        last_persisted_at: now,
+    }
+}
+
+#[cfg(feature = "ui")]
 fn launch_response_envelope(id: &str, launch: &WorkbenchLaunchResult) -> ResponseEnvelope {
     ResponseEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -3294,6 +3346,526 @@ async fn published_enrollment_and_resume_are_durable_exact_and_origin_bound() {
         "enrollment and one unique resume create two active sessions"
     );
     manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_enrollment_evicts_the_oldest_pairing_without_a_live_session() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let request_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id.clone(),
+        payload.workspace_key.clone(),
+    )
+    .expect("published request entry");
+    let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+    let now = unix_seconds();
+    let selectors = (b'a'..=b'h')
+        .map(|byte| char::from(byte).to_string().repeat(43))
+        .collect::<Vec<_>>();
+    let oldest_selector = selectors[0].clone();
+    let survivor_selectors = selectors[1..].to_vec();
+    let terminal_request_id = "r".repeat(43);
+    let outcome_key = WorkbenchResumeOutcomeKey {
+        pairing_selector: oldest_selector.clone(),
+        request_id: terminal_request_id.clone(),
+    };
+
+    let store = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        for (index, selector) in selectors.iter().enumerate() {
+            let pairing = test_pairing_grant(
+                selector.clone(),
+                &payload,
+                &fixture.root,
+                &capabilities,
+                now.saturating_sub(200 - index as u64),
+                now.saturating_sub(100 - index as u64),
+            );
+            state.pairing_grants.insert(selector.clone(), pairing);
+        }
+        state.resume_outcomes.insert(
+            outcome_key.clone(),
+            terminal_resume_outcome(&outcome_key, WorkbenchResumeTerminalErrorV1::Invalid, now),
+        );
+        let orphaned_memory_session = test_pairing_session(
+            state
+                .pairing_grants
+                .get(&oldest_selector)
+                .expect("oldest pairing"),
+            &fixture.root,
+            now,
+        );
+        state
+            .sessions
+            .insert(orphaned_memory_session.id.clone(), orphaned_memory_session);
+        authorization_store_from_collections(
+            fixture.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &state.resume_outcomes,
+        )
+    };
+    write_authorization_store(&manager.inner.authorization_store_path, &store)
+        .expect("persist capacity fixture");
+
+    let enrollment = manager
+        .inner
+        .enroll_pairing(ticket, None, &request_entry)
+        .expect("evict oldest inactive pairing");
+    let enrolled_selector = enrollment
+        .pairing_cookie
+        .split('.')
+        .nth(1)
+        .expect("enrolled pairing selector");
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
+        MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+    );
+    assert_eq!(
+        state
+            .pairing_grants
+            .get(&oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
+    assert!(state.pairing_grants.contains_key(enrolled_selector));
+    assert!(
+        survivor_selectors
+            .iter()
+            .all(|selector| state.pairing_grants.contains_key(selector)),
+        "newer inactive pairings remain retained"
+    );
+    assert_eq!(
+        state
+            .resume_outcomes
+            .get(&outcome_key)
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
+    );
+    assert!(
+        state.sessions.values().all(|session| {
+            session.pairing_selector.as_deref() != Some(oldest_selector.as_str())
+        }),
+        "in-memory sessions are removed only after the store write succeeds"
+    );
+    drop(state);
+
+    let persisted: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path).expect("read authorization store"),
+    )
+    .expect("decode authorization store");
+    assert_eq!(
+        persisted
+            .pairings
+            .iter()
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
+        MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+    );
+    assert_eq!(
+        persisted
+            .pairings
+            .iter()
+            .find(|pairing| pairing.selector == oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
+    assert_eq!(
+        persisted
+            .resume_outcomes
+            .iter()
+            .find(|outcome| outcome.pairing_selector == oldest_selector)
+            .and_then(WorkbenchResumeOutcomeV1::terminal_error),
+        Some(PairingExchangeError::Invalid)
+    );
+    assert_eq!(
+        manager
+            .inner
+            .resume_pairing(
+                &oldest_selector,
+                &format!("{oldest_selector}-secret"),
+                &terminal_request_id,
+                &request_entry,
+            )
+            .expect_err("evicted pairing replays its terminal resume result"),
+        PairingExchangeError::Invalid
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_enrollment_reuses_a_compatible_pairing_at_workspace_capacity() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let request_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id.clone(),
+        payload.workspace_key.clone(),
+    )
+    .expect("published request entry");
+    let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+    let now = unix_seconds();
+    let selectors = (b'a'..=b'h')
+        .map(|byte| char::from(byte).to_string().repeat(43))
+        .collect::<Vec<_>>();
+    let reusable_selector = selectors[3].clone();
+    let reusable_secret = format!("{reusable_selector}-secret");
+
+    let store = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        for (index, selector) in selectors.iter().enumerate() {
+            let pairing = test_pairing_grant(
+                selector.clone(),
+                &payload,
+                &fixture.root,
+                &capabilities,
+                now.saturating_sub(200 - index as u64),
+                now.saturating_sub(100 - index as u64),
+            );
+            state.pairing_grants.insert(selector.clone(), pairing);
+        }
+        authorization_store_from_collections(
+            fixture.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &state.resume_outcomes,
+        )
+    };
+    write_authorization_store(&manager.inner.authorization_store_path, &store)
+        .expect("persist capacity fixture");
+
+    let enrollment = manager
+        .inner
+        .enroll_pairing(
+            ticket,
+            Some((&reusable_selector, &reusable_secret)),
+            &request_entry,
+        )
+        .expect("reuse compatible pairing at capacity");
+    let mut pairing_parts = enrollment.pairing_cookie.split('.');
+    assert_eq!(pairing_parts.next(), Some("v1"));
+    assert_eq!(pairing_parts.next(), Some(reusable_selector.as_str()));
+    assert_eq!(pairing_parts.next(), Some(reusable_secret.as_str()));
+
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(
+        state.pairing_grants.len(),
+        MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+    );
+    assert!(
+        selectors
+            .iter()
+            .all(|selector| state.pairing_grants.contains_key(selector)),
+        "reusing a compatible pairing does not evict another workspace pairing"
+    );
+    assert_eq!(state.session_grants.len(), 1);
+    assert!(state.session_grants.values().all(|session| {
+        session.pairing_selector.as_deref() == Some(reusable_selector.as_str())
+    }));
+    drop(state);
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_enrollment_at_project_capacity_does_not_evict_another_workspace() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let request_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id.clone(),
+        payload.workspace_key.clone(),
+    )
+    .expect("published request entry");
+    let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+    let now = unix_seconds();
+    let selectors = (0..MAX_ACTIVE_PAIRINGS)
+        .map(|index| format!("{index:043}"))
+        .collect::<Vec<_>>();
+
+    let store = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        for (index, selector) in selectors.iter().enumerate() {
+            let mut pairing = test_pairing_grant(
+                selector.clone(),
+                &payload,
+                &fixture.root,
+                &capabilities,
+                now.saturating_sub(200 - index as u64),
+                now.saturating_sub(100 - index as u64),
+            );
+            pairing.workspace_key = format!("other-workspace-{index}");
+            state.pairing_grants.insert(selector.clone(), pairing);
+        }
+        authorization_store_from_collections(
+            fixture.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &state.resume_outcomes,
+        )
+    };
+    write_authorization_store(&manager.inner.authorization_store_path, &store)
+        .expect("persist project capacity fixture");
+
+    assert!(
+        matches!(
+            manager.inner.enroll_pairing(ticket, None, &request_entry),
+            Err(PairingExchangeError::Limit)
+        ),
+        "the project-wide cap remains a hard boundary"
+    );
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(state.pairing_grants.len(), MAX_ACTIVE_PAIRINGS);
+    assert!(
+        selectors
+            .iter()
+            .all(|selector| state.pairing_grants.contains_key(selector)),
+        "project capacity never evicts authority from another workspace"
+    );
+    assert!(
+        state
+            .pending_capabilities
+            .contains_key(&payload.capability_id),
+        "the capacity result leaves the enrollment ticket retryable"
+    );
+    drop(state);
+
+    let persisted: WorkbenchAuthorizationStoreV2 = serde_json::from_slice(
+        &fs::read(&manager.inner.authorization_store_path).expect("read authorization store"),
+    )
+    .expect("decode authorization store");
+    assert_eq!(persisted.pairings.len(), MAX_ACTIVE_PAIRINGS);
+    assert!(
+        selectors.iter().all(|selector| {
+            persisted
+                .pairings
+                .iter()
+                .any(|pairing| pairing.selector == *selector)
+        }),
+        "the persisted project authority is unchanged"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test(flavor = "multi_thread")]
+async fn published_enrollment_preserves_active_pairings_and_retries_after_inactivity() {
+    let fixture = fixture();
+    let manager = test_manager(Arc::clone(&fixture.project));
+    use_test_published_entries(&manager);
+    let launch = manager
+        .launch(&fixture.root)
+        .expect("launch published workbench");
+    let (_, ticket) = launch_parts(&launch);
+    let payload = published_ticket_payload(ticket);
+    let request_entry = WorkbenchEntryBinding::published(
+        payload.canonical_origin.clone(),
+        payload.project_instance_id.clone(),
+        payload.workspace_key.clone(),
+    )
+    .expect("published request entry");
+    let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+    let now = unix_seconds();
+    let selectors = (b'a'..=b'h')
+        .map(|byte| char::from(byte).to_string().repeat(43))
+        .collect::<Vec<_>>();
+    let oldest_selector = selectors[0].clone();
+
+    let store = {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        for (index, selector) in selectors.iter().enumerate() {
+            let pairing = test_pairing_grant(
+                selector.clone(),
+                &payload,
+                &fixture.root,
+                &capabilities,
+                now.saturating_sub(200 - index as u64),
+                now.saturating_sub(100 - index as u64),
+            );
+            let session = test_pairing_session(&pairing, &fixture.root, now);
+            state
+                .session_grants
+                .insert(session.id.clone(), WorkbenchSessionGrantV1::from(&session));
+            state.sessions.insert(session.id.clone(), session);
+            state.pairing_grants.insert(selector.clone(), pairing);
+        }
+        authorization_store_from_collections(
+            fixture.project.id.as_str(),
+            &state.session_grants,
+            &state.pairing_grants,
+            &state.resume_outcomes,
+        )
+    };
+    write_authorization_store(&manager.inner.authorization_store_path, &store)
+        .expect("persist active capacity fixture");
+
+    assert!(
+        matches!(
+            manager.inner.enroll_pairing(ticket, None, &request_entry),
+            Err(PairingExchangeError::Limit)
+        ),
+        "a workspace whose pairings all have live persisted sessions remains protected"
+    );
+    assert!(
+        manager
+            .inner
+            .state
+            .lock()
+            .expect("workbench state")
+            .pending_capabilities
+            .contains_key(&payload.capability_id),
+        "the capacity result leaves the enrollment ticket retryable"
+    );
+
+    {
+        let mut state = manager.inner.state.lock().expect("workbench state");
+        let session_id = state
+            .session_grants
+            .iter()
+            .find(|(_, session)| {
+                session.pairing_selector.as_deref() == Some(oldest_selector.as_str())
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .expect("oldest pairing session");
+        state
+            .session_grants
+            .get_mut(&session_id)
+            .expect("persisted session")
+            .expires_at = now;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("in-memory session")
+            .expires_at = now;
+    }
+
+    manager
+        .inner
+        .enroll_pairing(ticket, None, &request_entry)
+        .expect("retry after oldest pairing becomes inactive");
+    let state = manager.inner.state.lock().expect("workbench state");
+    assert_eq!(
+        state
+            .pairing_grants
+            .get(&oldest_selector)
+            .and_then(|pairing| pairing.revocation_cause),
+        Some(WorkbenchPairingRevocationCause::Replaced)
+    );
+    assert!(selectors[1..].iter().all(|selector| {
+        state
+            .pairing_grants
+            .get(selector)
+            .is_some_and(|pairing| pairing.is_live(now))
+    }));
+    assert_eq!(
+        state
+            .pairing_grants
+            .values()
+            .filter(|pairing| pairing.is_live(now))
+            .count(),
+        MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+    );
+    drop(state);
+    manager.shutdown().await;
+}
+
+#[cfg(feature = "ui")]
+#[test]
+fn session_inactive_pairing_lru_uses_creation_time_then_selector_as_tie_breakers() {
+    let now = 1_000;
+    let payload = WorkbenchTicketV2 {
+        version: 2,
+        capability_id: "c".repeat(43),
+        instance_id: "test-instance".to_string(),
+        project_id: "test-project".to_string(),
+        workspace_key: "test-workspace".to_string(),
+        entry_mode: WorkbenchLaunchMode::Published,
+        project_instance_id: "test-project-instance".to_string(),
+        canonical_origin: "https://workbench.test.localhost".to_string(),
+        capabilities: vec!["workbench.snapshot".to_string()],
+        issued_at: now,
+        expires_at: now + 60,
+    };
+    let capabilities = upgraded_session_capabilities(payload.capabilities.clone());
+    let later_selector = "z".repeat(43);
+    let lexical_selector = "a".repeat(43);
+    let mut pairings = HashMap::from([
+        (
+            later_selector.clone(),
+            test_pairing_grant(
+                later_selector.clone(),
+                &payload,
+                Path::new("/test/workspace"),
+                &capabilities,
+                100,
+                200,
+            ),
+        ),
+        (
+            lexical_selector.clone(),
+            test_pairing_grant(
+                lexical_selector.clone(),
+                &payload,
+                Path::new("/test/workspace"),
+                &capabilities,
+                101,
+                200,
+            ),
+        ),
+    ]);
+    assert_eq!(
+        least_recently_used_pairing_without_live_session(
+            &pairings,
+            &HashMap::new(),
+            &payload.workspace_key,
+            None,
+            now,
+        ),
+        Some(later_selector.clone()),
+        "an earlier creation wins when last use ties"
+    );
+
+    pairings
+        .get_mut(&later_selector)
+        .expect("later lexical pairing")
+        .created_at = 101;
+    assert_eq!(
+        least_recently_used_pairing_without_live_session(
+            &pairings,
+            &HashMap::new(),
+            &payload.workspace_key,
+            None,
+            now,
+        ),
+        Some(lexical_selector),
+        "selector byte order breaks an exact timestamp tie"
+    );
 }
 
 #[cfg(all(feature = "ui", unix))]

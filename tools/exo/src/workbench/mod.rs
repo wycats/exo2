@@ -3489,6 +3489,7 @@ impl WorkbenchHostInner {
         let reusable_pairing =
             presented_pairing.filter(|(pairing, _)| pairing.capabilities == capabilities);
         let creating_pairing = reusable_pairing.is_none();
+        let mut evicted_pairing_selector = None;
         if creating_pairing {
             let project_pairings = state
                 .pairing_grants
@@ -3506,8 +3507,22 @@ impl WorkbenchHostInner {
                     replaced_pairing_selector.as_deref() != Some(pairing.selector.as_str())
                 })
                 .count();
-            if project_pairings >= MAX_ACTIVE_PAIRINGS
-                || workspace_pairings >= MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+            if workspace_pairings >= MAX_ACTIVE_PAIRINGS_PER_WORKSPACE {
+                evicted_pairing_selector = least_recently_used_pairing_without_live_session(
+                    &state.pairing_grants,
+                    &state.session_grants,
+                    &payload.workspace_key,
+                    replaced_pairing_selector.as_deref(),
+                    now,
+                );
+                if evicted_pairing_selector.is_none()
+                    || workspace_pairings.saturating_sub(1) >= MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
+                {
+                    return Err(PairingExchangeError::Limit);
+                }
+            }
+            if project_pairings.saturating_sub(usize::from(evicted_pairing_selector.is_some()))
+                >= MAX_ACTIVE_PAIRINGS
             {
                 return Err(PairingExchangeError::Limit);
             }
@@ -3564,6 +3579,17 @@ impl WorkbenchHostInner {
         let mut candidate_sessions = state.session_grants.clone();
         let mut candidate_pairings = state.pairing_grants.clone();
         let mut candidate_outcomes = state.resume_outcomes.clone();
+        if let Some(evicted_selector) = evicted_pairing_selector.as_deref() {
+            candidate_sessions
+                .retain(|_, session| session.pairing_selector.as_deref() != Some(evicted_selector));
+            candidate_pairings
+                .get_mut(evicted_selector)
+                .expect("evicted pairing exists")
+                .revoke(now, WorkbenchPairingRevocationCause::Replaced);
+            candidate_outcomes.retain(|key, outcome| {
+                key.pairing_selector.as_str() != evicted_selector || outcome.is_terminal()
+            });
+        }
         if let Some(replaced_selector) = replaced_pairing_selector.as_deref() {
             candidate_sessions.retain(|_, session| {
                 session.pairing_selector.as_deref() != Some(replaced_selector)
@@ -3598,6 +3624,11 @@ impl WorkbenchHostInner {
             state.sessions.retain(|_, session| {
                 session.pairing_selector.as_deref() != Some(replaced_selector)
             });
+        }
+        if let Some(evicted_selector) = evicted_pairing_selector.as_deref() {
+            state
+                .sessions
+                .retain(|_, session| session.pairing_selector.as_deref() != Some(evicted_selector));
         }
         state.sessions.insert(session.id.clone(), session);
         drop(state);
@@ -4842,6 +4873,35 @@ fn retain_live_authorizations(state: &mut WorkbenchState, now: u64) {
             .as_ref()
             .is_none_or(|selector| live_pairings.contains(selector))
     });
+}
+
+fn least_recently_used_pairing_without_live_session(
+    pairings: &HashMap<String, WorkbenchPairingGrantV1>,
+    sessions: &HashMap<String, WorkbenchSessionGrantV1>,
+    workspace_key: &str,
+    excluded_selector: Option<&str>,
+    now: u64,
+) -> Option<String> {
+    let active_pairings = sessions
+        .values()
+        .filter(|session| session.is_live(now))
+        .filter_map(|session| session.pairing_selector.as_deref())
+        .collect::<HashSet<_>>();
+    pairings
+        .values()
+        .filter(|pairing| {
+            pairing.workspace_key == workspace_key
+                && pairing.is_live(now)
+                && excluded_selector != Some(pairing.selector.as_str())
+                && !active_pairings.contains(pairing.selector.as_str())
+        })
+        .min_by(|left, right| {
+            left.last_used_at
+                .cmp(&right.last_used_at)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.selector.cmp(&right.selector))
+        })
+        .map(|pairing| pairing.selector.clone())
 }
 
 fn retain_candidate_resume_outcomes(

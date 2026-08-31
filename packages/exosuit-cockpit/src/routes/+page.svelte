@@ -65,6 +65,12 @@
   const INSPECTED_LANE_HISTORY_KEY = "exoWorkbenchInspectedLaneId";
   const PROJECT_OVERVIEW_HISTORY_KEY = "exoWorkbenchProjectOverview";
   const TAB_RESUME_STATE_KEY = "exoWorkbenchResumeState";
+  const PAIRING_EVENTS_CHANNEL = "exo-workbench-pairing-events-v1";
+  const PAIRING_AUTH_LOCK = "exo-workbench-pairing-auth-v1";
+  const PAIRING_ENROLLED_NOTICE = {
+    kind: "pairing-enrolled",
+    version: 1,
+  } as const;
 
   interface FocusRequest {
     laneId: string;
@@ -183,6 +189,15 @@
     let recoveryInFlight = false;
     let liveUpdatesStarted = false;
     let bootstrapGeneration = 0;
+    let pairingEnrollmentRecoveryQueued = false;
+    let pairingEnrollmentRecoveryPending = false;
+    const pairingEvents = publishedEntry
+      ? new BroadcastChannel(PAIRING_EVENTS_CHANNEL)
+      : null;
+    const withPairingAuthLock = <T,>(operation: () => Promise<T>): Promise<T> =>
+      navigator.locks
+        .request(PAIRING_AUTH_LOCK, { mode: "exclusive" }, operation)
+        .then((result) => result);
 
     const refreshForVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -302,7 +317,9 @@
         recoveryTimer = null;
       }
     };
-    const resumePublishedSession = async (): Promise<WorkbenchClient> => {
+    const resumePublishedSession = async (
+      isCurrent: () => boolean = () => true,
+    ): Promise<WorkbenchClient> => {
       const resumeState = readTabResumeState();
       const requestId =
         pairingResumeRequestIdFromHistory(history.state) ??
@@ -320,7 +337,12 @@
         pendingState,
       );
       retainTabResumeState(pendingState);
-      const session = await resumeWorkbenchPairing(requestId);
+      const session = await withPairingAuthLock(() =>
+        resumeWorkbenchPairing(requestId),
+      );
+      if (!isCurrent()) {
+        throw new Error("A newer workbench bootstrap replaced this pairing resume");
+      }
       const resumedState = retainSessionSelector(
         clearPairingResumeRequestId(history.state),
         session.session_key,
@@ -337,6 +359,10 @@
       if (!activeClient || snapshot === null || recoveryInFlight) {
         return;
       }
+      const recoveryBootstrapGeneration = bootstrapGeneration;
+      const recoveryIsCurrent = () =>
+        recoveryBootstrapGeneration === bootstrapGeneration &&
+        client === activeClient;
       recoveryInFlight = true;
       snapshotRefreshGeneration += 1;
       clearRecoveryTimer();
@@ -352,7 +378,7 @@
             error instanceof WorkbenchClientError &&
             error.kind === "session_expired"
           ) {
-            activeClient = await resumePublishedSession();
+            activeClient = await resumePublishedSession(recoveryIsCurrent);
             client = activeClient;
           } else {
             throw error;
@@ -495,7 +521,12 @@
             `${location.pathname}${location.search}`,
             prepareWorkbenchTicketExchange(history.state),
           );
-          const session = await exchangeWorkbenchTicket(ticket);
+          const session = await (publishedEntry
+            ? withPairingAuthLock(() => exchangeWorkbenchTicket(ticket))
+            : exchangeWorkbenchTicket(ticket));
+          if (publishedEntry) {
+            pairingEvents?.postMessage(PAIRING_ENROLLED_NOTICE);
+          }
           if (!isCurrent()) {
             return;
           }
@@ -514,7 +545,7 @@
             screen = "session_required";
             return;
           }
-          const resumedClient = await resumePublishedSession();
+          const resumedClient = await resumePublishedSession(isCurrent);
           if (!isCurrent()) {
             return;
           }
@@ -550,7 +581,7 @@
               error instanceof WorkbenchClientError &&
               error.kind === "session_expired"
             ) {
-              client = await resumePublishedSession();
+              client = await resumePublishedSession(isCurrent);
               sessionKey = client.sessionKey;
             } else {
               throw error;
@@ -625,6 +656,55 @@
         }
       }
     };
+    const queuePairingEnrollmentRecovery = () => {
+      if (pairingEnrollmentRecoveryQueued) {
+        pairingEnrollmentRecoveryPending = true;
+        return;
+      }
+
+      pairingEnrollmentRecoveryQueued = true;
+      clearTabResumeState();
+      replacePageState(
+        `${location.pathname}${location.search}`,
+        prepareWorkbenchTicketExchange(history.state),
+      );
+      const recovery = bootstrap(undefined, null);
+      const recoveryGeneration = bootstrapGeneration;
+      void recovery.finally(() => {
+        const recoveryIsCurrent = recoveryGeneration === bootstrapGeneration;
+        pairingEnrollmentRecoveryQueued = false;
+        if (pairingEnrollmentRecoveryPending && recoveryIsCurrent) {
+          pairingEnrollmentRecoveryPending = false;
+          queuePairingEnrollmentRecovery();
+        } else if (!recoveryIsCurrent) {
+          pairingEnrollmentRecoveryPending = false;
+        }
+      });
+    };
+    const resumeAfterPairingEnrollment = (event: MessageEvent<unknown>) => {
+      if (
+        !publishedEntry ||
+        typeof event.data !== "object" ||
+        event.data === null ||
+        (event.data as Record<string, unknown>).kind !==
+          PAIRING_ENROLLED_NOTICE.kind ||
+        (event.data as Record<string, unknown>).version !==
+          PAIRING_ENROLLED_NOTICE.version ||
+        (!pairingEnrollmentRecoveryQueued &&
+          screen !== "loading" &&
+          screen !== "session_required" &&
+          screen !== "session_expired" &&
+          sessionRecovery !== "needs_launch" &&
+          sessionRecovery !== "reconnecting")
+      ) {
+        return;
+      }
+
+      queuePairingEnrollmentRecovery();
+    };
+    if (pairingEvents) {
+      pairingEvents.onmessage = resumeAfterPairingEnrollment;
+    }
     window.addEventListener("hashchange", bootstrapFreshTicket);
     window.addEventListener("popstate", bootstrapRestoredSession);
     queueMicrotask(() => void bootstrap());
@@ -636,6 +716,7 @@
       beginSessionRecovery = null;
       window.removeEventListener("hashchange", bootstrapFreshTicket);
       window.removeEventListener("popstate", bootstrapRestoredSession);
+      pairingEvents?.close();
       clearRecoveryTimer();
       stopUpdates();
       stopLiveUpdates = null;
