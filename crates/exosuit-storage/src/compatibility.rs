@@ -18,6 +18,8 @@ pub const PROJECTION_GENERATION_PREFIX: &str = "-- exo:minimum-writer-generation
 
 const COMPATIBILITY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPATIBILITY_LOCK_POLL: Duration = Duration::from_millis(25);
+const DATABASE_PROBE_ATTEMPTS: usize = 3;
+const DATABASE_PROBE_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateSurface {
@@ -284,6 +286,34 @@ pub fn probe_database_generation(path: &Path) -> Result<i32, DatabaseError> {
 }
 
 fn probe_database_generation_at_identity(path: &Path) -> Result<i32, DatabaseError> {
+    retry_database_generation_probe(|| probe_database_generation_once(path))
+}
+
+fn retry_database_generation_probe(
+    mut probe: impl FnMut() -> Result<i32, DatabaseError>,
+) -> Result<i32, DatabaseError> {
+    for attempt in 0..DATABASE_PROBE_ATTEMPTS {
+        match probe() {
+            Ok(generation) => return Ok(generation),
+            Err(error)
+                if attempt + 1 < DATABASE_PROBE_ATTEMPTS
+                    && matches!(
+                        error,
+                        DatabaseError::Sqlite(_)
+                            | DatabaseError::WriterCompatibility(
+                                WriterCompatibilityError::Io { .. }
+                            )
+                    ) =>
+            {
+                std::thread::park_timeout(DATABASE_PROBE_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the database probe attempt range is non-empty")
+}
+
+fn probe_database_generation_once(path: &Path) -> Result<i32, DatabaseError> {
     match path.metadata() {
         Ok(metadata) if metadata.len() == 0 => return Ok(0),
         Ok(_) => {}
@@ -1122,6 +1152,48 @@ mod tests {
             "the WAL index should remain available to read-only probes"
         );
         assert_eq!(preflight_database(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn database_probe_retries_after_legacy_writer_removes_wal_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_writer_probe(value TEXT NOT NULL);\n\
+                 INSERT INTO legacy_writer_probe(value) VALUES('ready');",
+            )
+            .unwrap();
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+
+        let mut connection = Some(connection);
+        let mut attempts = 0;
+        let generation = retry_database_generation_probe(|| {
+            attempts += 1;
+            if attempts == 1 {
+                drop(connection.take());
+                assert!(!wal_path.exists());
+                assert!(!shm_path.exists());
+                return Err(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(ffi::SQLITE_CANTOPEN),
+                    Some("WAL sidecars changed before read-only open".to_string()),
+                )
+                .into());
+            }
+            probe_database_generation_once(&path)
+        })
+        .unwrap();
+
+        assert_eq!(generation, 0);
+        assert_eq!(attempts, 2);
     }
 
     fn wait_for_test_marker(child: &mut std::process::Child, marker: &Path) {

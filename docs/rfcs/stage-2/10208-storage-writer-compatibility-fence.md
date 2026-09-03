@@ -200,6 +200,12 @@ reconstructing the shared WAL index. A missing WAL index remains a recovery
 case: the probe reconstructs it only in an isolated copy and does not create or
 modify canonical SQLite sidecar files.
 
+During a rolling upgrade, a compatible older writer may still remove those
+sidecars when its final connection closes. A probe that encounters SQLite or
+sidecar I/O failure retries a bounded number of times and resamples the
+canonical sidecar state before each attempt. Invalid or incompatible writer
+metadata remains an immediate failure.
+
 ## Portable Projection Contract
 
 RFC 10178's required `epochs.sql` file carries the projection generation. Its
