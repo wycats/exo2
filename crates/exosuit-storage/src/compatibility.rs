@@ -334,7 +334,7 @@ fn probe_database_generation_once(path: &Path) -> Result<i32, DatabaseError> {
     }
 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    read_database_generation(&conn).map_err(Into::into)
+    probe_connection_generation(&conn)
 }
 
 fn probe_database_generation_from_copy(
@@ -362,7 +362,7 @@ fn probe_database_generation_from_copy(
     })?;
 
     let conn = Connection::open_with_flags(&copied_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    read_database_generation(&conn).map_err(Into::into)
+    probe_connection_generation(&conn)
 }
 
 fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
@@ -666,13 +666,11 @@ fn database_has_pending_migrations(path: &Path) -> Result<bool, DatabaseError> {
     has_pending_migrations(&conn)
 }
 
-pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterCompatibilityError> {
-    let generation = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(|error| WriterCompatibilityError::MetadataInvalid {
-            surface: StateSurface::Database,
-            reason: error.to_string(),
-        })?;
+fn query_database_generation(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+}
+
+fn validate_database_generation(generation: i64) -> Result<i32, WriterCompatibilityError> {
     if !(0..=i64::from(MAX_WRITER_GENERATION)).contains(&generation) {
         return Err(WriterCompatibilityError::MetadataInvalid {
             surface: StateSurface::Database,
@@ -680,6 +678,26 @@ pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterC
         });
     }
     Ok(generation as i32)
+}
+
+fn probe_database_generation_from_query(
+    query: impl FnOnce() -> Result<i64, rusqlite::Error>,
+) -> Result<i32, DatabaseError> {
+    validate_database_generation(query()?).map_err(Into::into)
+}
+
+fn probe_connection_generation(conn: &Connection) -> Result<i32, DatabaseError> {
+    probe_database_generation_from_query(|| query_database_generation(conn))
+}
+
+pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterCompatibilityError> {
+    let generation = query_database_generation(conn).map_err(|error| {
+        WriterCompatibilityError::MetadataInvalid {
+            surface: StateSurface::Database,
+            reason: error.to_string(),
+        }
+    })?;
+    validate_database_generation(generation)
 }
 
 pub(crate) fn set_database_generation(
@@ -1182,11 +1200,12 @@ mod tests {
                 drop(connection.take());
                 assert!(!wal_path.exists());
                 assert!(!shm_path.exists());
-                return Err(rusqlite::Error::SqliteFailure(
-                    ffi::Error::new(ffi::SQLITE_CANTOPEN),
-                    Some("WAL sidecars changed before read-only open".to_string()),
-                )
-                .into());
+                return probe_database_generation_from_query(|| {
+                    Err(rusqlite::Error::SqliteFailure(
+                        ffi::Error::new(ffi::SQLITE_CANTOPEN),
+                        Some("WAL sidecars changed during generation query".to_string()),
+                    ))
+                });
             }
             probe_database_generation_once(&path)
         })
