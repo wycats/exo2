@@ -3201,11 +3201,12 @@ mod tests {
         let canonical_path = temp.path().join("canonical.db");
         let legacy_path = temp.path().join("legacy.db");
         for path in [&canonical_path, &legacy_path] {
-            let database = exosuit_storage::open_database(path).expect("initialize database");
-            database
-                .connection()
-                .pragma_update(None, "journal_mode", "delete")
+            drop(exosuit_storage::open_database(path).expect("initialize database"));
+            let connection = Connection::open(path).expect("open fixture database");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
                 .expect("set delete journal mode");
+            assert_eq!(journal_mode, "delete");
         }
 
         let candidate = SplitBrainCandidate {

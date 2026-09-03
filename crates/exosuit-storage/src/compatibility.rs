@@ -1,6 +1,6 @@
 //! Cross-version writer compatibility for canonical Exo storage.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{ffi, Connection, OpenFlags};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::ops::{Deref, DerefMut};
@@ -18,6 +18,8 @@ pub const PROJECTION_GENERATION_PREFIX: &str = "-- exo:minimum-writer-generation
 
 const COMPATIBILITY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPATIBILITY_LOCK_POLL: Duration = Duration::from_millis(25);
+const DATABASE_PROBE_ATTEMPTS: usize = 3;
+const DATABASE_PROBE_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateSurface {
@@ -284,6 +286,41 @@ pub fn probe_database_generation(path: &Path) -> Result<i32, DatabaseError> {
 }
 
 fn probe_database_generation_at_identity(path: &Path) -> Result<i32, DatabaseError> {
+    retry_database_generation_probe(|| probe_database_generation_once(path))
+}
+
+fn retry_database_generation_probe(
+    mut probe: impl FnMut() -> Result<i32, DatabaseError>,
+) -> Result<i32, DatabaseError> {
+    for attempt in 0..DATABASE_PROBE_ATTEMPTS {
+        match probe() {
+            Ok(generation) => return Ok(generation),
+            Err(error)
+                if attempt + 1 < DATABASE_PROBE_ATTEMPTS
+                    && matches!(
+                        error,
+                        DatabaseError::Sqlite(_)
+                            | DatabaseError::WriterCompatibility(
+                                WriterCompatibilityError::Io { .. }
+                            )
+                    ) =>
+            {
+                wait_for_database_probe_retry();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the database probe attempt range is non-empty")
+}
+
+fn wait_for_database_probe_retry() {
+    let deadline = Instant::now() + DATABASE_PROBE_RETRY_DELAY;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        std::thread::park_timeout(remaining);
+    }
+}
+
+fn probe_database_generation_once(path: &Path) -> Result<i32, DatabaseError> {
     match path.metadata() {
         Ok(metadata) if metadata.len() == 0 => return Ok(0),
         Ok(_) => {}
@@ -304,7 +341,7 @@ fn probe_database_generation_at_identity(path: &Path) -> Result<i32, DatabaseErr
     }
 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    read_database_generation(&conn).map_err(Into::into)
+    probe_connection_generation(&conn)
 }
 
 fn probe_database_generation_from_copy(
@@ -332,13 +369,32 @@ fn probe_database_generation_from_copy(
     })?;
 
     let conn = Connection::open_with_flags(&copied_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    read_database_generation(&conn).map_err(Into::into)
+    probe_connection_generation(&conn)
 }
 
 fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
     let mut path = database_path.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+fn enable_persistent_wal(conn: &Connection) -> Result<(), DatabaseError> {
+    let mut enabled = 1_i32;
+    // SAFETY: `conn` owns a live SQLite handle for the duration of this call,
+    // `main` is a static NUL-terminated database name, and SQLite reads and
+    // updates the pointed-to integer synchronously.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            std::ptr::from_mut(&mut enabled).cast(),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
+    Ok(())
 }
 
 /// Read and validate database writer metadata without creating or migrating it.
@@ -432,6 +488,7 @@ pub fn open_fenced_physical_connection(
 
     let is_new = path.metadata().map_or(true, |metadata| metadata.len() == 0);
     let conn = Connection::open(&path)?;
+    enable_persistent_wal(&conn)?;
     if is_new {
         conn.pragma_update(None, "auto_vacuum", AutoVacuumMode::Incremental.as_i64())?;
     }
@@ -501,6 +558,7 @@ pub fn open_fenced_existing_connection(
         &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    enable_persistent_wal(&conn)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(Some(FencedConnection {
         conn,
@@ -602,6 +660,7 @@ fn open_configured_connection(path: &Path) -> Result<Connection, DatabaseError> 
     }
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.pragma_update(None, "journal_mode", "wal")?;
+    enable_persistent_wal(&conn)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(conn)
 }
@@ -614,13 +673,11 @@ fn database_has_pending_migrations(path: &Path) -> Result<bool, DatabaseError> {
     has_pending_migrations(&conn)
 }
 
-pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterCompatibilityError> {
-    let generation = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(|error| WriterCompatibilityError::MetadataInvalid {
-            surface: StateSurface::Database,
-            reason: error.to_string(),
-        })?;
+fn query_database_generation(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+}
+
+fn validate_database_generation(generation: i64) -> Result<i32, WriterCompatibilityError> {
     if !(0..=i64::from(MAX_WRITER_GENERATION)).contains(&generation) {
         return Err(WriterCompatibilityError::MetadataInvalid {
             surface: StateSurface::Database,
@@ -628,6 +685,26 @@ pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterC
         });
     }
     Ok(generation as i32)
+}
+
+fn probe_database_generation_from_query(
+    query: impl FnOnce() -> Result<i64, rusqlite::Error>,
+) -> Result<i32, DatabaseError> {
+    validate_database_generation(query()?).map_err(Into::into)
+}
+
+fn probe_connection_generation(conn: &Connection) -> Result<i32, DatabaseError> {
+    probe_database_generation_from_query(|| query_database_generation(conn))
+}
+
+pub(crate) fn read_database_generation(conn: &Connection) -> Result<i32, WriterCompatibilityError> {
+    let generation = query_database_generation(conn).map_err(|error| {
+        WriterCompatibilityError::MetadataInvalid {
+            surface: StateSurface::Database,
+            reason: error.to_string(),
+        }
+    })?;
+    validate_database_generation(generation)
 }
 
 pub(crate) fn set_database_generation(
@@ -1070,6 +1147,89 @@ mod tests {
             "same"
         );
         assert!(!path.with_extension("db-wal").exists());
+    }
+
+    #[test]
+    fn configured_connection_retains_wal_index_for_later_read_only_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+
+        let (conn, lease) = open_database_connection(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE persistent_wal_probe(value TEXT NOT NULL);\n\
+             INSERT INTO persistent_wal_probe(value) VALUES('ready');",
+        )
+        .unwrap();
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+
+        drop(conn);
+        drop(lease);
+
+        assert!(
+            wal_path.exists(),
+            "the WAL should remain available to probes"
+        );
+        assert!(
+            shm_path.exists(),
+            "the WAL index should remain available to read-only probes"
+        );
+        assert_eq!(preflight_database(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn database_probe_retries_after_legacy_writer_removes_wal_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_writer_probe(value TEXT NOT NULL);\n\
+                 INSERT INTO legacy_writer_probe(value) VALUES('ready');",
+            )
+            .unwrap();
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+
+        let mut connection = Some(connection);
+        let mut attempts = 0;
+        let generation = retry_database_generation_probe(|| {
+            attempts += 1;
+            if attempts == 1 {
+                drop(connection.take());
+                assert!(!wal_path.exists());
+                assert!(!shm_path.exists());
+                return probe_database_generation_from_query(|| {
+                    Err(rusqlite::Error::SqliteFailure(
+                        ffi::Error::new(ffi::SQLITE_CANTOPEN),
+                        Some("WAL sidecars changed during generation query".to_string()),
+                    ))
+                });
+            }
+            probe_database_generation_once(&path)
+        })
+        .unwrap();
+
+        assert_eq!(generation, 0);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn database_probe_retry_waits_after_a_pending_unpark() {
+        std::thread::current().unpark();
+        let started = Instant::now();
+
+        wait_for_database_probe_retry();
+
+        assert!(started.elapsed() >= DATABASE_PROBE_RETRY_DELAY);
     }
 
     fn wait_for_test_marker(child: &mut std::process::Child, marker: &Path) {
