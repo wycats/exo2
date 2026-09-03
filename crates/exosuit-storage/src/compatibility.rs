@@ -305,12 +305,19 @@ fn retry_database_generation_probe(
                             )
                     ) =>
             {
-                std::thread::park_timeout(DATABASE_PROBE_RETRY_DELAY);
+                wait_for_database_probe_retry();
             }
             Err(error) => return Err(error),
         }
     }
     unreachable!("the database probe attempt range is non-empty")
+}
+
+fn wait_for_database_probe_retry() {
+    let deadline = Instant::now() + DATABASE_PROBE_RETRY_DELAY;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        std::thread::park_timeout(remaining);
+    }
 }
 
 fn probe_database_generation_once(path: &Path) -> Result<i32, DatabaseError> {
@@ -1213,6 +1220,16 @@ mod tests {
 
         assert_eq!(generation, 0);
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn database_probe_retry_waits_after_a_pending_unpark() {
+        std::thread::current().unpark();
+        let started = Instant::now();
+
+        wait_for_database_probe_retry();
+
+        assert!(started.elapsed() >= DATABASE_PROBE_RETRY_DELAY);
     }
 
     fn wait_for_test_marker(child: &mut std::process::Child, marker: &Path) {
