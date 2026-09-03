@@ -1,6 +1,6 @@
 //! Cross-version writer compatibility for canonical Exo storage.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{ffi, Connection, OpenFlags};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::ops::{Deref, DerefMut};
@@ -341,6 +341,25 @@ fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn enable_persistent_wal(conn: &Connection) -> Result<(), DatabaseError> {
+    let mut enabled = 1_i32;
+    // SAFETY: `conn` owns a live SQLite handle for the duration of this call,
+    // `main` is a static NUL-terminated database name, and SQLite reads and
+    // updates the pointed-to integer synchronously.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            std::ptr::from_mut(&mut enabled).cast(),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
+    Ok(())
+}
+
 /// Read and validate database writer metadata without creating or migrating it.
 pub fn preflight_database(path: &Path) -> Result<i32, DatabaseError> {
     let generation = probe_database_generation(path)?;
@@ -432,6 +451,7 @@ pub fn open_fenced_physical_connection(
 
     let is_new = path.metadata().map_or(true, |metadata| metadata.len() == 0);
     let conn = Connection::open(&path)?;
+    enable_persistent_wal(&conn)?;
     if is_new {
         conn.pragma_update(None, "auto_vacuum", AutoVacuumMode::Incremental.as_i64())?;
     }
@@ -501,6 +521,7 @@ pub fn open_fenced_existing_connection(
         &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    enable_persistent_wal(&conn)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(Some(FencedConnection {
         conn,
@@ -602,6 +623,7 @@ fn open_configured_connection(path: &Path) -> Result<Connection, DatabaseError> 
     }
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.pragma_update(None, "journal_mode", "wal")?;
+    enable_persistent_wal(&conn)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(conn)
 }
@@ -1070,6 +1092,36 @@ mod tests {
             "same"
         );
         assert!(!path.with_extension("db-wal").exists());
+    }
+
+    #[test]
+    fn configured_connection_retains_wal_index_for_later_read_only_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exo.db");
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let shm_path = sqlite_sidecar_path(&path, "-shm");
+
+        let (conn, lease) = open_database_connection(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE persistent_wal_probe(value TEXT NOT NULL);\n\
+             INSERT INTO persistent_wal_probe(value) VALUES('ready');",
+        )
+        .unwrap();
+        assert!(wal_path.exists());
+        assert!(shm_path.exists());
+
+        drop(conn);
+        drop(lease);
+
+        assert!(
+            wal_path.exists(),
+            "the WAL should remain available to probes"
+        );
+        assert!(
+            shm_path.exists(),
+            "the WAL index should remain available to read-only probes"
+        );
+        assert_eq!(preflight_database(&path).unwrap(), 0);
     }
 
     fn wait_for_test_marker(child: &mut std::process::Child, marker: &Path) {

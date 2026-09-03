@@ -193,6 +193,13 @@ seconds. The lock file is persistent coordination state and is not normally
 deleted. A timeout returns `storage.compatibility_busy`; it does not trigger
 repair, daemon replacement, or lock-file removal.
 
+Fence-aware writable connections also request SQLite's persistent-WAL behavior.
+The final connection therefore leaves the WAL and WAL-index files available for
+later read-only compatibility probes instead of repeatedly deleting and
+reconstructing the shared WAL index. A missing WAL index remains a recovery
+case: the probe reconstructs it only in an isolated copy and does not create or
+modify canonical SQLite sidecar files.
+
 ## Portable Projection Contract
 
 RFC 10178's required `epochs.sql` file carries the projection generation. Its
