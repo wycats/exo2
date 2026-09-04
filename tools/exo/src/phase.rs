@@ -366,7 +366,12 @@ struct PhaseRfcInfo {
 /// Project phase suggestions from the canonical typed-first campaign resolver.
 fn collect_phase_rfc_info(root: &Path, phase_id: &str) -> PhaseRfcInfo {
     let result = crate::project::Project::resolve(root).and_then(|project| {
-        crate::project_flow::campaign_rfc_objectives(&project.db_path(), phase_id)
+        let effective_rfcs = crate::rfc::load_effective_rfcs(root, Some(&project))?;
+        crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
+            &project.db_path(),
+            phase_id,
+            &effective_rfcs,
+        )
     });
     let (objectives, diagnostics) = match result {
         Ok(resolved) => resolved,

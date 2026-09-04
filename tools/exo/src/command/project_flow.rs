@@ -165,10 +165,15 @@ impl ProjectFlowCommands {
                 })?;
                 CommandBox::mutable(ProjectFlowPrAttach::new(identity, campaign, role))
             }
-            Self::PrDetach { selector, campaign } => CommandBox::mutable(ProjectFlowPrDetach::new(
-                PullRequestIdentity::parse(&selector)?,
-                campaign,
-            )),
+            Self::PrDetach { selector, campaign } => {
+                let identity = PullRequestIdentity::parse(&selector).map_err(|error| {
+                    project_flow_precondition(
+                        "project_flow.invalid_pull_request_selector",
+                        error.to_string(),
+                    )
+                })?;
+                CommandBox::mutable(ProjectFlowPrDetach::new(identity, campaign))
+            }
             Self::Refresh { campaign } => CommandBox::mutable(ProjectFlowRefresh::new(campaign)),
             Self::Status { campaign } => CommandBox::pure(ProjectFlowStatus::new(campaign)),
         })
@@ -866,6 +871,24 @@ mod tests {
         assert_eq!(
             failure.error.details.as_ref().unwrap()["kind"],
             "project_flow.invalid_rfc_relation"
+        );
+    }
+
+    #[test]
+    fn invalid_pr_detach_selector_is_a_typed_precondition() {
+        let error = ProjectFlowCommands::PrDetach {
+            selector: "not-a-pull-request".to_string(),
+            campaign: "campaign-one".to_string(),
+        }
+        .to_command_box(std::path::Path::new("."))
+        .expect_err("malformed pull-request selector must fail during command construction");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed project-flow precondition");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.invalid_pull_request_selector"
         );
     }
 }

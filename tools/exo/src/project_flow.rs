@@ -623,7 +623,10 @@ pub fn attach_rfc(
     let rfc = resolve_rfc(conn, selector)?;
     if let Some(target) = target_stage {
         if target > 4 {
-            bail!("target stage must be between 0 and 4");
+            return Err(project_flow_precondition(
+                "project_flow.invalid_target_stage",
+                "target stage must be between 0 and 4",
+            ));
         }
     }
     let phase_id: i64 = conn.query_row(
@@ -672,10 +675,13 @@ pub fn attach_rfc(
             && let Some(target) = target_stage
             && target <= rfc.stage
         {
-            bail!(
-                "target Stage {target} must be greater than current Stage {}",
-                rfc.stage
-            );
+            return Err(project_flow_precondition(
+                "project_flow.target_stage_not_future",
+                format!(
+                    "target Stage {target} must be greater than current Stage {}",
+                    rfc.stage
+                ),
+            ));
         }
         conn.execute(
             "UPDATE campaign_rfc_objectives
@@ -687,10 +693,13 @@ pub fn attach_rfc(
         if let Some(target) = target_stage
             && target <= rfc.stage
         {
-            bail!(
-                "target Stage {target} must be greater than current Stage {}",
-                rfc.stage
-            );
+            return Err(project_flow_precondition(
+                "project_flow.target_stage_not_future",
+                format!(
+                    "target Stage {target} must be greater than current Stage {}",
+                    rfc.stage
+                ),
+            ));
         }
         let text_id = ulid::Ulid::new().to_string().to_lowercase();
         conn.execute(
@@ -1468,8 +1477,8 @@ pub(crate) fn finalize_pr_attachment(
 }
 
 pub fn detach_pr(db_path: &Path, campaign: &str, identity: &PullRequestIdentity) -> Result<bool> {
-    let transaction = RequestTransaction::begin(db_path)?;
-    let conn = transaction.database().connection();
+    let db = open_request_database(db_path)?;
+    let conn = db.connection();
     let campaign = resolve_campaign(conn, campaign)?;
     let ids = conn
         .query_row(
@@ -1489,7 +1498,6 @@ pub fn detach_pr(db_path: &Path, campaign: &str, identity: &PullRequestIdentity)
         )
         .optional()?;
     let Some((relation_id, artifact_id)) = ids else {
-        transaction.rollback()?;
         return Ok(false);
     };
     conn.execute(
@@ -1507,7 +1515,6 @@ pub fn detach_pr(db_path: &Path, campaign: &str, identity: &PullRequestIdentity)
             [artifact_id],
         )?;
     }
-    transaction.commit()?;
     Ok(true)
 }
 
@@ -1779,6 +1786,44 @@ pub(crate) fn campaign_rfc_objectives(
     campaign_rfc_objectives_with_connection(db.connection(), &campaign)
 }
 
+pub(crate) fn campaign_rfc_objectives_with_effective_rfcs(
+    db_path: &Path,
+    campaign: &str,
+    effective_rfcs: &[crate::rfc::EffectiveRfcRecord],
+) -> Result<(Vec<RfcObjectiveView>, Vec<String>)> {
+    let (mut objectives, mut diagnostics) = campaign_rfc_objectives(db_path, campaign)?;
+    let effective = effective_rfcs
+        .iter()
+        .map(|effective| (effective.record.text_id.as_str(), &effective.record))
+        .collect::<std::collections::HashMap<_, _>>();
+    for objective in &mut objectives {
+        let Some(record) = effective.get(objective.rfc_ulid.as_str()) else {
+            continue;
+        };
+        let (lifecycle, superseded_by) = effective_rfc_lifecycle(record);
+        objective.rfc_number = record.rfc_number;
+        objective.title.clone_from(&record.title);
+        objective.current_stage = Some(record.stage);
+        objective.lifecycle = Some(lifecycle);
+        objective.superseded_by = superseded_by;
+        objective.diagnostic = None;
+    }
+    diagnostics.retain(|diagnostic| {
+        !objectives.iter().any(|objective| {
+            objective.current_stage.is_some()
+                && diagnostic
+                    == &format!("project_flow.rfc_identity_missing: {}", objective.rfc_ulid)
+        })
+    });
+    objectives.sort_by(|left, right| {
+        objective_relation_priority(&left.relation)
+            .cmp(&objective_relation_priority(&right.relation))
+            .then(left.rfc_number.cmp(&right.rfc_number))
+            .then(left.rfc_ulid.cmp(&right.rfc_ulid))
+    });
+    Ok((objectives, diagnostics))
+}
+
 fn campaign_rfc_objectives_with_connection(
     conn: &Connection,
     campaign: &str,
@@ -2008,6 +2053,7 @@ fn objective_relation_priority(relation: &str) -> u8 {
 mod tests {
     use super::*;
     use crate::context::SqliteWriter;
+    use crate::rfc::{EffectiveRfcRecord, RfcViewProvenance};
     use std::cell::Cell;
 
     #[derive(Debug)]
@@ -2372,6 +2418,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn rfc_targets_at_or_below_the_current_stage_are_typed_preconditions() {
+        let (_temp, path, campaign) = fixture();
+        let error = attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(2))
+            .expect_err("new objective must target a future stage");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed project-flow precondition");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.target_stage_not_future"
+        );
+
+        attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3)).unwrap();
+        let error = attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(2))
+            .expect_err("updated objective must target a future stage");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed project-flow precondition");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.target_stage_not_future"
+        );
+    }
+
+    #[test]
+    fn effective_workspace_rfc_view_overlays_campaign_objectives() {
+        let (_temp, path, campaign) = fixture();
+        attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3)).unwrap();
+        let effective = EffectiveRfcRecord {
+            record: RfcRecord {
+                text_id: "01rfc000000000000000000001".to_string(),
+                rfc_number: 10207,
+                title: "Workspace project flow".to_string(),
+                stage: 3,
+                status: "active".to_string(),
+                feature: None,
+                slug: "project-flow".to_string(),
+                file_path: "docs/rfcs/stage-3/10207.md".to_string(),
+                superseded_by: None,
+                supersedes: None,
+                withdrawal_reason: None,
+                archived_reason: None,
+                consolidated_into: None,
+            },
+            provenance: RfcViewProvenance {
+                document_source: "workspace".to_string(),
+                workspace_presence: "present".to_string(),
+                canonical_presence: "present".to_string(),
+                workspace_branch: Some("wycats/project-flow".to_string()),
+                workspace_head: Some("abc123".to_string()),
+                canonical_ref: Some("refs/heads/main".to_string()),
+                canonical_head: Some("def456".to_string()),
+                differs_from_canonical: true,
+            },
+        };
+
+        let (objectives, diagnostics) =
+            campaign_rfc_objectives_with_effective_rfcs(&path, &campaign, &[effective]).unwrap();
+        assert_eq!(objectives[0].title, "Workspace project flow");
+        assert_eq!(objectives[0].current_stage, Some(3));
+        assert_eq!(objectives[0].motion(), RfcObjectiveMotion::TargetReached);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -3014,5 +3127,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn detach_pr_reuses_the_outer_request_transaction() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("PR")),
+        };
+        attach_pr_with_provider(
+            &path,
+            "attach-before-atomic-detach",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+
+        let transaction = RequestTransaction::begin(&path).unwrap();
+        assert!(detach_pr(&path, &campaign, &identity).unwrap());
+        let remaining: i64 = transaction
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM phase_pull_request_relations_data",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        transaction.rollback().unwrap();
+
+        assert_eq!(status(&path, &campaign).unwrap().pull_requests.len(), 1);
     }
 }
