@@ -75,6 +75,7 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_FAILED_PROBE_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_HEALTH_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_HEALTH_PERSIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
 const PROCESS_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
