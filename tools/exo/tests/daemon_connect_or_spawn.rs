@@ -726,7 +726,11 @@ fn future_writer_errors_match_between_direct_and_ready_daemon(backend: &str) {
     let connection =
         exosuit_storage::Connection::open(project.db_path()).expect("open future-writer fixture");
     connection
-        .pragma_update(None, "user_version", 1)
+        .pragma_update(
+            None,
+            "user_version",
+            exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+        )
         .expect("raise writer generation");
     drop(connection);
 
