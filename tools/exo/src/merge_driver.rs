@@ -543,7 +543,7 @@ value = 3
         fs::write(&base, "-- exo:minimum-writer-generation=0\n").unwrap();
         let current_content = "-- exo:minimum-writer-generation=0\n";
         fs::write(&current, current_content).unwrap();
-        fs::write(&other, "-- exo:minimum-writer-generation=1\n").unwrap();
+        fs::write(&other, "-- exo:minimum-writer-generation=2\n").unwrap();
 
         assert_eq!(
             run(

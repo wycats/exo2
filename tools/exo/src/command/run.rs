@@ -209,6 +209,7 @@ impl Command for RunTaskCommand {
             project: ctx.project,
             format: ctx.format,
             agent_id: ctx.agent_id.clone(),
+            request_id: ctx.request_id.clone(),
             workflow_confirmation: ctx.workflow_confirmation.clone(),
             input_content: ctx.input_content.clone(),
             runtime_services: ctx.runtime_services,

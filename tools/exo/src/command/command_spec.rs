@@ -523,6 +523,7 @@ impl CommandSpec {
         spec.merge_exospec::<super::workbench::WorkbenchCommands>();
         spec.merge_exospec::<super::plan::PlanCommands>();
         spec.merge_exospec::<super::project::ProjectCommands>();
+        spec.merge_exospec::<super::project_flow::ProjectFlowCommands>();
         spec.merge_exospec::<super::sidecar::SidecarCommands>();
         spec.merge_exospec::<super::json::JsonCommands>();
         spec.merge_exospec::<super::docs::DocsCommands>();

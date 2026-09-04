@@ -65,12 +65,21 @@ pub const TABLE_ORDER: &[(&str, &str)] = &[
     ("inbox", "inbox_data"),
     ("rfcs", "rfcs_data"),
     ("workbench_lanes", "workbench_lanes_data"),
+    ("campaign_rfc_objectives", "campaign_rfc_objectives_data"),
+    (
+        "project_flow_pull_requests",
+        "project_flow_pull_requests_data",
+    ),
     ("task_logs", "task_logs"),
     ("task_verifications", "task_verifications"),
     ("axioms", "axioms"),
     ("axiom_implications", "axiom_implications"),
     ("axiom_tags", "axiom_tags"),
     ("phase_rfcs", "phase_rfcs_data"),
+    (
+        "phase_pull_request_relations",
+        "phase_pull_request_relations_data",
+    ),
     ("entity_aliases", "entity_aliases"),
     ("idea_tags", "idea_tags"),
     ("idea_task_refs", "idea_task_refs"),
@@ -117,6 +126,7 @@ fn dump_tables_from_snapshot(conn: &Connection) -> Result<Vec<TableDump>, DumpEr
     let idea_ids = build_text_id_map(conn, "ideas_data")?;
     let axiom_ids = build_text_id_map(conn, "axioms")?;
     let rfc_ids = build_text_id_map(conn, "rfcs_data")?;
+    let pull_request_ids = build_text_id_map(conn, "project_flow_pull_requests_data")?;
 
     // Entity type → table name for entity_aliases resolution
     let entity_type_maps: HashMap<&str, &HashMap<i64, String>> = HashMap::from([
@@ -277,6 +287,40 @@ fn dump_tables_from_snapshot(conn: &Connection) -> Result<Vec<TableDump>, DumpEr
 
     results.push(dump_entity_table(
         conn,
+        "campaign_rfc_objectives_data",
+        &[
+            "text_id",
+            "phase_id",
+            "rfc_ulid",
+            "rfc_number_snapshot",
+            "rfc_title_snapshot",
+            "observed_stage",
+            "target_stage",
+            "relation",
+            "created_at",
+            "updated_at",
+        ],
+        &[("phase_id", "phase_text_id")],
+        &HashMap::from([("phase_id", &phase_ids)]),
+    )?);
+
+    results.push(dump_entity_table(
+        conn,
+        "project_flow_pull_requests_data",
+        &[
+            "text_id",
+            "provider",
+            "repository",
+            "number",
+            "url",
+            "created_at",
+        ],
+        &[],
+        &HashMap::new(),
+    )?);
+
+    results.push(dump_entity_table(
+        conn,
         "axioms",
         &[
             "text_id",
@@ -326,6 +370,24 @@ fn dump_tables_from_snapshot(conn: &Connection) -> Result<Vec<TableDump>, DumpEr
         &[("phase_id", "phase_text_id")],
         &HashMap::from([("phase_id", &phase_ids)]),
         &["phase_text_id", "rfc_id"], // sort key after FK resolution
+    )?);
+
+    results.push(dump_junction_table(
+        conn,
+        "phase_pull_request_relations_data",
+        &[
+            "phase_id",
+            "artifact_id",
+            "role",
+            "created_at",
+            "updated_at",
+        ],
+        &[
+            ("phase_id", "phase_text_id"),
+            ("artifact_id", "artifact_text_id"),
+        ],
+        &HashMap::from([("phase_id", &phase_ids), ("artifact_id", &pull_request_ids)]),
+        &["phase_text_id", "artifact_text_id"],
     )?);
 
     results.push(dump_entity_aliases(conn, &entity_type_maps)?);
@@ -817,6 +879,11 @@ const ENTITY_FK_MAPPINGS: &[(&str, &str, &str)] = &[
     ("idea_text_id", "idea_id", "ideas_data"),
     ("axiom_text_id", "axiom_id", "axioms"),
     (
+        "artifact_text_id",
+        "artifact_id",
+        "project_flow_pull_requests_data",
+    ),
+    (
         "execution_phase_text_id",
         "execution_phase_id",
         "phases_data",
@@ -867,6 +934,8 @@ fn has_text_id_column(table: &str) -> bool {
             | "inbox_data"
             | "rfcs_data"
             | "workbench_lanes_data"
+            | "campaign_rfc_objectives_data"
+            | "project_flow_pull_requests_data"
             | "axioms"
     )
 }
@@ -1413,7 +1482,7 @@ mod tests {
 
         let dumps = dump_tables(conn).expect("dump should succeed");
 
-        assert_eq!(dumps.len(), 18, "expected 18 table dumps");
+        assert_eq!(dumps.len(), 21, "expected 21 table dumps");
 
         // Verify table order (dependency order)
         let table_names: Vec<&str> = dumps.iter().map(|(name, _)| name.as_str()).collect();
@@ -1428,10 +1497,13 @@ mod tests {
                 "inbox_data",
                 "rfcs_data",
                 "workbench_lanes_data",
+                "campaign_rfc_objectives_data",
+                "project_flow_pull_requests_data",
                 "axioms",
                 "task_logs",
                 "task_verifications",
                 "phase_rfcs_data",
+                "phase_pull_request_relations_data",
                 "entity_aliases",
                 "axiom_implications",
                 "axiom_tags",
@@ -1461,7 +1533,7 @@ mod tests {
         // Should be sorted by text_id
         let lines: Vec<&str> = epochs_sql.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "-- exo:minimum-writer-generation=0");
+        assert_eq!(lines[0], "-- exo:minimum-writer-generation=1");
         assert!(lines[1].contains("'01EPOCH_AAA'"));
         assert!(lines[2].contains("'01EPOCH_BBB'"));
 
@@ -1733,7 +1805,7 @@ mod tests {
         assert_eq!(dumps.len(), TABLE_ORDER.len());
         for (name, sql) in &dumps {
             if name == "epochs_data" {
-                assert_eq!(sql, "-- exo:minimum-writer-generation=0\n");
+                assert_eq!(sql, "-- exo:minimum-writer-generation=1\n");
             } else {
                 assert!(
                     sql.is_empty(),
@@ -2012,7 +2084,7 @@ mod tests {
         let dumps2 = dump_tables(db2.connection()).expect("second dump should succeed");
         for (name, sql) in &dumps2 {
             if name == "epochs_data" {
-                assert_eq!(sql, "-- exo:minimum-writer-generation=0\n");
+                assert_eq!(sql, "-- exo:minimum-writer-generation=1\n");
             } else {
                 assert!(sql.is_empty(), "table {name} should still be empty");
             }
@@ -2089,7 +2161,7 @@ mod tests {
         let (_, epochs_sql) = &dumps[0];
         let lines: Vec<&str> = epochs_sql.lines().collect();
         assert_eq!(lines.len(), 2, "metadata plus one entity line expected");
-        assert_eq!(lines[0], "-- exo:minimum-writer-generation=0");
+        assert_eq!(lines[0], "-- exo:minimum-writer-generation=1");
         assert!(lines[1].contains("\\n"), "should contain escaped newline");
         assert!(
             !lines[1].contains('\n'),
@@ -2184,5 +2256,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(title, "It's a\ntest with (parens) and \\backslash");
+    }
+
+    #[test]
+    fn project_flow_relationships_round_trip_without_local_provider_state() {
+        let db = open_memory_database().expect("should create source database");
+        let conn = db.connection();
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO epochs_data(text_id, title, slug, reviewed, sort_key)
+                 VALUES('01EPOCH_FLOW', 'Flow', 'flow', 0, '00000001');
+             INSERT INTO phases_data(text_id, title, status, epoch_id, kind, slug, sort_key)
+                 VALUES('01PHASE_FLOW', 'Flow campaign', 'pending', 1, 'regular', 'flow-campaign', 'a');
+             INSERT INTO campaign_rfc_objectives_data(
+                 text_id, phase_id, rfc_ulid, rfc_number_snapshot, rfc_title_snapshot,
+                 observed_stage, target_stage, relation
+             ) VALUES('01OBJECTIVE_FLOW', 1, '01RFC_FLOW', 10207, 'Project flow', 2, 3, 'drives');
+             INSERT INTO project_flow_pull_requests_data(
+                 text_id, provider, repository, number, url
+             ) VALUES('01PR_FLOW', 'github', 'wycats/exo2', 75, 'https://github.com/wycats/exo2/pull/75');
+             INSERT INTO phase_pull_request_relations_data(phase_id, artifact_id, role)
+                 VALUES(1, 1, 'implements');
+             INSERT INTO project_flow_pull_request_observations_data(
+                 artifact_id, title, lifecycle, review_state, checks_state,
+                 last_success_at, last_attempt_at
+             ) VALUES(1, 'Local observation', 'open', 'approved', 'passing',
+                      '2026-09-03T12:00:00Z', '2026-09-03T12:00:00Z');
+             INSERT INTO project_flow_prepared_reads(
+                 request_id, request_hash, normalized_payload, phase_text_id, targets_json,
+                 owner_instance_id, owner_pid, owner_process_start_id, recovery_class,
+                 state, prepared_at
+             ) VALUES('request-flow', 'hash', '{}', '01PHASE_FLOW', '[]',
+                      'daemon', 1, 'start', 'prepared_external_read', 'prepared',
+                      '2026-09-03T12:00:00Z');",
+        )
+        .unwrap();
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+            .unwrap();
+
+        let dumps = dump_tables(conn).expect("project-flow dump should succeed");
+        assert!(dumps
+            .iter()
+            .any(|(table, sql)| table == "campaign_rfc_objectives_data"
+                && sql.contains("01OBJECTIVE_FLOW")));
+        assert!(dumps
+            .iter()
+            .any(|(table, sql)| table == "project_flow_pull_requests_data"
+                && sql.contains("01PR_FLOW")));
+        assert!(dumps
+            .iter()
+            .any(|(table, sql)| table == "phase_pull_request_relations_data"
+                && sql.contains("01PR_FLOW")));
+        assert!(dumps.iter().all(|(table, _)| {
+            table != "project_flow_pull_request_observations_data"
+                && table != "project_flow_prepared_reads"
+        }));
+
+        let restored = open_memory_database().expect("should create restored database");
+        import_tables(restored.connection(), &dumps).expect("project-flow import should succeed");
+        for table in [
+            "campaign_rfc_objectives_data",
+            "project_flow_pull_requests_data",
+            "phase_pull_request_relations_data",
+        ] {
+            let count: i64 = restored
+                .connection()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "{table} should round-trip");
+        }
+        let local_count: i64 = restored
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM project_flow_pull_request_observations_data",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_count, 0, "provider observations remain machine-local");
     }
 }

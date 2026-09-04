@@ -2362,7 +2362,11 @@ impl MutableCommand for PhaseFinish {
             let writer = SqliteWriter::open(ctx.db_path())?;
             writer.clear_phase_owner(active_phase_id)?;
         }
-        let (rfc_suggestions, next_phase) = (result.rfc_suggestions, result.next_phase);
+        let (rfc_suggestions, rfc_diagnostics, next_phase) = (
+            result.rfc_suggestions,
+            result.rfc_diagnostics,
+            result.next_phase,
+        );
 
         #[derive(Serialize)]
         struct PhaseFinishOutput {
@@ -2370,6 +2374,8 @@ impl MutableCommand for PhaseFinish {
             ok: bool,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             rfc_suggestions: Vec<phase::RfcSuggestion>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            rfc_diagnostics: Vec<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             next_phase: Option<phase::NextPhaseInfo>,
         }
@@ -2378,6 +2384,7 @@ impl MutableCommand for PhaseFinish {
             kind: "phase.finish",
             ok: true,
             rfc_suggestions,
+            rfc_diagnostics,
             next_phase,
         };
 

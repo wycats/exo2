@@ -539,6 +539,36 @@ mod tests {
             Some(&TypedValue::Bool(true))
         );
     }
+
+    #[test]
+    fn compile_joins_nested_project_flow_operation_tokens() {
+        let mut spec = CommandSpec::new();
+        let namespace =
+            crate::command::command_spec::NamespaceSpec::new("project-flow", "project flow")
+                .with_operation(OperationSpec::new(
+                    "rfc.attach",
+                    "attach an RFC",
+                    Effect::Write,
+                ));
+        spec.namespaces
+            .insert("project-flow".to_string(), namespace);
+
+        let argv = vec![
+            "project-flow".to_string(),
+            "rfc".to_string(),
+            "attach".to_string(),
+        ];
+        let compilation = compile_argv_v2(&spec, &argv);
+
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            compilation.diagnostics
+        );
+        let invocation = compilation.invocation.expect("invocation");
+        assert_eq!(invocation.namespace(), "project-flow");
+        assert_eq!(invocation.operation(), "rfc.attach");
+    }
 }
 
 fn bump_occurrence(invocation: &mut Invocation, arg_id: &str) {

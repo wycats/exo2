@@ -30,6 +30,8 @@ pub enum RecoveryClass {
     ReplayableRead,
     /// State and the replayable core response commit in one project transaction.
     AtomicProjectState,
+    /// Provider inputs are committed before I/O, so a replacement daemon can resume exactly.
+    PreparedExternalRead,
     /// The request may perform effects outside the canonical SQLite transaction.
     ExternalAtMostOnce,
 }

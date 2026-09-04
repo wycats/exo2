@@ -207,6 +207,10 @@ pub fn default_registry() -> CommandRegistry {
     use super::project::{
         ProjectList, ProjectMoveRoot, ProjectRepair, ProjectResolve, ProjectSnapshot,
     };
+    use super::project_flow::{
+        ProjectFlowPrAttach, ProjectFlowPrDetach, ProjectFlowRefresh, ProjectFlowRfcAttach,
+        ProjectFlowRfcDetach, ProjectFlowStatus,
+    };
     use super::root::{MapCommand, StatusCommand};
     use super::sidecar::{
         SidecarBootstrap, SidecarInit, SidecarLink, SidecarRepo, SidecarStatus, SidecarUnlink,
@@ -426,6 +430,31 @@ pub fn default_registry() -> CommandRegistry {
         true,
     )));
 
+    // Project-flow namespace
+    registry.register(Box::new(ProjectFlowRfcAttach::new(
+        "placeholder",
+        "placeholder",
+        crate::project_flow::RfcRelation::Drives,
+        Some(1),
+    )));
+    registry.register(Box::new(ProjectFlowRfcDetach::new(
+        "placeholder",
+        "placeholder",
+    )));
+    registry.register(Box::new(ProjectFlowPrAttach::new(
+        crate::project_flow::PullRequestIdentity::parse("example/project#1")
+            .expect("static project-flow identity"),
+        "placeholder",
+        crate::project_flow::DeliveryRole::Implements,
+    )));
+    registry.register(Box::new(ProjectFlowPrDetach::new(
+        crate::project_flow::PullRequestIdentity::parse("example/project#1")
+            .expect("static project-flow identity"),
+        "placeholder",
+    )));
+    registry.register(Box::new(ProjectFlowRefresh::new(None)));
+    registry.register(Box::new(ProjectFlowStatus::new(None)));
+
     // Sidecar namespace
     registry.register(Box::new(SidecarBootstrap::new(
         None, None, false, false, None, false,
@@ -577,6 +606,9 @@ pub fn build_command_from_invocation(
         )),
         "project" => Ok(Some(
             super::project::ProjectCommands::from_invocation(inv)?.to_command_box(root)?,
+        )),
+        "project-flow" => Ok(Some(
+            super::project_flow::ProjectFlowCommands::from_invocation(inv)?.to_command_box(root)?,
         )),
         "sidecar" => Ok(Some(
             super::sidecar::SidecarCommands::from_invocation(inv)?.to_command_box(root)?,
@@ -899,7 +931,7 @@ mod tests {
         assert!(registry.find("storage", "compatibility").is_some());
 
         // Verify total count: registry.len() gives actual count - update as commands are added
-        assert_eq!(registry.len(), 129);
+        assert_eq!(registry.len(), 135);
     }
 
     #[test]
@@ -937,7 +969,7 @@ mod tests {
             .filter(|command| command.recovery_class == RecoveryClass::AtomicProjectState)
             .collect::<Vec<_>>();
 
-        assert_eq!(atomic.len(), 46);
+        assert_eq!(atomic.len(), 49);
         assert!(
             atomic
                 .iter()

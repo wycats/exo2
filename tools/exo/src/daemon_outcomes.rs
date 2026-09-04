@@ -14,7 +14,8 @@ use crate::api::protocol::{
 use crate::command::command_spec::CommandSpec;
 use crate::command::registry::{build_command_from_invocation, default_registry};
 use crate::command::router::Invocation;
-use anyhow::{Context, Result, anyhow};
+use crate::failure::ExoFailure;
+use anyhow::{Context, Result, anyhow, bail};
 use exosuit_storage::rusqlite::{OpenFlags, TransactionBehavior};
 use exosuit_storage::{Connection, OptionalExtension, RequestTransaction, params};
 use std::collections::HashSet;
@@ -73,6 +74,280 @@ enum Reservation {
         recovery_class: Option<RecoveryClass>,
     },
     Conflict,
+}
+
+#[derive(Debug)]
+enum CanonicalOutcome {
+    Missing,
+    Replay(ResponseEnvelope),
+    Conflict(ResponseEnvelope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedTerminalization {
+    Recorded,
+    NotOwned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonOwnerIdentity {
+    pub instance_id: String,
+    pub pid: u32,
+    pub process_start_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonOwnerState {
+    Current,
+    Dead,
+    PidReused,
+    Unknown,
+}
+
+pub(crate) fn classify_daemon_owner(owner: &DaemonOwnerIdentity) -> DaemonOwnerState {
+    classify_daemon_owner_with(owner, crate::daemon::process_start_identity)
+}
+
+pub(crate) fn direct_prepared_read_owner() -> Result<DaemonOwnerIdentity> {
+    let pid = std::process::id();
+    Ok(DaemonOwnerIdentity {
+        instance_id: format!("direct-{}", ulid::Ulid::new().to_string().to_lowercase()),
+        pid,
+        process_start_id: crate::daemon::process_start_identity(pid)
+            .context("read exact direct-process start identity")?,
+    })
+}
+
+pub(crate) fn execute_prepared_external_read_direct<F, P, G>(
+    request: RequestEnvelope,
+    effect: Effect,
+    project_db_path: &Path,
+    prepare: P,
+    execute: F,
+    finalize: G,
+) -> OutcomeExecution
+where
+    F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+    P: FnOnce(&RequestEnvelope, &DaemonOwnerIdentity) -> Result<()>,
+    G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
+{
+    let request_id = request.id.clone();
+    let request_hash = match request_hash(&request) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return OutcomeExecution {
+                response: without_committed_effect(ledger_error_response(
+                    request_id,
+                    effect,
+                    "daemon.request_outcome_fingerprint_failed",
+                    error,
+                    false,
+                )),
+                replayed: false,
+            };
+        }
+    };
+    match canonical_atomic_outcome(project_db_path, &request_id, &request_hash, effect) {
+        Ok(CanonicalOutcome::Replay(response)) => {
+            if response.effect.is_none() {
+                return OutcomeExecution {
+                    response,
+                    replayed: true,
+                };
+            }
+            let response = match finalize(response) {
+                Ok(response) | Err(response) => response,
+            };
+            return OutcomeExecution {
+                response,
+                replayed: true,
+            };
+        }
+        Ok(CanonicalOutcome::Conflict(response)) => {
+            return OutcomeExecution {
+                response,
+                replayed: false,
+            };
+        }
+        Ok(CanonicalOutcome::Missing) => {}
+        Err(error) => {
+            return OutcomeExecution {
+                response: without_committed_effect(ledger_error_response(
+                    request_id,
+                    effect,
+                    "daemon.request_outcome_lookup_failed",
+                    error,
+                    false,
+                )),
+                replayed: false,
+            };
+        }
+    }
+    let owner = match direct_prepared_read_owner() {
+        Ok(owner) => owner,
+        Err(error) => {
+            return OutcomeExecution {
+                response: without_committed_effect(ledger_error_response(
+                    request_id,
+                    effect,
+                    "daemon.prepared_external_read_owner_failed",
+                    error,
+                    false,
+                )),
+                replayed: false,
+            };
+        }
+    };
+    if let Err(error) = prepare(&request, &owner) {
+        let response = without_committed_effect(ledger_error_response(
+            request_id.clone(),
+            effect,
+            "daemon.prepared_external_read_failed",
+            error,
+            false,
+        ));
+        let response = match record_prepared_terminal_outcome(
+            project_db_path,
+            &request_id,
+            &request_hash,
+            effect,
+            &owner,
+            None,
+            &response,
+        ) {
+            Ok(PreparedTerminalization::Recorded) => response,
+            Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                prepared_terminalization_indeterminate_response(request_id.clone(), effect, &owner)
+            }
+        };
+        return OutcomeExecution {
+            response,
+            replayed: false,
+        };
+    }
+    match recover_prepared_terminal_outcome(
+        project_db_path,
+        &request_id,
+        &request_hash,
+        effect,
+        &owner,
+    ) {
+        Ok(Some(response)) => {
+            return OutcomeExecution {
+                response,
+                replayed: true,
+            };
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return OutcomeExecution {
+                response: prepared_terminalization_indeterminate_response(
+                    request_id, effect, &owner,
+                ),
+                replayed: false,
+            };
+        }
+    }
+    let prepared_hash = match prepared_hash_for_owner(project_db_path, &request_id, &owner) {
+        Ok(Some(hash)) => hash,
+        Ok(None) | Err(_) => {
+            return OutcomeExecution {
+                response: prepared_terminalization_indeterminate_response(
+                    request_id, effect, &owner,
+                ),
+                replayed: false,
+            };
+        }
+    };
+    match execute_atomic_core(
+        project_db_path,
+        &request_hash,
+        effect,
+        request,
+        execute,
+        || Ok(()),
+    ) {
+        Ok(atomic) if atomic.committed => {
+            let response = match finalize(atomic.response) {
+                Ok(response) | Err(response) => response,
+            };
+            OutcomeExecution {
+                response,
+                replayed: atomic.replayed,
+            }
+        }
+        Ok(atomic) if atomic.request_id_conflict => OutcomeExecution {
+            response: atomic.response,
+            replayed: atomic.replayed,
+        },
+        Ok(atomic) => {
+            let response = match record_prepared_terminal_outcome(
+                project_db_path,
+                &request_id,
+                &request_hash,
+                effect,
+                &owner,
+                Some(&prepared_hash),
+                &atomic.response,
+            ) {
+                Ok(PreparedTerminalization::Recorded) => atomic.response,
+                Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                    prepared_terminalization_indeterminate_response(
+                        request_id.clone(),
+                        effect,
+                        &owner,
+                    )
+                }
+            };
+            OutcomeExecution {
+                response,
+                replayed: false,
+            }
+        }
+        Err(error) => {
+            let response = without_committed_effect(ledger_error_response(
+                request_id.clone(),
+                effect,
+                "daemon.atomic_request_commit_failed",
+                error,
+                false,
+            ));
+            let response = match record_prepared_terminal_outcome(
+                project_db_path,
+                &request_id,
+                &request_hash,
+                effect,
+                &owner,
+                Some(&prepared_hash),
+                &response,
+            ) {
+                Ok(PreparedTerminalization::Recorded) => response,
+                Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                    prepared_terminalization_indeterminate_response(
+                        request_id.clone(),
+                        effect,
+                        &owner,
+                    )
+                }
+            };
+            OutcomeExecution {
+                response,
+                replayed: false,
+            }
+        }
+    }
+}
+
+fn classify_daemon_owner_with(
+    owner: &DaemonOwnerIdentity,
+    probe: impl FnOnce(u32) -> std::io::Result<String>,
+) -> DaemonOwnerState {
+    match probe(owner.pid) {
+        Ok(current) if current == owner.process_start_id => DaemonOwnerState::Current,
+        Ok(_) => DaemonOwnerState::PidReused,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DaemonOwnerState::Dead,
+        Err(_) => DaemonOwnerState::Unknown,
+    }
 }
 
 #[derive(Debug)]
@@ -146,6 +421,8 @@ impl RequestOutcomeLedger {
                  request_hash TEXT NOT NULL,
                  effect TEXT NOT NULL,
                  instance_id TEXT NOT NULL,
+                 owner_pid INTEGER,
+                 owner_process_start_id TEXT,
                  recovery_class TEXT,
                  response_json TEXT,
                  started_at INTEGER NOT NULL,
@@ -167,6 +444,25 @@ impl RequestOutcomeLedger {
                 "ALTER TABLE daemon_request_outcomes ADD COLUMN recovery_class TEXT",
                 [],
             )?;
+        }
+        for (column, declaration) in [("owner_pid", "INTEGER"), ("owner_process_start_id", "TEXT")]
+        {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pragma_table_info('daemon_request_outcomes')
+                     WHERE name = ?1
+                 )",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                connection.execute(
+                    &format!(
+                        "ALTER TABLE daemon_request_outcomes ADD COLUMN {column} {declaration}"
+                    ),
+                    [],
+                )?;
+            }
         }
         ledger.sanitize_legacy_workbench_launch_responses(&connection)?;
         ledger.prune_completed(&connection)?;
@@ -414,6 +710,531 @@ impl RequestOutcomeLedger {
     where
         F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
     {
+        self.execute_external_with_class(
+            request,
+            effect,
+            RecoveryClass::ExternalAtMostOnce,
+            instance_id,
+            in_flight_wait,
+            execute,
+        )
+    }
+
+    /// Resume a provider read whose exact inputs are durably prepared in project state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_prepared_external_read_with_finalization<F, P, G, L, U, V>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        owner: &DaemonOwnerIdentity,
+        in_flight_wait: Duration,
+        project_db_path: &Path,
+        prepare: P,
+        execute: F,
+        acquire_finalization_guard: G,
+        finalize: V,
+        publish_revision: U,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        P: FnOnce(&RequestEnvelope) -> Result<()>,
+        G: FnOnce() -> Result<L>,
+        V: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
+        U: FnOnce(),
+    {
+        self.execute_prepared_external_read_with_finalization_hooks(
+            request,
+            effect,
+            owner,
+            in_flight_wait,
+            project_db_path,
+            prepare,
+            execute,
+            acquire_finalization_guard,
+            finalize,
+            publish_revision,
+            classify_daemon_owner,
+            || Ok(()),
+            || Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_prepared_external_read_with_hooks<F, P, C, B, A>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        owner: &DaemonOwnerIdentity,
+        in_flight_wait: Duration,
+        project_db_path: &Path,
+        prepare: P,
+        execute: F,
+        classify_owner: C,
+        before_canonical_commit: B,
+        after_canonical_commit: A,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        P: FnOnce(&RequestEnvelope) -> Result<()>,
+        C: Fn(&DaemonOwnerIdentity) -> DaemonOwnerState,
+        B: FnOnce() -> Result<()>,
+        A: FnOnce() -> Result<()>,
+    {
+        self.execute_prepared_external_read_with_finalization_hooks(
+            request,
+            effect,
+            owner,
+            in_flight_wait,
+            project_db_path,
+            prepare,
+            execute,
+            || Ok(()),
+            Ok,
+            || {},
+            classify_owner,
+            before_canonical_commit,
+            after_canonical_commit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_prepared_external_read_with_finalization_hooks<F, P, G, L, U, V, C, B, A>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        owner: &DaemonOwnerIdentity,
+        in_flight_wait: Duration,
+        project_db_path: &Path,
+        prepare: P,
+        execute: F,
+        acquire_finalization_guard: G,
+        finalize: V,
+        publish_revision: U,
+        classify_owner: C,
+        before_canonical_commit: B,
+        after_canonical_commit: A,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+        P: FnOnce(&RequestEnvelope) -> Result<()>,
+        G: FnOnce() -> Result<L>,
+        V: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
+        U: FnOnce(),
+        C: Fn(&DaemonOwnerIdentity) -> DaemonOwnerState,
+        B: FnOnce() -> Result<()>,
+        A: FnOnce() -> Result<()>,
+    {
+        let request_id = request.id.clone();
+        let request_hashes = match request_hashes(&request) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                return OutcomeExecution {
+                    response: without_committed_effect(ledger_error_response(
+                        request_id,
+                        effect,
+                        "daemon.request_outcome_fingerprint_failed",
+                        error,
+                        false,
+                    )),
+                    replayed: false,
+                };
+            }
+        };
+        let request_hash = request_hashes.current.clone();
+
+        loop {
+            match self.reserve_prepared_with_classifier(
+                &request_id,
+                &request_hashes,
+                effect,
+                owner,
+                &classify_owner,
+            ) {
+                Ok(Reservation::Replay(completion)) => {
+                    return OutcomeExecution {
+                        response: generic_replay_response(&request_id, effect, completion),
+                        replayed: true,
+                    };
+                }
+                Ok(Reservation::Conflict) => {
+                    return OutcomeExecution {
+                        response: without_committed_effect(request_id_conflict_response(
+                            request_id, effect,
+                        )),
+                        replayed: false,
+                    };
+                }
+                Ok(Reservation::InFlight {
+                    instance_id: current,
+                    ..
+                }) if current == owner.instance_id => {
+                    match recover_prepared_terminal_outcome(
+                        project_db_path,
+                        &request_id,
+                        &request_hash,
+                        effect,
+                        owner,
+                    ) {
+                        Ok(Some(response)) => {
+                            let _ = self.complete_prepared_runtime(
+                                owner,
+                                &request_id,
+                                &request_hash,
+                                &response,
+                            );
+                            return OutcomeExecution {
+                                response,
+                                replayed: true,
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            return OutcomeExecution {
+                                response: prepared_terminalization_indeterminate_response(
+                                    request_id, effect, owner,
+                                ),
+                                replayed: false,
+                            };
+                        }
+                    }
+                    match self.wait_for_response(&request_id, &request_hash, in_flight_wait) {
+                        Ok(WaitForResponse::Completed(completion)) => {
+                            return OutcomeExecution {
+                                response: generic_replay_response(&request_id, effect, completion),
+                                replayed: true,
+                            };
+                        }
+                        Ok(WaitForResponse::ReservationReleased) => continue,
+                        Ok(WaitForResponse::TimedOut) => {
+                            return OutcomeExecution {
+                                response: in_flight_response(request_id, effect, &current, false),
+                                replayed: false,
+                            };
+                        }
+                        Err(error) => {
+                            return OutcomeExecution {
+                                response: without_committed_effect(ledger_error_response(
+                                    request_id,
+                                    effect,
+                                    "daemon.request_outcome_lookup_failed",
+                                    error,
+                                    false,
+                                )),
+                                replayed: false,
+                            };
+                        }
+                    }
+                }
+                Ok(Reservation::InFlight {
+                    instance_id: current,
+                    ..
+                }) => {
+                    return OutcomeExecution {
+                        response: in_flight_response(request_id, effect, &current, true),
+                        replayed: false,
+                    };
+                }
+                Ok(Reservation::Execute) => break,
+                Err(error) => {
+                    return OutcomeExecution {
+                        response: without_committed_effect(ledger_error_response(
+                            request_id,
+                            effect,
+                            "daemon.request_outcome_reservation_failed",
+                            error,
+                            false,
+                        )),
+                        replayed: false,
+                    };
+                }
+            }
+        }
+
+        match canonical_atomic_outcome(project_db_path, &request_id, &request_hash, effect) {
+            Ok(CanonicalOutcome::Replay(response)) => {
+                if response.effect.is_none() {
+                    let _ = self.complete_prepared_runtime(
+                        owner,
+                        &request_id,
+                        &request_hash,
+                        &response,
+                    );
+                    return OutcomeExecution {
+                        response,
+                        replayed: true,
+                    };
+                }
+                let finalization_guard = match acquire_finalization_guard() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return OutcomeExecution {
+                            response: prepared_terminalization_indeterminate_response(
+                                request_id, effect, owner,
+                            ),
+                            replayed: false,
+                        };
+                    }
+                };
+                let finalized = finalize(response);
+                publish_revision();
+                drop(finalization_guard);
+                let response = match finalized {
+                    Ok(response) => response,
+                    Err(response) => {
+                        let _ = self.abandon_prepared(owner, &request_id, &request_hash);
+                        return OutcomeExecution {
+                            response,
+                            replayed: true,
+                        };
+                    }
+                };
+                let _ =
+                    self.complete_prepared_runtime(owner, &request_id, &request_hash, &response);
+                return OutcomeExecution {
+                    response,
+                    replayed: true,
+                };
+            }
+            Ok(CanonicalOutcome::Conflict(response)) => {
+                let _ = self.abandon_prepared(owner, &request_id, &request_hash);
+                return OutcomeExecution {
+                    response,
+                    replayed: false,
+                };
+            }
+            Ok(CanonicalOutcome::Missing) => {}
+            Err(_error) => {
+                return OutcomeExecution {
+                    response: prepared_terminalization_indeterminate_response(
+                        request_id, effect, owner,
+                    ),
+                    replayed: false,
+                };
+            }
+        }
+
+        if let Err(error) = prepare(&request) {
+            let response = without_committed_effect(ledger_error_response(
+                request_id.clone(),
+                effect,
+                "daemon.prepared_external_read_failed",
+                error,
+                false,
+            ));
+            let response = match record_prepared_terminal_outcome(
+                project_db_path,
+                &request_id,
+                &request_hash,
+                effect,
+                owner,
+                None,
+                &response,
+            ) {
+                Ok(PreparedTerminalization::Recorded) => {
+                    let _ = self.complete_prepared_runtime(
+                        owner,
+                        &request_id,
+                        &request_hash,
+                        &response,
+                    );
+                    response
+                }
+                Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                    prepared_terminalization_indeterminate_response(
+                        request_id.clone(),
+                        effect,
+                        owner,
+                    )
+                }
+            };
+            return OutcomeExecution {
+                response,
+                replayed: false,
+            };
+        }
+        match recover_prepared_terminal_outcome(
+            project_db_path,
+            &request_id,
+            &request_hash,
+            effect,
+            owner,
+        ) {
+            Ok(Some(response)) => {
+                let _ =
+                    self.complete_prepared_runtime(owner, &request_id, &request_hash, &response);
+                return OutcomeExecution {
+                    response,
+                    replayed: true,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return OutcomeExecution {
+                    response: prepared_terminalization_indeterminate_response(
+                        request_id, effect, owner,
+                    ),
+                    replayed: false,
+                };
+            }
+        }
+        let prepared_hash = match prepared_hash_for_owner(project_db_path, &request_id, owner) {
+            Ok(Some(hash)) => hash,
+            Ok(None) | Err(_) => {
+                return OutcomeExecution {
+                    response: prepared_terminalization_indeterminate_response(
+                        request_id, effect, owner,
+                    ),
+                    replayed: false,
+                };
+            }
+        };
+
+        let finalization_guard = match acquire_finalization_guard() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return OutcomeExecution {
+                    response: prepared_terminalization_indeterminate_response(
+                        request_id, effect, owner,
+                    ),
+                    replayed: false,
+                };
+            }
+        };
+
+        let atomic = match execute_atomic_core(
+            project_db_path,
+            &request_hash,
+            effect,
+            request,
+            execute,
+            before_canonical_commit,
+        ) {
+            Ok(atomic) => atomic,
+            Err(error) => {
+                let response = without_committed_effect(ledger_error_response(
+                    request_id.clone(),
+                    effect,
+                    "daemon.atomic_request_commit_failed",
+                    error,
+                    false,
+                ));
+                let response = match record_prepared_terminal_outcome(
+                    project_db_path,
+                    &request_id,
+                    &request_hash,
+                    effect,
+                    owner,
+                    Some(&prepared_hash),
+                    &response,
+                ) {
+                    Ok(PreparedTerminalization::Recorded) => {
+                        let _ = self.complete_prepared_runtime(
+                            owner,
+                            &request_id,
+                            &request_hash,
+                            &response,
+                        );
+                        response
+                    }
+                    Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                        prepared_terminalization_indeterminate_response(
+                            request_id.clone(),
+                            effect,
+                            owner,
+                        )
+                    }
+                };
+                return OutcomeExecution {
+                    response,
+                    replayed: false,
+                };
+            }
+        };
+        if atomic.request_id_conflict {
+            let _ = self.abandon_prepared(owner, &request_id, &request_hash);
+            return OutcomeExecution {
+                response: atomic.response,
+                replayed: atomic.replayed,
+            };
+        }
+        if !atomic.committed {
+            let response = match record_prepared_terminal_outcome(
+                project_db_path,
+                &request_id,
+                &request_hash,
+                effect,
+                owner,
+                Some(&prepared_hash),
+                &atomic.response,
+            ) {
+                Ok(PreparedTerminalization::Recorded) => {
+                    let _ = self.complete_prepared_runtime(
+                        owner,
+                        &request_id,
+                        &request_hash,
+                        &atomic.response,
+                    );
+                    atomic.response
+                }
+                Ok(PreparedTerminalization::NotOwned) | Err(_) => {
+                    prepared_terminalization_indeterminate_response(
+                        request_id.clone(),
+                        effect,
+                        owner,
+                    )
+                }
+            };
+            return OutcomeExecution {
+                response,
+                replayed: false,
+            };
+        }
+        if let Err(error) = after_canonical_commit() {
+            drop(finalization_guard);
+            return OutcomeExecution {
+                response: ledger_error_response(
+                    request_id,
+                    effect,
+                    "daemon.prepared_external_read_post_commit_interrupted",
+                    error,
+                    true,
+                ),
+                replayed: false,
+            };
+        }
+        let finalized = finalize(atomic.response);
+        publish_revision();
+        drop(finalization_guard);
+        let response = match finalized {
+            Ok(response) => response,
+            Err(response) => {
+                let _ = self.abandon_prepared(owner, &request_id, &request_hash);
+                return OutcomeExecution {
+                    response,
+                    replayed: atomic.replayed,
+                };
+            }
+        };
+        let _ = self.complete_prepared_runtime(owner, &request_id, &request_hash, &response);
+        OutcomeExecution {
+            response,
+            replayed: atomic.replayed,
+        }
+    }
+
+    fn execute_external_with_class<F>(
+        &self,
+        request: RequestEnvelope,
+        effect: Effect,
+        recovery_class: RecoveryClass,
+        instance_id: &str,
+        in_flight_wait: Duration,
+        execute: F,
+    ) -> OutcomeExecution
+    where
+        F: FnOnce(RequestEnvelope) -> ResponseEnvelope,
+    {
         let request_id = request.id.clone();
         let request_hashes = match request_hashes(&request) {
             Ok(hashes) => hashes,
@@ -435,11 +1256,11 @@ impl RequestOutcomeLedger {
         let mut request = Some(request);
         let mut execute = Some(execute);
         loop {
-            match self.reserve_compatible(
+            match self.reserve_external(
                 &request_id,
                 &request_hashes,
                 effect,
-                RecoveryClass::ExternalAtMostOnce,
+                recovery_class,
                 instance_id,
             ) {
                 Ok(Reservation::Replay(completion)) => {
@@ -578,6 +1399,220 @@ impl RequestOutcomeLedger {
                 }
             }
         }
+    }
+
+    fn reserve_external(
+        &self,
+        request_id: &str,
+        request_hashes: &RequestHashes,
+        effect: Effect,
+        recovery_class: RecoveryClass,
+        instance_id: &str,
+    ) -> Result<Reservation> {
+        self.reserve_compatible(
+            request_id,
+            request_hashes,
+            effect,
+            recovery_class,
+            instance_id,
+        )
+    }
+
+    fn reserve_prepared_with_classifier<C>(
+        &self,
+        request_id: &str,
+        request_hashes: &RequestHashes,
+        effect: Effect,
+        current: &DaemonOwnerIdentity,
+        classify_owner: &C,
+    ) -> Result<Reservation>
+    where
+        C: Fn(&DaemonOwnerIdentity) -> DaemonOwnerState,
+    {
+        loop {
+            let existing = self
+                .connection()?
+                .query_row(
+                    "SELECT request_hash, instance_id, owner_pid, owner_process_start_id,
+                        recovery_class, response_json
+                 FROM daemon_request_outcomes WHERE request_id = ?1",
+                    [request_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            match existing {
+                Some((stored_hash, _, _, _, _, _)) if !request_hashes.matches(&stored_hash) => {
+                    return Ok(Reservation::Conflict);
+                }
+                Some((_, _, _, _, _, Some(response_json))) => {
+                    return Ok(Reservation::Replay(persisted_completion_from_json(
+                        &response_json,
+                    )?));
+                }
+                Some((stored_hash, instance_id, pid, process_start_id, recovery_class, None)) => {
+                    let stored_owner = match (pid, process_start_id) {
+                        (Some(pid), Some(process_start_id)) => Some(DaemonOwnerIdentity {
+                            instance_id: instance_id.clone(),
+                            pid,
+                            process_start_id,
+                        }),
+                        _ => None,
+                    };
+                    let recovery_class =
+                        recovery_class.as_deref().and_then(recovery_class_from_name);
+                    if recovery_class != Some(RecoveryClass::PreparedExternalRead)
+                        || stored_owner.as_ref() == Some(current)
+                    {
+                        return Ok(Reservation::InFlight {
+                            instance_id,
+                            recovery_class,
+                        });
+                    }
+                    let Some(stored_owner) = stored_owner else {
+                        return Ok(Reservation::InFlight {
+                            instance_id,
+                            recovery_class,
+                        });
+                    };
+                    if !matches!(
+                        classify_owner(&stored_owner),
+                        DaemonOwnerState::Dead | DaemonOwnerState::PidReused
+                    ) {
+                        return Ok(Reservation::InFlight {
+                            instance_id,
+                            recovery_class,
+                        });
+                    }
+                    let mut connection = self.connection()?;
+                    let transaction =
+                        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let changed = transaction.execute(
+                        "UPDATE daemon_request_outcomes
+                         SET request_hash = ?2, instance_id = ?3, owner_pid = ?4,
+                             owner_process_start_id = ?5, started_at = ?6
+                         WHERE request_id = ?1 AND request_hash = ?7
+                           AND instance_id = ?8 AND owner_pid = ?9
+                           AND owner_process_start_id = ?10
+                           AND recovery_class = 'prepared_external_read'
+                           AND response_json IS NULL",
+                        params![
+                            request_id,
+                            request_hashes.current,
+                            current.instance_id,
+                            current.pid,
+                            current.process_start_id,
+                            now_timestamp(),
+                            stored_hash,
+                            stored_owner.instance_id,
+                            stored_owner.pid,
+                            stored_owner.process_start_id,
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    if changed == 1 {
+                        return Ok(Reservation::Execute);
+                    }
+                    return Ok(Reservation::InFlight {
+                        instance_id,
+                        recovery_class,
+                    });
+                }
+                None => {
+                    let mut connection = self.connection()?;
+                    let transaction =
+                        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let changed = transaction.execute(
+                        "INSERT INTO daemon_request_outcomes (
+                         request_id, request_hash, effect, instance_id, owner_pid,
+                         owner_process_start_id, recovery_class, started_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared_external_read', ?7)
+                     ON CONFLICT(request_id) DO NOTHING",
+                        params![
+                            request_id,
+                            request_hashes.current,
+                            effect_name(effect),
+                            current.instance_id,
+                            current.pid,
+                            current.process_start_id,
+                            now_timestamp(),
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    if changed == 1 {
+                        return Ok(Reservation::Execute);
+                    }
+                }
+            }
+        }
+    }
+
+    fn complete_prepared_runtime(
+        &self,
+        owner: &DaemonOwnerIdentity,
+        request_id: &str,
+        request_hash: &str,
+        response: &ResponseEnvelope,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE daemon_request_outcomes
+             SET response_json = ?7, completed_at = ?8
+             WHERE request_id = ?1 AND request_hash = ?2 AND instance_id = ?3
+               AND owner_pid = ?4 AND owner_process_start_id = ?5
+               AND recovery_class = ?6 AND response_json IS NULL",
+            params![
+                request_id,
+                request_hash,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id,
+                recovery_class_name(RecoveryClass::PreparedExternalRead),
+                serde_json::to_string(response)?,
+                now_timestamp(),
+            ],
+        )?;
+        if changed != 1 {
+            bail!("prepared runtime reservation changed before completion");
+        }
+        self.notify_waiters();
+        Ok(())
+    }
+
+    fn abandon_prepared(
+        &self,
+        owner: &DaemonOwnerIdentity,
+        request_id: &str,
+        request_hash: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM daemon_request_outcomes
+             WHERE request_id = ?1 AND request_hash = ?2 AND instance_id = ?3
+               AND owner_pid = ?4 AND owner_process_start_id = ?5
+               AND recovery_class = 'prepared_external_read' AND response_json IS NULL",
+            params![
+                request_id,
+                request_hash,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("prepared runtime reservation changed before abandonment");
+        }
+        self.notify_waiters();
+        Ok(())
     }
 
     /// Execute `workbench.launch` without persisting its bearer-bearing response.
@@ -1481,6 +2516,203 @@ impl RequestOutcomeLedger {
     }
 }
 
+fn record_prepared_terminal_outcome(
+    project_db_path: &Path,
+    request_id: &str,
+    request_hash: &str,
+    effect: Effect,
+    owner: &DaemonOwnerIdentity,
+    prepared_request_hash: Option<&str>,
+    response: &ResponseEnvelope,
+) -> Result<PreparedTerminalization> {
+    let response_json = serde_json::to_string(response)?;
+    if let Some(prepared_hash) = prepared_request_hash {
+        let transaction = RequestTransaction::begin(project_db_path)
+            .map_err(crate::storage_compatibility::map_database_error)
+            .context("begin prepared terminal intent transaction")?;
+        let conn = transaction.database().connection();
+        let changed = conn.execute(
+            "UPDATE project_flow_prepared_reads
+             SET state = 'terminalizing', result_json = ?2
+             WHERE request_id = ?1 AND request_hash = ?3
+               AND owner_instance_id = ?4 AND owner_pid = ?5
+               AND owner_process_start_id = ?6
+               AND state IN ('prepared', 'ready')",
+            params![
+                request_id,
+                response_json,
+                prepared_hash,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id,
+            ],
+        )?;
+        if changed == 0 {
+            let matching_terminal_intent: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM project_flow_prepared_reads
+                     WHERE request_id = ?1 AND request_hash = ?2
+                       AND owner_instance_id = ?3 AND owner_pid = ?4
+                       AND owner_process_start_id = ?5
+                       AND state = 'terminalizing' AND result_json = ?6
+                 )",
+                params![
+                    request_id,
+                    prepared_hash,
+                    owner.instance_id,
+                    owner.pid,
+                    owner.process_start_id,
+                    response_json,
+                ],
+                |row| row.get(0),
+            )?;
+            if !matching_terminal_intent {
+                transaction.rollback()?;
+                return Ok(PreparedTerminalization::NotOwned);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(crate::storage_compatibility::map_database_error)
+            .context("commit prepared terminal intent")?;
+    }
+
+    let transaction = RequestTransaction::begin(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("begin prepared terminal outcome transaction")?;
+    let conn = transaction.database().connection();
+    if let Some(prepared_hash) = prepared_request_hash {
+        let changed = conn.execute(
+            "UPDATE project_flow_prepared_reads
+             SET state = 'abandoned', completed_at = ?2
+             WHERE request_id = ?1 AND request_hash = ?3
+               AND owner_instance_id = ?4 AND owner_pid = ?5
+               AND owner_process_start_id = ?6
+               AND state = 'terminalizing' AND result_json = ?7",
+            params![
+                request_id,
+                now_timestamp(),
+                prepared_hash,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id,
+                response_json,
+            ],
+        )?;
+        if changed != 1 {
+            transaction.rollback()?;
+            return Ok(PreparedTerminalization::NotOwned);
+        }
+    } else {
+        let appeared: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_flow_prepared_reads WHERE request_id = ?1)",
+            [request_id],
+            |row| row.get(0),
+        )?;
+        if appeared {
+            transaction.rollback()?;
+            return Ok(PreparedTerminalization::NotOwned);
+        }
+    }
+    conn.execute(
+        "INSERT INTO atomic_request_outcomes (
+             request_id, request_hash, effect, response_json, committed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            request_id,
+            request_hash,
+            effect_name(effect),
+            response_json,
+            now_timestamp(),
+        ],
+    )?;
+    transaction
+        .commit()
+        .map_err(crate::storage_compatibility::map_database_error)
+        .context("commit prepared terminal outcome")?;
+    Ok(PreparedTerminalization::Recorded)
+}
+
+fn prepared_hash_for_owner(
+    project_db_path: &Path,
+    request_id: &str,
+    owner: &DaemonOwnerIdentity,
+) -> Result<Option<String>> {
+    let connection = exosuit_storage::open_fenced_connection(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("open project database {}", project_db_path.display()))?;
+    connection
+        .query_row(
+            "SELECT request_hash FROM project_flow_prepared_reads
+             WHERE request_id = ?1 AND owner_instance_id = ?2 AND owner_pid = ?3
+               AND owner_process_start_id = ?4
+               AND state IN ('prepared', 'ready', 'terminalizing')",
+            params![
+                request_id,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn prepared_terminal_response_for_owner(
+    project_db_path: &Path,
+    request_id: &str,
+    owner: &DaemonOwnerIdentity,
+) -> Result<Option<(String, ResponseEnvelope)>> {
+    let connection = exosuit_storage::open_fenced_connection(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("open project database {}", project_db_path.display()))?;
+    let row = connection
+        .query_row(
+            "SELECT request_hash, result_json FROM project_flow_prepared_reads
+             WHERE request_id = ?1 AND owner_instance_id = ?2 AND owner_pid = ?3
+               AND owner_process_start_id = ?4 AND state = 'terminalizing'",
+            params![
+                request_id,
+                owner.instance_id,
+                owner.pid,
+                owner.process_start_id
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(hash, response)| Ok((hash, serde_json::from_str(&response)?)))
+        .transpose()
+}
+
+fn recover_prepared_terminal_outcome(
+    project_db_path: &Path,
+    request_id: &str,
+    request_hash: &str,
+    effect: Effect,
+    owner: &DaemonOwnerIdentity,
+) -> Result<Option<ResponseEnvelope>> {
+    let Some((prepared_hash, response)) =
+        prepared_terminal_response_for_owner(project_db_path, request_id, owner)?
+    else {
+        return Ok(None);
+    };
+    match record_prepared_terminal_outcome(
+        project_db_path,
+        request_id,
+        request_hash,
+        effect,
+        owner,
+        Some(&prepared_hash),
+        &response,
+    )? {
+        PreparedTerminalization::Recorded => Ok(Some(response)),
+        PreparedTerminalization::NotOwned => {
+            bail!("prepared terminal outcome ownership changed during recovery")
+        }
+    }
+}
+
 fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> Result<bool> {
     if !project_db_path.exists() {
         return Ok(false);
@@ -1512,6 +2744,56 @@ fn canonical_atomic_outcome_exists(project_db_path: &Path, request_id: &str) -> 
         )
         .optional()?
         .is_some())
+}
+
+fn canonical_atomic_outcome(
+    project_db_path: &Path,
+    request_id: &str,
+    request_hash: &str,
+    effect: Effect,
+) -> Result<CanonicalOutcome> {
+    if !project_db_path.exists() {
+        return Ok(CanonicalOutcome::Missing);
+    }
+    let connection = exosuit_storage::open_fenced_connection(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| {
+            format!(
+                "open canonical atomic outcome database {}",
+                project_db_path.display()
+            )
+        })?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'atomic_request_outcomes'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(CanonicalOutcome::Missing);
+    }
+    let existing = connection
+        .query_row(
+            "SELECT request_hash, response_json
+             FROM atomic_request_outcomes WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_hash, response_json)) = existing else {
+        return Ok(CanonicalOutcome::Missing);
+    };
+    if stored_hash != request_hash {
+        return Ok(CanonicalOutcome::Conflict(without_committed_effect(
+            request_id_conflict_response(request_id.to_string(), effect),
+        )));
+    }
+    Ok(CanonicalOutcome::Replay(
+        serde_json::from_str(&response_json)
+            .context("deserialize canonical atomic request outcome")?,
+    ))
 }
 
 pub fn resolved_request_recovery(
@@ -1927,6 +3209,7 @@ const fn recovery_class_name(recovery_class: RecoveryClass) -> &'static str {
     match recovery_class {
         RecoveryClass::ReplayableRead => "replayable_read",
         RecoveryClass::AtomicProjectState => "atomic_project_state",
+        RecoveryClass::PreparedExternalRead => "prepared_external_read",
         RecoveryClass::ExternalAtMostOnce => "external_at_most_once",
     }
 }
@@ -1935,6 +3218,7 @@ fn recovery_class_from_name(name: &str) -> Option<RecoveryClass> {
     match name {
         "replayable_read" => Some(RecoveryClass::ReplayableRead),
         "atomic_project_state" => Some(RecoveryClass::AtomicProjectState),
+        "prepared_external_read" => Some(RecoveryClass::PreparedExternalRead),
         "external_at_most_once" => Some(RecoveryClass::ExternalAtMostOnce),
         _ => None,
     }
@@ -2036,6 +3320,19 @@ fn ledger_error_response(
     error: anyhow::Error,
     mutation_may_have_completed: bool,
 ) -> ResponseEnvelope {
+    if let Some(failure) = error.downcast_ref::<ExoFailure>() {
+        return response_error(
+            id,
+            effect,
+            failure.error.code,
+            failure.error.message.clone(),
+            failure
+                .error
+                .details
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
+        );
+    }
     if let Some(failure) =
         crate::storage_compatibility::writer_compatibility_failure_from_error(&error)
     {
@@ -2065,15 +3362,53 @@ fn ledger_error_response(
     )
 }
 
+fn prepared_terminalization_indeterminate_response(
+    id: String,
+    effect: Effect,
+    owner: &DaemonOwnerIdentity,
+) -> ResponseEnvelope {
+    response_error(
+        id.clone(),
+        effect,
+        ErrorCode::PreconditionFailed,
+        "The prepared project-flow outcome could not be persisted. The request remains reserved for exact-owner recovery."
+            .to_string(),
+        serde_json::json!({
+            "kind": "daemon.prepared_external_read_outcome_indeterminate",
+            "request_id": id,
+            "effect": effect_name(effect),
+            "owner_instance_id": owner.instance_id,
+            "mutation_may_have_completed": false,
+            "retry_with_same_request_id": true,
+            "mutation_replayed": false,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::protocol::{CallParams, Op};
     use crate::context::SqliteWriter;
+    use crate::project_flow::{
+        DeliveryRole, ProviderFailure, ProviderObservation, PullRequestIdentity,
+        PullRequestProvider, finalize_pr_attachment, prepare_pr_attachment,
+    };
     use exosuit_storage::open_database;
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard, mpsc};
+
+    struct TestFinalizationGuard {
+        _guard: MutexGuard<'static, ()>,
+        held: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestFinalizationGuard {
+        fn drop(&mut self) {
+            self.held.store(false, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn wrapped_writer_compatibility_error_survives_atomic_daemon_response() {
@@ -2133,6 +3468,102 @@ mod tests {
             effect: Some(Effect::Write),
             trace: None,
         }
+    }
+
+    fn prepared_owner(instance_id: &str, pid: u32, process_start_id: &str) -> DaemonOwnerIdentity {
+        DaemonOwnerIdentity {
+            instance_id: instance_id.to_string(),
+            pid,
+            process_start_id: process_start_id.to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CountingProjectFlowProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PullRequestProvider for CountingProjectFlowProvider {
+        fn observe(
+            &self,
+            _identity: &PullRequestIdentity,
+        ) -> std::result::Result<ProviderObservation, ProviderFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderObservation {
+                title: "Prepared recovery".to_string(),
+                lifecycle: "open".to_string(),
+                head_oid: Some("abc123".to_string()),
+                review_state: "approved".to_string(),
+                checks_state: "passing".to_string(),
+            })
+        }
+    }
+
+    fn project_flow_fixture(temp: &tempfile::TempDir) -> (PathBuf, String, PullRequestIdentity) {
+        let db_path = temp.path().join("exo.db");
+        let writer = SqliteWriter::open(&db_path).expect("open project-flow fixture");
+        let epoch = writer
+            .add_epoch("Recovery", Some("recovery"), &[])
+            .expect("add recovery epoch");
+        let campaign = writer
+            .add_phase(
+                &epoch,
+                "Prepared external read recovery",
+                "regular",
+                Some("prepared-recovery"),
+                &[],
+            )
+            .expect("add recovery campaign");
+        drop(writer);
+        (
+            db_path,
+            campaign,
+            PullRequestIdentity::parse("wycats/exo2#10207").expect("parse test PR"),
+        )
+    }
+
+    fn project_flow_recovery_state(db_path: &Path, request_id: &str) -> (i64, i64, String, i64) {
+        let db = open_database(db_path).expect("open recovery state");
+        let connection = db.connection();
+        let relations = connection
+            .query_row(
+                "SELECT COUNT(*) FROM phase_pull_request_relations_data",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count PR relations");
+        let observations = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_flow_pull_request_observations_data",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count PR observations");
+        let prepared_state = connection
+            .query_row(
+                "SELECT state FROM project_flow_prepared_reads WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .expect("read prepared state");
+        let outcomes = connection
+            .query_row("SELECT COUNT(*) FROM atomic_request_outcomes", [], |row| {
+                row.get(0)
+            })
+            .expect("count canonical outcomes");
+        (relations, observations, prepared_state, outcomes)
+    }
+
+    fn prepared_targets_json(db_path: &Path, request_id: &str) -> String {
+        open_database(db_path)
+            .expect("open prepared bytes")
+            .connection()
+            .query_row(
+                "SELECT targets_json FROM project_flow_prepared_reads WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .expect("read prepared target bytes")
     }
 
     fn launch_request(id: &str, workspace_root: &str) -> RequestEnvelope {
@@ -3901,6 +5332,1205 @@ mod tests {
             Some(("instance-a".to_string(), false)),
             "recovery failure must not delete another instance's reservation"
         );
+    }
+
+    #[test]
+    fn direct_prepared_external_read_fetches_once_and_replays_v021() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let request = request("prepared-direct-replay", "task-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let finalizations = Cell::new(0);
+
+        let first = execute_prepared_external_read_direct(
+            request.clone(),
+            Effect::Write,
+            &db_path,
+            |request, owner| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    owner,
+                    &provider,
+                )
+            },
+            |request| {
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .expect("finalize direct prepared read");
+                response(&request.id)
+            },
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                let db = open_database(&db_path).expect("open committed project database");
+                let committed: (i64, i64) = db
+                    .connection()
+                    .query_row(
+                        "SELECT
+                            (SELECT COUNT(*) FROM phase_pull_request_relations_data),
+                            (SELECT COUNT(*) FROM atomic_request_outcomes WHERE request_id = ?1)",
+                        [&request.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("read committed relationship and V021 outcome");
+                assert_eq!(committed, (1, 1));
+                Ok(response)
+            },
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        assert!(!first.replayed);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finalizations.get(), 1);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (1, 1, "completed".to_string(), 1)
+        );
+
+        let replay = execute_prepared_external_read_direct(
+            request,
+            Effect::Write,
+            &db_path,
+            |_, _| panic!("V021 replay must not prepare or call the provider"),
+            |_| panic!("V021 replay must not execute the project transaction"),
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+        );
+        assert_eq!(replay.response.status, Status::Ok);
+        assert!(replay.replayed);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finalizations.get(), 2);
+    }
+
+    #[test]
+    fn prepared_external_read_acquires_project_gate_only_for_finalization() {
+        #[derive(Debug)]
+        struct GateCheckingProvider {
+            held: Arc<AtomicBool>,
+        }
+
+        impl PullRequestProvider for GateCheckingProvider {
+            fn observe(
+                &self,
+                _identity: &PullRequestIdentity,
+            ) -> std::result::Result<ProviderObservation, ProviderFailure> {
+                assert!(
+                    !self.held.load(Ordering::SeqCst),
+                    "provider I/O must happen before the project-state gate"
+                );
+                Ok(ProviderObservation {
+                    title: "Outside the gate".to_string(),
+                    lifecycle: "open".to_string(),
+                    head_oid: Some("abc123".to_string()),
+                    review_state: "approved".to_string(),
+                    checks_state: "passing".to_string(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-finalization-gate", "task-a");
+        let owner = prepared_owner("instance-gate", 101, "start-gate");
+        let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+        let held = Arc::new(AtomicBool::new(false));
+        let revision = Arc::new(AtomicU64::new(0));
+        let prepare_identity = identity.clone();
+        let provider = GateCheckingProvider {
+            held: Arc::clone(&held),
+        };
+
+        let outcome = ledger.execute_prepared_external_read_with_finalization(
+            request,
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    prepare_identity,
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                assert!(held.load(Ordering::SeqCst));
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity,
+                    DeliveryRole::Implements,
+                )
+                .expect("finalize project flow");
+                response(&request.id)
+            },
+            || {
+                let guard = gate.lock().expect("acquire test project-state gate");
+                held.store(true, Ordering::SeqCst);
+                Ok(TestFinalizationGuard {
+                    _guard: guard,
+                    held: Arc::clone(&held),
+                })
+            },
+            |response| {
+                assert!(held.load(Ordering::SeqCst));
+                Ok(response)
+            },
+            || {
+                assert!(held.load(Ordering::SeqCst));
+                revision.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(outcome.response.status, Status::Ok);
+        assert_eq!(revision.load(Ordering::SeqCst), 1);
+        assert!(!held.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn prepared_external_read_commit_and_revision_are_one_snapshot_gate_interval() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let runtime_path = temp.path().join(DAEMON_OUTCOME_DB_NAME);
+        let request = request("prepared-snapshot-race", "task-a");
+        let owner = prepared_owner("instance-snapshot", 101, "start-snapshot");
+        let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+        let revision = Arc::new(AtomicU64::new(0));
+        let (before_commit_tx, before_commit_rx) = mpsc::channel();
+        let (release_commit_tx, release_commit_rx) = mpsc::channel();
+        let execution_db_path = db_path.clone();
+        let execution_revision = Arc::clone(&revision);
+        let prepare_identity = identity.clone();
+
+        let execution = std::thread::spawn(move || {
+            let ledger = RequestOutcomeLedger::open(runtime_path).expect("open runtime ledger");
+            let provider = CountingProjectFlowProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            ledger.execute_prepared_external_read_with_finalization_hooks(
+                request,
+                Effect::Write,
+                &owner,
+                Duration::ZERO,
+                &execution_db_path,
+                |request| {
+                    prepare_pr_attachment(
+                        &execution_db_path,
+                        &request.id,
+                        &campaign,
+                        prepare_identity,
+                        DeliveryRole::Implements,
+                        &owner,
+                        &provider,
+                    )
+                },
+                |request| {
+                    finalize_pr_attachment(
+                        &execution_db_path,
+                        &request.id,
+                        &campaign,
+                        identity,
+                        DeliveryRole::Implements,
+                    )
+                    .expect("stage project-flow finalization");
+                    response(&request.id)
+                },
+                || Ok(gate.lock().expect("acquire project-state gate")),
+                Ok,
+                || {
+                    execution_revision.fetch_add(1, Ordering::SeqCst);
+                },
+                |_| DaemonOwnerState::Current,
+                || {
+                    before_commit_tx.send(()).expect("announce staged commit");
+                    release_commit_rx.recv().expect("release staged commit");
+                    Ok(())
+                },
+                || Ok(()),
+            )
+        });
+
+        before_commit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("finalization reaches the canonical commit hook");
+        assert!(
+            matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "canonical transaction must hold the snapshot gate"
+        );
+        let snapshot_db_path = db_path.clone();
+        let snapshot_revision = Arc::clone(&revision);
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let snapshot = std::thread::spawn(move || {
+            let _guard = gate.lock().expect("snapshot acquires project-state gate");
+            let db = open_database(&snapshot_db_path).expect("open snapshot database");
+            let relationships = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM phase_pull_request_relations_data",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read committed project flow");
+            snapshot_tx
+                .send((snapshot_revision.load(Ordering::SeqCst), relationships))
+                .expect("send snapshot observation");
+        });
+        assert!(snapshot_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_commit_tx.send(()).expect("release commit");
+
+        let outcome = execution.join().expect("join finalization");
+        let observed = snapshot_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot observes committed state");
+        snapshot.join().expect("join snapshot");
+        assert_eq!(outcome.response.status, Status::Ok);
+        assert_eq!(observed, (1, 1));
+    }
+
+    #[test]
+    fn prepared_external_read_live_owner_blocks_takeover_before_provider_fetch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, _campaign, _identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-live-owner", "task-a");
+        let hashes = request_hashes(&request).expect("hash request");
+        let old_owner = prepared_owner("instance-live", 101, "start-live");
+        assert!(matches!(
+            ledger
+                .reserve_prepared_with_classifier(
+                    &request.id,
+                    &hashes,
+                    Effect::Write,
+                    &old_owner,
+                    &|_| DaemonOwnerState::Current,
+                )
+                .expect("reserve live owner"),
+            Reservation::Execute
+        ));
+
+        let provider_calls = Cell::new(0);
+        let replacement = prepared_owner("instance-replacement", 202, "start-replacement");
+        let outcome = ledger.execute_prepared_external_read_with_hooks(
+            request,
+            Effect::Write,
+            &replacement,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                provider_calls.set(provider_calls.get() + 1);
+                Ok(())
+            },
+            |_| panic!("live-owner takeover must not execute"),
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert_eq!(outcome.response.status, Status::Error);
+        assert_eq!(provider_calls.get(), 0);
+        assert_eq!(
+            runtime_reservation(&ledger, "prepared-live-owner"),
+            Some(("instance-live".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn runtime_takeover_probes_outside_lock_and_rejects_changed_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-runtime-owner-cas", "task-a");
+        let hashes = request_hashes(&request).expect("hash request");
+        let old_owner = prepared_owner("old", 101, "old-start");
+        assert!(matches!(
+            ledger
+                .reserve_prepared_with_classifier(
+                    &request.id,
+                    &hashes,
+                    Effect::Write,
+                    &old_owner,
+                    &|_| DaemonOwnerState::Current,
+                )
+                .unwrap(),
+            Reservation::Execute
+        ));
+        let replacement = prepared_owner("replacement", 202, "replacement-start");
+        let reservation = ledger
+            .reserve_prepared_with_classifier(
+                &request.id,
+                &hashes,
+                Effect::Write,
+                &replacement,
+                &|_| {
+                    Connection::open(ledger.path())
+                        .expect("probe must run outside writer lock")
+                        .execute(
+                            "UPDATE daemon_request_outcomes
+                         SET instance_id = 'changed', owner_pid = 303,
+                             owner_process_start_id = 'changed-start'
+                         WHERE request_id = ?1",
+                            [&request.id],
+                        )
+                        .unwrap();
+                    DaemonOwnerState::Dead
+                },
+            )
+            .expect("changed owner is rejected without a write error");
+        assert!(matches!(reservation, Reservation::InFlight { .. }));
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("changed".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn prepared_external_read_dead_and_pid_reused_takeover_have_one_winner() {
+        for stale_state in [DaemonOwnerState::Dead, DaemonOwnerState::PidReused] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (db_path, campaign, identity) = project_flow_fixture(&temp);
+            let ledger = Arc::new(
+                RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+                    .expect("open runtime ledger"),
+            );
+            let request_id = format!("prepared-takeover-{stale_state:?}");
+            let request = request(&request_id, "task-a");
+            let old_owner = prepared_owner("instance-old", 303, "start-old");
+            let initial_calls = Arc::new(AtomicUsize::new(0));
+            prepare_pr_attachment(
+                &db_path,
+                &request_id,
+                &campaign,
+                identity.clone(),
+                DeliveryRole::Implements,
+                &old_owner,
+                &CountingProjectFlowProvider {
+                    calls: Arc::clone(&initial_calls),
+                },
+            )
+            .expect("prepare provider result");
+            assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+            let prepared_bytes = prepared_targets_json(&db_path, &request_id);
+            let hashes = request_hashes(&request).expect("hash request");
+            assert!(matches!(
+                ledger
+                    .reserve_prepared_with_classifier(
+                        &request.id,
+                        &hashes,
+                        Effect::Write,
+                        &old_owner,
+                        &|_| DaemonOwnerState::Current,
+                    )
+                    .expect("reserve old owner"),
+                Reservation::Execute
+            ));
+
+            let barrier = Arc::new(Barrier::new(3));
+            let executions = Arc::new(AtomicUsize::new(0));
+            let retry_provider_calls = Arc::new(AtomicUsize::new(0));
+            let mut workers = Vec::new();
+            for (instance, pid) in [("instance-b", 404), ("instance-c", 505)] {
+                let ledger = Arc::clone(&ledger);
+                let barrier = Arc::clone(&barrier);
+                let executions = Arc::clone(&executions);
+                let retry_provider_calls = Arc::clone(&retry_provider_calls);
+                let db_path = db_path.clone();
+                let campaign = campaign.clone();
+                let identity = identity.clone();
+                let request = request.clone();
+                let owner = prepared_owner(instance, pid, &format!("start-{pid}"));
+                workers.push(std::thread::spawn(move || {
+                    let prepare_owner = owner.clone();
+                    let prepare_identity = identity.clone();
+                    let provider = CountingProjectFlowProvider {
+                        calls: retry_provider_calls,
+                    };
+                    barrier.wait();
+                    ledger.execute_prepared_external_read_with_hooks(
+                        request,
+                        Effect::Write,
+                        &owner,
+                        Duration::ZERO,
+                        &db_path,
+                        |request| {
+                            prepare_pr_attachment(
+                                &db_path,
+                                &request.id,
+                                &campaign,
+                                prepare_identity.clone(),
+                                DeliveryRole::Implements,
+                                &prepare_owner,
+                                &provider,
+                            )
+                        },
+                        |request| {
+                            executions.fetch_add(1, Ordering::SeqCst);
+                            finalize_pr_attachment(
+                                &db_path,
+                                &request.id,
+                                &campaign,
+                                identity,
+                                DeliveryRole::Implements,
+                            )
+                            .expect("finalize winning replacement");
+                            response(&request.id)
+                        },
+                        move |stored| {
+                            if stored.instance_id == "instance-old" {
+                                stale_state
+                            } else {
+                                DaemonOwnerState::Current
+                            }
+                        },
+                        || Ok(()),
+                        || Ok(()),
+                    )
+                }));
+            }
+            barrier.wait();
+            let outcomes = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("join replacement"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+            assert_eq!(retry_provider_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| outcome.response.status == Status::Ok)
+            );
+            assert_eq!(prepared_targets_json(&db_path, &request_id), prepared_bytes);
+            assert_eq!(
+                project_flow_recovery_state(&db_path, &request_id),
+                (1, 1, "completed".to_string(), 1)
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_external_read_precommit_failure_is_terminal_and_replayable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-precommit-failure", "task-a");
+        let owner_a = prepared_owner("instance-a", 606, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let prepare_identity = identity.clone();
+        let executions = Cell::new(0);
+
+        let first = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner_a,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    prepare_identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner_a,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .expect("stage canonical project-flow writes");
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Err(anyhow!("injected failure before canonical commit")),
+            || Ok(()),
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+
+        let owner_b = prepared_owner("instance-b", 707, "start-b");
+        let second = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner_b,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner_b,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .expect("retry canonical project-flow writes");
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Dead,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Error);
+        assert_eq!(executions.get(), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn prepared_external_read_final_validation_failure_is_terminal_and_replayable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-final-validation-failure", "task-a");
+        let owner = prepared_owner("instance-a", 717, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+
+        let first = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                let failure = ExoFailure::new(
+                    ErrorCode::PreconditionFailed,
+                    "prepared project-flow relationship no longer exists",
+                    ExoFailure::orienting_steering(Vec::new()),
+                )
+                .with_details(serde_json::json!({
+                    "kind": "project_flow.prepared_input_changed"
+                }));
+                without_committed_effect(ledger_error_response(
+                    request.id,
+                    Effect::Write,
+                    "project_flow.prepared_input_changed",
+                    failure.into(),
+                    false,
+                ))
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert_eq!(first.response.status, Status::Error);
+        let first_error = first.response.error.as_ref().expect("typed domain error");
+        assert_eq!(first_error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            first_error.message,
+            "prepared project-flow relationship no longer exists"
+        );
+        assert_eq!(
+            first_error.details.as_ref().unwrap()["kind"],
+            "project_flow.prepared_input_changed"
+        );
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+
+        let prepares = Cell::new(0);
+        let second = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                prepares.set(prepares.get() + 1);
+                Ok(())
+            },
+            |_| response(&request.id),
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Error);
+        assert_eq!(second.response.error, first.response.error);
+        assert_eq!(prepares.get(), 0);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepared_external_read_postcommit_interruption_replays_without_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-postcommit-interruption", "task-a");
+        let owner_a = prepared_owner("instance-a", 808, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let published_revisions = Arc::new(AtomicUsize::new(0));
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+
+        let first = ledger.execute_prepared_external_read_with_finalization_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner_a,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner_a,
+                    &provider,
+                )
+            },
+            |request| {
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .expect("commit project-flow state");
+                response(&request.id)
+            },
+            || Ok(()),
+            |response| {
+                finalizations.fetch_add(1, Ordering::SeqCst);
+                Ok(response)
+            },
+            || {
+                published_revisions.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Err(anyhow!("injected interruption before runtime completion")),
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (1, 1, "completed".to_string(), 1)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), false))
+        );
+        assert_eq!(published_revisions.load(Ordering::SeqCst), 0);
+        assert_eq!(finalizations.load(Ordering::SeqCst), 0);
+
+        let replacement_prepares = Cell::new(0);
+        let replacement_executes = Cell::new(0);
+        let owner_b = prepared_owner("instance-b", 909, "start-b");
+        let second = ledger.execute_prepared_external_read_with_finalization_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner_b,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                replacement_prepares.set(replacement_prepares.get() + 1);
+                Ok(())
+            },
+            |_| {
+                replacement_executes.set(replacement_executes.get() + 1);
+                response(&request.id)
+            },
+            || Ok(()),
+            |response| {
+                finalizations.fetch_add(1, Ordering::SeqCst);
+                Ok(response)
+            },
+            || {
+                published_revisions.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| DaemonOwnerState::Dead,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(replacement_prepares.get(), 0);
+        assert_eq!(replacement_executes.get(), 0);
+        assert_eq!(finalizations.load(Ordering::SeqCst), 1);
+        assert_eq!(published_revisions.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(published_revisions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-b".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn prepared_external_read_v021_insertion_failure_rolls_back_project_flow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        open_database(&db_path)
+            .expect("open project database")
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_prepared_v021
+                 BEFORE INSERT ON atomic_request_outcomes
+                 WHEN NEW.response_json LIKE '%\"status\":\"ok\"%'
+                 BEGIN SELECT RAISE(ABORT, 'injected V021 insertion failure'); END;",
+            )
+            .expect("install V021 failpoint");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-v021-failure", "task-a");
+        let owner = prepared_owner("instance-a", 4_000_001, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let prepare_identity = identity.clone();
+
+        let outcome = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    prepare_identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity,
+                    DeliveryRole::Implements,
+                )
+                .expect("stage project-flow writes");
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert_eq!(outcome.response.status, Status::Error);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn failed_terminal_commit_retains_reservation_without_reexecution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        open_database(&db_path)
+            .unwrap()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_all_prepared_v021
+             BEFORE INSERT ON atomic_request_outcomes
+             BEGIN SELECT RAISE(ABORT, 'injected terminal persistence failure'); END;",
+            )
+            .unwrap();
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME)).unwrap();
+        let request = request("prepared-terminal-persistence-failure", "task-a");
+        let owner = prepared_owner("instance-a", 4_000_001, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let executions = Cell::new(0);
+        let generation_before = *ledger.notifications.generation.lock().unwrap();
+
+        let first = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .unwrap();
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(
+            first
+                .response
+                .error
+                .as_ref()
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "daemon.prepared_external_read_outcome_indeterminate"
+        );
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "terminalizing".to_string(), 0)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), false))
+        );
+        assert_eq!(
+            *ledger.notifications.generation.lock().unwrap(),
+            generation_before,
+            "indeterminate terminal persistence must not wake waiters"
+        );
+
+        let retry_prepares = Cell::new(0);
+        let retry_executes = Cell::new(0);
+        let retry = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                retry_prepares.set(retry_prepares.get() + 1);
+                Ok(())
+            },
+            |_| {
+                retry_executes.set(retry_executes.get() + 1);
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert_eq!(retry.response.status, Status::Error);
+        assert_eq!(
+            retry
+                .response
+                .error
+                .as_ref()
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "daemon.prepared_external_read_outcome_indeterminate"
+        );
+        assert_eq!(retry_prepares.get(), 0);
+        assert_eq!(retry_executes.get(), 0);
+        assert_eq!(executions.get(), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+
+        open_database(&db_path)
+            .unwrap()
+            .connection()
+            .execute_batch("DROP TRIGGER fail_all_prepared_v021")
+            .unwrap();
+        let replacement = prepared_owner("instance-b", 4_000_002, "start-b");
+        let replacement_executes = Cell::new(0);
+        let recovered = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &replacement,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &replacement,
+                    &provider,
+                )
+            },
+            |_| {
+                replacement_executes.set(replacement_executes.get() + 1);
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Dead,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(recovered.replayed);
+        assert_eq!(recovered.response.status, Status::Error);
+        assert_eq!(replacement_executes.get(), 0);
+        assert_eq!(executions.get(), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-b".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn direct_terminal_persistence_failure_never_reexecutes_external_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        open_database(&db_path)
+            .unwrap()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_direct_prepared_v021
+                 BEFORE INSERT ON atomic_request_outcomes
+                 BEGIN SELECT RAISE(ABORT, 'injected direct terminal persistence failure'); END;",
+            )
+            .unwrap();
+        let request = request("direct-terminal-persistence-failure", "task-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let executions = Cell::new(0);
+        let finalizations = Cell::new(0);
+
+        let first = execute_prepared_external_read_direct(
+            request.clone(),
+            Effect::Write,
+            &db_path,
+            |request, owner| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    owner,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .unwrap();
+                response(&request.id)
+            },
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+        );
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(finalizations.get(), 0);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "terminalizing".to_string(), 0)
+        );
+
+        let second = execute_prepared_external_read_direct(
+            request.clone(),
+            Effect::Write,
+            &db_path,
+            |request, owner| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    owner,
+                    &provider,
+                )
+            },
+            |_| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+        );
+        assert_eq!(second.response.status, Status::Error);
+        assert_eq!(finalizations.get(), 0);
+        assert_eq!(
+            second
+                .response
+                .error
+                .as_ref()
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "daemon.prepared_external_read_outcome_indeterminate"
+        );
+        assert_eq!(executions.get(), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "terminalizing".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn conflicting_terminalization_cannot_abandon_original_prepared_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let original = prepared_owner("original", 111, "original-start");
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let request_id = "prepared-terminal-conflict";
+        prepare_pr_attachment(
+            &db_path,
+            request_id,
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+            &original,
+            &provider,
+        )
+        .unwrap();
+        let before: (String, String, u32, String) = open_database(&db_path)
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT request_hash, owner_instance_id, owner_pid, owner_process_start_id
+                 FROM project_flow_prepared_reads WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let result = record_prepared_terminal_outcome(
+            &db_path,
+            request_id,
+            "different-envelope-hash",
+            Effect::Write,
+            &original,
+            Some("different-prepared-hash"),
+            &request_id_conflict_response(request_id.to_string(), Effect::Write),
+        )
+        .unwrap();
+        assert_eq!(result, PreparedTerminalization::NotOwned);
+        let after: (String, String, u32, String, String) = open_database(&db_path)
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT request_hash, owner_instance_id, owner_pid, owner_process_start_id, state
+                 FROM project_flow_prepared_reads WHERE request_id = ?1",
+                [request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (&after.0, &after.1, after.2, &after.3),
+            (&before.0, &before.1, before.2, &before.3)
+        );
+        assert_eq!(after.4, "ready");
+        assert_eq!(atomic_outcome_count(&db_path), 0);
     }
 
     #[test]

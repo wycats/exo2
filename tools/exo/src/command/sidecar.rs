@@ -5303,7 +5303,7 @@ mod sql_projection_merge_tests {
         run_git_test(root, &["checkout", "--quiet", "-b", "remote-change"]);
         std::fs::write(
             projection_dir.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write incompatible remote projection");
         run_git_test(root, &["add", "."]);
@@ -5344,7 +5344,7 @@ mod sql_projection_merge_tests {
 
         let error = semantic_merge_upstream_if_needed(&repo, &branch)
             .expect_err("incompatible remote projection must fail before merge");
-        assert!(error.to_string().contains("writer generation 1"));
+        assert!(error.to_string().contains("writer generation 2"));
         assert_eq!(run_git_test(root, &["rev-parse", "HEAD"]), base);
         assert!(!root.join(".git/MERGE_HEAD").exists());
         assert!(!repo.project.db_path().exists());
@@ -5416,7 +5416,11 @@ mod sql_projection_merge_tests {
         std::fs::create_dir_all(db_path.parent().unwrap()).expect("create database parent");
         let connection = exosuit_storage::Connection::open(&db_path).expect("create database");
         connection
-            .pragma_update(None, "user_version", 1)
+            .pragma_update(
+                None,
+                "user_version",
+                exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+            )
             .expect("raise generation");
         drop(connection);
         let before_database = std::fs::read(&db_path).expect("read database");
@@ -5508,7 +5512,13 @@ mod sql_projection_merge_tests {
 
         let error = semantic_merge_upstream_if_needed_with_hook(&repo, &branch, || {
             let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
-            advancing.pragma_update(None, "user_version", 1).unwrap();
+            advancing
+                .pragma_update(
+                    None,
+                    "user_version",
+                    exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+                )
+                .unwrap();
         })
         .expect_err("generation advance must be rejected before merge");
 

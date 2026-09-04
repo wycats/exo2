@@ -4,6 +4,7 @@
 use locald_publisher_client::ProcessSpawnBarrier;
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// Guarded process-creation operations for standard-library commands.
 pub trait CommandSpawnExt {
@@ -12,6 +13,9 @@ pub trait CommandSpawnExt {
 
     /// Run to completion with the same I/O behavior as [`Command::output`].
     fn output_guarded(&mut self) -> io::Result<Output>;
+
+    /// Run to completion, killing and reaping the child when the deadline expires.
+    fn output_guarded_timeout(&mut self, timeout: Duration) -> io::Result<Output>;
 
     /// Run to completion while preserving the caller's configured stdout and stderr.
     fn output_with_configured_stdio_guarded(&mut self) -> io::Result<Output>;
@@ -41,6 +45,28 @@ impl CommandSpawnExt for Command {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.spawn_guarded()?.wait_with_output()
+    }
+
+    fn output_guarded_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.spawn_guarded()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait()?.is_some() {
+                return child.wait_with_output();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("process exceeded {} ms timeout", timeout.as_millis()),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn output_with_configured_stdio_guarded(&mut self) -> io::Result<Output> {
@@ -93,6 +119,18 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_timeout_kills_and_reaps_the_child() {
+        let started = Instant::now();
+        let error = Command::new("sh")
+            .args(["-c", "exec sleep 10"])
+            .output_guarded_timeout(Duration::from_millis(50))
+            .expect_err("child should time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]

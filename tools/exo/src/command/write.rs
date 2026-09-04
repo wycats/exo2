@@ -145,6 +145,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: Some("from the machine channel\n".to_string()),
             runtime_services: None,

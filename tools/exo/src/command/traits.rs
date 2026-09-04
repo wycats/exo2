@@ -38,6 +38,8 @@ pub struct CommandContext<'a> {
     pub format: OutputFormat,
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
+    /// Stable machine request identity used by recoverable external reads.
+    pub request_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
@@ -53,6 +55,8 @@ pub struct MutableCommandContext<'a> {
     pub format: OutputFormat,
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
+    /// Stable machine request identity used by recoverable external reads.
+    pub request_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
@@ -174,6 +178,7 @@ impl CommandBox {
                     project: ctx.project,
                     format: ctx.format,
                     agent_id: ctx.agent_id.clone(),
+                    request_id: ctx.request_id.clone(),
                     workflow_confirmation: ctx.workflow_confirmation.clone(),
                     input_content: ctx.input_content.clone(),
                     runtime_services: ctx.runtime_services,
@@ -519,6 +524,7 @@ pub fn invoke_command_box_json(
         project: transport.project(),
         format: transport.output_format(),
         agent_id: transport.agent_id().map(String::from),
+        request_id: transport.request_id().map(String::from),
         workflow_confirmation: transport.workflow_confirmation().cloned(),
         input_content: transport.input_content().map(String::from),
         runtime_services: transport.runtime_services(),
@@ -725,6 +731,7 @@ pub trait Command: Send + Sync {
             project: transport.project(),
             format: transport.output_format(),
             agent_id: transport.agent_id().map(String::from),
+            request_id: transport.request_id().map(String::from),
             workflow_confirmation: transport.workflow_confirmation().cloned(),
             input_content: transport.input_content().map(String::from),
             runtime_services: transport.runtime_services(),
@@ -796,6 +803,13 @@ pub fn recovery_class_for_command(
         return RecoveryClass::ReplayableRead;
     }
 
+    if matches!(
+        (namespace, operation),
+        ("project-flow", "pr.attach" | "refresh")
+    ) {
+        return RecoveryClass::PreparedExternalRead;
+    }
+
     let atomic_project_state = matches!(
         (namespace, operation),
         ("axiom", "add" | "remove")
@@ -822,6 +836,7 @@ pub fn recovery_class_for_command(
                 "add" | "focus" | "move" | "release" | "remove" | "reorder" | "start" | "update"
             )
             | ("plan", "move-goals" | "update-status")
+            | ("project-flow", "rfc.attach" | "rfc.detach" | "pr.detach")
             | (
                 "task",
                 "add" | "complete" | "log" | "remove" | "rename" | "reorder" | "start" | "update"
@@ -1024,6 +1039,7 @@ mod tests {
             project: Some(&project),
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
