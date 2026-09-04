@@ -151,33 +151,33 @@ impl ProjectFlowCommands {
                 campaign,
                 role,
             } => {
-                let identity = PullRequestIdentity::parse(&selector).map_err(|error| {
-                    project_flow_precondition(
-                        "project_flow.invalid_pull_request_selector",
-                        error.to_string(),
-                    )
-                })?;
-                let role = DeliveryRole::parse(&role).map_err(|error| {
-                    project_flow_precondition(
-                        "project_flow.invalid_delivery_role",
-                        error.to_string(),
-                    )
-                })?;
+                let identity = parse_pull_request_identity(&selector)?;
+                let role = parse_delivery_role(&role)?;
                 CommandBox::mutable(ProjectFlowPrAttach::new(identity, campaign, role))
             }
             Self::PrDetach { selector, campaign } => {
-                let identity = PullRequestIdentity::parse(&selector).map_err(|error| {
-                    project_flow_precondition(
-                        "project_flow.invalid_pull_request_selector",
-                        error.to_string(),
-                    )
-                })?;
+                let identity = parse_pull_request_identity(&selector)?;
                 CommandBox::mutable(ProjectFlowPrDetach::new(identity, campaign))
             }
             Self::Refresh { campaign } => CommandBox::mutable(ProjectFlowRefresh::new(campaign)),
             Self::Status { campaign } => CommandBox::pure(ProjectFlowStatus::new(campaign)),
         })
     }
+}
+
+fn parse_pull_request_identity(selector: &str) -> ExoResult<PullRequestIdentity> {
+    PullRequestIdentity::parse(selector).map_err(|error| {
+        project_flow_precondition(
+            "project_flow.invalid_pull_request_selector",
+            error.to_string(),
+        )
+    })
+}
+
+fn parse_delivery_role(role: &str) -> ExoResult<DeliveryRole> {
+    DeliveryRole::parse(role).map_err(|error| {
+        project_flow_precondition("project_flow.invalid_delivery_role", error.to_string())
+    })
 }
 
 fn active_campaign(ctx: &CommandContext<'_>) -> ExoResult<String> {
@@ -252,8 +252,8 @@ pub(crate) fn prepare_external_read_request(
             db_path,
             &request.id,
             &campaign,
-            PullRequestIdentity::parse(&selector)?,
-            DeliveryRole::parse(&role)?,
+            parse_pull_request_identity(&selector)?,
+            parse_delivery_role(&role)?,
             owner,
             &provider,
         ),
@@ -723,7 +723,7 @@ fn observation_age(timestamp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::protocol::ErrorCode;
+    use crate::api::protocol::{Address, CallParams, ErrorCode};
     use crate::failure::ExoFailure;
     use crate::project_flow::{PullRequestView, RfcObjectiveView};
 
@@ -890,5 +890,65 @@ mod tests {
             failure.error.details.as_ref().unwrap()["kind"],
             "project_flow.invalid_pull_request_selector"
         );
+    }
+
+    #[test]
+    fn prepared_pr_attachment_validation_uses_typed_preconditions() {
+        let request = |selector: &str, role: &str| RequestEnvelope {
+            protocol_version: 1,
+            id: "prepared-attach-validation".to_string(),
+            op: Op::Call(CallParams {
+                address: Address::Operation {
+                    path: vec![
+                        "project-flow".to_string(),
+                        "pr".to_string(),
+                        "attach".to_string(),
+                    ],
+                },
+                input: serde_json::json!({
+                    "selector": selector,
+                    "campaign": "campaign-one",
+                    "role": role,
+                }),
+            }),
+            workspace_root: None,
+            auth: None,
+            workflow_confirmation: None,
+            agent_id: None,
+        };
+        let owner = DaemonOwnerIdentity {
+            instance_id: "instance-a".to_string(),
+            pid: 101,
+            process_start_id: "start-a".to_string(),
+        };
+
+        for (selector, role, expected_kind) in [
+            (
+                "not-a-pull-request",
+                "implements",
+                "project_flow.invalid_pull_request_selector",
+            ),
+            (
+                "wycats/exo2#76",
+                "related",
+                "project_flow.invalid_delivery_role",
+            ),
+        ] {
+            let error = prepare_external_read_request(
+                std::path::Path::new("unused.db"),
+                std::path::Path::new("."),
+                &request(selector, role),
+                &owner,
+            )
+            .expect_err("invalid prepared attachment must fail before provider I/O");
+            let failure = error
+                .downcast_ref::<ExoFailure>()
+                .expect("typed project-flow precondition");
+            assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+            assert_eq!(
+                failure.error.details.as_ref().unwrap()["kind"],
+                expected_kind
+            );
+        }
     }
 }

@@ -244,13 +244,12 @@ where
             error,
             false,
         ));
-        let response = match record_prepared_terminal_outcome(
+        let response = match record_preparation_failure_terminal_outcome(
             project_db_path,
             &request_id,
             &request_hash,
             effect,
             &owner,
-            None,
             &response,
         ) {
             Ok(PreparedTerminalization::Recorded) => response,
@@ -1091,13 +1090,12 @@ impl RequestOutcomeLedger {
                 error,
                 false,
             ));
-            let response = match record_prepared_terminal_outcome(
+            let response = match record_preparation_failure_terminal_outcome(
                 project_db_path,
                 &request_id,
                 &request_hash,
                 effect,
                 owner,
-                None,
                 &response,
             ) {
                 Ok(PreparedTerminalization::Recorded) => {
@@ -2718,6 +2716,26 @@ fn record_prepared_terminal_outcome(
         .map_err(crate::storage_compatibility::map_database_error)
         .context("commit prepared terminal outcome")?;
     Ok(PreparedTerminalization::Recorded)
+}
+
+fn record_preparation_failure_terminal_outcome(
+    project_db_path: &Path,
+    request_id: &str,
+    request_hash: &str,
+    effect: Effect,
+    owner: &DaemonOwnerIdentity,
+    response: &ResponseEnvelope,
+) -> Result<PreparedTerminalization> {
+    let prepared_hash = prepared_hash_for_owner(project_db_path, request_id, owner)?;
+    record_prepared_terminal_outcome(
+        project_db_path,
+        request_id,
+        request_hash,
+        effect,
+        owner,
+        prepared_hash.as_deref(),
+        response,
+    )
 }
 
 fn prepared_hash_for_owner(
@@ -6063,6 +6081,93 @@ mod tests {
                 (1, 1, "completed".to_string(), 1)
             );
         }
+    }
+
+    #[test]
+    fn prepared_provider_result_failure_terminalizes_the_committed_preparation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        open_database(&db_path)
+            .expect("open project database")
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_prepared_provider_result
+                 BEFORE UPDATE OF provider_results_json ON project_flow_prepared_reads
+                 BEGIN SELECT RAISE(ABORT, 'injected provider-result persistence failure'); END;",
+            )
+            .expect("install provider-result failpoint");
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-provider-result-failure", "task-a");
+        let owner = prepared_owner("instance-a", 505, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let executions = Cell::new(0);
+
+        let first = ledger.execute_prepared_external_read_with_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert_eq!(first.response.status, Status::Error);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executions.get(), 0);
+        assert_eq!(
+            project_flow_recovery_state(&db_path, &request.id),
+            (0, 0, "abandoned".to_string(), 1)
+        );
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), true))
+        );
+
+        let retry_prepares = Cell::new(0);
+        let retry_executes = Cell::new(0);
+        let retry = ledger.execute_prepared_external_read_with_hooks(
+            request,
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                retry_prepares.set(retry_prepares.get() + 1);
+                Ok(())
+            },
+            |request| {
+                retry_executes.set(retry_executes.get() + 1);
+                response(&request.id)
+            },
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(retry.replayed);
+        assert_eq!(retry.response.status, Status::Error);
+        assert_eq!(retry_prepares.get(), 0);
+        assert_eq!(retry_executes.get(), 0);
     }
 
     #[test]

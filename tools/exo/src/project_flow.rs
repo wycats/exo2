@@ -1307,6 +1307,85 @@ fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<
     Ok(conn.last_insert_rowid())
 }
 
+fn campaign_artifact_id(
+    conn: &Connection,
+    campaign: &str,
+    identity: &PullRequestIdentity,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT artifact.id FROM project_flow_pull_requests_data artifact
+             JOIN phase_pull_request_relations_data relation ON relation.artifact_id = artifact.id
+             JOIN phases_data phase ON phase.id = relation.phase_id
+             WHERE phase.text_id = ?1 AND artifact.provider = ?2
+               AND artifact.repository = ?3 AND artifact.number = ?4",
+            params![
+                campaign,
+                identity.provider,
+                identity.repository,
+                identity.number
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn upsert_campaign_delivery_relation(
+    conn: &Connection,
+    campaign: &str,
+    previous_artifact_id: Option<i64>,
+    canonical_identity: &PullRequestIdentity,
+    role: &str,
+) -> Result<i64> {
+    let canonical_artifact_id = ensure_artifact(conn, canonical_identity)?;
+    let canonical_relation_id = conn
+        .query_row(
+            "SELECT relation.id
+             FROM phase_pull_request_relations_data relation
+             JOIN phases_data phase ON phase.id = relation.phase_id
+             WHERE phase.text_id = ?1 AND relation.artifact_id = ?2",
+            params![campaign, canonical_artifact_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(relation_id) = canonical_relation_id {
+        conn.execute(
+            "UPDATE phase_pull_request_relations
+             SET role = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![relation_id, role],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
+             VALUES((SELECT id FROM phases_data WHERE text_id = ?1), ?2, ?3)",
+            params![campaign, canonical_artifact_id, role],
+        )?;
+    }
+    if let Some(previous_artifact_id) =
+        previous_artifact_id.filter(|artifact_id| *artifact_id != canonical_artifact_id)
+    {
+        conn.execute(
+            "DELETE FROM phase_pull_request_relations
+             WHERE phase_id = (SELECT id FROM phases_data WHERE text_id = ?1)
+               AND artifact_id = ?2",
+            params![campaign, previous_artifact_id],
+        )?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM phase_pull_request_relations_data WHERE artifact_id = ?1",
+            [previous_artifact_id],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            conn.execute(
+                "DELETE FROM project_flow_pull_requests WHERE id = ?1",
+                [previous_artifact_id],
+            )?;
+        }
+    }
+    Ok(canonical_artifact_id)
+}
+
 pub fn attach_pr_with_provider(
     db_path: &Path,
     request_id: &str,
@@ -1437,34 +1516,14 @@ pub(crate) fn finalize_pr_attachment(
         .as_ref()
         .map(|observation| &observation.identity)
         .unwrap_or(&identity);
-    let artifact_id = ensure_artifact(conn, canonical_identity)?;
-    let phase_id: i64 = conn.query_row(
-        "SELECT id FROM phases_data WHERE text_id = ?1",
-        [&campaign],
-        |row| row.get(0),
+    let requested_artifact_id = campaign_artifact_id(conn, &campaign, &identity)?;
+    let artifact_id = upsert_campaign_delivery_relation(
+        conn,
+        &campaign,
+        requested_artifact_id,
+        canonical_identity,
+        role.as_str(),
     )?;
-    let relation_id = conn
-        .query_row(
-            "SELECT id FROM phase_pull_request_relations_data
-             WHERE phase_id = ?1 AND artifact_id = ?2",
-            params![phase_id, artifact_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if let Some(id) = relation_id {
-        conn.execute(
-            "UPDATE phase_pull_request_relations
-             SET role = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?1",
-            params![id, role.as_str()],
-        )?;
-    } else {
-        conn.execute(
-            "INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
-             VALUES (?1, ?2, ?3)",
-            params![phase_id, artifact_id, role.as_str()],
-        )?;
-    }
     record_observation(
         conn,
         artifact_id,
@@ -1662,52 +1721,13 @@ pub(crate) fn finalize_refresh(
             .as_ref()
             .map(|observation| &observation.identity)
             .unwrap_or(&target.identity);
-        let canonical_artifact_id = ensure_artifact(conn, canonical_identity)?;
-        if canonical_artifact_id != artifact_id {
-            let canonical_relation_id = conn
-                .query_row(
-                    "SELECT relation.id
-                     FROM phase_pull_request_relations_data relation
-                     JOIN phases_data phase ON phase.id = relation.phase_id
-                     WHERE phase.text_id = ?1 AND relation.artifact_id = ?2",
-                    params![campaign, canonical_artifact_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            if let Some(relation_id) = canonical_relation_id {
-                conn.execute(
-                    "UPDATE phase_pull_request_relations
-                     SET role = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                     WHERE id = ?1",
-                    params![relation_id, target.role],
-                )?;
-            } else {
-                conn.execute(
-                    "INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
-                     VALUES(
-                         (SELECT id FROM phases_data WHERE text_id = ?1), ?2, ?3
-                     )",
-                    params![campaign, canonical_artifact_id, target.role],
-                )?;
-            }
-            conn.execute(
-                "DELETE FROM phase_pull_request_relations
-                 WHERE phase_id = (SELECT id FROM phases_data WHERE text_id = ?1)
-                   AND artifact_id = ?2",
-                params![campaign, artifact_id],
-            )?;
-            let remaining: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM phase_pull_request_relations_data WHERE artifact_id = ?1",
-                [artifact_id],
-                |row| row.get(0),
-            )?;
-            if remaining == 0 {
-                conn.execute(
-                    "DELETE FROM project_flow_pull_requests WHERE id = ?1",
-                    [artifact_id],
-                )?;
-            }
-        }
+        let canonical_artifact_id = upsert_campaign_delivery_relation(
+            conn,
+            &campaign,
+            Some(artifact_id),
+            canonical_identity,
+            &target.role,
+        )?;
         record_observation(
             conn,
             canonical_artifact_id,
@@ -2214,6 +2234,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old_count, 0);
+    }
+
+    #[test]
+    fn successful_retry_rehomes_a_failed_attachment_to_the_canonical_identity() {
+        let (_temp, path, campaign) = fixture();
+        let requested = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let failed = attach_pr_with_provider(
+            &path,
+            "failed-provider-identity",
+            &campaign,
+            requested.clone(),
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Err(ProviderFailure {
+                    class: "not_found",
+                    message: "repository moved".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(failed.pull_requests.len(), 1);
+        assert_eq!(failed.pull_requests[0].identity, requested);
+
+        let mut canonical = observation("Moved PR");
+        canonical.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+        let recovered = attach_pr_with_provider(
+            &path,
+            "successful-provider-identity",
+            &campaign,
+            requested,
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(canonical),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered.pull_requests.len(), 1);
+        assert_eq!(
+            recovered.pull_requests[0].identity.repository,
+            "new-owner/new-repo"
+        );
+        let artifact_count: i64 = SqliteWriter::open(&path)
+            .unwrap()
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM project_flow_pull_requests_data",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artifact_count, 1);
     }
 
     #[test]
