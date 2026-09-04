@@ -34,7 +34,9 @@ pub fn should_write_sql_dump(namespace: &str, operation: &str, effect: Effect) -
         return false;
     }
 
-    if is_machine_local_workbench_write(namespace, operation) {
+    if is_machine_local_workbench_write(namespace, operation)
+        || (namespace == "project-flow" && operation == "refresh")
+    {
         return false;
     }
 
@@ -141,9 +143,50 @@ pub fn persist_after_success(
     operation: &str,
     effect: Effect,
 ) -> ExoResult<Option<PostWritePersistenceReport>> {
-    let should_write_dump = should_write_sql_dump(namespace, operation, effect);
+    persist_after_result(
+        workspace_root,
+        project,
+        namespace,
+        operation,
+        effect,
+        &serde_json::Value::Null,
+    )
+}
+
+pub fn should_persist_after_result(
+    project: Option<&Project>,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+    result: &serde_json::Value,
+) -> bool {
+    let result = result
+        .get("_command_envelope")
+        .and_then(|envelope| envelope.get("result"))
+        .unwrap_or(result);
+    should_persist_after_success(project, namespace, operation, effect)
+        || (namespace == "project-flow"
+            && operation == "refresh"
+            && effect != Effect::Pure
+            && result
+                .get("portable_state_changed")
+                .and_then(serde_json::Value::as_bool)
+                // Retained outcomes from older writers may still need checkpointing.
+                .unwrap_or(true))
+}
+
+pub fn persist_after_result(
+    workspace_root: &Path,
+    project: Option<&Project>,
+    namespace: &str,
+    operation: &str,
+    effect: Effect,
+    result: &serde_json::Value,
+) -> ExoResult<Option<PostWritePersistenceReport>> {
+    let should_write_dump =
+        should_persist_after_result(project, namespace, operation, effect, result);
     let should_auto_persist =
-        should_auto_persist_after_success(effect, namespace, operation, project);
+        should_write_dump && project.is_some_and(|project| project.policy == StatePolicy::Sidecar);
 
     if !should_write_dump && !should_auto_persist {
         return Ok(None);
@@ -162,8 +205,8 @@ pub fn persist_after_success(
             )?;
         report.sql_dump_written = true;
     } else if should_write_dump {
-        report.sql_dump_written =
-            write_sql_dump_after_success(workspace_root, project, namespace, operation, effect)?;
+        crate::context::write_sql_dump_with_project(workspace_root, project);
+        report.sql_dump_written = true;
     }
 
     Ok(Some(report))
@@ -484,29 +527,67 @@ mod tests {
     }
 
     #[test]
-    fn project_flow_refresh_preserves_canonical_identity_changes() {
+    fn project_flow_refresh_persists_only_canonical_identity_changes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let sidecar_root = temp.path().join("sidecar");
         let project = sidecar_project(workspace, sidecar_root);
 
-        assert!(should_write_sql_dump(
+        assert!(!should_write_sql_dump(
             "project-flow",
             "refresh",
             Effect::Write
         ));
-        assert!(should_auto_persist_after_success(
+        assert!(!should_auto_persist_after_success(
             Effect::Write,
             "project-flow",
             "refresh",
             Some(&project)
         ));
-        assert!(should_persist_after_success(
+        assert!(!should_persist_after_success(
             Some(&project),
             "project-flow",
             "refresh",
             Effect::Write
         ));
+        preflight_sidecar_post_write(Some(&project), "project-flow", "refresh", Effect::Write)
+            .expect("observation refresh skips sidecar ownership");
+        for legacy in [
+            serde_json::json!({"campaign_id": "campaign"}),
+            serde_json::json!({"_command_envelope": {"result": {"campaign_id": "campaign"}}}),
+        ] {
+            assert!(should_persist_after_result(
+                Some(&project),
+                "project-flow",
+                "refresh",
+                Effect::Write,
+                &legacy,
+            ));
+        }
+        for changed in [false, true] {
+            let result = serde_json::json!({"portable_state_changed": changed});
+            assert_eq!(
+                should_persist_after_result(
+                    Some(&project),
+                    "project-flow",
+                    "refresh",
+                    Effect::Write,
+                    &result
+                ),
+                changed
+            );
+            let envelope = serde_json::json!({"_command_envelope": {"result": result}});
+            assert_eq!(
+                should_persist_after_result(
+                    Some(&project),
+                    "project-flow",
+                    "refresh",
+                    Effect::Write,
+                    &envelope
+                ),
+                changed
+            );
+        }
     }
 
     #[test]

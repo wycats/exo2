@@ -4121,7 +4121,7 @@ pub fn supersede_file(root: &Path, path: &str, by: &str) -> Result<RfcSupersedeF
     })
 }
 
-fn find_rfc_file(rfc_root: &Path, id: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn find_rfc_file(rfc_root: &Path, id: &str) -> Result<std::path::PathBuf> {
     find_optional_rfc_file(rfc_root, id)?
         .ok_or_else(|| anyhow::anyhow!("RFC {id} not found under {}", rfc_root.display()))
 }

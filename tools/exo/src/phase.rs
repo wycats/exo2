@@ -7,7 +7,7 @@ use crate::failure::ExoFailure;
 use crate::process_spawn::CommandSpawnExt as _;
 use crate::steering::{SuggestedAction, WorkIntent};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
@@ -368,22 +368,13 @@ struct PhaseRfcInfo {
 fn collect_phase_rfc_info(root: &Path, phase_id: &str) -> PhaseRfcInfo {
     let result = crate::project::Project::resolve(root).and_then(|project| {
         let effective_rfcs = crate::rfc::load_effective_rfcs(root, Some(&project))?;
-        let mut rfc_number_counts = HashMap::new();
-        for rfc in &effective_rfcs {
-            *rfc_number_counts.entry(rfc.record.rfc_number).or_insert(0) += 1;
-        }
-        let ambiguous_rfc_numbers = rfc_number_counts
-            .into_iter()
-            .filter_map(|(number, count)| (count > 1).then_some(number))
-            .collect::<HashSet<_>>();
-        let resolved = crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
+        crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
             &project.db_path(),
             phase_id,
             &effective_rfcs,
-        )?;
-        Ok((resolved, ambiguous_rfc_numbers))
+        )
     });
-    let ((objectives, diagnostics), ambiguous_rfc_numbers) = match result {
+    let (objectives, diagnostics) = match result {
         Ok(resolved) => resolved,
         Err(error) => {
             return PhaseRfcInfo {
@@ -392,7 +383,26 @@ fn collect_phase_rfc_info(root: &Path, phase_id: &str) -> PhaseRfcInfo {
             };
         }
     };
-    phase_rfc_info_from_objectives(objectives, diagnostics, &ambiguous_rfc_numbers)
+    phase_rfc_info_for_workspace(root, objectives, diagnostics)
+}
+
+fn phase_rfc_info_for_workspace(
+    root: &Path,
+    objectives: Vec<crate::project_flow::RfcObjectiveView>,
+    diagnostics: Vec<String>,
+) -> PhaseRfcInfo {
+    let unavailable_numbers = objectives
+        .iter()
+        .filter(|objective| {
+            crate::rfc::find_rfc_file(&root.join("docs/rfcs"), &objective.rfc_number.to_string())
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|content| crate::rfc::extract_anchor_ulid(&content))
+                .is_none_or(|ulid| ulid != objective.rfc_ulid)
+        })
+        .map(|objective| objective.rfc_number)
+        .collect::<HashSet<_>>();
+    phase_rfc_info_from_objectives(objectives, diagnostics, &unavailable_numbers)
 }
 
 fn phase_rfc_info_from_objectives(
@@ -432,13 +442,13 @@ fn phase_rfc_info_from_objectives(
                         .expect("advancing objective has a target stage");
                     if ambiguous_rfc_numbers.contains(&objective.rfc_number) {
                         format!(
-                            "Currently Stage {current_stage}, target Stage {target_stage}. RFC number {} is ambiguous; repair the duplicate number before promotion (attached RFC {}).",
+                            "Currently Stage {current_stage}, target Stage {target_stage}. RFC number {} does not select a unique workspace document with the attached identity; repair the workspace document before promotion (attached RFC {}).",
                             objective.rfc_number, objective.rfc_ulid
                         )
                     } else {
                         format!(
-                            "Currently Stage {current_stage}, target Stage {target_stage}. Consider: `exo rfc promote {} --stage {target_stage}`",
-                            objective.rfc_number
+                            "Currently Stage {current_stage}, target Stage {target_stage}. Consider: `exo rfc promote {} --stage {}`",
+                            objective.rfc_number, current_stage + 1
                         )
                     }
                 }
@@ -563,7 +573,7 @@ mod project_flow_tests {
             vec![
                 objective(3, Some(3)),
                 objective(4, None),
-                objective(2, Some(3)),
+                objective(2, Some(4)),
             ],
             Vec::new(),
             &HashSet::new(),
@@ -584,11 +594,24 @@ mod project_flow_tests {
             crate::project_flow::RfcObjectiveMotion::Advancing
         );
         assert!(info.suggestions[2].suggestion.contains("exo rfc promote"));
+        assert!(info.suggestions[2].suggestion.contains("target Stage 4"));
+        assert!(info.suggestions[2].suggestion.contains("--stage 3"));
     }
 
     #[test]
     fn phase_projection_does_not_suggest_an_ambiguous_numeric_promotion() {
-        let info = phase_rfc_info_from_objectives(
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("docs/rfcs/stage-2");
+        std::fs::create_dir_all(&stage).unwrap();
+        for name in ["10207-first.md", "10207-duplicate.md"] {
+            std::fs::write(
+                stage.join(name),
+                "<!-- exo:10207 ulid:01rfc000000000000000000001 -->\n# Project flow\n",
+            )
+            .unwrap();
+        }
+        let info = phase_rfc_info_for_workspace(
+            temp.path(),
             vec![RfcObjectiveView {
                 rfc_ulid: "01rfc000000000000000000001".to_string(),
                 rfc_number: 10207,
@@ -603,13 +626,12 @@ mod project_flow_tests {
                 diagnostic: None,
             }],
             Vec::new(),
-            &HashSet::from([10207]),
         );
 
         assert!(
             info.suggestions[0]
                 .suggestion
-                .contains("number 10207 is ambiguous")
+                .contains("does not select a unique workspace document")
         );
         assert!(
             info.suggestions[0]

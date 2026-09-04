@@ -95,6 +95,8 @@ pub struct CommandOutput {
 pub struct CommandInvokeResult {
     /// The JSON result data.
     pub data: serde_json::Value,
+    /// Structured command output before transport rendering, for persistence decisions.
+    pub structured_data: serde_json::Value,
     /// Human-readable message from the command, if available.
     /// Used by the machine channel handler to generate display metadata.
     pub human_message: Option<String>,
@@ -603,9 +605,11 @@ pub fn invoke_command_box_json(
     };
 
     let human_message = output.human_message.clone();
+    let structured_data = output.data.clone();
     let data = transport_output_to_json(transport.format_output(output));
     Ok(CommandInvokeResult {
         data,
+        structured_data,
         human_message,
         effect,
         trace,
@@ -1098,5 +1102,46 @@ mod tests {
             error_msg.is_some_and(|m| m.contains("Failed to read TOML file")),
             "expected TOML read error, got: {err}"
         );
+    }
+
+    #[test]
+    fn invocation_preserves_refresh_persistence_intent_across_cli_formats() {
+        struct RefreshResult(bool);
+        impl Command for RefreshResult {
+            fn namespace(&self) -> &'static str {
+                "project-flow"
+            }
+
+            fn operation(&self) -> &'static str {
+                "refresh"
+            }
+
+            fn execute(&self, _ctx: &CommandContext) -> ExoResult<CommandOutput> {
+                Ok(CommandOutput {
+                    data: serde_json::json!({"portable_state_changed": self.0}),
+                    human_message: Some("Refreshed project motion".to_string()),
+                })
+            }
+        }
+
+        for format in [OutputFormat::Human, OutputFormat::Json] {
+            let transport = crate::command::transport::CliTransport::new(format);
+            for changed in [false, true] {
+                let command = CommandBox::pure(RefreshResult(changed));
+                let result = invoke_command_box_json(&command, &transport).unwrap();
+                assert_eq!(result.structured_data["portable_state_changed"], changed);
+                assert_ne!(result.data, result.structured_data);
+                assert_eq!(
+                    crate::post_write::should_persist_after_result(
+                        None,
+                        "project-flow",
+                        "refresh",
+                        Effect::Write,
+                        &result.structured_data,
+                    ),
+                    changed,
+                );
+            }
+        }
     }
 }

@@ -13,8 +13,8 @@ use crate::daemon_outcomes::{DaemonOwnerIdentity, request_command_path};
 use crate::project_flow::{
     DeliveryRole, GithubProvider, ProjectFlowStatus as ProjectFlowStatusData, PullRequestIdentity,
     RfcObjectiveMotion, RfcRelation, attach_pr_with_provider, attach_rfc, detach_pr, detach_rfc,
-    finalize_pr_attachment, finalize_refresh, prepare_pr_attachment, prepare_refresh,
-    project_flow_precondition, refresh_with_provider, status,
+    finalize_pr_attachment, finalize_refresh_with_preflight, prepare_pr_attachment,
+    prepare_refresh, project_flow_precondition, refresh_with_provider_and_preflight, status,
 };
 use anyhow::{Result as ExoResult, bail};
 
@@ -530,14 +530,23 @@ impl MutableCommand for ProjectFlowRefresh {
             .clone()
             .map_or_else(|| active_campaign_mut(ctx), Ok)?;
         let request_id = request_id(ctx);
+        let preflight = || {
+            crate::post_write::preflight_sidecar_post_write(
+                ctx.project,
+                "project-flow",
+                "pr.attach",
+                Effect::Write,
+            )
+        };
         let status = if prepared_read_is_finalizing(ctx)? {
-            finalize_refresh(&ctx.db_path(), &request_id, &campaign)?
+            finalize_refresh_with_preflight(&ctx.db_path(), &request_id, &campaign, preflight)?
         } else {
-            refresh_with_provider(
+            refresh_with_provider_and_preflight(
                 &ctx.db_path(),
                 &request_id,
                 &campaign,
                 &GithubProvider::default(),
+                preflight,
             )?
         };
         let message = render_project_flow_mutation("Refreshed project-flow observations.", &status);
@@ -730,6 +739,7 @@ mod tests {
     #[test]
     fn project_flow_status_human_output_renders_motion_and_degraded_truth() {
         let rendered = render_project_flow_status(&ProjectFlowStatusData {
+            portable_state_changed: false,
             campaign_id: "campaign-one".to_string(),
             rfc_objectives: vec![RfcObjectiveView {
                 rfc_ulid: "01rfc".to_string(),
@@ -784,6 +794,7 @@ mod tests {
         };
         let render = |objective| {
             render_project_flow_status(&ProjectFlowStatusData {
+                portable_state_changed: false,
                 campaign_id: "campaign-one".to_string(),
                 rfc_objectives: vec![objective],
                 pull_requests: Vec::new(),
@@ -814,6 +825,7 @@ mod tests {
             "transport: child process failed",
         ] {
             let status = ProjectFlowStatusData {
+                portable_state_changed: false,
                 campaign_id: "campaign-one".to_string(),
                 rfc_objectives: Vec::new(),
                 pull_requests: vec![PullRequestView {

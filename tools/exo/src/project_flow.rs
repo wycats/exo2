@@ -503,6 +503,14 @@ pub struct ProjectFlowStatus {
     pub rfc_objectives: Vec<RfcObjectiveView>,
     pub pull_requests: Vec<PullRequestView>,
     pub diagnostics: Vec<String>,
+    /// Retained with refresh outcomes so post-commit persistence can be replayed.
+    #[serde(default = "legacy_refresh_requires_persistence")]
+    pub portable_state_changed: bool,
+}
+
+fn legacy_refresh_requires_persistence() -> bool {
+    // Older retained refresh outcomes did not distinguish observation-only writes.
+    true
 }
 
 pub fn resolve_campaign(conn: &Connection, selector: &str) -> Result<String> {
@@ -537,7 +545,12 @@ pub fn resolve_campaign(conn: &Connection, selector: &str) -> Result<String> {
 fn resolve_rfc(conn: &Connection, selector: &str) -> Result<RfcRecord> {
     let by_number = selector.bytes().all(|byte| byte.is_ascii_digit());
     let (sql, parameter): (&str, Box<dyn exosuit_storage::rusqlite::ToSql>) = if by_number {
-        let number = selector.parse::<i64>().context("invalid RFC number")?;
+        let number = selector.parse::<i64>().map_err(|_| {
+            project_flow_precondition(
+                "project_flow.invalid_rfc_selector",
+                format!("invalid RFC number '{selector}'"),
+            )
+        })?;
         (
             "SELECT text_id, rfc_number, title, stage, status, feature, slug, file_path, superseded_by, supersedes, withdrawal_reason, archived_reason, consolidated_into FROM rfcs_data WHERE rfc_number = ?1 ORDER BY text_id",
             Box::new(number),
@@ -1287,7 +1300,7 @@ fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<
         .optional()?;
     if let Some(id) = existing {
         conn.execute(
-            "UPDATE project_flow_pull_requests SET url = ?2 WHERE id = ?1",
+            "UPDATE project_flow_pull_requests SET url = ?2 WHERE id = ?1 AND url != ?2",
             params![id, identity.url],
         )?;
         return Ok(id);
@@ -1352,7 +1365,7 @@ fn upsert_campaign_delivery_relation(
         conn.execute(
             "UPDATE phase_pull_request_relations
              SET role = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?1",
+             WHERE id = ?1 AND role != ?2",
             params![relation_id, role],
         )?;
     } else {
@@ -1583,10 +1596,21 @@ pub fn refresh_with_provider(
     campaign: &str,
     provider: &dyn PullRequestProvider,
 ) -> Result<ProjectFlowStatus> {
+    refresh_with_provider_and_preflight(db_path, request_id, campaign, provider, || Ok(()))
+}
+
+pub(crate) fn refresh_with_provider_and_preflight(
+    db_path: &Path,
+    request_id: &str,
+    campaign: &str,
+    provider: &dyn PullRequestProvider,
+    preflight_portable_write: impl FnOnce() -> Result<()>,
+) -> Result<ProjectFlowStatus> {
     let owner = direct_process_owner()?;
     prepare_refresh(db_path, request_id, campaign, &owner, provider)?;
     let transaction = RequestTransaction::begin(db_path)?;
-    let status = finalize_refresh(db_path, request_id, campaign)?;
+    let status =
+        finalize_refresh_with_preflight(db_path, request_id, campaign, preflight_portable_write)?;
     transaction.commit()?;
     Ok(status)
 }
@@ -1637,10 +1661,20 @@ pub(crate) fn prepare_refresh(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn finalize_refresh(
     db_path: &Path,
     request_id: &str,
     campaign: &str,
+) -> Result<ProjectFlowStatus> {
+    finalize_refresh_with_preflight(db_path, request_id, campaign, || Ok(()))
+}
+
+pub(crate) fn finalize_refresh_with_preflight(
+    db_path: &Path,
+    request_id: &str,
+    campaign: &str,
+    preflight_portable_write: impl FnOnce() -> Result<()>,
 ) -> Result<ProjectFlowStatus> {
     let db = open_request_database(db_path)?;
     let campaign = resolve_campaign(db.connection(), campaign)?;
@@ -1678,6 +1712,18 @@ pub(crate) fn finalize_refresh(
             "project_flow.prepared_input_changed",
             "prepared project-flow targets and provider results do not align",
         ));
+    }
+    let portable_state_changed = targets
+        .iter()
+        .zip(&observations)
+        .any(|(target, observation)| {
+            observation
+                .observation
+                .as_ref()
+                .is_some_and(|result| result.identity != target.identity)
+        });
+    if portable_state_changed {
+        preflight_portable_write()?;
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
@@ -1735,7 +1781,8 @@ pub(crate) fn finalize_refresh(
             &observation.attempted_at,
         )?;
     }
-    let status = status_with_connection(conn, &campaign)?;
+    let mut status = status_with_connection(conn, &campaign)?;
+    status.portable_state_changed = portable_state_changed;
     let completed_at = Utc::now().to_rfc3339();
     complete_prepared_read(conn, request_id, &hash, &completed_at, &status)?;
     Ok(status)
@@ -1794,6 +1841,7 @@ fn status_with_connection(conn: &Connection, campaign: &str) -> Result<ProjectFl
         rfc_objectives: objectives,
         pull_requests,
         diagnostics,
+        portable_state_changed: false,
     })
 }
 
@@ -1874,15 +1922,12 @@ fn campaign_rfc_objectives_with_connection(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut typed_ulids = std::collections::HashSet::new();
-    let mut typed_numbers = std::collections::HashSet::new();
     let mut objectives = Vec::new();
     for (ulid, number_snapshot, title_snapshot, observed_stage, target_stage, relation) in
         typed_rows
     {
         typed_ulids.insert(ulid.clone());
-        typed_numbers.insert(number_snapshot);
         if let Some(current) = current_rfcs.get(&ulid) {
-            typed_numbers.insert(current.rfc_number);
             let (lifecycle, superseded_by) = effective_rfc_lifecycle(current);
             objectives.push(RfcObjectiveView {
                 rfc_ulid: ulid,
@@ -1920,7 +1965,6 @@ fn campaign_rfc_objectives_with_connection(
         phase_id,
         &current_rfcs,
         &typed_ulids,
-        &typed_numbers,
         &mut objectives,
         &mut diagnostics,
     )?;
@@ -1970,7 +2014,6 @@ fn append_legacy_objectives(
     phase_id: i64,
     current: &std::collections::HashMap<String, RfcRecord>,
     typed_ulids: &std::collections::HashSet<String>,
-    typed_numbers: &std::collections::HashSet<i64>,
     objectives: &mut Vec<RfcObjectiveView>,
     diagnostics: &mut Vec<String>,
 ) -> Result<()> {
@@ -2025,9 +2068,6 @@ fn append_legacy_objectives(
                 "project_flow.legacy_rfc_target_conflict: {number_value} ({previous:?} vs {target:?})"
             ));
         }
-        if typed_numbers.contains(&number_value) {
-            continue;
-        }
         let matches = current
             .values()
             .filter(|rfc| rfc.rfc_number == number_value)
@@ -2073,6 +2113,21 @@ fn objective_relation_priority(relation: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_refresh_outcome_conservatively_requires_persistence() {
+        let mut retained = serde_json::json!({
+            "campaign_id": "campaign",
+            "rfc_objectives": [],
+            "pull_requests": [],
+            "diagnostics": []
+        });
+        let legacy: super::ProjectFlowStatus = serde_json::from_value(retained.clone()).unwrap();
+        assert!(legacy.portable_state_changed);
+        retained["portable_state_changed"] = false.into();
+        let current: super::ProjectFlowStatus = serde_json::from_value(retained).unwrap();
+        assert!(!current.portable_state_changed);
+    }
+
     use super::*;
     use crate::context::SqliteWriter;
     use crate::rfc::{EffectiveRfcRecord, RfcViewProvenance};
@@ -2746,6 +2801,176 @@ mod tests {
             Some(3),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn malformed_numeric_rfc_selectors_are_preconditions() {
+        let (_temp, path, campaign) = fixture();
+        for selector in ["", "9223372036854775808", "9999999999999999999999999999"] {
+            for error in [
+                attach_rfc(&path, &campaign, selector, RfcRelation::Drives, Some(3)).unwrap_err(),
+                detach_rfc(&path, &campaign, selector).unwrap_err(),
+            ] {
+                let failure = error
+                    .downcast_ref::<ExoFailure>()
+                    .expect("typed input error");
+                assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+                assert_eq!(
+                    failure.error.details.as_ref().unwrap()["kind"],
+                    "project_flow.invalid_rfc_selector"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_objective_can_reuse_a_renumbered_typed_objectives_old_number() {
+        let (_temp, path, campaign) = fixture();
+        attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3)).unwrap();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let conn = writer.database().connection();
+        conn.execute(
+            "UPDATE rfcs SET rfc_number = 10208 WHERE rfc_number = 10207",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+             VALUES('01rfc000000000000000000002', 10207, 'New RFC', 1, 'active', 'new-rfc', 'docs/rfcs/stage-1/10207-new.md')", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO phase_rfcs(phase_id, rfc_id, target, relation)
+             VALUES((SELECT id FROM phases_data WHERE text_id = ?1), '10207', 2, 'driving')",
+            [&campaign],
+        )
+        .unwrap();
+        let projected = status(&path, &campaign).unwrap();
+        assert_eq!(projected.rfc_objectives.len(), 2);
+        assert!(projected.rfc_objectives.iter().any(|rfc| rfc.rfc_ulid
+            == "01rfc000000000000000000002"
+            && rfc.source == "legacy_phase"));
+        assert!(
+            projected
+                .rfc_objectives
+                .iter()
+                .any(|rfc| rfc.rfc_ulid == "01rfc000000000000000000001" && rfc.rfc_number == 10208)
+        );
+    }
+
+    #[test]
+    fn observation_refresh_preserves_portable_rows_and_skips_portable_preflight() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        attach_pr_with_provider(
+            &path,
+            "attach-for-local-refresh",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("Original")),
+            },
+        )
+        .unwrap();
+        let writer = SqliteWriter::open(&path).unwrap();
+        writer
+            .database()
+            .connection()
+            .execute(
+                "UPDATE phase_pull_request_relations SET updated_at = '2000-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        let portable_rows = || {
+            let writer = SqliteWriter::open(&path).unwrap();
+            writer.database().connection().query_row(
+                "SELECT relation.updated_at, artifact.url FROM phase_pull_request_relations_data relation
+                 JOIN project_flow_pull_requests_data artifact ON artifact.id = relation.artifact_id", [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        };
+        let before = portable_rows();
+        for (id, result) in [
+            ("refresh-success-local", Ok(observation("Updated"))),
+            (
+                "refresh-failure-local",
+                Err(ProviderFailure {
+                    class: "provider_unavailable",
+                    message: "offline".to_string(),
+                }),
+            ),
+        ] {
+            let refreshed = refresh_with_provider_and_preflight(
+                &path,
+                id,
+                &campaign,
+                &FakeProvider {
+                    calls: Cell::new(0),
+                    result,
+                },
+                || panic!("observation-only refresh must not request portable authority"),
+            )
+            .unwrap();
+            assert!(!refreshed.portable_state_changed);
+            assert_eq!(portable_rows(), before);
+        }
+    }
+
+    #[test]
+    fn canonical_refresh_preflights_before_mutation_and_replays_persistence_intent() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        attach_pr_with_provider(
+            &path,
+            "attach-for-rehome",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("Original")),
+            },
+        )
+        .unwrap();
+        let mut moved = observation("Moved");
+        moved.identity = PullRequestIdentity::parse("wycats/moved#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(moved.clone()),
+        };
+        let error = refresh_with_provider_and_preflight(
+            &path,
+            "refresh-needs-authority",
+            &campaign,
+            &provider,
+            || {
+                Err(project_flow_precondition(
+                    "test.no_portable_authority",
+                    "held elsewhere",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<ExoFailure>().is_some());
+        assert_eq!(
+            status(&path, &campaign).unwrap().pull_requests[0].identity,
+            identity
+        );
+        let transaction = RequestTransaction::begin(&path).unwrap();
+        let refreshed =
+            finalize_refresh_with_preflight(&path, "refresh-needs-authority", &campaign, || Ok(()))
+                .unwrap();
+        transaction.commit().unwrap();
+        assert!(refreshed.portable_state_changed);
+        assert_eq!(refreshed.pull_requests[0].identity, moved.identity);
+        let replayed =
+            finalize_refresh_with_preflight(&path, "refresh-needs-authority", &campaign, || {
+                panic!("completed replay does not mutate again")
+            })
+            .unwrap();
+        assert!(replayed.portable_state_changed);
+        assert_eq!(provider.calls.get(), 1);
     }
 
     #[test]

@@ -611,10 +611,12 @@ mod project_flow_pipeline_tests {
         assert_eq!(objective.id, "10207");
         assert_eq!(objective.title, "Project flow");
         assert_eq!(objective.current_stage, None);
-        assert!(
-            !pipeline.contains_key("01rfc000000000000000000002"),
-            "a same-number RFC must not replace the stored typed identity"
+        let legacy = pipeline.get("01rfc000000000000000000002").expect(
+            "the explicit legacy association resolves independently of the missing typed identity",
         );
+        assert_eq!(legacy.title, "Different RFC");
+        assert_eq!(legacy.current_stage, Some(4));
+        assert_eq!(pipeline.len(), 2, "both identities remain distinct");
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic == "project_flow.rfc_identity_missing: 01rfc000000000000000000001"
         }));

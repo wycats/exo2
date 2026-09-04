@@ -2158,19 +2158,21 @@ fn main() {
         let result = exo::command::invoke_command_box_json(&command_box, &transport);
         match result {
             Ok(mut invoke_result) => {
-                let post_write_report = if exo::post_write::should_persist_after_success(
+                let post_write_report = if exo::post_write::should_persist_after_result(
                     context.project.as_ref(),
                     namespace,
                     operation,
                     invoke_result.effect,
+                    &invoke_result.structured_data,
                 ) {
                     exo::post_write::with_sidecar_runtime_lock(context.project.as_ref(), || {
-                        exo::post_write::persist_after_success(
+                        exo::post_write::persist_after_result(
                             &context.root,
                             context.project.as_ref(),
                             namespace,
                             operation,
                             invoke_result.effect,
+                            &invoke_result.structured_data,
                         )
                     })
                 } else {

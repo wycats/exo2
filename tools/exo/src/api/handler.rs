@@ -1883,9 +1883,12 @@ fn persist_after_success_with_diagnostics(
     namespace: &str,
     operation: &str,
     effect: Effect,
+    result: &JsonValue,
     diagnostics: &DaemonDiagnostics,
 ) -> anyhow::Result<Option<crate::post_write::PostWritePersistenceReport>> {
-    if !crate::post_write::should_persist_after_success(project, namespace, operation, effect) {
+    if !crate::post_write::should_persist_after_result(
+        project, namespace, operation, effect, result,
+    ) {
         return Ok(None);
     }
 
@@ -1895,12 +1898,13 @@ fn persist_after_success_with_diagnostics(
             "request.post_write_persistence_start",
             json!({ "namespace": namespace, "operation": operation }),
         );
-        let report = crate::post_write::persist_after_success(
+        let report = crate::post_write::persist_after_result(
             workspace_root,
             project,
             namespace,
             operation,
             effect,
+            result,
         );
         let report_json = match &report {
             Ok(report) => json!(report),
@@ -1937,6 +1941,7 @@ pub(crate) fn finalize_atomic_response_after_commit(
         namespace,
         operation,
         effect,
+        response.result.as_ref().unwrap_or(&JsonValue::Null),
         diagnostics,
     ) {
         Ok(report) => report,
@@ -2420,6 +2425,7 @@ fn handle_call_with_namespace_operation(
                             namespace,
                             operation,
                             effect,
+                            &invoke_result.structured_data,
                             diagnostics,
                         ) {
                             Ok(report) => report,
@@ -2674,6 +2680,7 @@ fn handle_list(
                 let namespace = invocation.path.namespace.as_str();
                 let operation = invocation.path.operation.as_str();
                 let invoke_result = CommandInvokeResult {
+                    structured_data: result.clone(),
                     data: normalize_list_result(result),
                     human_message: None,
                     effect: Effect::Pure,
@@ -3172,6 +3179,7 @@ mod tests {
     #[test]
     fn update_display_renders_detailed_human_report_from_machine_data() {
         let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
             data: json!({
                 "kind": "update",
                 "ok": true,
@@ -3208,6 +3216,7 @@ mod tests {
     #[test]
     fn workbench_launch_display_keeps_the_url_and_expiration() {
         let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
             data: json!({
                 "kind": "workbench.launch",
                 "ok": true,
@@ -3248,6 +3257,7 @@ mod tests {
     #[test]
     fn project_flow_status_display_keeps_the_human_motion_report() {
         let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
             data: json!({
                 "campaign_id": "campaign-one",
                 "rfc_objectives": [{"rfc_number": 10207}],
@@ -3281,6 +3291,7 @@ mod tests {
     fn project_flow_write_display_keeps_degraded_human_diagnostics() {
         for operation in ["pr.attach", "refresh"] {
             let invoke_result = CommandInvokeResult {
+                structured_data: JsonValue::Null,
                 data: json!({
                     "campaign_id": "campaign-one",
                     "rfc_objectives": [],
