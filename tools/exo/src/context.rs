@@ -1885,7 +1885,11 @@ fn import_preflighted_sql_dumps_with_connection(
         .context("Failed to start projection import transaction")?;
     let import_result = (|| -> ExoResult<()> {
         conn.execute_batch(
-            "DELETE FROM rfc_relations;
+            "DELETE FROM project_flow_pull_request_observations_data;
+             DELETE FROM phase_pull_request_relations_data;
+             DELETE FROM campaign_rfc_objectives_data;
+             DELETE FROM project_flow_pull_requests_data;
+             DELETE FROM rfc_relations;
              DELETE FROM idea_task_refs;
              DELETE FROM idea_tags;
              DELETE FROM entity_aliases;
@@ -2833,6 +2837,36 @@ status = "pending"
         writer
             .set_workspace_lane_focus("/tmp/exo-worktree", &lane_id)
             .expect("set workspace lane focus");
+        writer
+            .database()
+            .connection()
+            .execute_batch(&format!(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+                 VALUES('01projectionrfc', 10207, 'Project flow', 2, 'active',
+                        'project-flow', 'docs/rfcs/stage-2/10207-project-flow.md');
+                 INSERT INTO campaign_rfc_objectives(
+                     text_id, phase_id, rfc_ulid, rfc_number_snapshot, rfc_title_snapshot,
+                     observed_stage, target_stage, relation
+                 ) VALUES(
+                     '01projectionobjective',
+                     (SELECT id FROM phases_data WHERE text_id = '{phase_id}'),
+                     '01projectionrfc', 10207, 'Project flow', 2, 3, 'drives'
+                 );
+                 INSERT INTO project_flow_pull_requests(
+                     text_id, provider, repository, number, url
+                 ) VALUES(
+                     '01projectionpr', 'github', 'wycats/exo2', 76,
+                     'https://github.com/wycats/exo2/pull/76'
+                 );
+                 INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
+                 VALUES(
+                     (SELECT id FROM phases_data WHERE text_id = '{phase_id}'),
+                     (SELECT id FROM project_flow_pull_requests_data
+                      WHERE text_id = '01projectionpr'),
+                     'implements'
+                 );"
+            ))
+            .expect("add portable project-flow relationships");
         drop(writer);
 
         write_sql_dump_with_project_result(root, None).expect("write SQL projection");
@@ -2854,6 +2888,18 @@ status = "pending"
             .expect("load lane")
             .expect("lane should survive projection replacement");
         assert_eq!(lane.execution_phase_id, phase_id);
+        let relationship_counts: (i64, i64) = loader
+            .database()
+            .connection()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM campaign_rfc_objectives_data),
+                     (SELECT COUNT(*) FROM phase_pull_request_relations_data)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read restored project-flow relationships");
+        assert_eq!(relationship_counts, (1, 1));
         assert_eq!(
             loader
                 .load_workspace_lane_focus("/tmp/exo-worktree")

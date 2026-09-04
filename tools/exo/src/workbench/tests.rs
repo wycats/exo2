@@ -1229,16 +1229,20 @@ async fn locald_publication_keeps_two_worktrees_on_one_host_across_daemon_restar
     async fn launch_eventually(
         manager: &WorkbenchHostManager,
         workspace: &Path,
-    ) -> WorkbenchLaunchResult {
+        sandbox_log: &Path,
+    ) -> (WorkbenchLaunchResult, usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut failed_attempts = 0;
         loop {
             let error = match manager.launch(workspace) {
-                Ok(launch) => return launch,
+                Ok(launch) => return (launch, failed_attempts),
                 Err(error) => error,
             };
+            failed_attempts += 1;
             assert!(
                 std::time::Instant::now() < deadline,
-                "published workbench did not recover: {error:#}"
+                "published workbench did not recover: {error:?}; sandbox log: {}",
+                fs::read_to_string(sandbox_log).unwrap_or_default()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1317,11 +1321,15 @@ timeout = 1
     ));
     manager.set_entry_provider(provider.clone());
 
-    let first = launch_eventually(&manager, &primary).await;
-    let second = launch_eventually(&manager, &linked).await;
+    let (first, first_failed_attempts) =
+        launch_eventually(&manager, &primary, &sandbox.log_path).await;
+    let (second, _) = launch_eventually(&manager, &linked, &sandbox.log_path).await;
     assert_eq!(first.launch_mode, WorkbenchLaunchMode::Published);
     assert_eq!(second.launch_mode, WorkbenchLaunchMode::Published);
-    assert!(!first.reused_host);
+    assert!(
+        !first.reused_host || first_failed_attempts > 0,
+        "a fresh manager can reuse its host only after an earlier launch attempt started it"
+    );
     assert!(second.reused_host);
     let first_origin = canonical_origin(&first).to_owned();
     let second_origin = canonical_origin(&second).to_owned();
@@ -1363,8 +1371,8 @@ timeout = 1
 
     provider.mark_publications_terminal_for_test();
     assert_eq!(provider.failed_publication_count(), 2);
-    let reacquired_first = launch_eventually(&manager, &primary).await;
-    let reacquired_second = launch_eventually(&manager, &linked).await;
+    let (reacquired_first, _) = launch_eventually(&manager, &primary, &sandbox.log_path).await;
+    let (reacquired_second, _) = launch_eventually(&manager, &linked, &sandbox.log_path).await;
     assert_eq!(canonical_origin(&reacquired_first), first_origin);
     assert_eq!(canonical_origin(&reacquired_second), second_origin);
     assert_eq!(provider.failed_publication_count(), 0);
@@ -1374,8 +1382,8 @@ timeout = 1
     daemon = sandbox.spawn();
     sandbox.wait_until_active(&mut daemon);
 
-    let recovered_first = launch_eventually(&manager, &primary).await;
-    let recovered_second = launch_eventually(&manager, &linked).await;
+    let (recovered_first, _) = launch_eventually(&manager, &primary, &sandbox.log_path).await;
+    let (recovered_second, _) = launch_eventually(&manager, &linked, &sandbox.log_path).await;
     assert_eq!(canonical_origin(&recovered_first), first_origin);
     assert_eq!(canonical_origin(&recovered_second), second_origin);
     assert!(recovered_first.reused_host);
@@ -3425,12 +3433,13 @@ async fn published_enrollment_evicts_the_oldest_pairing_without_a_live_session()
         .split('.')
         .nth(1)
         .expect("enrolled pairing selector");
+    let observed_at = unix_seconds();
     let state = manager.inner.state.lock().expect("workbench state");
     assert_eq!(
         state
             .pairing_grants
             .values()
-            .filter(|pairing| pairing.is_live(now))
+            .filter(|pairing| pairing.is_live(observed_at))
             .count(),
         MAX_ACTIVE_PAIRINGS_PER_WORKSPACE
     );

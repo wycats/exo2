@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 use locald_publisher_client::ProcessSpawnBarrier;
-use std::io;
+use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -52,14 +52,30 @@ impl CommandSpawnExt for Command {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = self.spawn_guarded()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+        let stdout = std::thread::spawn(move || drain_output(stdout));
+        let stderr = std::thread::spawn(move || drain_output(stderr));
         let deadline = Instant::now() + timeout;
         loop {
-            if child.try_wait()?.is_some() {
-                return child.wait_with_output();
+            if let Some(status) = child.try_wait()? {
+                return Ok(Output {
+                    status,
+                    stdout: join_output(stdout, "stdout")?,
+                    stderr: join_output(stderr, "stderr")?,
+                });
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_output(stdout, "stdout");
+                let _ = join_output(stderr, "stderr");
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("process exceeded {} ms timeout", timeout.as_millis()),
@@ -85,6 +101,21 @@ impl CommandSpawnExt for Command {
         let _permit = ProcessSpawnBarrier::global().enter_spawn();
         self.exec()
     }
+}
+
+fn drain_output(mut output: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_output(
+    reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream: &str,
+) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other(format!("{stream} reader panicked")))?
 }
 
 /// Guarded process creation for Tokio commands.
@@ -131,6 +162,21 @@ mod tests {
             .expect_err("child should time out");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_timeout_drains_large_output_while_the_child_runs() {
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+            ])
+            .output_guarded_timeout(Duration::from_secs(5))
+            .expect("large output should not fill a pipe and time out");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1_048_576);
+        assert_eq!(output.stderr.len(), 1_048_576);
     }
 
     #[cfg(unix)]

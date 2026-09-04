@@ -107,6 +107,26 @@ impl Drop for StoppedProcessGuard {
     }
 }
 
+#[cfg(unix)]
+fn wait_for_process_stopped(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("inspect stopped daemon process");
+        let state = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && state.trim_start().starts_with('T') {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon process {pid} did not enter the stopped state: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn run_git_ok(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -1703,6 +1723,7 @@ fn daemon_status_ignores_missing_and_mismatched_health(backend: &str) {
     )
     .expect("pause daemon");
     let _stopped = StoppedProcessGuard(pid);
+    wait_for_process_stopped(pid);
 
     std::fs::remove_file(paths.health_path()).expect("remove daemon health");
     let missing = run_exo_daemon_status(&workspace);

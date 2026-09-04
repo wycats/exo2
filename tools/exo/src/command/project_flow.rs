@@ -14,9 +14,9 @@ use crate::project_flow::{
     DeliveryRole, GithubProvider, ProjectFlowStatus as ProjectFlowStatusData, PullRequestIdentity,
     RfcObjectiveMotion, RfcRelation, attach_pr_with_provider, attach_rfc, detach_pr, detach_rfc,
     finalize_pr_attachment, finalize_refresh, prepare_pr_attachment, prepare_refresh,
-    refresh_with_provider, status,
+    project_flow_precondition, refresh_with_provider, status,
 };
-use anyhow::{Context, Result as ExoResult, bail};
+use anyhow::{Result as ExoResult, bail};
 
 fn mutable_command_unreachable(name: &str) -> ! {
     unreachable!("{name} should be dispatched via execute_mut")
@@ -158,9 +158,16 @@ fn active_campaign(ctx: &CommandContext<'_>) -> ExoResult<String> {
     let Some(details) =
         loader.load_active_phase_details_for_workspace(workspace_root.as_deref())?
     else {
-        bail!("no active campaign; pass --campaign with an exact campaign ID or alias");
+        return Err(no_active_campaign_error());
     };
     Ok(details.phase_id)
+}
+
+fn no_active_campaign_error() -> anyhow::Error {
+    project_flow_precondition(
+        "project_flow.active_campaign_required",
+        "no active campaign; pass --campaign with an exact campaign ID or alias",
+    )
 }
 
 fn active_campaign_mut(ctx: &MutableCommandContext<'_>) -> ExoResult<String> {
@@ -239,7 +246,7 @@ fn active_campaign_at(
     loader
         .load_active_phase_details_for_workspace(agent.workspace_root_key().as_deref())?
         .map(|details| details.phase_id)
-        .context("no active campaign; pass --campaign with an exact campaign ID or alias")
+        .ok_or_else(no_active_campaign_error)
 }
 
 #[derive(Debug, Clone)]
@@ -687,6 +694,8 @@ fn observation_age(timestamp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::protocol::ErrorCode;
+    use crate::failure::ExoFailure;
     use crate::project_flow::{PullRequestView, RfcObjectiveView};
 
     #[test]
@@ -799,5 +808,18 @@ mod tests {
                 assert!(rendered.contains(diagnostic), "{diagnostic}");
             }
         }
+    }
+
+    #[test]
+    fn missing_active_campaign_is_a_typed_precondition() {
+        let error = no_active_campaign_error();
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed project-flow precondition");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.active_campaign_required"
+        );
     }
 }

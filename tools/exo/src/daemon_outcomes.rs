@@ -842,6 +842,7 @@ impl RequestOutcomeLedger {
             }
         };
         let request_hash = request_hashes.current.clone();
+        let _ = self.prune_canonical_outcomes(project_db_path);
 
         loop {
             match self.reserve_prepared_with_classifier(
@@ -869,6 +870,36 @@ impl RequestOutcomeLedger {
                     instance_id: current,
                     ..
                 }) if current == owner.instance_id => {
+                    match canonical_atomic_outcome(
+                        project_db_path,
+                        &request_id,
+                        &request_hash,
+                        effect,
+                    ) {
+                        Ok(CanonicalOutcome::Replay(_) | CanonicalOutcome::Conflict(_)) => {
+                            if self
+                                .abandon_prepared(owner, &request_id, &request_hash)
+                                .is_err()
+                            {
+                                return OutcomeExecution {
+                                    response: prepared_terminalization_indeterminate_response(
+                                        request_id, effect, owner,
+                                    ),
+                                    replayed: false,
+                                };
+                            }
+                            continue;
+                        }
+                        Ok(CanonicalOutcome::Missing) => {}
+                        Err(_) => {
+                            return OutcomeExecution {
+                                response: prepared_terminalization_indeterminate_response(
+                                    request_id, effect, owner,
+                                ),
+                                replayed: false,
+                            };
+                        }
+                    }
                     match recover_prepared_terminal_outcome(
                         project_db_path,
                         &request_id,
@@ -2502,12 +2533,30 @@ impl RequestOutcomeLedger {
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
             for request_id in expired_request_ids {
-                if !unresolved_request_ids.contains(&request_id) {
-                    project_transaction.execute(
-                        "DELETE FROM atomic_request_outcomes WHERE request_id = ?1",
-                        [&request_id],
-                    )?;
+                if unresolved_request_ids.contains(&request_id) {
+                    continue;
                 }
+                let prepared_state: Option<String> = project_transaction
+                    .query_row(
+                        "SELECT state FROM project_flow_prepared_reads WHERE request_id = ?1",
+                        [&request_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match prepared_state.as_deref() {
+                    Some("completed" | "abandoned") => {
+                        project_transaction.execute(
+                            "DELETE FROM project_flow_prepared_reads WHERE request_id = ?1",
+                            [&request_id],
+                        )?;
+                    }
+                    Some(_) => continue,
+                    None => {}
+                }
+                project_transaction.execute(
+                    "DELETE FROM atomic_request_outcomes WHERE request_id = ?1",
+                    [&request_id],
+                )?;
             }
         }
         project_transaction.commit()?;
@@ -4327,6 +4376,95 @@ mod tests {
     }
 
     #[test]
+    fn canonical_outcome_pruning_removes_only_expired_terminal_prepared_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, _) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open ledger");
+        let old_seconds = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS - 1;
+        let recent_seconds = now_timestamp();
+        let old_completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(old_seconds, 0)
+            .unwrap()
+            .to_rfc3339();
+        let recent_completed_at = chrono::Utc::now().to_rfc3339();
+        let project = open_database(&db_path).expect("open project retention fixture");
+        let conn = project.connection();
+        for (request_id, state, completed_at, committed_at) in [
+            (
+                "old-completed",
+                "completed",
+                Some(old_completed_at.as_str()),
+                old_seconds,
+            ),
+            (
+                "old-abandoned",
+                "abandoned",
+                Some(old_completed_at.as_str()),
+                old_seconds,
+            ),
+            (
+                "recent-completed",
+                "completed",
+                Some(recent_completed_at.as_str()),
+                recent_seconds,
+            ),
+            ("old-ready", "ready", None, old_seconds),
+        ] {
+            conn.execute(
+                "INSERT INTO project_flow_prepared_reads(
+                     request_id, request_hash, normalized_payload, phase_text_id, targets_json,
+                     provider_results_json, owner_instance_id, owner_pid,
+                     owner_process_start_id, recovery_class, state, prepared_at, completed_at,
+                     result_json
+                 ) VALUES(
+                     ?1, ?2, '{}', ?3, '[]', '[]', 'instance-a', 101, 'start-a',
+                     'prepared_external_read', ?4, ?5, ?6, '{}'
+                 )",
+                params![
+                    request_id,
+                    format!("hash-{request_id}"),
+                    campaign,
+                    state,
+                    old_completed_at,
+                    completed_at,
+                ],
+            )
+            .expect("insert prepared retention row");
+            conn.execute(
+                "INSERT INTO atomic_request_outcomes(
+                     request_id, request_hash, effect, response_json, committed_at
+                 ) VALUES(?1, ?2, 'write', '{}', ?3)",
+                params![request_id, format!("hash-{request_id}"), committed_at],
+            )
+            .expect("insert canonical retention row");
+        }
+        drop(project);
+
+        ledger
+            .prune_canonical_outcomes(&db_path)
+            .expect("prune project-flow retention rows");
+
+        let project = open_database(&db_path).expect("inspect project retention fixture");
+        let conn = project.connection();
+        let retained = |table: &str, request_id: &str| -> bool {
+            conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE request_id = ?1)"),
+                [request_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for request_id in ["old-completed", "old-abandoned"] {
+            assert!(!retained("project_flow_prepared_reads", request_id));
+            assert!(!retained("atomic_request_outcomes", request_id));
+        }
+        for request_id in ["recent-completed", "old-ready"] {
+            assert!(retained("project_flow_prepared_reads", request_id));
+            assert!(retained("atomic_request_outcomes", request_id));
+        }
+    }
+
+    #[test]
     fn approved_retry_discards_legacy_terminal_confirmation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
@@ -6124,6 +6262,117 @@ mod tests {
         assert_eq!(
             runtime_reservation(&ledger, &request.id),
             Some(("instance-b".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn prepared_external_read_recovers_when_runtime_completion_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, identity) = project_flow_fixture(&temp);
+        let ledger = RequestOutcomeLedger::open(temp.path().join(DAEMON_OUTCOME_DB_NAME))
+            .expect("open runtime ledger");
+        let request = request("prepared-runtime-completion-failure", "task-a");
+        let owner = prepared_owner("instance-a", 1_010, "start-a");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProjectFlowProvider {
+            calls: Arc::clone(&provider_calls),
+        };
+        let executions = Cell::new(0);
+        let finalizations = Cell::new(0);
+
+        let first = ledger.execute_prepared_external_read_with_finalization_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |request| {
+                prepare_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &provider,
+                )
+            },
+            |request| {
+                executions.set(executions.get() + 1);
+                finalize_pr_attachment(
+                    &db_path,
+                    &request.id,
+                    &campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                )
+                .expect("commit project-flow state");
+                response(&request.id)
+            },
+            || Ok(()),
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+            || {},
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || {
+                ledger.connection()?.execute_batch(
+                    "CREATE TRIGGER fail_prepared_runtime_completion
+                         BEFORE UPDATE OF response_json ON daemon_request_outcomes
+                         WHEN NEW.request_id = 'prepared-runtime-completion-failure'
+                         BEGIN SELECT RAISE(ABORT, 'injected runtime completion failure'); END;",
+                )?;
+                Ok(())
+            },
+        );
+        assert_eq!(first.response.status, Status::Ok);
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), false))
+        );
+        ledger
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_prepared_runtime_completion")
+            .unwrap();
+
+        let prepares = Cell::new(0);
+        let second = ledger.execute_prepared_external_read_with_finalization_hooks(
+            request.clone(),
+            Effect::Write,
+            &owner,
+            Duration::ZERO,
+            &db_path,
+            |_| {
+                prepares.set(prepares.get() + 1);
+                Ok(())
+            },
+            |_| {
+                executions.set(executions.get() + 1);
+                response(&request.id)
+            },
+            || Ok(()),
+            |response| {
+                finalizations.set(finalizations.get() + 1);
+                Ok(response)
+            },
+            || {},
+            |_| DaemonOwnerState::Current,
+            || Ok(()),
+            || Ok(()),
+        );
+
+        assert!(second.replayed);
+        assert_eq!(second.response.status, Status::Ok);
+        assert_eq!(prepares.get(), 0);
+        assert_eq!(executions.get(), 1);
+        assert_eq!(finalizations.get(), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime_reservation(&ledger, &request.id),
+            Some(("instance-a".to_string(), true))
         );
     }
 

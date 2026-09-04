@@ -15,7 +15,10 @@ use serde_json::Value;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Output};
 
-fn project_flow_precondition(kind: &'static str, message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn project_flow_precondition(
+    kind: &'static str,
+    message: impl Into<String>,
+) -> anyhow::Error {
     ExoFailure::new(
         ErrorCode::PreconditionFailed,
         message,
@@ -614,7 +617,8 @@ pub fn attach_rfc(
                 diagnostic: None,
             });
         }
-        if let Some(target) = target_stage
+        if existing_target != target_stage
+            && let Some(target) = target_stage
             && target <= rfc.stage
         {
             bail!(
@@ -1521,9 +1525,9 @@ pub(crate) fn finalize_refresh(
                 "prepared project-flow provider result changed identity",
             ));
         }
-        let artifact_id: i64 = conn
+        let (artifact_id, current_role): (i64, String) = conn
             .query_row(
-                "SELECT artifact.id FROM project_flow_pull_requests_data artifact
+                "SELECT artifact.id, relation.role FROM project_flow_pull_requests_data artifact
              JOIN phase_pull_request_relations_data relation ON relation.artifact_id = artifact.id
              JOIN phases_data phase ON phase.id = relation.phase_id
              WHERE phase.text_id = ?1 AND artifact.provider = ?2
@@ -1534,7 +1538,7 @@ pub(crate) fn finalize_refresh(
                     target.identity.repository,
                     target.identity.number
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -1543,6 +1547,12 @@ pub(crate) fn finalize_refresh(
                     "prepared project-flow relationship no longer exists",
                 )
             })?;
+        if current_role != target.role {
+            return Err(project_flow_precondition(
+                "project_flow.prepared_input_changed",
+                "prepared project-flow relationship changed delivery role",
+            ));
+        }
         record_observation(
             conn,
             artifact_id,
@@ -1776,19 +1786,19 @@ fn append_legacy_objectives(
             })?
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let mut legacy_targets = std::collections::HashMap::<String, Option<u8>>::new();
+    let mut legacy_targets = std::collections::HashMap::<i64, Option<u8>>::new();
     for (number, target, relation, source) in candidates {
-        if let Some(previous) = legacy_targets.insert(number.clone(), target)
-            && previous != target
-        {
-            diagnostics.push(format!(
-                "project_flow.legacy_rfc_target_conflict: {number} ({previous:?} vs {target:?})"
-            ));
-        }
         let Ok(number_value) = number.parse::<i64>() else {
             diagnostics.push(format!("project_flow.legacy_rfc_invalid: {number}"));
             continue;
         };
+        if let Some(previous) = legacy_targets.insert(number_value, target)
+            && previous != target
+        {
+            diagnostics.push(format!(
+                "project_flow.legacy_rfc_target_conflict: {number_value} ({previous:?} vs {target:?})"
+            ));
+        }
         if typed_numbers.contains(&number_value) {
             continue;
         }
@@ -2067,14 +2077,11 @@ mod tests {
             after_advance, before,
             "advanced exact reattachment is a no-op"
         );
-        let changed_at_reached_target =
+        let relation_only_change =
             attach_rfc(&path, &campaign, "10207", RfcRelation::Validates, Some(3))
-                .expect_err("changed attachment must still target a future stage");
-        assert!(
-            changed_at_reached_target
-                .to_string()
-                .contains("must be greater than current Stage 3")
-        );
+                .expect("an unchanged reached target permits a relationship correction");
+        assert_eq!(relation_only_change.relation, "validates");
+        assert_eq!(relation_only_change.target_stage, Some(3));
         attach_rfc(&path, &campaign, "10207", RfcRelation::Validates, Some(4)).unwrap();
         let after: (String, String, u8) = writer
             .database()
@@ -2406,7 +2413,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO goals_data(text_id, label, status, phase_id, kind, rfc, target_stage)
-             VALUES('legacy-goal', 'Advance RFC', 'pending', ?1, 'regular', '10207', 3)",
+             VALUES('legacy-goal', 'Advance RFC', 'pending', ?1, 'regular', '010207', 3)",
             [phase_id],
         )
         .unwrap();
@@ -2418,6 +2425,57 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.contains("project_flow.legacy_rfc_target_conflict"))
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_a_delivery_role_change_after_provider_io() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("Prepared refresh")),
+        };
+        attach_pr_with_provider(
+            &path,
+            "attach-before-role-change",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+        let owner = DaemonOwnerIdentity {
+            instance_id: "role-change-owner".to_string(),
+            pid: 303,
+            process_start_id: "role-change-start".to_string(),
+        };
+        prepare_refresh(
+            &path,
+            "refresh-before-role-change",
+            &campaign,
+            &owner,
+            &provider,
+        )
+        .unwrap();
+        SqliteWriter::open(&path)
+            .unwrap()
+            .database()
+            .connection()
+            .execute(
+                "UPDATE phase_pull_request_relations SET role = 'validates'",
+                [],
+            )
+            .unwrap();
+
+        let error = finalize_refresh(&path, "refresh-before-role-change", &campaign)
+            .expect_err("changed delivery role must invalidate prepared provider evidence");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed prepared-input failure");
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.prepared_input_changed"
         );
     }
 
