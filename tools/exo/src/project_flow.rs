@@ -770,6 +770,13 @@ pub fn detach_rfc(db_path: &Path, campaign: &str, selector: &str) -> Result<bool
 struct PreparedTarget {
     identity: PullRequestIdentity,
     role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment_snapshot: Option<PreparedAttachmentSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PreparedAttachmentSnapshot {
+    artifact_ulid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1289,6 +1296,17 @@ fn observation_id(conn: &Connection, artifact_id: i64) -> Result<Option<i64>> {
         .optional()?)
 }
 
+fn artifact_ulid(conn: &Connection, identity: &PullRequestIdentity) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT text_id FROM project_flow_pull_requests_data
+         WHERE provider = ?1 AND repository = ?2 AND number = ?3",
+            params![identity.provider, identity.repository, identity.number],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<i64> {
     let existing = conn
         .query_row(
@@ -1320,24 +1338,12 @@ fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<
     Ok(conn.last_insert_rowid())
 }
 
-fn campaign_artifact_id(
-    conn: &Connection,
-    campaign: &str,
-    identity: &PullRequestIdentity,
-) -> Result<Option<i64>> {
+fn artifact_id(conn: &Connection, identity: &PullRequestIdentity) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
-            "SELECT artifact.id FROM project_flow_pull_requests_data artifact
-             JOIN phase_pull_request_relations_data relation ON relation.artifact_id = artifact.id
-             JOIN phases_data phase ON phase.id = relation.phase_id
-             WHERE phase.text_id = ?1 AND artifact.provider = ?2
-               AND artifact.repository = ?3 AND artifact.number = ?4",
-            params![
-                campaign,
-                identity.provider,
-                identity.repository,
-                identity.number
-            ],
+            "SELECT id FROM project_flow_pull_requests_data
+             WHERE provider = ?1 AND repository = ?2 AND number = ?3",
+            params![identity.provider, identity.repository, identity.number],
             |row| row.get(0),
         )
         .optional()?)
@@ -1350,6 +1356,35 @@ fn upsert_campaign_delivery_relation(
     canonical_identity: &PullRequestIdentity,
     role: &str,
 ) -> Result<i64> {
+    // A provider rename changes the existing artifact, not its portable identity.
+    if let Some(previous_id) = previous_artifact_id {
+        let destination: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project_flow_pull_requests_data
+                 WHERE provider = ?1 AND repository = ?2 AND number = ?3",
+                params![
+                    canonical_identity.provider,
+                    canonical_identity.repository,
+                    canonical_identity.number
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if destination.is_none() {
+            conn.execute(
+                "UPDATE project_flow_pull_requests
+                 SET provider = ?2, repository = ?3, number = ?4, url = ?5
+                 WHERE id = ?1",
+                params![
+                    previous_id,
+                    canonical_identity.provider,
+                    canonical_identity.repository,
+                    canonical_identity.number,
+                    canonical_identity.url
+                ],
+            )?;
+        }
+    }
     let canonical_artifact_id = ensure_artifact(conn, canonical_identity)?;
     let canonical_relation_id = conn
         .query_row(
@@ -1442,6 +1477,7 @@ pub(crate) fn prepare_pr_attachment(
     let target = PreparedTarget {
         identity,
         role: role.as_str().to_string(),
+        attachment_snapshot: None,
     };
     let payload = serde_json::to_string(&("pr.attach", &campaign, &target))?;
     prepare_external_read(
@@ -1450,7 +1486,13 @@ pub(crate) fn prepare_pr_attachment(
         &payload,
         &campaign,
         owner,
-        |_| Ok(vec![target]),
+        |conn| {
+            let mut target = target;
+            target.attachment_snapshot = Some(PreparedAttachmentSnapshot {
+                artifact_ulid: artifact_ulid(conn, &target.identity)?,
+            });
+            Ok(vec![target])
+        },
         provider,
     )?;
     Ok(())
@@ -1468,6 +1510,7 @@ pub(crate) fn finalize_pr_attachment(
     let target = PreparedTarget {
         identity: identity.clone(),
         role: role.as_str().to_string(),
+        attachment_snapshot: None,
     };
     let payload = serde_json::to_string(&("pr.attach", &campaign, &target))?;
     let hash = blake3::hash(payload.as_bytes()).to_hex().to_string();
@@ -1524,12 +1567,24 @@ pub(crate) fn finalize_pr_attachment(
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
+    let snapshot = target.attachment_snapshot.ok_or_else(|| {
+        project_flow_precondition(
+            "project_flow.prepared_identity_snapshot_missing",
+            "this older prepared attachment lacks an artifact identity snapshot; retry with a new request",
+        )
+    })?;
+    if artifact_ulid(conn, &identity)? != snapshot.artifact_ulid {
+        return Err(project_flow_precondition(
+            "project_flow.prepared_input_changed",
+            "the prepared pull-request artifact identity changed; retry with a new request",
+        ));
+    }
     let canonical_identity = observation
         .observation
         .as_ref()
         .map(|observation| &observation.identity)
         .unwrap_or(&identity);
-    let requested_artifact_id = campaign_artifact_id(conn, &campaign, &identity)?;
+    let requested_artifact_id = artifact_id(conn, &identity)?;
     let artifact_id = upsert_campaign_delivery_relation(
         conn,
         &campaign,
@@ -1645,6 +1700,7 @@ pub(crate) fn prepare_refresh(
             Ok(stmt
                 .query_map([&campaign], |row| {
                     Ok(PreparedTarget {
+                        attachment_snapshot: None,
                         identity: PullRequestIdentity {
                             provider: row.get(0)?,
                             repository: row.get(1)?,
@@ -1794,8 +1850,28 @@ pub fn status(db_path: &Path, campaign: &str) -> Result<ProjectFlowStatus> {
     status_with_connection(db.connection(), &campaign)
 }
 
+pub(crate) fn status_with_effective_rfcs(
+    db_path: &Path,
+    campaign: &str,
+    effective_rfcs: &[crate::rfc::EffectiveRfcRecord],
+) -> Result<ProjectFlowStatus> {
+    let db = open_request_database(db_path)?;
+    let conn = db.connection();
+    let campaign = resolve_campaign(conn, campaign)?;
+    let rfcs = effective_rfc_map(conn, effective_rfcs)?;
+    status_with_rfc_map(conn, &campaign, &rfcs)
+}
+
 fn status_with_connection(conn: &Connection, campaign: &str) -> Result<ProjectFlowStatus> {
-    let (objectives, mut diagnostics) = campaign_rfc_objectives_with_connection(conn, campaign)?;
+    status_with_rfc_map(conn, campaign, &load_rfc_map(conn)?)
+}
+
+fn status_with_rfc_map(
+    conn: &Connection,
+    campaign: &str,
+    rfcs: &std::collections::HashMap<String, RfcRecord>,
+) -> Result<ProjectFlowStatus> {
+    let (objectives, mut diagnostics) = campaign_rfc_objectives_with_rfc_map(conn, campaign, rfcs)?;
     let phase_id: i64 = conn.query_row(
         "SELECT id FROM phases WHERE text_id = ?1",
         [campaign],
@@ -1859,42 +1935,37 @@ pub(crate) fn campaign_rfc_objectives_with_effective_rfcs(
     campaign: &str,
     effective_rfcs: &[crate::rfc::EffectiveRfcRecord],
 ) -> Result<(Vec<RfcObjectiveView>, Vec<String>)> {
-    let (mut objectives, mut diagnostics) = campaign_rfc_objectives(db_path, campaign)?;
-    let effective = effective_rfcs
-        .iter()
-        .map(|effective| (effective.record.text_id.as_str(), &effective.record))
-        .collect::<std::collections::HashMap<_, _>>();
-    for objective in &mut objectives {
-        let Some(record) = effective.get(objective.rfc_ulid.as_str()) else {
-            continue;
-        };
-        let (lifecycle, superseded_by) = effective_rfc_lifecycle(record);
-        objective.rfc_number = record.rfc_number;
-        objective.title.clone_from(&record.title);
-        objective.current_stage = Some(record.stage);
-        objective.lifecycle = Some(lifecycle);
-        objective.superseded_by = superseded_by;
-        objective.diagnostic = None;
-    }
-    diagnostics.retain(|diagnostic| {
-        !objectives.iter().any(|objective| {
-            objective.current_stage.is_some()
-                && diagnostic
-                    == &format!("project_flow.rfc_identity_missing: {}", objective.rfc_ulid)
-        })
-    });
-    objectives.sort_by(|left, right| {
-        objective_relation_priority(&left.relation)
-            .cmp(&objective_relation_priority(&right.relation))
-            .then(left.rfc_number.cmp(&right.rfc_number))
-            .then(left.rfc_ulid.cmp(&right.rfc_ulid))
-    });
-    Ok((objectives, diagnostics))
+    let db = open_request_database(db_path)?;
+    let conn = db.connection();
+    let campaign = resolve_campaign(conn, campaign)?;
+    let rfcs = effective_rfc_map(conn, effective_rfcs)?;
+    campaign_rfc_objectives_with_rfc_map(conn, &campaign, &rfcs)
+}
+
+fn effective_rfc_map(
+    conn: &Connection,
+    effective_rfcs: &[crate::rfc::EffectiveRfcRecord],
+) -> Result<std::collections::HashMap<String, RfcRecord>> {
+    let mut rfcs = load_rfc_map(conn)?;
+    rfcs.extend(
+        effective_rfcs
+            .iter()
+            .map(|effective| (effective.record.text_id.clone(), effective.record.clone())),
+    );
+    Ok(rfcs)
 }
 
 fn campaign_rfc_objectives_with_connection(
     conn: &Connection,
     campaign: &str,
+) -> Result<(Vec<RfcObjectiveView>, Vec<String>)> {
+    campaign_rfc_objectives_with_rfc_map(conn, campaign, &load_rfc_map(conn)?)
+}
+
+fn campaign_rfc_objectives_with_rfc_map(
+    conn: &Connection,
+    campaign: &str,
+    current_rfcs: &std::collections::HashMap<String, RfcRecord>,
 ) -> Result<(Vec<RfcObjectiveView>, Vec<String>)> {
     let mut diagnostics = Vec::new();
     let phase_id: i64 = conn.query_row(
@@ -1902,7 +1973,6 @@ fn campaign_rfc_objectives_with_connection(
         [campaign],
         |row| row.get(0),
     )?;
-    let current_rfcs = load_rfc_map(conn)?;
     let mut stmt = conn.prepare(
         "SELECT objective.rfc_ulid, objective.rfc_number_snapshot, objective.rfc_title_snapshot,
                 objective.observed_stage, objective.target_stage, objective.relation
@@ -1963,7 +2033,7 @@ fn campaign_rfc_objectives_with_connection(
     append_legacy_objectives(
         conn,
         phase_id,
-        &current_rfcs,
+        current_rfcs,
         &typed_ulids,
         &mut objectives,
         &mut diagnostics,
@@ -2366,6 +2436,23 @@ mod tests {
             },
         )
         .unwrap();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let portable_keys = |conn: &Connection| -> (String, i64, String, String) {
+            conn.query_row(
+                "SELECT artifact.text_id, relation.id, relation.created_at, relation.updated_at
+                 FROM project_flow_pull_requests_data artifact
+                 JOIN phase_pull_request_relations_data relation ON relation.artifact_id = artifact.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap()
+        };
+        let original_keys = portable_keys(writer.database().connection());
+        let sibling = _temp.path().join("sibling.db");
+        writer
+            .database()
+            .connection()
+            .execute("VACUUM INTO ?1", [sibling.to_str().unwrap()])
+            .unwrap();
         let mut moved = observation("Moved PR");
         moved.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
 
@@ -2375,7 +2462,7 @@ mod tests {
             &campaign,
             &FakeProvider {
                 calls: Cell::new(0),
-                result: Ok(moved),
+                result: Ok(moved.clone()),
             },
         )
         .unwrap();
@@ -2385,6 +2472,368 @@ mod tests {
             status.pull_requests[0].identity.repository,
             "new-owner/new-repo"
         );
+        assert_eq!(portable_keys(writer.database().connection()), original_keys);
+        let sibling_status = refresh_with_provider(
+            &sibling,
+            "sibling-refresh-canonical-identity",
+            &campaign,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(moved),
+            },
+        )
+        .unwrap();
+        let sibling_writer = SqliteWriter::open(&sibling).unwrap();
+        assert_eq!(
+            portable_keys(sibling_writer.database().connection()),
+            original_keys
+        );
+        assert_eq!(
+            sibling_status.pull_requests[0].identity,
+            status.pull_requests[0].identity
+        );
+    }
+
+    #[test]
+    fn canonicalization_reuses_an_existing_destination_artifact() {
+        let (_temp, path, campaign) = fixture();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let conn = writer.database().connection();
+        let old = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let destination = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+        let old_id =
+            upsert_campaign_delivery_relation(conn, &campaign, None, &old, "implements").unwrap();
+        let destination_id =
+            upsert_campaign_delivery_relation(conn, &campaign, None, &destination, "validates")
+                .unwrap();
+        let updated = upsert_campaign_delivery_relation(
+            conn,
+            &campaign,
+            Some(old_id),
+            &destination,
+            "implements",
+        )
+        .unwrap();
+        assert_eq!(updated, destination_id);
+        let rows: (i64, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM project_flow_pull_requests_data),
+                    (SELECT COUNT(*) FROM phase_pull_request_relations_data), role
+             FROM phase_pull_request_relations_data",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (1, 1, "implements".to_string()));
+    }
+
+    #[test]
+    fn attaching_a_new_campaign_preserves_a_known_artifacts_identity() {
+        let (_temp, path, campaign_a) = fixture();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let epoch = writer
+            .add_epoch("Second epoch", Some("second-epoch"), &[])
+            .unwrap();
+        let campaign_b = writer
+            .add_phase(
+                &epoch,
+                "Second campaign",
+                "regular",
+                Some("second-campaign"),
+                &[],
+            )
+            .unwrap();
+        let identity = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let mut original = observation("Original PR");
+        original.identity = identity.clone();
+        attach_pr_with_provider(
+            &path,
+            "known-artifact-a",
+            &campaign_a,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(original),
+            },
+        )
+        .unwrap();
+        let original_ulid = artifact_ulid(writer.database().connection(), &identity)
+            .unwrap()
+            .unwrap();
+        let mut moved = observation("Moved PR");
+        moved.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+        attach_pr_with_provider(
+            &path,
+            "known-artifact-b",
+            &campaign_b,
+            identity,
+            DeliveryRole::Validates,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(moved.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_ulid(writer.database().connection(), &moved.identity).unwrap(),
+            Some(original_ulid)
+        );
+        for campaign in [&campaign_a, &campaign_b] {
+            let current = status(&path, campaign).unwrap();
+            assert_eq!(current.pull_requests.len(), 1);
+            assert_eq!(current.pull_requests[0].identity, moved.identity);
+        }
+        assert_eq!(
+            writer
+                .database()
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM project_flow_pull_requests_data",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_attachment_cannot_recreate_a_renamed_shared_artifact() {
+        let (_temp, path, campaign_a) = fixture();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let epoch = writer
+            .add_epoch("Second epoch", Some("second-epoch"), &[])
+            .unwrap();
+        let campaign_b = writer
+            .add_phase(
+                &epoch,
+                "Second campaign",
+                "regular",
+                Some("second-campaign"),
+                &[],
+            )
+            .unwrap();
+        let identity = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let mut original = observation("Original PR");
+        original.identity = identity.clone();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(original),
+        };
+        for (request, campaign) in [("attach-a", &campaign_a), ("attach-b", &campaign_b)] {
+            attach_pr_with_provider(
+                &path,
+                request,
+                campaign,
+                identity.clone(),
+                DeliveryRole::Implements,
+                &provider,
+            )
+            .unwrap();
+        }
+        let failed = FakeProvider {
+            calls: Cell::new(0),
+            result: Err(ProviderFailure {
+                class: "unavailable",
+                message: "provider offline".to_string(),
+            }),
+        };
+        prepare_pr_attachment(
+            &path,
+            "pending-b",
+            &campaign_b,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &direct_process_owner().unwrap(),
+            &failed,
+        )
+        .unwrap();
+        let mut moved = observation("Moved PR");
+        moved.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+        refresh_with_provider(
+            &path,
+            "rename-a",
+            &campaign_a,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(moved.clone()),
+            },
+        )
+        .unwrap();
+        let error = finalize_pr_attachment(
+            &path,
+            "pending-b",
+            &campaign_b,
+            identity,
+            DeliveryRole::Implements,
+        )
+        .expect_err("stale alias must not be recreated");
+        let failure = error.downcast_ref::<ExoFailure>().unwrap();
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.prepared_input_changed"
+        );
+        let status_b = status(&path, &campaign_b).unwrap();
+        assert_eq!(status_b.pull_requests.len(), 1);
+        assert_eq!(status_b.pull_requests[0].identity, moved.identity);
+        assert_eq!(
+            writer
+                .database()
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM project_flow_pull_requests_data",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn older_uncompleted_attachment_requires_a_fresh_identity_snapshot() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        prepare_pr_attachment(
+            &path,
+            "legacy-prepared-attach",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &direct_process_owner().unwrap(),
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("PR")),
+            },
+        )
+        .unwrap();
+        let writer = SqliteWriter::open(&path).unwrap();
+        #[derive(Serialize)]
+        struct LegacyTarget<'a> {
+            identity: &'a PullRequestIdentity,
+            role: &'a str,
+        }
+        let legacy_payload = serde_json::to_string(&(
+            "pr.attach",
+            &campaign,
+            LegacyTarget {
+                identity: &identity,
+                role: "implements",
+            },
+        ))
+        .unwrap();
+        let retained_payload: String = writer.database().connection().query_row(
+            "SELECT normalized_payload FROM project_flow_prepared_reads WHERE request_id = 'legacy-prepared-attach'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            retained_payload, legacy_payload,
+            "adding the snapshot must preserve request hashes"
+        );
+        writer.database().connection().execute(
+            "UPDATE project_flow_prepared_reads SET targets_json = json_remove(targets_json, '$[0].attachment_snapshot')
+             WHERE request_id = 'legacy-prepared-attach'", [],
+        ).unwrap();
+        let error = finalize_pr_attachment(
+            &path,
+            "legacy-prepared-attach",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ExoFailure>()
+                .unwrap()
+                .error
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "project_flow.prepared_identity_snapshot_missing"
+        );
+        assert!(status(&path, &campaign).unwrap().pull_requests.is_empty());
+
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let completed = attach_pr_with_provider(
+            &path,
+            "legacy-completed-attach",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("Completed PR")),
+            },
+        )
+        .unwrap();
+        writer.database().connection().execute(
+            "UPDATE project_flow_prepared_reads SET targets_json = json_remove(targets_json, '$[0].attachment_snapshot')
+             WHERE request_id = 'legacy-completed-attach'", [],
+        ).unwrap();
+        let replayed = finalize_pr_attachment(
+            &path,
+            "legacy-completed-attach",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(completed).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_attachment_rejects_an_artifact_created_during_provider_io() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("PR")),
+        };
+        prepare_pr_attachment(
+            &path,
+            "initially-absent",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+            &direct_process_owner().unwrap(),
+            &provider,
+        )
+        .unwrap();
+        attach_pr_with_provider(
+            &path,
+            "concurrent-creation",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Validates,
+            &provider,
+        )
+        .unwrap();
+        let error = finalize_pr_attachment(
+            &path,
+            "initially-absent",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ExoFailure>()
+                .unwrap()
+                .error
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "project_flow.prepared_input_changed"
+        );
+        let current = status(&path, &campaign).unwrap();
+        assert_eq!(current.pull_requests.len(), 1);
+        assert_eq!(current.pull_requests[0].role, "validates");
     }
 
     #[test]
@@ -2612,11 +3061,76 @@ mod tests {
         };
 
         let (objectives, diagnostics) =
-            campaign_rfc_objectives_with_effective_rfcs(&path, &campaign, &[effective]).unwrap();
+            campaign_rfc_objectives_with_effective_rfcs(&path, &campaign, &[effective.clone()])
+                .unwrap();
         assert_eq!(objectives[0].title, "Workspace project flow");
         assert_eq!(objectives[0].current_stage, Some(3));
         assert_eq!(objectives[0].motion(), RfcObjectiveMotion::TargetReached);
         assert!(diagnostics.is_empty());
+
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("Stored PR")),
+        };
+        attach_pr_with_provider(
+            &path,
+            "attach-workspace-status",
+            &campaign,
+            PullRequestIdentity::parse("wycats/exo2#75").unwrap(),
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+        let workspace_status =
+            status_with_effective_rfcs(&path, &campaign, &[effective.clone()]).unwrap();
+        assert_eq!(
+            workspace_status.rfc_objectives[0].title,
+            "Workspace project flow"
+        );
+        assert_eq!(
+            workspace_status.rfc_objectives[0].motion(),
+            RfcObjectiveMotion::TargetReached
+        );
+        assert_eq!(
+            workspace_status.pull_requests[0].title.as_deref(),
+            Some("Stored PR")
+        );
+        assert_eq!(
+            provider.calls.get(),
+            1,
+            "status performs no provider refresh"
+        );
+
+        let writer = SqliteWriter::open(&path).unwrap();
+        writer
+            .replace_phase_rfcs(&campaign, &["10207".to_string()])
+            .unwrap();
+        let mut renamed = effective.clone();
+        renamed.record.rfc_number = 10208;
+        let mut reused = effective.clone();
+        reused.record.text_id = "01rfc000000000000000000002".to_string();
+        reused.record.title = "New workspace RFC".to_string();
+        let (objectives, diagnostics) = campaign_rfc_objectives_with_effective_rfcs(
+            &path,
+            &campaign,
+            &[renamed, reused.clone()],
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(objectives.len(), 2);
+        assert_eq!(objectives[0].rfc_ulid, effective.record.text_id);
+        assert_eq!(objectives[0].rfc_number, 10208);
+        assert_eq!(objectives[1].rfc_ulid, reused.record.text_id);
+        assert_eq!(objectives[1].source, "legacy_phase");
+
+        let (_, diagnostics) =
+            campaign_rfc_objectives_with_effective_rfcs(&path, &campaign, &[effective, reused])
+                .unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d == "project_flow.rfc_ambiguous: 10207")
+        );
     }
 
     #[test]
@@ -2995,6 +3509,7 @@ mod tests {
             "pr.attach",
             &campaign,
             PreparedTarget {
+                attachment_snapshot: None,
                 identity,
                 role: DeliveryRole::Implements.as_str().to_string(),
             },

@@ -335,32 +335,12 @@ fn build_rfc_pipeline(
         return (pipeline, Vec::new());
     };
 
-    match crate::project_flow::campaign_rfc_objectives(db_path, &phase.id) {
-        Ok((mut objectives, mut diagnostics)) => {
-            let effective = effective_rfcs
-                .iter()
-                .map(|effective| (effective.record.text_id.as_str(), &effective.record))
-                .collect::<HashMap<_, _>>();
-            for objective in &mut objectives {
-                let Some(record) = effective.get(objective.rfc_ulid.as_str()) else {
-                    continue;
-                };
-                let (lifecycle, superseded_by) =
-                    crate::project_flow::effective_rfc_lifecycle(record);
-                objective.rfc_number = record.rfc_number;
-                objective.title.clone_from(&record.title);
-                objective.current_stage = Some(record.stage);
-                objective.lifecycle = Some(lifecycle);
-                objective.superseded_by = superseded_by;
-                objective.diagnostic = None;
-            }
-            diagnostics.retain(|diagnostic| {
-                !objectives.iter().any(|objective| {
-                    objective.current_stage.is_some()
-                        && diagnostic
-                            == &format!("project_flow.rfc_identity_missing: {}", objective.rfc_ulid)
-                })
-            });
+    match crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
+        db_path,
+        &phase.id,
+        effective_rfcs,
+    ) {
+        Ok((objectives, diagnostics)) => {
             for objective in objectives {
                 let id = format!("{:05}", objective.rfc_number);
                 let motion = objective.motion();
@@ -514,7 +494,8 @@ mod project_flow_pipeline_tests {
             },
         };
 
-        let (pipeline, diagnostics) = build_rfc_pipeline(&db_path, Some(&phase), &[effective]);
+        let (pipeline, diagnostics) =
+            build_rfc_pipeline(&db_path, Some(&phase), &[effective.clone()]);
         let objective = &pipeline["01rfc000000000000000000001"];
         assert_eq!(objective.title, "Workspace project flow");
         assert_eq!(objective.current_stage, Some(3));
@@ -523,6 +504,24 @@ mod project_flow_pipeline_tests {
             crate::project_flow::RfcObjectiveMotion::TargetReached
         );
         assert!(diagnostics.is_empty());
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .replace_phase_rfcs(&phase.id, &["10207".to_string()])
+            .unwrap();
+        let mut renumbered = effective.clone();
+        renumbered.record.rfc_number = 10208;
+        let mut replacement = effective;
+        replacement.record.text_id = "01rfc000000000000000000002".to_string();
+        replacement.record.title = "Replacement workspace RFC".to_string();
+        let (pipeline, diagnostics) =
+            build_rfc_pipeline(&db_path, Some(&phase), &[renumbered, replacement]);
+        assert!(diagnostics.is_empty());
+        assert_eq!(pipeline.len(), 2);
+        assert_eq!(pipeline["01rfc000000000000000000001"].id, "10208");
+        assert_eq!(
+            pipeline["01rfc000000000000000000002"].title,
+            "Replacement workspace RFC"
+        );
     }
 
     #[test]

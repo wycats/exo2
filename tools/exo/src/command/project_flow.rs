@@ -14,7 +14,8 @@ use crate::project_flow::{
     DeliveryRole, GithubProvider, ProjectFlowStatus as ProjectFlowStatusData, PullRequestIdentity,
     RfcObjectiveMotion, RfcRelation, attach_pr_with_provider, attach_rfc, detach_pr, detach_rfc,
     finalize_pr_attachment, finalize_refresh_with_preflight, prepare_pr_attachment,
-    prepare_refresh, project_flow_precondition, refresh_with_provider_and_preflight, status,
+    prepare_refresh, project_flow_precondition, refresh_with_provider_and_preflight,
+    status_with_effective_rfcs,
 };
 use anyhow::{Result as ExoResult, bail};
 
@@ -584,7 +585,8 @@ impl Command for ProjectFlowStatus {
             .campaign
             .clone()
             .map_or_else(|| active_campaign(ctx), Ok)?;
-        let status = status(&ctx.db_path(), &campaign)?;
+        let effective_rfcs = crate::rfc::load_effective_rfcs(ctx.root, ctx.project)?;
+        let status = status_with_effective_rfcs(&ctx.db_path(), &campaign, &effective_rfcs)?;
         let message = render_project_flow_status(&status);
         Ok(CommandOutput::data(status).with_message(message))
     }
@@ -735,6 +737,98 @@ mod tests {
     use crate::api::protocol::{Address, CallParams, ErrorCode};
     use crate::failure::ExoFailure;
     use crate::project_flow::{PullRequestView, RfcObjectiveView};
+
+    #[test]
+    fn status_command_observes_the_workspace_rfc_document() {
+        use crate::process_spawn::CommandSpawnExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output_guarded()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.name", "Exo Test"]);
+        git(&["config", "user.email", "exo-test@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        let original = root.join("docs/rfcs/stage-2/10207-project-flow.md");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original,
+            "<!-- exo:10207 ulid:01rfc000000000000000000001 -->\n\n# RFC 10207: Canonical project flow\n").unwrap();
+        git(&["add", "docs/rfcs"]);
+        git(&["commit", "-m", "Canonical RFC"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+
+        let path = crate::context::db_path(root, None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let writer = crate::context::SqliteWriter::open(&path).unwrap();
+        let epoch = writer.add_epoch("Epoch", Some("epoch"), &[]).unwrap();
+        let campaign = writer
+            .add_phase(&epoch, "Campaign", "regular", Some("campaign"), &[])
+            .unwrap();
+        crate::rfc::observe_effective_rfcs(root, None).unwrap();
+        crate::project_flow::attach_rfc(
+            &path,
+            &campaign,
+            "10207",
+            crate::project_flow::RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+
+        let promoted = root.join("docs/rfcs/stage-3/10207-project-flow.md");
+        std::fs::create_dir_all(promoted.parent().unwrap()).unwrap();
+        std::fs::rename(original, &promoted).unwrap();
+        std::fs::write(promoted,
+            "<!-- exo:10207 ulid:01rfc000000000000000000001 -->\n\n# RFC 10207: Workspace project flow\n").unwrap();
+        let ctx = CommandContext {
+            root,
+            project: None,
+            format: crate::command::traits::OutputFormat::Json,
+            agent_id: None,
+            request_id: None,
+            workflow_confirmation: None,
+            input_content: None,
+            runtime_services: None,
+        };
+        let output = ProjectFlowStatus::new(Some(campaign))
+            .execute(&ctx)
+            .unwrap();
+        assert_eq!(output.data["rfc_objectives"][0]["current_stage"], 3);
+        assert_eq!(
+            output.data["rfc_objectives"][0]["title"],
+            "Workspace project flow"
+        );
+        assert_eq!(
+            writer
+                .database()
+                .connection()
+                .query_row(
+                    "SELECT stage FROM rfcs_data WHERE rfc_number = 10207",
+                    [],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            2,
+            "the status view must not promote shared canonical state"
+        );
+    }
 
     #[test]
     fn project_flow_status_human_output_renders_motion_and_degraded_truth() {
