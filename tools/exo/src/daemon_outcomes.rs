@@ -118,6 +118,43 @@ pub(crate) fn direct_prepared_read_owner() -> Result<DaemonOwnerIdentity> {
     })
 }
 
+fn prune_direct_prepared_external_read_outcomes(project_db_path: &Path) -> Result<()> {
+    if !project_db_path.exists() {
+        return Ok(());
+    }
+    let mut connection = exosuit_storage::open_fenced_connection(project_db_path)
+        .map_err(crate::storage_compatibility::map_database_error)
+        .with_context(|| format!("open project database {}", project_db_path.display()))?;
+    connection.pragma_update(None, "busy_timeout", 0)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let cutoff = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS;
+    let expired_request_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT outcome.request_id
+             FROM atomic_request_outcomes outcome
+             JOIN project_flow_prepared_reads prepared
+               ON prepared.request_id = outcome.request_id
+             WHERE outcome.committed_at < ?1
+               AND prepared.state IN ('completed', 'abandoned')",
+        )?;
+        statement
+            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for request_id in expired_request_ids {
+        transaction.execute(
+            "DELETE FROM project_flow_prepared_reads WHERE request_id = ?1",
+            [&request_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM atomic_request_outcomes WHERE request_id = ?1",
+            [&request_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(crate) fn execute_prepared_external_read_direct<F, P, G>(
     request: RequestEnvelope,
     effect: Effect,
@@ -131,6 +168,7 @@ where
     P: FnOnce(&RequestEnvelope, &DaemonOwnerIdentity) -> Result<()>,
     G: FnOnce(ResponseEnvelope) -> Result<ResponseEnvelope, ResponseEnvelope>,
 {
+    let _ = prune_direct_prepared_external_read_outcomes(project_db_path);
     let request_id = request.id.clone();
     let request_hash = match request_hash(&request) {
         Ok(hash) => hash,
@@ -3535,10 +3573,11 @@ mod tests {
     impl PullRequestProvider for CountingProjectFlowProvider {
         fn observe(
             &self,
-            _identity: &PullRequestIdentity,
+            identity: &PullRequestIdentity,
         ) -> std::result::Result<ProviderObservation, ProviderFailure> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ProviderObservation {
+                identity: identity.clone(),
                 title: "Prepared recovery".to_string(),
                 lifecycle: "open".to_string(),
                 head_oid: Some("abc123".to_string()),
@@ -4462,6 +4501,66 @@ mod tests {
             assert!(retained("project_flow_prepared_reads", request_id));
             assert!(retained("atomic_request_outcomes", request_id));
         }
+    }
+
+    #[test]
+    fn direct_external_reads_prune_expired_terminal_prepared_outcomes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (db_path, campaign, _) = project_flow_fixture(&temp);
+        let old_seconds = now_timestamp() - COMPLETED_OUTCOME_RETENTION_SECS - 1;
+        let old_completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(old_seconds, 0)
+            .unwrap()
+            .to_rfc3339();
+        let project = open_database(&db_path).expect("open project retention fixture");
+        let conn = project.connection();
+        for (request_id, state) in [("direct-completed", "completed"), ("direct-ready", "ready")] {
+            conn.execute(
+                "INSERT INTO project_flow_prepared_reads(
+                     request_id, request_hash, normalized_payload, phase_text_id, targets_json,
+                     provider_results_json, owner_instance_id, owner_pid,
+                     owner_process_start_id, recovery_class, state, prepared_at, completed_at,
+                     result_json
+                 ) VALUES(
+                     ?1, ?2, '{}', ?3, '[]', '[]', 'instance-a', 101, 'start-a',
+                     'prepared_external_read', ?4, ?5, ?5, '{}'
+                 )",
+                params![
+                    request_id,
+                    format!("hash-{request_id}"),
+                    campaign,
+                    state,
+                    old_completed_at,
+                ],
+            )
+            .expect("insert direct prepared row");
+            conn.execute(
+                "INSERT INTO atomic_request_outcomes(
+                     request_id, request_hash, effect, response_json, committed_at
+                 ) VALUES(?1, ?2, 'write', '{}', ?3)",
+                params![request_id, format!("hash-{request_id}"), old_seconds],
+            )
+            .expect("insert direct canonical outcome");
+        }
+        drop(project);
+
+        prune_direct_prepared_external_read_outcomes(&db_path)
+            .expect("prune direct project-flow outcomes");
+
+        let project = open_database(&db_path).expect("inspect direct retention fixture");
+        let retained = |table: &str, request_id: &str| -> bool {
+            project
+                .connection()
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE request_id = ?1)"),
+                    [request_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(!retained("project_flow_prepared_reads", "direct-completed"));
+        assert!(!retained("atomic_request_outcomes", "direct-completed"));
+        assert!(retained("project_flow_prepared_reads", "direct-ready"));
+        assert!(retained("atomic_request_outcomes", "direct-ready"));
     }
 
     #[test]
@@ -5562,13 +5661,14 @@ mod tests {
         impl PullRequestProvider for GateCheckingProvider {
             fn observe(
                 &self,
-                _identity: &PullRequestIdentity,
+                identity: &PullRequestIdentity,
             ) -> std::result::Result<ProviderObservation, ProviderFailure> {
                 assert!(
                     !self.held.load(Ordering::SeqCst),
                     "provider I/O must happen before the project-state gate"
                 );
                 Ok(ProviderObservation {
+                    identity: identity.clone(),
                     title: "Outside the gate".to_string(),
                     lifecycle: "open".to_string(),
                     head_oid: Some("abc123".to_string()),

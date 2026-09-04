@@ -19,12 +19,22 @@ pub(crate) fn project_flow_precondition(
     kind: &'static str,
     message: impl Into<String>,
 ) -> anyhow::Error {
+    project_flow_precondition_with_details(kind, message, serde_json::json!({}))
+}
+
+pub(crate) fn project_flow_precondition_with_details(
+    kind: &'static str,
+    message: impl Into<String>,
+    details: Value,
+) -> anyhow::Error {
+    let mut details = details.as_object().cloned().unwrap_or_default();
+    details.insert("kind".to_string(), Value::String(kind.to_string()));
     ExoFailure::new(
         ErrorCode::PreconditionFailed,
         message,
         ExoFailure::orienting_steering(Vec::new()),
     )
-    .with_details(serde_json::json!({ "kind": kind }))
+    .with_details(Value::Object(details))
     .into()
 }
 
@@ -172,6 +182,7 @@ fn validate_github_repository(repository: &str) -> Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderObservation {
+    pub identity: PullRequestIdentity,
     pub title: String,
     pub lifecycle: String,
     pub head_oid: Option<String>,
@@ -266,6 +277,19 @@ impl<P: GhProcess> PullRequestProvider for GithubProvider<P> {
 }
 
 fn parse_github_observation(value: &Value) -> Result<ProviderObservation, ProviderFailure> {
+    let identity = value
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderFailure {
+            class: "invalid_response",
+            message: "GitHub response omitted the canonical pull-request URL".to_string(),
+        })
+        .and_then(|url| {
+            PullRequestIdentity::parse(url).map_err(|error| ProviderFailure {
+                class: "invalid_response",
+                message: format!("GitHub returned an invalid pull-request URL: {error}"),
+            })
+        })?;
     let title = value
         .get("title")
         .and_then(Value::as_str)
@@ -319,6 +343,7 @@ fn parse_github_observation(value: &Value) -> Result<ProviderObservation, Provid
         Some(Value::Null) | None | Some(_) => "unknown",
     };
     Ok(ProviderObservation {
+        identity,
         title: title.to_string(),
         lifecycle: lifecycle.to_string(),
         head_oid: value
@@ -399,6 +424,7 @@ pub struct RfcObjectiveView {
     pub rfc_ulid: String,
     pub rfc_number: i64,
     pub title: String,
+    pub observed_stage: Option<u8>,
     pub current_stage: Option<u8>,
     pub lifecycle: Option<String>,
     pub superseded_by: Option<String>,
@@ -445,7 +471,7 @@ impl RfcObjectiveView {
     }
 }
 
-fn effective_rfc_lifecycle(rfc: &RfcRecord) -> (String, Option<String>) {
+pub(crate) fn effective_rfc_lifecycle(rfc: &RfcRecord) -> (String, Option<String>) {
     let superseded_by = rfc.superseded_by.clone();
     let lifecycle = if matches!(rfc.status.as_str(), "withdrawn" | "archived") {
         rfc.status.as_str()
@@ -548,20 +574,39 @@ fn resolve_rfc(conn: &Connection, selector: &str) -> Result<RfcRecord> {
             "project_flow.rfc_not_found",
             format!("RFC '{selector}' not found"),
         )),
-        _ => Err(project_flow_precondition(
-            "project_flow.rfc_ambiguous",
-            format!(
-                "RFC number {selector} resolves to {}",
-                records
-                    .iter()
-                    .map(|record| format!(
-                        "{} ({}, Stage {}, {})",
-                        record.text_id, record.title, record.stage, record.file_path
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )),
+        _ => {
+            let candidates = records
+                .iter()
+                .map(|record| {
+                    serde_json::json!({
+                        "rfc_ulid": record.text_id,
+                        "title": record.title,
+                        "stage": record.stage,
+                        "status": record.status,
+                        "path": record.file_path,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Err(project_flow_precondition_with_details(
+                "project_flow.rfc_ambiguous",
+                format!(
+                    "RFC number {selector} resolves to {}",
+                    records
+                        .iter()
+                        .map(|record| format!(
+                            "{} ({}, Stage {}, {}, {})",
+                            record.text_id,
+                            record.title,
+                            record.stage,
+                            record.status,
+                            record.file_path
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                serde_json::json!({ "selector": selector, "candidates": candidates }),
+            ))
+        }
     }
 }
 
@@ -589,25 +634,31 @@ pub fn attach_rfc(
     let now = Utc::now().to_rfc3339();
     let existing = conn
         .query_row(
-            "SELECT id, target_stage, relation FROM campaign_rfc_objectives_data
+            "SELECT id, observed_stage, target_stage, relation FROM campaign_rfc_objectives_data
              WHERE phase_id = ?1 AND rfc_ulid = ?2",
             params![phase_id, rfc.text_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<u8>>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u8>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((id, existing_target, existing_relation)) = existing {
+    let observed_stage = existing
+        .as_ref()
+        .and_then(|(_, observed_stage, _, _)| *observed_stage)
+        .unwrap_or(rfc.stage);
+    if let Some((id, _, existing_target, existing_relation)) = existing {
         if existing_target == target_stage && existing_relation == relation.as_str() {
             let (lifecycle, superseded_by) = effective_rfc_lifecycle(&rfc);
             return Ok(RfcObjectiveView {
                 rfc_ulid: rfc.text_id,
                 rfc_number: rfc.rfc_number,
                 title: rfc.title,
+                observed_stage: Some(observed_stage),
                 current_stage: Some(rfc.stage),
                 lifecycle: Some(lifecycle),
                 superseded_by,
@@ -665,6 +716,7 @@ pub fn attach_rfc(
         rfc_ulid: rfc.text_id,
         rfc_number: rfc.rfc_number,
         title: rfc.title,
+        observed_stage: Some(observed_stage),
         current_stage: Some(rfc.stage),
         lifecycle: Some(lifecycle),
         superseded_by,
@@ -710,6 +762,7 @@ struct PreparedObservation {
 impl PreparedObservation {
     fn from_provider(
         identity: PullRequestIdentity,
+        attempted_at: String,
         result: Result<ProviderObservation, ProviderFailure>,
     ) -> Self {
         match result {
@@ -718,14 +771,14 @@ impl PreparedObservation {
                 observation: Some(observation),
                 failure_class: None,
                 failure_message: None,
-                attempted_at: Utc::now().to_rfc3339(),
+                attempted_at,
             },
             Err(failure) => Self {
                 identity,
                 observation: None,
                 failure_class: Some(failure.class.to_string()),
                 failure_message: Some(failure.message),
-                attempted_at: Utc::now().to_rfc3339(),
+                attempted_at,
             },
         }
     }
@@ -908,99 +961,15 @@ where
         read_prepared(db.connection(), request_id, &hash, payload, campaign)?
     };
     if let Some(prepared) = prepared {
-        let (targets, observations, stored_owner, state) = match prepared {
-            PreparedRead::Completed(result) => return Ok(PreparedRead::Completed(result)),
-            PreparedRead::Prepared {
-                targets,
-                owner: stored_owner,
-            } => (targets, None, stored_owner, "prepared"),
-            PreparedRead::Ready {
-                targets,
-                observations,
-                owner: stored_owner,
-            } => (targets, Some(observations), stored_owner, "ready"),
-            PreparedRead::Terminalizing {
-                owner: stored_owner,
-            } => (Vec::new(), None, stored_owner, "terminalizing"),
-        };
-        if stored_owner == *owner {
-            if state == "terminalizing" {
-                return Ok(PreparedRead::Terminalizing {
-                    owner: owner.clone(),
-                });
-            }
-            if let Some(observations) = observations {
-                return Ok(PreparedRead::Ready {
-                    targets,
-                    observations,
-                    owner: owner.clone(),
-                });
-            } else {
-                return observe_and_ready(db_path, request_id, &hash, owner, targets, provider);
-            }
-        }
-        match classify_owner(&stored_owner) {
-            DaemonOwnerState::Dead | DaemonOwnerState::PidReused => {}
-            DaemonOwnerState::Current => {
-                return Err(project_flow_precondition(
-                    "project_flow.prepared_owner_live",
-                    format!(
-                        "project-flow request is owned by live daemon instance {}",
-                        stored_owner.instance_id
-                    ),
-                ));
-            }
-            DaemonOwnerState::Unknown => {
-                return Err(project_flow_precondition(
-                    "project_flow.prepared_owner_unknown",
-                    format!(
-                        "project-flow request owner {} could not be verified",
-                        stored_owner.instance_id
-                    ),
-                ));
-            }
-        }
-        let transaction = RequestTransaction::begin(db_path)?;
-        let conn = transaction.database().connection();
-        let changed = conn.execute(
-            "UPDATE project_flow_prepared_reads
-             SET owner_instance_id = ?2, owner_pid = ?3, owner_process_start_id = ?4
-             WHERE request_id = ?1 AND request_hash = ?5 AND state = ?9
-               AND owner_instance_id = ?6 AND owner_pid = ?7
-               AND owner_process_start_id = ?8",
-            params![
-                request_id,
-                owner.instance_id,
-                owner.pid,
-                owner.process_start_id,
-                hash,
-                stored_owner.instance_id,
-                stored_owner.pid,
-                stored_owner.process_start_id,
-                state,
-            ],
-        )?;
-        if changed != 1 {
-            transaction.rollback()?;
-            return Err(project_flow_precondition(
-                "project_flow.prepared_owner_changed",
-                "project-flow prepared read ownership changed during recovery",
-            ));
-        }
-        transaction.commit()?;
-        return if state == "terminalizing" {
-            Ok(PreparedRead::Terminalizing {
-                owner: owner.clone(),
-            })
-        } else if let Some(observations) = observations {
-            Ok(PreparedRead::Ready {
-                targets,
-                observations,
-                owner: owner.clone(),
-            })
-        } else {
-            observe_and_ready(db_path, request_id, &hash, owner, targets, provider)
-        };
+        return resume_prepared_external_read(
+            db_path,
+            request_id,
+            &hash,
+            owner,
+            prepared,
+            provider,
+            &classify_owner,
+        );
     }
     let transaction = RequestTransaction::begin(db_path)?;
     let conn = transaction.database().connection();
@@ -1018,13 +987,133 @@ where
     )?;
     if changed != 1 {
         transaction.rollback()?;
-        return Err(project_flow_precondition(
-            "project_flow.request_id_conflict",
-            "project-flow request ID conflicts with another prepared input",
-        ));
+        let db = open_request_database(db_path)?;
+        let prepared = read_prepared(db.connection(), request_id, &hash, payload, campaign)?
+            .ok_or_else(|| {
+                project_flow_precondition(
+                    "project_flow.prepared_insert_lost",
+                    "project-flow prepared read disappeared after a concurrent insertion",
+                )
+            })?;
+        drop(db);
+        return resume_prepared_external_read(
+            db_path,
+            request_id,
+            &hash,
+            owner,
+            prepared,
+            provider,
+            &classify_owner,
+        );
     }
     transaction.commit()?;
     observe_and_ready(db_path, request_id, &hash, owner, targets, provider)
+}
+
+fn resume_prepared_external_read<C>(
+    db_path: &Path,
+    request_id: &str,
+    hash: &str,
+    owner: &DaemonOwnerIdentity,
+    prepared: PreparedRead,
+    provider: &dyn PullRequestProvider,
+    classify_owner: &C,
+) -> Result<PreparedRead>
+where
+    C: Fn(&DaemonOwnerIdentity) -> DaemonOwnerState,
+{
+    let (targets, observations, stored_owner, state) = match prepared {
+        PreparedRead::Completed(result) => return Ok(PreparedRead::Completed(result)),
+        PreparedRead::Prepared {
+            targets,
+            owner: stored_owner,
+        } => (targets, None, stored_owner, "prepared"),
+        PreparedRead::Ready {
+            targets,
+            observations,
+            owner: stored_owner,
+        } => (targets, Some(observations), stored_owner, "ready"),
+        PreparedRead::Terminalizing {
+            owner: stored_owner,
+        } => (Vec::new(), None, stored_owner, "terminalizing"),
+    };
+    if stored_owner == *owner {
+        if state == "terminalizing" {
+            return Ok(PreparedRead::Terminalizing {
+                owner: owner.clone(),
+            });
+        }
+        if let Some(observations) = observations {
+            return Ok(PreparedRead::Ready {
+                targets,
+                observations,
+                owner: owner.clone(),
+            });
+        }
+        return observe_and_ready(db_path, request_id, hash, owner, targets, provider);
+    }
+    match classify_owner(&stored_owner) {
+        DaemonOwnerState::Dead | DaemonOwnerState::PidReused => {}
+        DaemonOwnerState::Current => {
+            return Err(project_flow_precondition(
+                "project_flow.prepared_owner_live",
+                format!(
+                    "project-flow request is owned by live daemon instance {}",
+                    stored_owner.instance_id
+                ),
+            ));
+        }
+        DaemonOwnerState::Unknown => {
+            return Err(project_flow_precondition(
+                "project_flow.prepared_owner_unknown",
+                format!(
+                    "project-flow request owner {} could not be verified",
+                    stored_owner.instance_id
+                ),
+            ));
+        }
+    }
+    let transaction = RequestTransaction::begin(db_path)?;
+    let conn = transaction.database().connection();
+    let changed = conn.execute(
+        "UPDATE project_flow_prepared_reads
+         SET owner_instance_id = ?2, owner_pid = ?3, owner_process_start_id = ?4
+         WHERE request_id = ?1 AND request_hash = ?5 AND state = ?9
+           AND owner_instance_id = ?6 AND owner_pid = ?7
+           AND owner_process_start_id = ?8",
+        params![
+            request_id,
+            owner.instance_id,
+            owner.pid,
+            owner.process_start_id,
+            hash,
+            stored_owner.instance_id,
+            stored_owner.pid,
+            stored_owner.process_start_id,
+            state,
+        ],
+    )?;
+    if changed != 1 {
+        transaction.rollback()?;
+        return Err(project_flow_precondition(
+            "project_flow.prepared_owner_changed",
+            "project-flow prepared read ownership changed during recovery",
+        ));
+    }
+    transaction.commit()?;
+    if state == "terminalizing" {
+        Ok(PreparedRead::Terminalizing {
+            owner: owner.clone(),
+        })
+    } else if let Some(observations) = observations {
+        Ok(PreparedRead::Ready {
+            targets,
+            observations,
+            owner: owner.clone(),
+        })
+    } else {
+        observe_and_ready(db_path, request_id, hash, owner, targets, provider)
+    }
 }
 
 fn observe_and_ready(
@@ -1038,8 +1127,10 @@ fn observe_and_ready(
     let observations = targets
         .iter()
         .map(|target| {
+            let attempted_at = Utc::now().to_rfc3339();
             PreparedObservation::from_provider(
                 target.identity.clone(),
+                attempted_at,
                 provider.observe(&target.identity),
             )
         })
@@ -1115,7 +1206,7 @@ fn record_observation(
                      SET title = ?2, lifecycle = ?3, head_oid = ?4, review_state = ?5,
                          checks_state = ?6, last_success_at = ?7, last_attempt_at = ?7,
                          last_error = NULL
-                     WHERE id = ?1",
+                     WHERE id = ?1 AND (last_attempt_at IS NULL OR last_attempt_at <= ?7)",
                     params![
                         id,
                         observation.title,
@@ -1149,7 +1240,8 @@ fn record_observation(
             if let Some(id) = observation_id(conn, artifact_id)? {
                 conn.execute(
                     "UPDATE project_flow_pull_request_observations
-                     SET last_attempt_at = ?2, last_error = ?3 WHERE id = ?1",
+                     SET last_attempt_at = ?2, last_error = ?3
+                     WHERE id = ?1 AND (last_attempt_at IS NULL OR last_attempt_at <= ?2)",
                     params![id, attempted_at, message],
                 )?;
             } else {
@@ -1247,7 +1339,7 @@ pub(crate) fn prepare_pr_attachment(
     let campaign = resolve_campaign(db.connection(), campaign)?;
     drop(db);
     let target = PreparedTarget {
-        identity: identity.clone(),
+        identity,
         role: role.as_str().to_string(),
     };
     let payload = serde_json::to_string(&("pr.attach", &campaign, &target))?;
@@ -1331,7 +1423,12 @@ pub(crate) fn finalize_pr_attachment(
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
-    let artifact_id = ensure_artifact(conn, &identity)?;
+    let canonical_identity = observation
+        .observation
+        .as_ref()
+        .map(|observation| &observation.identity)
+        .unwrap_or(&identity);
+    let artifact_id = ensure_artifact(conn, canonical_identity)?;
     let phase_id: i64 = conn.query_row(
         "SELECT id FROM phases_data WHERE text_id = ?1",
         [&campaign],
@@ -1553,9 +1650,60 @@ pub(crate) fn finalize_refresh(
                 "prepared project-flow relationship changed delivery role",
             ));
         }
+        let canonical_identity = observation
+            .observation
+            .as_ref()
+            .map(|observation| &observation.identity)
+            .unwrap_or(&target.identity);
+        let canonical_artifact_id = ensure_artifact(conn, canonical_identity)?;
+        if canonical_artifact_id != artifact_id {
+            let canonical_relation_id = conn
+                .query_row(
+                    "SELECT relation.id
+                     FROM phase_pull_request_relations_data relation
+                     JOIN phases_data phase ON phase.id = relation.phase_id
+                     WHERE phase.text_id = ?1 AND relation.artifact_id = ?2",
+                    params![campaign, canonical_artifact_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(relation_id) = canonical_relation_id {
+                conn.execute(
+                    "UPDATE phase_pull_request_relations
+                     SET role = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE id = ?1",
+                    params![relation_id, target.role],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
+                     VALUES(
+                         (SELECT id FROM phases_data WHERE text_id = ?1), ?2, ?3
+                     )",
+                    params![campaign, canonical_artifact_id, target.role],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM phase_pull_request_relations
+                 WHERE phase_id = (SELECT id FROM phases_data WHERE text_id = ?1)
+                   AND artifact_id = ?2",
+                params![campaign, artifact_id],
+            )?;
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM phase_pull_request_relations_data WHERE artifact_id = ?1",
+                [artifact_id],
+                |row| row.get(0),
+            )?;
+            if remaining == 0 {
+                conn.execute(
+                    "DELETE FROM project_flow_pull_requests WHERE id = ?1",
+                    [artifact_id],
+                )?;
+            }
+        }
         record_observation(
             conn,
-            artifact_id,
+            canonical_artifact_id,
             &observation.result(),
             &observation.attempted_at,
         )?;
@@ -1644,7 +1792,7 @@ fn campaign_rfc_objectives_with_connection(
     let current_rfcs = load_rfc_map(conn)?;
     let mut stmt = conn.prepare(
         "SELECT objective.rfc_ulid, objective.rfc_number_snapshot, objective.rfc_title_snapshot,
-                objective.target_stage, objective.relation
+                objective.observed_stage, objective.target_stage, objective.relation
          FROM campaign_rfc_objectives_data objective
          WHERE objective.phase_id = ?1 ORDER BY objective.rfc_number_snapshot, objective.rfc_ulid",
     )?;
@@ -1655,14 +1803,17 @@ fn campaign_rfc_objectives_with_connection(
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<u8>>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<u8>>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut typed_ulids = std::collections::HashSet::new();
     let mut typed_numbers = std::collections::HashSet::new();
     let mut objectives = Vec::new();
-    for (ulid, number_snapshot, title_snapshot, target_stage, relation) in typed_rows {
+    for (ulid, number_snapshot, title_snapshot, observed_stage, target_stage, relation) in
+        typed_rows
+    {
         typed_ulids.insert(ulid.clone());
         typed_numbers.insert(number_snapshot);
         if let Some(current) = current_rfcs.get(&ulid) {
@@ -1672,6 +1823,7 @@ fn campaign_rfc_objectives_with_connection(
                 rfc_ulid: ulid,
                 rfc_number: current.rfc_number,
                 title: current.title.clone(),
+                observed_stage,
                 current_stage: Some(current.stage),
                 lifecycle: Some(lifecycle),
                 superseded_by,
@@ -1686,6 +1838,7 @@ fn campaign_rfc_objectives_with_connection(
                 rfc_ulid: ulid,
                 rfc_number: number_snapshot,
                 title: title_snapshot,
+                observed_stage,
                 current_stage: None,
                 lifecycle: None,
                 superseded_by: None,
@@ -1706,6 +1859,12 @@ fn campaign_rfc_objectives_with_connection(
         &mut objectives,
         &mut diagnostics,
     )?;
+    objectives.sort_by(|left, right| {
+        objective_relation_priority(&left.relation)
+            .cmp(&objective_relation_priority(&right.relation))
+            .then(left.rfc_number.cmp(&right.rfc_number))
+            .then(left.rfc_ulid.cmp(&right.rfc_ulid))
+    });
     diagnostics.sort();
     diagnostics.dedup();
     Ok((objectives, diagnostics))
@@ -1818,6 +1977,7 @@ fn append_legacy_objectives(
                     rfc_ulid: rfc.text_id.clone(),
                     rfc_number: rfc.rfc_number,
                     title: rfc.title.clone(),
+                    observed_stage: None,
                     current_stage: Some(rfc.stage),
                     lifecycle: Some(lifecycle),
                     superseded_by,
@@ -1825,19 +1985,23 @@ fn append_legacy_objectives(
                     relation,
                     source,
                     diagnostic: None,
-                })
+                });
             }
             [] => diagnostics.push(format!("project_flow.legacy_rfc_missing: {number}")),
             [_] => {}
             _ => diagnostics.push(format!("project_flow.rfc_ambiguous: {number}")),
         }
     }
-    objectives.sort_by(|left, right| {
-        left.rfc_number
-            .cmp(&right.rfc_number)
-            .then(left.rfc_ulid.cmp(&right.rfc_ulid))
-    });
     Ok(())
+}
+
+fn objective_relation_priority(relation: &str) -> u8 {
+    match relation {
+        "drives" => 0,
+        "implements" => 1,
+        "validates" => 2,
+        _ => 3,
+    }
 }
 
 #[cfg(test)]
@@ -1898,6 +2062,7 @@ mod tests {
 
     fn observation(title: &str) -> ProviderObservation {
         ProviderObservation {
+            identity: PullRequestIdentity::parse("wycats/exo2#75").unwrap(),
             title: title.to_string(),
             lifecycle: "open".to_string(),
             head_oid: Some("abc".to_string()),
@@ -1947,6 +2112,104 @@ mod tests {
     }
 
     #[test]
+    fn github_observation_uses_the_provider_canonical_identity() {
+        let observed = parse_github_observation(&serde_json::json!({
+            "url": "https://github.com/New-Owner/Renamed-Repo/pull/75",
+            "title": "Moved PR",
+            "state": "OPEN",
+            "mergedAt": null,
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [],
+        }))
+        .unwrap();
+
+        assert_eq!(observed.identity.repository, "new-owner/renamed-repo");
+        assert_eq!(
+            observed.identity.url,
+            "https://github.com/new-owner/renamed-repo/pull/75"
+        );
+    }
+
+    #[test]
+    fn attachment_persists_the_provider_canonical_identity() {
+        let (_temp, path, campaign) = fixture();
+        let requested = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let mut canonical = observation("Moved PR");
+        canonical.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(canonical),
+        };
+
+        let status = attach_pr_with_provider(
+            &path,
+            "canonical-provider-identity",
+            &campaign,
+            requested,
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+
+        assert_eq!(status.pull_requests.len(), 1);
+        assert_eq!(
+            status.pull_requests[0].identity.repository,
+            "new-owner/new-repo"
+        );
+        let old_count: i64 = SqliteWriter::open(&path)
+            .unwrap()
+            .database()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM project_flow_pull_requests_data
+                 WHERE repository = 'old-owner/old-repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+    }
+
+    #[test]
+    fn refresh_rehomes_a_relation_to_the_provider_canonical_identity() {
+        let (_temp, path, campaign) = fixture();
+        let requested = PullRequestIdentity::parse("old-owner/old-repo#75").unwrap();
+        let mut original = observation("Original PR");
+        original.identity = requested.clone();
+        attach_pr_with_provider(
+            &path,
+            "attach-original-identity",
+            &campaign,
+            requested,
+            DeliveryRole::Implements,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(original),
+            },
+        )
+        .unwrap();
+        let mut moved = observation("Moved PR");
+        moved.identity = PullRequestIdentity::parse("new-owner/new-repo#75").unwrap();
+
+        let status = refresh_with_provider(
+            &path,
+            "refresh-canonical-identity",
+            &campaign,
+            &FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(moved),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(status.pull_requests.len(), 1);
+        assert_eq!(
+            status.pull_requests[0].identity.repository,
+            "new-owner/new-repo"
+        );
+    }
+
+    #[test]
     fn typed_objectives_project_effective_terminal_lifecycle() {
         let (_temp, path, campaign) = fixture();
         attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3)).unwrap();
@@ -1979,6 +2242,7 @@ mod tests {
             rfc_ulid: "01rfc000000000000000000001".to_string(),
             rfc_number: 10207,
             title: "Project flow".to_string(),
+            observed_stage: current_stage,
             current_stage,
             lifecycle: lifecycle.map(str::to_string),
             superseded_by: None,
@@ -2062,6 +2326,7 @@ mod tests {
             .unwrap();
         let advanced_noop = attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3))
             .expect("exact attachment remains idempotent after reaching its target");
+        assert_eq!(advanced_noop.observed_stage, Some(2));
         assert_eq!(advanced_noop.current_stage, Some(3));
         let after_advance: (String, String, u8, String) = writer
             .database()
@@ -2124,6 +2389,7 @@ mod tests {
     fn github_check_rollup_distinguishes_check_runs_and_status_contexts() {
         let observation_with = |checks: Value| {
             parse_github_observation(&serde_json::json!({
+                "url": "https://github.com/wycats/exo2/pull/75",
                 "title": "PR",
                 "state": "OPEN",
                 "mergedAt": null,
@@ -2206,6 +2472,7 @@ mod tests {
     fn github_check_rollup_distinguishes_valid_empty_from_missing_or_malformed() {
         let observation = |rollup: Option<Value>| {
             let mut value = serde_json::json!({
+                "url": "https://github.com/wycats/exo2/pull/75",
                 "title": "PR",
                 "state": "OPEN",
                 "mergedAt": null,
@@ -2277,6 +2544,10 @@ mod tests {
                 .and_then(|details| details["kind"].as_str()),
             Some("project_flow.rfc_ambiguous")
         );
+        let details = failure.error.details.as_ref().unwrap();
+        assert_eq!(details["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(details["candidates"][1]["status"], "withdrawn");
+        assert!(failure.error.message.contains("withdrawn"));
         attach_rfc(
             &path,
             &campaign,
@@ -2426,6 +2697,84 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("project_flow.legacy_rfc_target_conflict"))
         );
+    }
+
+    #[test]
+    fn project_motion_orders_typed_relations_before_legacy_objectives() {
+        let (_temp, path, campaign) = fixture();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let conn = writer.database().connection();
+        for (ulid, number, title) in [
+            ("01rfc000000000000000000002", 10208, "Validation"),
+            ("01rfc000000000000000000003", 10209, "Implementation"),
+            ("01rfc000000000000000000004", 10206, "Legacy"),
+        ] {
+            conn.execute(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+                 VALUES(?1, ?2, ?3, 1, 'active', ?3, ?3)",
+                params![ulid, number, title],
+            )
+            .unwrap();
+        }
+        attach_rfc(&path, &campaign, "10208", RfcRelation::Validates, Some(2)).unwrap();
+        attach_rfc(&path, &campaign, "10209", RfcRelation::Implements, Some(2)).unwrap();
+        let phase_id: i64 = conn
+            .query_row(
+                "SELECT id FROM phases_data WHERE text_id = ?1",
+                [&campaign],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO phase_rfcs_data(phase_id, rfc_id, relation)
+             VALUES(?1, '10206', 'related')",
+            [phase_id],
+        )
+        .unwrap();
+
+        let (objectives, _) = campaign_rfc_objectives(&path, &campaign).unwrap();
+        assert_eq!(
+            objectives
+                .iter()
+                .map(|objective| objective.relation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["implements", "validates", "related"]
+        );
+    }
+
+    #[test]
+    fn older_provider_attempt_cannot_overwrite_a_newer_observation() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let conn = writer.database().connection();
+        let artifact_id = ensure_artifact(conn, &identity).unwrap();
+        let mut newer = observation("Newer title");
+        newer.review_state = "approved".to_string();
+        record_observation(conn, artifact_id, &Ok(newer), "2026-09-03T12:05:00+00:00").unwrap();
+        record_observation(
+            conn,
+            artifact_id,
+            &Err(ProviderFailure {
+                class: "provider_unavailable",
+                message: "older failure".to_string(),
+            }),
+            "2026-09-03T12:00:00+00:00",
+        )
+        .unwrap();
+
+        let stored: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT title, last_attempt_at, last_error
+                 FROM project_flow_pull_request_observations_data WHERE artifact_id = ?1",
+                [artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "Newer title");
+        assert_eq!(stored.1, "2026-09-03T12:05:00+00:00");
+        assert_eq!(stored.2, None);
+        drop(campaign);
     }
 
     #[test]

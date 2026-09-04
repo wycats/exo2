@@ -118,14 +118,28 @@ impl ProjectFlowCommands {
                 relation,
                 target_stage,
             } => {
-                let target_stage = target_stage
-                    .map(u8::try_from)
-                    .transpose()
-                    .map_err(|_| anyhow::anyhow!("target stage must be between 0 and 4"))?;
+                let target_stage = target_stage.map(u8::try_from).transpose().map_err(|_| {
+                    project_flow_precondition(
+                        "project_flow.invalid_target_stage",
+                        "target stage must be between 0 and 4",
+                    )
+                })?;
+                if target_stage.is_some_and(|stage| stage > 4) {
+                    return Err(project_flow_precondition(
+                        "project_flow.invalid_target_stage",
+                        "target stage must be between 0 and 4",
+                    ));
+                }
+                let relation = RfcRelation::parse(&relation).map_err(|error| {
+                    project_flow_precondition(
+                        "project_flow.invalid_rfc_relation",
+                        error.to_string(),
+                    )
+                })?;
                 CommandBox::mutable(ProjectFlowRfcAttach::new(
                     selector,
                     campaign,
-                    RfcRelation::parse(&relation)?,
+                    relation,
                     target_stage,
                 ))
             }
@@ -136,11 +150,21 @@ impl ProjectFlowCommands {
                 selector,
                 campaign,
                 role,
-            } => CommandBox::mutable(ProjectFlowPrAttach::new(
-                PullRequestIdentity::parse(&selector)?,
-                campaign,
-                DeliveryRole::parse(&role)?,
-            )),
+            } => {
+                let identity = PullRequestIdentity::parse(&selector).map_err(|error| {
+                    project_flow_precondition(
+                        "project_flow.invalid_pull_request_selector",
+                        error.to_string(),
+                    )
+                })?;
+                let role = DeliveryRole::parse(&role).map_err(|error| {
+                    project_flow_precondition(
+                        "project_flow.invalid_delivery_role",
+                        error.to_string(),
+                    )
+                })?;
+                CommandBox::mutable(ProjectFlowPrAttach::new(identity, campaign, role))
+            }
             Self::PrDetach { selector, campaign } => CommandBox::mutable(ProjectFlowPrDetach::new(
                 PullRequestIdentity::parse(&selector)?,
                 campaign,
@@ -706,6 +730,7 @@ mod tests {
                 rfc_ulid: "01rfc".to_string(),
                 rfc_number: 10207,
                 title: "Project flow".to_string(),
+                observed_stage: Some(2),
                 current_stage: Some(2),
                 lifecycle: Some("active".to_string()),
                 superseded_by: None,
@@ -743,6 +768,7 @@ mod tests {
             rfc_ulid: format!("01rfc{current_stage}{target_stage:?}"),
             rfc_number: 10207,
             title: "Project flow".to_string(),
+            observed_stage: Some(current_stage),
             current_stage: Some(current_stage),
             lifecycle: Some("active".to_string()),
             superseded_by: None,
@@ -820,6 +846,26 @@ mod tests {
         assert_eq!(
             failure.error.details.as_ref().unwrap()["kind"],
             "project_flow.active_campaign_required"
+        );
+    }
+
+    #[test]
+    fn invalid_rfc_relation_is_a_typed_precondition() {
+        let error = ProjectFlowCommands::RfcAttach {
+            selector: "10207".to_string(),
+            campaign: "campaign-one".to_string(),
+            relation: "related".to_string(),
+            target_stage: Some(3),
+        }
+        .to_command_box(std::path::Path::new("."))
+        .expect_err("legacy relation must not enter the typed command path");
+        let failure = error
+            .downcast_ref::<ExoFailure>()
+            .expect("typed project-flow precondition");
+        assert_eq!(failure.error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.error.details.as_ref().unwrap()["kind"],
+            "project_flow.invalid_rfc_relation"
         );
     }
 }
