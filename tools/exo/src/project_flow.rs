@@ -1750,7 +1750,7 @@ pub fn status(db_path: &Path, campaign: &str) -> Result<ProjectFlowStatus> {
 fn status_with_connection(conn: &Connection, campaign: &str) -> Result<ProjectFlowStatus> {
     let (objectives, mut diagnostics) = campaign_rfc_objectives_with_connection(conn, campaign)?;
     let phase_id: i64 = conn.query_row(
-        "SELECT id FROM phases_data WHERE text_id = ?1",
+        "SELECT id FROM phases WHERE text_id = ?1",
         [campaign],
         |row| row.get(0),
     )?;
@@ -1760,9 +1760,9 @@ fn status_with_connection(conn: &Connection, campaign: &str) -> Result<ProjectFl
                 observation.title, observation.lifecycle, observation.head_oid,
                 observation.review_state, observation.checks_state,
                 observation.last_success_at, observation.last_attempt_at, observation.last_error
-         FROM phase_pull_request_relations_data relation
-         JOIN project_flow_pull_requests_data artifact ON artifact.id = relation.artifact_id
-         LEFT JOIN project_flow_pull_request_observations_data observation ON observation.artifact_id = artifact.id
+         FROM phase_pull_request_relations relation
+         JOIN project_flow_pull_requests artifact ON artifact.id = relation.artifact_id
+         LEFT JOIN project_flow_pull_request_observations observation ON observation.artifact_id = artifact.id
          WHERE relation.phase_id = ?1
          ORDER BY relation.role, artifact.provider, artifact.repository, artifact.number",
     )?;
@@ -1850,7 +1850,7 @@ fn campaign_rfc_objectives_with_connection(
 ) -> Result<(Vec<RfcObjectiveView>, Vec<String>)> {
     let mut diagnostics = Vec::new();
     let phase_id: i64 = conn.query_row(
-        "SELECT id FROM phases_data WHERE text_id = ?1",
+        "SELECT id FROM phases WHERE text_id = ?1",
         [campaign],
         |row| row.get(0),
     )?;
@@ -1858,7 +1858,7 @@ fn campaign_rfc_objectives_with_connection(
     let mut stmt = conn.prepare(
         "SELECT objective.rfc_ulid, objective.rfc_number_snapshot, objective.rfc_title_snapshot,
                 objective.observed_stage, objective.target_stage, objective.relation
-         FROM campaign_rfc_objectives_data objective
+         FROM campaign_rfc_objectives objective
          WHERE objective.phase_id = ?1 ORDER BY objective.rfc_number_snapshot, objective.rfc_ulid",
     )?;
     let typed_rows = stmt
@@ -1939,7 +1939,7 @@ fn load_rfc_map(conn: &Connection) -> Result<std::collections::HashMap<String, R
     let mut stmt = conn.prepare(
         "SELECT text_id, rfc_number, title, stage, status, feature, slug, file_path,
                 superseded_by, supersedes, withdrawal_reason, archived_reason, consolidated_into
-         FROM rfcs_data",
+         FROM rfcs",
     )?;
     Ok(stmt
         .query_map([], |row| {
@@ -1976,7 +1976,7 @@ fn append_legacy_objectives(
 ) -> Result<()> {
     let mut candidates = Vec::<(String, Option<u8>, String, String)>::new();
     let mut phase_stmt =
-        conn.prepare("SELECT rfc_id, target, relation FROM phase_rfcs_data WHERE phase_id = ?1")?;
+        conn.prepare("SELECT rfc_id, target, relation FROM phase_rfcs WHERE phase_id = ?1")?;
     candidates.extend(
         phase_stmt
             .query_map([phase_id], |row| {
@@ -1990,7 +1990,9 @@ fn append_legacy_objectives(
             .collect::<Result<Vec<_>, _>>()?,
     );
     let mut goal_stmt = conn.prepare(
-        "SELECT rfc, target_stage FROM goals_data WHERE phase_id = ?1 AND rfc IS NOT NULL",
+        "SELECT rfc, target_stage FROM goals
+         WHERE phase_id = ?1 AND rfc IS NOT NULL
+         ORDER BY text_id",
     )?;
     candidates.extend(
         goal_stmt
@@ -2885,6 +2887,75 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.contains("project_flow.legacy_rfc_target_conflict"))
         );
+    }
+
+    #[test]
+    fn legacy_goal_conflicts_choose_a_stable_representative() {
+        let (_temp, path, campaign) = fixture();
+        let writer = SqliteWriter::open(&path).unwrap();
+        let conn = writer.database().connection();
+        let phase_id: i64 = conn
+            .query_row(
+                "SELECT id FROM phases_data WHERE text_id = ?1",
+                [&campaign],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (text_id, target_stage) in [("z-later", 4), ("a-first", 3)] {
+            conn.execute(
+                "INSERT INTO goals_data(text_id, label, status, phase_id, kind, rfc, target_stage)
+                 VALUES(?1, ?1, 'pending', ?2, 'regular', '10207', ?3)",
+                params![text_id, phase_id, target_stage],
+            )
+            .unwrap();
+        }
+
+        let (objectives, diagnostics) = campaign_rfc_objectives(&path, &campaign).unwrap();
+        assert_eq!(objectives.len(), 1);
+        assert_eq!(objectives[0].target_stage, Some(3));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("project_flow.legacy_rfc_target_conflict"))
+        );
+    }
+
+    #[test]
+    fn status_reads_project_motion_through_reactive_tables() {
+        let (_temp, path, campaign) = fixture();
+        attach_rfc(&path, &campaign, "10207", RfcRelation::Drives, Some(3)).unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("Reactive delivery")),
+        };
+        attach_pr_with_provider(
+            &path,
+            "reactive-status",
+            &campaign,
+            PullRequestIdentity::parse("wycats/exo2#75").unwrap(),
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+
+        let (result, trace) = exosuit_storage::TraceScope::run(|| status(&path, &campaign));
+        result.unwrap();
+        let sources = trace
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.cell_id.source_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for expected in [
+            "campaign_rfc_objectives_data",
+            "phase_pull_request_relations_data",
+            "project_flow_pull_requests_data",
+            "project_flow_pull_request_observations_data",
+        ] {
+            assert!(
+                sources.contains(expected),
+                "missing reactive dependency {expected}"
+            );
+        }
     }
 
     #[test]

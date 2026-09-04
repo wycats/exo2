@@ -29,18 +29,12 @@ fn is_machine_local_authorization_mutation(namespace: &str, operation: &str) -> 
         )
 }
 
-fn is_machine_local_project_flow_write(namespace: &str, operation: &str) -> bool {
-    namespace == "project-flow" && operation == "refresh"
-}
-
 pub fn should_write_sql_dump(namespace: &str, operation: &str, effect: Effect) -> bool {
     if effect == Effect::Pure {
         return false;
     }
 
-    if is_machine_local_workbench_write(namespace, operation)
-        || is_machine_local_project_flow_write(namespace, operation)
-    {
+    if is_machine_local_workbench_write(namespace, operation) {
         return false;
     }
 
@@ -490,31 +484,29 @@ mod tests {
     }
 
     #[test]
-    fn project_flow_refresh_skips_canonical_project_post_write_work() {
+    fn project_flow_refresh_preserves_canonical_identity_changes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let sidecar_root = temp.path().join("sidecar");
         let project = sidecar_project(workspace, sidecar_root);
 
-        assert!(!should_write_sql_dump(
+        assert!(should_write_sql_dump(
             "project-flow",
             "refresh",
             Effect::Write
         ));
-        assert!(!should_auto_persist_after_success(
+        assert!(should_auto_persist_after_success(
             Effect::Write,
             "project-flow",
             "refresh",
             Some(&project)
         ));
-        assert!(!should_persist_after_success(
+        assert!(should_persist_after_success(
             Some(&project),
             "project-flow",
             "refresh",
             Effect::Write
         ));
-        preflight_sidecar_post_write(Some(&project), "project-flow", "refresh", Effect::Write)
-            .expect("machine-local provider refresh skips sidecar ownership");
     }
 
     #[test]
