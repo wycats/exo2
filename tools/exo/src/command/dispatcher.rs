@@ -43,6 +43,7 @@ impl<'a> CommandDispatcher<'a> {
             project: self.ctx.project,
             format: self.ctx.format,
             agent_id: self.ctx.agent_id.clone(),
+            request_id: self.ctx.request_id.clone(),
             workflow_confirmation: self.ctx.workflow_confirmation.clone(),
             input_content: self.ctx.input_content.clone(),
             runtime_services: self.ctx.runtime_services,

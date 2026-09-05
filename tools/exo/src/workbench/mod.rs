@@ -176,6 +176,14 @@ impl DaemonRuntimeServices {
         Self { host }
     }
 
+    pub(crate) fn prepared_read_owner(&self) -> crate::daemon_outcomes::DaemonOwnerIdentity {
+        crate::daemon_outcomes::DaemonOwnerIdentity {
+            instance_id: self.host.inner.instance_id.to_string(),
+            pid: std::process::id(),
+            process_start_id: self.host.inner.process_start_id.to_string(),
+        }
+    }
+
     pub fn set_dispatcher(&self, dispatcher: DaemonRequestDispatcher) -> Result<()> {
         self.host.set_dispatcher(dispatcher)
     }

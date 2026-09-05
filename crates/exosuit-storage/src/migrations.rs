@@ -2,8 +2,10 @@
 //!
 //! Simple migration runner that embeds SQL files at compile time.
 
+use rusqlite::config::DbConfig;
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::compatibility::{
     read_database_generation, set_database_generation, StateSurface, WriterCompatibilityError,
@@ -166,6 +168,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/V024__phase_completion_time.sql"),
         required_writer_generation: 0,
     },
+    Migration {
+        version: 25,
+        name: "project_flow_relationships",
+        sql: include_str!("../migrations/V025__project_flow_relationships.sql"),
+        required_writer_generation: 1,
+    },
 ];
 
 /// Run all pending migrations on the given connection.
@@ -178,6 +186,22 @@ fn run_migrations_with_hook(
     migrations: &[Migration],
     supported_writer_generation: i32,
     after_generation_raise: impl FnOnce(i32) -> Result<(), DatabaseError>,
+) -> Result<(), DatabaseError> {
+    run_migrations_with_hooks(
+        conn,
+        migrations,
+        supported_writer_generation,
+        after_generation_raise,
+        |_| Ok(()),
+    )
+}
+
+fn run_migrations_with_hooks(
+    conn: &Connection,
+    migrations: &[Migration],
+    supported_writer_generation: i32,
+    after_generation_raise: impl FnOnce(i32) -> Result<(), DatabaseError>,
+    mut after_migration_sql: impl FnMut(u32) -> Result<(), DatabaseError>,
 ) -> Result<(), DatabaseError> {
     let applied = applied_versions(conn)?;
     let current_generation = read_database_generation(conn)?;
@@ -203,8 +227,10 @@ fn run_migrations_with_hook(
         after_generation_raise(required_generation)?;
     }
 
-    // Enable foreign keys before running migrations
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // Match the historical runner contract even when the caller already owns
+    // a transaction. Unlike PRAGMA foreign_keys, sqlite3_db_config is effective
+    // inside an existing transaction or savepoint.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
 
     // Create migration tracking table
     conn.execute_batch(
@@ -221,20 +247,65 @@ fn run_migrations_with_hook(
             continue;
         }
 
-        // Migration progress is intentionally silent. The storage library
-        // should not write to stderr — that's the CLI's responsibility.
-        // Callers can detect applied migrations via the return value if needed.
-        // Execute migration SQL
-        conn.execute_batch(migration.sql)?;
-
-        // Record migration
-        conn.execute(
-            "INSERT INTO __schema_history (version, name) VALUES (?1, ?2)",
-            (migration.version, migration.name),
-        )?;
+        apply_migration(conn, migration, &mut after_migration_sql)?;
     }
 
     Ok(())
+}
+
+static MIGRATION_SAVEPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn apply_migration(
+    conn: &Connection,
+    migration: &Migration,
+    after_migration_sql: &mut impl FnMut(u32) -> Result<(), DatabaseError>,
+) -> Result<(), DatabaseError> {
+    let savepoint = format!(
+        "exo_migration_{}_{}",
+        migration.version,
+        MIGRATION_SAVEPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let foreign_keys_before = conn.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+    let disables_foreign_keys = migration
+        .sql
+        .to_ascii_lowercase()
+        .contains("pragma foreign_keys = off");
+    if disables_foreign_keys {
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)?;
+    }
+
+    let result = (|| {
+        conn.execute_batch(&format!("SAVEPOINT {savepoint};"))?;
+        let migration_result = (|| {
+            conn.execute_batch(migration.sql)?;
+            after_migration_sql(migration.version)?;
+            conn.execute(
+                "INSERT INTO __schema_history (version, name) VALUES (?1, ?2)",
+                (migration.version, migration.name),
+            )?;
+            Ok(())
+        })();
+
+        match migration_result {
+            Ok(()) => conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint};"))?,
+            Err(error) => {
+                conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};"
+                ))?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    })();
+
+    let restore_result = conn
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, foreign_keys_before)
+        .map(|_| ())
+        .map_err(DatabaseError::from);
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), restore) => restore,
+    }
 }
 
 pub(crate) fn has_pending_migrations(conn: &Connection) -> Result<bool, DatabaseError> {
@@ -273,6 +344,14 @@ mod tests {
         sql: "CREATE TABLE generation_one_state(value TEXT NOT NULL);\n\
               INSERT INTO generation_one_state(value) VALUES('migrated');",
         required_writer_generation: 1,
+    }];
+
+    const LEGACY_NON_IDEMPOTENT_MIGRATION: &[Migration] = &[Migration {
+        version: 1_002,
+        name: "legacy_non_idempotent_fixture",
+        sql: "CREATE TABLE legacy_non_idempotent_state(value TEXT NOT NULL);\n\
+              INSERT INTO legacy_non_idempotent_state(value) VALUES('migrated');",
+        required_writer_generation: 0,
     }];
 
     #[test]
@@ -344,6 +423,101 @@ mod tests {
         run_migrations_with_hook(&reopened, GENERATION_ONE_MIGRATION, 1, |_| Ok(()))
             .expect("compatible writer resumes interrupted migration");
         assert!(test_table_exists(&reopened, "generation_one_state"));
+    }
+
+    #[test]
+    fn every_migration_and_history_record_are_crash_atomic_and_retryable() {
+        let conn = Connection::open_in_memory().expect("open database");
+
+        let error = run_migrations_with_hooks(
+            &conn,
+            LEGACY_NON_IDEMPOTENT_MIGRATION,
+            1,
+            |_| Ok(()),
+            |version| {
+                assert_eq!(version, 1_002);
+                Err(DatabaseError::Migration(
+                    "injected interruption before schema history".to_string(),
+                ))
+            },
+        )
+        .expect_err("interruption must roll back schema and history together");
+
+        assert!(matches!(error, DatabaseError::Migration(_)));
+        assert_eq!(read_database_generation(&conn).unwrap(), 0);
+        assert!(!test_table_exists(&conn, "legacy_non_idempotent_state"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 1002",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        run_migrations_with_hook(&conn, LEGACY_NON_IDEMPOTENT_MIGRATION, 1, |_| Ok(()))
+            .expect("retry applies the rolled-back non-idempotent migration");
+        assert!(test_table_exists(&conn, "legacy_non_idempotent_state"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 1002",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_savepoint_nests_inside_an_existing_transaction_and_savepoint() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch("BEGIN IMMEDIATE; SAVEPOINT caller_owned;")
+            .expect("begin caller transaction and savepoint");
+
+        run_migrations_with_hook(&conn, LEGACY_NON_IDEMPOTENT_MIGRATION, 1, |_| Ok(()))
+            .expect("migration nests under caller savepoint");
+        assert!(test_table_exists(&conn, "legacy_non_idempotent_state"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM __schema_history WHERE version = 1002",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT caller_owned; RELEASE SAVEPOINT caller_owned; COMMIT;",
+        )
+        .expect("roll back caller transaction");
+        assert!(!test_table_exists(&conn, "legacy_non_idempotent_state"));
+        assert!(!test_table_exists(&conn, "__schema_history"));
+    }
+
+    #[test]
+    fn all_project_migrations_nest_inside_an_existing_transaction_and_savepoint() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch("BEGIN IMMEDIATE; SAVEPOINT caller_owned;")
+            .expect("begin caller transaction and savepoint");
+
+        run_migrations(&conn).expect("all project migrations nest under caller savepoint");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM __schema_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            MIGRATIONS.len() as i64
+        );
+
+        conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT caller_owned; RELEASE SAVEPOINT caller_owned; COMMIT;",
+        )
+        .expect("roll back caller transaction");
+        assert!(!test_table_exists(&conn, "__schema_history"));
+        assert!(!test_table_exists(&conn, "phases"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::failure::ExoFailure;
 use crate::process_spawn::CommandSpawnExt as _;
 use crate::steering::{SuggestedAction, WorkIntent};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
@@ -83,6 +84,8 @@ pub(crate) struct PhaseFinishResult {
     pub phase_id: String,
     /// RFC promotion suggestions for phase-attached RFCs.
     pub rfc_suggestions: Vec<RfcSuggestion>,
+    /// Diagnostics produced while resolving canonical campaign RFC objectives.
+    pub rfc_diagnostics: Vec<String>,
     /// Info about the next pending phase in the epoch, if any.
     pub next_phase: Option<NextPhaseInfo>,
 }
@@ -91,9 +94,13 @@ pub(crate) struct PhaseFinishResult {
 #[derive(Debug, Serialize)]
 pub(crate) struct RfcSuggestion {
     pub rfc_id: String,
+    pub rfc_ulid: String,
     pub title: String,
-    pub current_stage: u8,
+    pub current_stage: Option<u8>,
+    pub lifecycle: Option<String>,
+    pub superseded_by: Option<String>,
     pub target_stage: Option<u8>,
+    pub motion: crate::project_flow::RfcObjectiveMotion,
     pub suggestion: String,
     pub is_driving: bool,
 }
@@ -275,7 +282,7 @@ pub(crate) fn finish_phase(
     }
 
     // 3. Collect RFC info for the completed phase before marking it done
-    let rfc_suggestions = collect_phase_rfc_info(root, plan, &active_phase_id);
+    let rfc_info = collect_phase_rfc_info(root, &active_phase_id);
 
     // 4. Update status to completed
     {
@@ -315,10 +322,16 @@ pub(crate) fn finish_phase(
 
     if emit_output {
         // Print RFC suggestions
-        for suggestion in &rfc_suggestions {
+        for diagnostic in &rfc_info.diagnostics {
+            println!("\nRFC objective diagnostic: {diagnostic}");
+        }
+        for suggestion in &rfc_info.suggestions {
+            let stage = suggestion
+                .current_stage
+                .map_or_else(|| "unavailable".to_string(), |stage| stage.to_string());
             println!(
                 "\nRFC {}: {} (Stage {})",
-                suggestion.rfc_id, suggestion.title, suggestion.current_stage
+                suggestion.rfc_id, suggestion.title, stage
             );
             println!("  → {}", suggestion.suggestion);
         }
@@ -340,75 +353,291 @@ pub(crate) fn finish_phase(
 
     Ok(PhaseFinishResult {
         phase_id: active_phase_id,
-        rfc_suggestions,
+        rfc_suggestions: rfc_info.suggestions,
+        rfc_diagnostics: rfc_info.diagnostics,
         next_phase,
     })
 }
 
-/// Collect RFC information for a phase's attached RFCs.
-///
-/// Reads each attached RFC through the effective workspace view, then generates
-/// a promotion suggestion based on whether the RFC is driving or related.
-fn collect_phase_rfc_info(root: &Path, plan: &ExoState, phase_id: &str) -> Vec<RfcSuggestion> {
-    // Find the phase's RFC attachments
-    let phase_rfcs: Vec<_> = plan
-        .epochs
-        .iter()
-        .flat_map(|e| &e.phases)
-        .find(|p| p.id == phase_id)
-        .map(|p| p.rfcs.clone())
-        .unwrap_or_default();
+struct PhaseRfcInfo {
+    suggestions: Vec<RfcSuggestion>,
+    diagnostics: Vec<String>,
+}
 
-    if phase_rfcs.is_empty() {
-        return Vec::new();
-    }
-
-    let project = crate::project::Project::resolve(root).ok();
-    let rfc_index = match crate::rfc::load_effective_rfcs(root, project.as_ref()) {
-        Ok(rfcs) => rfcs
-            .into_iter()
-            .map(|effective| {
-                let rfc = effective.record;
-                (format!("{:05}", rfc.rfc_number), (rfc.title, rfc.stage))
-            })
-            .collect::<std::collections::HashMap<_, _>>(),
-        Err(_) => return Vec::new(),
+/// Project phase suggestions from the canonical typed-first campaign resolver.
+fn collect_phase_rfc_info(root: &Path, phase_id: &str) -> PhaseRfcInfo {
+    let result = crate::project::Project::resolve(root).and_then(|project| {
+        let effective_rfcs = crate::rfc::load_effective_rfcs(root, Some(&project))?;
+        crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
+            &project.db_path(),
+            phase_id,
+            &effective_rfcs,
+        )
+    });
+    let (objectives, diagnostics) = match result {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return PhaseRfcInfo {
+                suggestions: Vec::new(),
+                diagnostics: vec![format!("project_flow.objective_resolution_failed: {error}")],
+            };
+        }
     };
+    phase_rfc_info_for_workspace(root, objectives, diagnostics)
+}
 
-    let mut suggestions = Vec::new();
+fn phase_rfc_info_for_workspace(
+    root: &Path,
+    objectives: Vec<crate::project_flow::RfcObjectiveView>,
+    diagnostics: Vec<String>,
+) -> PhaseRfcInfo {
+    let unavailable_numbers = objectives
+        .iter()
+        .filter(|objective| {
+            crate::rfc::find_rfc_file(&root.join("docs/rfcs"), &objective.rfc_number.to_string())
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|content| crate::rfc::extract_anchor_ulid(&content))
+                .is_none_or(|ulid| ulid != objective.rfc_ulid)
+        })
+        .map(|objective| objective.rfc_number)
+        .collect::<HashSet<_>>();
+    phase_rfc_info_from_objectives(objectives, diagnostics, &unavailable_numbers)
+}
 
-    for phase_rfc in &phase_rfcs {
-        let (title, current_stage) = match rfc_index.get(&phase_rfc.id) {
-            Some((title, stage)) => (title.clone(), *stage),
-            None => (format!("RFC {}", phase_rfc.id), 0),
-        };
-
-        let suggestion = if let Some(target) = phase_rfc.target {
-            if current_stage >= target {
-                format!(
-                    "Already at Stage {current_stage} (target was {target}). No promotion needed."
-                )
-            } else {
-                format!(
-                    "Currently Stage {}, target Stage {}. Consider: `exo rfc promote {} --stage {}`",
-                    current_stage, target, phase_rfc.id, target
-                )
+fn phase_rfc_info_from_objectives(
+    objectives: Vec<crate::project_flow::RfcObjectiveView>,
+    diagnostics: Vec<String>,
+    ambiguous_rfc_numbers: &HashSet<i64>,
+) -> PhaseRfcInfo {
+    let suggestions = objectives
+        .into_iter()
+        .map(|objective| {
+            let motion = objective.motion();
+            let suggestion = match motion {
+                crate::project_flow::RfcObjectiveMotion::IdentityMissing => {
+                    "Canonical RFC identity is unavailable. Repair the project-flow relationship before promotion."
+                        .to_string()
+                }
+                crate::project_flow::RfcObjectiveMotion::Terminal => {
+                    let lifecycle = objective.lifecycle.as_deref().unwrap_or("terminal");
+                    match objective.superseded_by.as_deref() {
+                        Some(successor) => format!(
+                            "RFC is {lifecycle} and superseded by {successor}. No promotion is available."
+                        ),
+                        None => format!("RFC is {lifecycle}. No promotion is available."),
+                    }
+                }
+                crate::project_flow::RfcObjectiveMotion::TargetReached => format!(
+                    "Already at Stage {} (target was {}). No promotion needed.",
+                    objective.current_stage.expect("reached target has a current stage"),
+                    objective.target_stage.expect("reached target has a target stage")
+                ),
+                crate::project_flow::RfcObjectiveMotion::Advancing => {
+                    let current_stage = objective
+                        .current_stage
+                        .expect("advancing objective has a current stage");
+                    let target_stage = objective
+                        .target_stage
+                        .expect("advancing objective has a target stage");
+                    if ambiguous_rfc_numbers.contains(&objective.rfc_number) {
+                        format!(
+                            "Currently Stage {current_stage}, target Stage {target_stage}. RFC number {} does not select a unique workspace document with the attached identity; repair the workspace document before promotion (attached RFC {}).",
+                            objective.rfc_number, objective.rfc_ulid
+                        )
+                    } else {
+                        format!(
+                            "Currently Stage {current_stage}, target Stage {target_stage}. Consider: `exo rfc promote {} --stage {}`",
+                            objective.rfc_number, current_stage + 1
+                        )
+                    }
+                }
+                crate::project_flow::RfcObjectiveMotion::Associated => {
+                    let current_stage = objective
+                        .current_stage
+                        .expect("associated objective has a current stage");
+                    if current_stage == 4 {
+                        "Stable (Stage 4). No action needed.".to_string()
+                    } else {
+                        format!(
+                            "Associated RFC at Stage {current_stage}. No targeted promotion is pending."
+                        )
+                    }
+                }
+            };
+            RfcSuggestion {
+                rfc_id: format!("{:05}", objective.rfc_number),
+                rfc_ulid: objective.rfc_ulid,
+                title: objective.title,
+                current_stage: objective.current_stage,
+                lifecycle: objective.lifecycle,
+                superseded_by: objective.superseded_by,
+                target_stage: objective.target_stage,
+                motion,
+                suggestion,
+                is_driving: matches!(objective.relation.as_str(), "drives" | "driving"),
             }
-        } else if current_stage < 4 {
-            format!("Related RFC at Stage {current_stage}. Review if this work advances it.")
-        } else {
-            format!("Stable (Stage {current_stage}). No action needed.")
-        };
+        })
+        .collect();
+    PhaseRfcInfo {
+        suggestions,
+        diagnostics,
+    }
+}
 
-        suggestions.push(RfcSuggestion {
-            rfc_id: phase_rfc.id.clone(),
-            title,
-            current_stage,
-            target_stage: phase_rfc.target,
-            suggestion,
-            is_driving: phase_rfc.is_driving(),
-        });
+#[cfg(test)]
+mod project_flow_tests {
+    use super::*;
+    use crate::project_flow::RfcObjectiveView;
+
+    #[test]
+    fn phase_projection_retains_disconnected_typed_objective() {
+        let info = phase_rfc_info_from_objectives(
+            vec![RfcObjectiveView {
+                rfc_ulid: "01rfc000000000000000000001".to_string(),
+                rfc_number: 10207,
+                title: "Stored project-flow title".to_string(),
+                observed_stage: Some(2),
+                current_stage: None,
+                lifecycle: None,
+                superseded_by: None,
+                target_stage: Some(3),
+                relation: "drives".to_string(),
+                source: "typed".to_string(),
+                diagnostic: Some(
+                    "project_flow.rfc_identity_missing: 01rfc000000000000000000001".to_string(),
+                ),
+            }],
+            vec!["project_flow.rfc_identity_missing: 01rfc000000000000000000001".to_string()],
+            &HashSet::new(),
+        );
+
+        assert_eq!(info.suggestions.len(), 1);
+        assert_eq!(info.suggestions[0].rfc_id, "10207");
+        assert_eq!(info.suggestions[0].rfc_ulid, "01rfc000000000000000000001");
+        assert_eq!(info.suggestions[0].title, "Stored project-flow title");
+        assert_eq!(info.suggestions[0].current_stage, None);
+        assert!(
+            info.suggestions[0]
+                .suggestion
+                .contains("identity is unavailable")
+        );
+        assert_eq!(info.diagnostics.len(), 1);
     }
 
-    suggestions
+    #[test]
+    fn phase_projection_reports_terminal_objective_without_promotion() {
+        let info = phase_rfc_info_from_objectives(
+            vec![RfcObjectiveView {
+                rfc_ulid: "01rfc000000000000000000001".to_string(),
+                rfc_number: 10207,
+                title: "Stored project-flow title".to_string(),
+                observed_stage: Some(2),
+                current_stage: Some(2),
+                lifecycle: Some("superseded".to_string()),
+                superseded_by: Some("10208".to_string()),
+                target_stage: Some(3),
+                relation: "drives".to_string(),
+                source: "typed".to_string(),
+                diagnostic: None,
+            }],
+            Vec::new(),
+            &HashSet::new(),
+        );
+
+        assert!(
+            info.suggestions[0]
+                .suggestion
+                .contains("superseded by 10208")
+        );
+        assert!(!info.suggestions[0].suggestion.contains("exo rfc promote"));
+        assert_eq!(info.suggestions[0].lifecycle.as_deref(), Some("superseded"));
+    }
+
+    #[test]
+    fn phase_projection_only_prompts_for_a_strictly_future_target() {
+        let objective = |current_stage, target_stage| RfcObjectiveView {
+            rfc_ulid: format!("01rfc{current_stage}{target_stage:?}"),
+            rfc_number: 10207,
+            title: "Project flow".to_string(),
+            observed_stage: Some(current_stage),
+            current_stage: Some(current_stage),
+            lifecycle: Some("active".to_string()),
+            superseded_by: None,
+            target_stage,
+            relation: "drives".to_string(),
+            source: "typed".to_string(),
+            diagnostic: None,
+        };
+        let info = phase_rfc_info_from_objectives(
+            vec![
+                objective(3, Some(3)),
+                objective(4, None),
+                objective(2, Some(4)),
+            ],
+            Vec::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            info.suggestions[0].motion,
+            crate::project_flow::RfcObjectiveMotion::TargetReached
+        );
+        assert!(!info.suggestions[0].suggestion.contains("exo rfc promote"));
+        assert_eq!(
+            info.suggestions[1].motion,
+            crate::project_flow::RfcObjectiveMotion::Associated
+        );
+        assert!(!info.suggestions[1].suggestion.contains("exo rfc promote"));
+        assert_eq!(
+            info.suggestions[2].motion,
+            crate::project_flow::RfcObjectiveMotion::Advancing
+        );
+        assert!(info.suggestions[2].suggestion.contains("exo rfc promote"));
+        assert!(info.suggestions[2].suggestion.contains("target Stage 4"));
+        assert!(info.suggestions[2].suggestion.contains("--stage 3"));
+    }
+
+    #[test]
+    fn phase_projection_does_not_suggest_an_ambiguous_numeric_promotion() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("docs/rfcs/stage-2");
+        std::fs::create_dir_all(&stage).unwrap();
+        for name in ["10207-first.md", "10207-duplicate.md"] {
+            std::fs::write(
+                stage.join(name),
+                "<!-- exo:10207 ulid:01rfc000000000000000000001 -->\n# Project flow\n",
+            )
+            .unwrap();
+        }
+        let info = phase_rfc_info_for_workspace(
+            temp.path(),
+            vec![RfcObjectiveView {
+                rfc_ulid: "01rfc000000000000000000001".to_string(),
+                rfc_number: 10207,
+                title: "Project flow".to_string(),
+                observed_stage: Some(2),
+                current_stage: Some(2),
+                lifecycle: Some("active".to_string()),
+                superseded_by: None,
+                target_stage: Some(3),
+                relation: "drives".to_string(),
+                source: "typed".to_string(),
+                diagnostic: None,
+            }],
+            Vec::new(),
+        );
+
+        assert!(
+            info.suggestions[0]
+                .suggestion
+                .contains("does not select a unique workspace document")
+        );
+        assert!(
+            info.suggestions[0]
+                .suggestion
+                .contains("01rfc000000000000000000001")
+        );
+        assert!(!info.suggestions[0].suggestion.contains("exo rfc promote"));
+    }
 }

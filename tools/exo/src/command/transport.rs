@@ -105,6 +105,10 @@ pub trait TransportContext {
     fn agent_id(&self) -> Option<&str> {
         None
     }
+    /// Stable request identity for daemon recovery (None = direct CLI/test).
+    fn request_id(&self) -> Option<&str> {
+        None
+    }
     fn workflow_confirmation(&self) -> Option<&WorkflowConfirmationInput> {
         None
     }
@@ -291,6 +295,10 @@ impl TransportContext for MachineChannelTransport<'_> {
 
     fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
+    }
+
+    fn request_id(&self) -> Option<&str> {
+        Some(&self.request_id)
     }
 
     fn workflow_confirmation(&self) -> Option<&WorkflowConfirmationInput> {

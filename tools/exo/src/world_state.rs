@@ -1,6 +1,5 @@
 use crate::ExoResult;
 use crate::command::sidecar::SidecarRepoSyncStatus;
-use crate::context::rfc::{self, RfcIndexEntry};
 use crate::context::{ActivePhaseData, AgentContext, Goal};
 use crate::process_spawn::CommandSpawnExt as _;
 use crate::task;
@@ -63,10 +62,13 @@ pub struct GitChangeSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct RfcPipelineEntry {
     pub id: String,
-    pub current_stage: u8,
+    pub current_stage: Option<u8>,
+    pub lifecycle: Option<String>,
+    pub superseded_by: Option<String>,
     pub target_stage: Option<u8>,
     pub title: String,
     pub is_driving: bool,
+    pub motion: crate::project_flow::RfcObjectiveMotion,
 }
 
 /// Info about an epoch that needs review.
@@ -122,6 +124,7 @@ pub struct WorldState {
     pub tasks: Vec<(String, String, String)>,
     pub goals: Vec<Goal>,
     pub rfc_pipeline: HashMap<String, RfcPipelineEntry>,
+    pub rfc_objective_diagnostics: Vec<String>,
     /// Epochs that are completed but not yet reviewed.
     pub unreviewed_epochs: Vec<UnreviewedEpoch>,
     /// Session boundary detection result.
@@ -181,8 +184,8 @@ impl WorldState {
         let git_changes = git_porcelain.as_deref().map(summarize_git_porcelain);
         let current_snapshots = snapshot_statuses(&context.root);
 
-        let rfc_index = rfc::index_effective_rfcs(&rfc_view.records);
-        let rfc_pipeline = build_rfc_pipeline(active_phase.as_ref(), &rfc_index);
+        let (rfc_pipeline, rfc_objective_diagnostics) =
+            build_rfc_pipeline(&db_path, active_phase.as_ref(), &rfc_view.records);
 
         // Find unreviewed completed epochs
         let unreviewed_epochs = context
@@ -212,6 +215,7 @@ impl WorldState {
             tasks,
             goals,
             rfc_pipeline,
+            rfc_objective_diagnostics,
             unreviewed_epochs,
             session_boundary: crate::session_boundary::BoundaryDetection {
                 boundary_type: crate::session_boundary::BoundaryType::Session,
@@ -321,34 +325,46 @@ impl WorldState {
 }
 
 fn build_rfc_pipeline(
+    db_path: &Path,
     active_phase: Option<&ActivePhaseData>,
-    rfc_index: &HashMap<String, RfcIndexEntry>,
-) -> HashMap<String, RfcPipelineEntry> {
+    effective_rfcs: &[crate::rfc::EffectiveRfcRecord],
+) -> (HashMap<String, RfcPipelineEntry>, Vec<String>) {
     let mut pipeline = HashMap::new();
 
     let Some(phase) = active_phase else {
-        return pipeline;
+        return (pipeline, Vec::new());
     };
 
-    for rfc in &phase.rfcs {
-        let (current_stage, title) = match rfc_index.get(&rfc.id) {
-            Some(entry) => (entry.stage, entry.title.clone()),
-            None => (0, format!("RFC {}", rfc.id)),
-        };
-
-        pipeline.insert(
-            rfc.id.clone(),
-            RfcPipelineEntry {
-                id: rfc.id.clone(),
-                current_stage,
-                target_stage: rfc.target,
-                title,
-                is_driving: rfc.is_driving(),
-            },
-        );
+    match crate::project_flow::campaign_rfc_objectives_with_effective_rfcs(
+        db_path,
+        &phase.id,
+        effective_rfcs,
+    ) {
+        Ok((objectives, diagnostics)) => {
+            for objective in objectives {
+                let id = format!("{:05}", objective.rfc_number);
+                let motion = objective.motion();
+                pipeline.insert(
+                    objective.rfc_ulid,
+                    RfcPipelineEntry {
+                        id,
+                        current_stage: objective.current_stage,
+                        lifecycle: objective.lifecycle,
+                        superseded_by: objective.superseded_by,
+                        target_stage: objective.target_stage,
+                        title: objective.title,
+                        is_driving: matches!(objective.relation.as_str(), "drives" | "driving"),
+                        motion,
+                    },
+                );
+            }
+            (pipeline, diagnostics)
+        }
+        Err(error) => (
+            pipeline,
+            vec![format!("project_flow.objective_resolution_failed: {error}")],
+        ),
     }
-
-    pipeline
 }
 
 /// Read the phase id from the last completed phase in SQLite-backed state.
@@ -370,6 +386,240 @@ fn read_last_executed_phase_id(_root: &Path, context: &AgentContext) -> Option<S
         }
     }
     last_completed
+}
+
+#[cfg(test)]
+mod project_flow_pipeline_tests {
+    use super::*;
+    use crate::context::sqlite_loader::RfcRecord;
+    use crate::context::{PhaseKind, SqliteWriter};
+    use crate::project_flow::{RfcRelation, attach_rfc};
+    use crate::rfc::{EffectiveRfcRecord, RfcViewProvenance};
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, ActivePhaseData) {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("exo.db");
+        let writer = SqliteWriter::open(&db_path).unwrap();
+        let epoch = writer.add_epoch("Epoch", Some("epoch"), &[]).unwrap();
+        let phase = writer
+            .add_phase(&epoch, "Campaign", "regular", Some("campaign"), &[])
+            .unwrap();
+        writer
+            .database()
+            .connection()
+            .execute(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+             VALUES('01rfc000000000000000000001', 10207, 'Project flow', 2, 'active',
+                    'project-flow', 'docs/rfcs/stage-2/10207.md')",
+                [],
+            )
+            .unwrap();
+        (
+            temp,
+            db_path,
+            ActivePhaseData {
+                id: phase,
+                title: "Campaign".to_string(),
+                epoch_id: epoch,
+                epoch_title: "Epoch".to_string(),
+                rfcs: Vec::new(),
+                kind: PhaseKind::Regular,
+            },
+        )
+    }
+
+    #[test]
+    fn typed_only_objective_is_visible_in_pipeline() {
+        let (_temp, db_path, phase) = fixture();
+        attach_rfc(
+            &db_path,
+            &phase.id,
+            "01rfc000000000000000000001",
+            RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+
+        let (pipeline, diagnostics) = build_rfc_pipeline(&db_path, Some(&phase), &[]);
+        let objective = pipeline
+            .get("01rfc000000000000000000001")
+            .expect("typed objective in pipeline");
+        assert_eq!(objective.current_stage, Some(2));
+        assert_eq!(objective.lifecycle.as_deref(), Some("active"));
+        assert_eq!(objective.superseded_by, None);
+        assert_eq!(objective.target_stage, Some(3));
+        assert_eq!(
+            objective.motion,
+            crate::project_flow::RfcObjectiveMotion::Advancing
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn pipeline_uses_the_supplied_effective_rfc_view() {
+        let (_temp, db_path, phase) = fixture();
+        attach_rfc(
+            &db_path,
+            &phase.id,
+            "01rfc000000000000000000001",
+            RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+        let effective = EffectiveRfcRecord {
+            record: RfcRecord {
+                text_id: "01rfc000000000000000000001".to_string(),
+                rfc_number: 10207,
+                title: "Workspace project flow".to_string(),
+                stage: 3,
+                status: "active".to_string(),
+                feature: None,
+                slug: "project-flow".to_string(),
+                file_path: "docs/rfcs/stage-3/10207.md".to_string(),
+                superseded_by: None,
+                supersedes: None,
+                withdrawal_reason: None,
+                archived_reason: None,
+                consolidated_into: None,
+            },
+            provenance: RfcViewProvenance {
+                document_source: "workspace".to_string(),
+                workspace_presence: "present".to_string(),
+                canonical_presence: "present".to_string(),
+                workspace_branch: Some("wycats/project-flow".to_string()),
+                workspace_head: Some("abc123".to_string()),
+                canonical_ref: Some("refs/heads/main".to_string()),
+                canonical_head: Some("def456".to_string()),
+                differs_from_canonical: true,
+            },
+        };
+
+        let (pipeline, diagnostics) =
+            build_rfc_pipeline(&db_path, Some(&phase), &[effective.clone()]);
+        let objective = &pipeline["01rfc000000000000000000001"];
+        assert_eq!(objective.title, "Workspace project flow");
+        assert_eq!(objective.current_stage, Some(3));
+        assert_eq!(
+            objective.motion,
+            crate::project_flow::RfcObjectiveMotion::TargetReached
+        );
+        assert!(diagnostics.is_empty());
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .replace_phase_rfcs(&phase.id, &["10207".to_string()])
+            .unwrap();
+        let mut renumbered = effective.clone();
+        renumbered.record.rfc_number = 10208;
+        let mut replacement = effective;
+        replacement.record.text_id = "01rfc000000000000000000002".to_string();
+        replacement.record.title = "Replacement workspace RFC".to_string();
+        let (pipeline, diagnostics) =
+            build_rfc_pipeline(&db_path, Some(&phase), &[renumbered, replacement]);
+        assert!(diagnostics.is_empty());
+        assert_eq!(pipeline.len(), 2);
+        assert_eq!(pipeline["01rfc000000000000000000001"].id, "10208");
+        assert_eq!(
+            pipeline["01rfc000000000000000000002"].title,
+            "Replacement workspace RFC"
+        );
+    }
+
+    #[test]
+    fn world_pipeline_marks_reached_and_stable_objectives_as_non_advancing() {
+        let (_temp, db_path, phase) = fixture();
+        attach_rfc(
+            &db_path,
+            &phase.id,
+            "01rfc000000000000000000001",
+            RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .database()
+            .connection()
+            .execute("UPDATE rfcs SET stage = 3", [])
+            .unwrap();
+        let (pipeline, _) = build_rfc_pipeline(&db_path, Some(&phase), &[]);
+        assert_eq!(
+            pipeline["01rfc000000000000000000001"].motion,
+            crate::project_flow::RfcObjectiveMotion::TargetReached
+        );
+
+        let (_temp, db_path, phase) = fixture();
+        attach_rfc(
+            &db_path,
+            &phase.id,
+            "01rfc000000000000000000001",
+            RfcRelation::Drives,
+            None,
+        )
+        .unwrap();
+        SqliteWriter::open(&db_path)
+            .unwrap()
+            .database()
+            .connection()
+            .execute("UPDATE rfcs SET stage = 4", [])
+            .unwrap();
+        let (pipeline, _) = build_rfc_pipeline(&db_path, Some(&phase), &[]);
+        assert_eq!(
+            pipeline["01rfc000000000000000000001"].motion,
+            crate::project_flow::RfcObjectiveMotion::Associated
+        );
+    }
+
+    #[test]
+    fn missing_typed_identity_is_not_replaced_or_fabricated_at_stage_zero() {
+        let (_temp, db_path, phase) = fixture();
+        attach_rfc(
+            &db_path,
+            &phase.id,
+            "01rfc000000000000000000001",
+            RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+        let writer = SqliteWriter::open(&db_path).unwrap();
+        writer
+            .database()
+            .connection()
+            .execute(
+                "DELETE FROM rfcs WHERE text_id = '01rfc000000000000000000001'",
+                [],
+            )
+            .unwrap();
+        writer
+            .database()
+            .connection()
+            .execute(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+             VALUES('01rfc000000000000000000002', 10207, 'Different RFC', 4, 'active',
+                    'different', 'docs/rfcs/stage-4/10207-different.md')",
+                [],
+            )
+            .unwrap();
+        writer
+            .replace_phase_rfcs(&phase.id, &["10207".to_string()])
+            .unwrap();
+
+        let (pipeline, diagnostics) = build_rfc_pipeline(&db_path, Some(&phase), &[]);
+        let objective = pipeline
+            .get("01rfc000000000000000000001")
+            .expect("disconnected typed objective remains visible");
+        assert_eq!(objective.id, "10207");
+        assert_eq!(objective.title, "Project flow");
+        assert_eq!(objective.current_stage, None);
+        let legacy = pipeline.get("01rfc000000000000000000002").expect(
+            "the explicit legacy association resolves independently of the missing typed identity",
+        );
+        assert_eq!(legacy.title, "Different RFC");
+        assert_eq!(legacy.current_stage, Some(4));
+        assert_eq!(pipeline.len(), 2, "both identities remain distinct");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic == "project_flow.rfc_identity_missing: 01rfc000000000000000000001"
+        }));
+    }
 }
 
 fn git_status_porcelain(root: &Path) -> Option<String> {

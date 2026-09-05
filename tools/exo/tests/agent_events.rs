@@ -178,7 +178,10 @@ fn retention_cleanup_rejects_incompatible_projection_before_deleting_events() {
     drop(db);
     std::fs::write(
         root.join("docs/agent-context/epochs.sql"),
-        "-- exo:minimum-writer-generation=1\n",
+        format!(
+            "-- exo:minimum-writer-generation={}\n",
+            exosuit_storage::SUPPORTED_WRITER_GENERATION + 1
+        ),
     )
     .expect("raise projection generation");
 

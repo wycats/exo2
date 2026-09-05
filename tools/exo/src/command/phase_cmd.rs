@@ -1935,7 +1935,8 @@ impl Command for PhaseRemove {
 impl MutableCommand for PhaseRemove {
     fn execute_mut(&self, ctx: &mut MutableCommandContext) -> ExoResult<CommandOutput> {
         phase_owner::ensure_phase_write_allowed(ctx.root, ctx.project, &ctx.db_path(), &self.id)?;
-        let lanes = SqliteLoader::open(ctx.db_path())?
+        let loader = SqliteLoader::open(ctx.db_path())?;
+        let lanes = loader
             .load_workbench_lanes()?
             .into_iter()
             .filter(|lane| lane.execution_phase_id == self.id)
@@ -1970,6 +1971,56 @@ impl MutableCommand for PhaseRemove {
             }))
             .into());
         }
+        let conn = loader.database().connection();
+        let rfc_objectives = {
+            let mut statement = conn.prepare(
+                "SELECT objective.rfc_ulid
+                 FROM campaign_rfc_objectives_data objective
+                 JOIN phases_data phase ON phase.id = objective.phase_id
+                 WHERE phase.text_id = ?1
+                 ORDER BY objective.rfc_ulid",
+            )?;
+            statement
+                .query_map([&self.id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let pull_requests = {
+            let mut statement = conn.prepare(
+                "SELECT artifact.url
+                 FROM phase_pull_request_relations_data relation
+                 JOIN phases_data phase ON phase.id = relation.phase_id
+                 JOIN project_flow_pull_requests_data artifact ON artifact.id = relation.artifact_id
+                 WHERE phase.text_id = ?1
+                 ORDER BY artifact.provider, artifact.repository, artifact.number",
+            )?;
+            statement
+                .query_map([&self.id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !rfc_objectives.is_empty() || !pull_requests.is_empty() {
+            return Err(ExoFailure::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "Phase '{}' cannot be removed while it has attached project motion",
+                    self.id
+                ),
+                ExoFailure::orienting_steering(vec![SuggestedAction {
+                    label: "Inspect attached project motion".to_string(),
+                    command: format!("exo project-flow status --campaign {}", self.id),
+                    rationale: "Detach the RFC objectives and pull requests that still reference this campaign before removing it.".to_string(),
+                    intent: WorkIntent::Orient,
+                    confidence: Some(1.0),
+                }]),
+            )
+            .with_details(json!({
+                "kind": "phase.has_project_flow_relationships",
+                "phase_id": self.id,
+                "rfc_objectives": rfc_objectives,
+                "pull_requests": pull_requests,
+            }))
+            .into());
+        }
+        drop(loader);
         let writer = SqliteWriter::open(ctx.db_path())?;
         writer.remove_phase(&self.id)?;
 
@@ -2362,7 +2413,11 @@ impl MutableCommand for PhaseFinish {
             let writer = SqliteWriter::open(ctx.db_path())?;
             writer.clear_phase_owner(active_phase_id)?;
         }
-        let (rfc_suggestions, next_phase) = (result.rfc_suggestions, result.next_phase);
+        let (rfc_suggestions, rfc_diagnostics, next_phase) = (
+            result.rfc_suggestions,
+            result.rfc_diagnostics,
+            result.next_phase,
+        );
 
         #[derive(Serialize)]
         struct PhaseFinishOutput {
@@ -2370,6 +2425,8 @@ impl MutableCommand for PhaseFinish {
             ok: bool,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             rfc_suggestions: Vec<phase::RfcSuggestion>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            rfc_diagnostics: Vec<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             next_phase: Option<phase::NextPhaseInfo>,
         }
@@ -2378,6 +2435,7 @@ impl MutableCommand for PhaseFinish {
             kind: "phase.finish",
             ok: true,
             rfc_suggestions,
+            rfc_diagnostics,
             next_phase,
         };
 

@@ -337,9 +337,13 @@ pub struct RfcSteeringContext {
     pub id: String,
     pub title: String,
     pub current_stage: u8,
+    pub lifecycle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_stage: Option<u8>,
-    /// Whether this phase is driving (advancing) this RFC vs just referencing it.
+    pub motion: crate::project_flow::RfcObjectiveMotion,
+    /// Whether the stored relationship is driving rather than referential.
     pub is_driving: bool,
     /// Human-readable requirement for the next stage promotion (if driving).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1160,6 +1164,23 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
     // Override progress mode with world-derived value (may differ from phase-only derivation)
     steering.progress_mode = progress_mode;
 
+    let non_advancing_goal_rfc = world
+        .goals
+        .iter()
+        .find(|goal| !goal.is_terminal() && goal.target_stage.is_some())
+        .and_then(|goal| goal.rfc.as_deref())
+        .filter(|goal_rfc| {
+            world.rfc_pipeline.values().any(|entry| {
+                rfc_selector_matches(&entry.id, goal_rfc)
+                    && entry.motion != crate::project_flow::RfcObjectiveMotion::Advancing
+            })
+        });
+    if non_advancing_goal_rfc.is_some() {
+        steering.next_actions.retain(|action| {
+            !(action.label.starts_with("Review RFC ") && action.label.contains(" promotion"))
+        });
+    }
+
     // Apply confidence adjustments based on progress mode
     adjust_confidence_for_mode(&mut steering.next_actions, progress_mode);
     adjust_confidence_for_mode(&mut steering.repair_actions, progress_mode);
@@ -1171,6 +1192,15 @@ pub fn derive_world_steering(world: &WorldState, agent_id: Option<&str>) -> Stee
     add_concern_on_completed_repairs(world, agent_id, &mut steering.repair_actions);
     add_goal_completion_log_nudges(world, &mut steering.next_actions);
     add_phase_completion_nudge(world, &mut steering.next_actions);
+    if !world.rfc_objective_diagnostics.is_empty() {
+        steering.repair_actions.push(SuggestedAction::exo(
+            "Inspect RFC objective diagnostics",
+            ExoCommandReference::new(&["project-flow", "status"]),
+            world.rfc_objective_diagnostics.join("; "),
+            WorkIntent::Orient,
+            Some(0.9),
+        ));
+    }
 
     // Build top-level RFC context from pipeline data
     let rfc_context = build_rfc_steering_context(world);
@@ -1796,20 +1826,21 @@ fn add_goal_centric_nudges(
     // This is an advisory - RFC linkage is strongly encouraged but not required
     // Skip this check for Chore phases.
     if !world.tasks.is_empty()
-        && active_phase.rfcs.is_empty()
+        && world.rfc_pipeline.is_empty()
         && active_phase.kind == PhaseKind::Regular
     {
         let rationale = format!(
-            "Phase '{}' has {} goal(s) but no RFC linkage. Consider linking to \
-                 an RFC for traceability between planning decisions and implementation.",
+            "Campaign '{}' has {} goal(s) but no RFC objective. Consider attaching an \
+                 RFC objective for traceability between planning decisions and implementation.",
             active_phase.title,
             world.tasks.len()
         );
         repair_actions.push(SuggestedAction::exo(
-            "Link phase to RFC(s)",
-            ExoCommandReference::new(&["phase", "update"])
-                .positional(active_phase.id.clone())
-                .option_placeholder("rfcs", "rfc-id", "10194"),
+            "Attach an RFC objective to the campaign",
+            ExoCommandReference::new(&["project-flow", "rfc", "attach"])
+                .positional_placeholder("selector", "rfc-id")
+                .option("campaign", active_phase.id.clone())
+                .option_placeholder("relation", "type", "drives"),
             apply_rfc_context(rfc_context.as_ref(), rationale),
             WorkIntent::Plan,
             Some(0.5), // Lower priority advisory
@@ -1819,7 +1850,7 @@ fn add_goal_centric_nudges(
 
 /// Build top-level RFC context from the world's pipeline data.
 /// This produces a structured summary of all RFCs linked to the current phase,
-/// suitable for inclusion in steering output so agents always know what they're advancing.
+/// suitable for inclusion in steering output so agents know each RFC's relationship and motion.
 fn build_rfc_steering_context(world: &WorldState) -> Vec<RfcSteeringContext> {
     // Collect RFC IDs that are attached to in-progress goals
     let goal_rfc_ids: std::collections::HashSet<&str> = world
@@ -1832,14 +1863,9 @@ fn build_rfc_steering_context(world: &WorldState) -> Vec<RfcSteeringContext> {
     let mut entries: Vec<_> = world
         .rfc_pipeline
         .values()
-        .map(|entry| {
-            let promotion_requirement = if entry.is_driving {
-                entry
-                    .target_stage
-                    .map(|target| promotion_requirements(entry.current_stage, target).to_string())
-            } else {
-                None
-            };
+        .filter_map(|entry| {
+            let current_stage = entry.current_stage?;
+            let promotion_requirement = promotion_requirement_for_pipeline_entry(entry);
 
             // Derive implementation status:
             // - "in-progress" if attached to an in-progress goal
@@ -1850,15 +1876,21 @@ fn build_rfc_steering_context(world: &WorldState) -> Vec<RfcSteeringContext> {
                 Some("in-flight".to_string())
             };
 
-            RfcSteeringContext {
+            Some(RfcSteeringContext {
                 id: entry.id.clone(),
                 title: entry.title.clone(),
-                current_stage: entry.current_stage,
+                current_stage,
+                lifecycle: entry
+                    .lifecycle
+                    .clone()
+                    .unwrap_or_else(|| "active".to_string()),
+                superseded_by: entry.superseded_by.clone(),
                 target_stage: entry.target_stage,
+                motion: entry.motion,
                 is_driving: entry.is_driving,
                 promotion_requirement,
                 implementation_status,
-            }
+            })
         })
         .collect();
 
@@ -1878,33 +1910,84 @@ fn format_rfc_summary(context: &[RfcSteeringContext]) -> String {
 
     match driving.as_slice() {
         [] => String::new(),
-        [single] => {
-            let target = single
-                .target_stage
-                .map_or(String::new(), |t| format!("→{t}"));
-            format!(
-                "Phase is advancing RFC {} «{}» (Stage {}{}).",
-                single.id, single.title, single.current_stage, target
-            )
-        }
+        [single] => match single.motion {
+            crate::project_flow::RfcObjectiveMotion::Advancing => format!(
+                "Phase is advancing RFC {} «{}» (Stage {}→{}).",
+                single.id,
+                single.title,
+                single.current_stage,
+                single
+                    .target_stage
+                    .expect("advancing objective has a target")
+            ),
+            crate::project_flow::RfcObjectiveMotion::TargetReached => format!(
+                "Phase references RFC {} «{}» (Stage {}; target {} reached).",
+                single.id,
+                single.title,
+                single.current_stage,
+                single.target_stage.expect("reached objective has a target")
+            ),
+            crate::project_flow::RfcObjectiveMotion::Associated => format!(
+                "Phase references RFC {} «{}» (Stage {}; associated).",
+                single.id, single.title, single.current_stage
+            ),
+            crate::project_flow::RfcObjectiveMotion::Terminal => format!(
+                "Phase references RFC {} «{}» (Stage {}; {}).",
+                single.id, single.title, single.current_stage, single.lifecycle
+            ),
+            crate::project_flow::RfcObjectiveMotion::IdentityMissing => {
+                unreachable!("identity-missing objectives have no current stage")
+            }
+        },
         multiple => {
             let summaries: Vec<_> = multiple
                 .iter()
-                .map(|e| {
-                    let target = e.target_stage.map_or(String::new(), |t| format!("→{t}"));
-                    format!("RFC {} (Stage {}{})", e.id, e.current_stage, target)
+                .map(|e| match e.motion {
+                    crate::project_flow::RfcObjectiveMotion::Advancing => format!(
+                        "RFC {} (Stage {}→{})",
+                        e.id,
+                        e.current_stage,
+                        e.target_stage.expect("advancing objective has a target")
+                    ),
+                    crate::project_flow::RfcObjectiveMotion::TargetReached => format!(
+                        "RFC {} (Stage {}; target {} reached)",
+                        e.id,
+                        e.current_stage,
+                        e.target_stage.expect("reached objective has a target")
+                    ),
+                    crate::project_flow::RfcObjectiveMotion::Associated => {
+                        format!("RFC {} (Stage {}; associated)", e.id, e.current_stage)
+                    }
+                    crate::project_flow::RfcObjectiveMotion::Terminal => {
+                        format!("RFC {} (Stage {}; {})", e.id, e.current_stage, e.lifecycle)
+                    }
+                    crate::project_flow::RfcObjectiveMotion::IdentityMissing => {
+                        unreachable!("identity-missing objectives have no current stage")
+                    }
                 })
                 .collect();
-            format!("Phase is advancing {}.", summaries.join(", "))
+            format!("Phase RFC context: {}.", summaries.join(", "))
         }
     }
+}
+
+fn rfc_selector_matches(canonical: &str, selector: &str) -> bool {
+    canonical == selector
+        || canonical.parse::<i64>().ok().is_some_and(|canonical| {
+            selector
+                .parse::<i64>()
+                .ok()
+                .is_some_and(|selector| canonical == selector)
+        })
 }
 
 fn rfc_context_for_goal_nudges(world: &WorldState) -> Option<String> {
     let mut driving: Vec<_> = world
         .rfc_pipeline
         .values()
-        .filter(|entry| entry.is_driving)
+        .filter(|entry| {
+            entry.is_driving && entry.motion == crate::project_flow::RfcObjectiveMotion::Advancing
+        })
         .collect();
 
     if driving.is_empty() {
@@ -1913,13 +1996,26 @@ fn rfc_context_for_goal_nudges(world: &WorldState) -> Option<String> {
 
     driving.sort_by_key(|entry| (entry.current_stage, entry.id.as_str()));
     let primary = driving.first()?;
+    let current_stage = primary.current_stage?;
     let target = primary.target_stage?;
-    let requirement = promotion_requirements(primary.current_stage, target);
+    let requirement = promotion_requirements(current_stage, target);
 
     Some(format!(
         "Phase is advancing RFC {} (Stage {}→{}). {}.",
-        primary.id, primary.current_stage, target, requirement
+        primary.id, current_stage, target, requirement
     ))
+}
+
+fn promotion_requirement_for_pipeline_entry(
+    entry: &crate::world_state::RfcPipelineEntry,
+) -> Option<String> {
+    if !entry.is_driving || entry.motion != crate::project_flow::RfcObjectiveMotion::Advancing {
+        return None;
+    }
+    let current = entry.current_stage?;
+    entry
+        .target_stage
+        .map(|target| promotion_requirements(current, target).to_string())
 }
 
 fn apply_rfc_context(context: Option<&String>, rationale: String) -> String {
@@ -2229,6 +2325,95 @@ mod tests {
     #[test]
     fn promotion_requirements_for_stage_0_to_1() {
         assert_eq!(promotion_requirements(0, 1), "User approval required");
+    }
+
+    #[test]
+    fn terminal_rfc_pipeline_entry_has_no_promotion_requirement() {
+        for lifecycle in ["withdrawn", "archived", "superseded"] {
+            let entry = crate::world_state::RfcPipelineEntry {
+                id: "10207".to_string(),
+                current_stage: Some(2),
+                lifecycle: Some(lifecycle.to_string()),
+                superseded_by: (lifecycle == "superseded").then(|| "10208".to_string()),
+                target_stage: Some(3),
+                title: "Project flow".to_string(),
+                is_driving: true,
+                motion: crate::project_flow::RfcObjectiveMotion::Terminal,
+            };
+            assert_eq!(
+                super::promotion_requirement_for_pipeline_entry(&entry),
+                None
+            );
+            let context = super::RfcSteeringContext {
+                id: entry.id.clone(),
+                title: entry.title.clone(),
+                current_stage: 2,
+                lifecycle: lifecycle.to_string(),
+                superseded_by: entry.superseded_by.clone(),
+                target_stage: Some(3),
+                motion: crate::project_flow::RfcObjectiveMotion::Terminal,
+                is_driving: true,
+                promotion_requirement: None,
+                implementation_status: Some("in-flight".to_string()),
+            };
+            let summary = super::format_rfc_summary(&[context]);
+            assert!(summary.contains(lifecycle));
+            assert!(!summary.contains("is advancing"));
+        }
+    }
+
+    #[test]
+    fn steering_only_describes_strictly_future_targets_as_advancing() {
+        let entry = |current_stage, target_stage, motion| crate::world_state::RfcPipelineEntry {
+            id: "10207".to_string(),
+            current_stage: Some(current_stage),
+            lifecycle: Some("active".to_string()),
+            superseded_by: None,
+            target_stage,
+            title: "Project flow".to_string(),
+            is_driving: true,
+            motion,
+        };
+        let context = |entry: &crate::world_state::RfcPipelineEntry| super::RfcSteeringContext {
+            id: entry.id.clone(),
+            title: entry.title.clone(),
+            current_stage: entry.current_stage.unwrap(),
+            lifecycle: "active".to_string(),
+            superseded_by: None,
+            target_stage: entry.target_stage,
+            motion: entry.motion,
+            is_driving: true,
+            promotion_requirement: super::promotion_requirement_for_pipeline_entry(entry),
+            implementation_status: Some("in-flight".to_string()),
+        };
+
+        let reached = entry(
+            3,
+            Some(3),
+            crate::project_flow::RfcObjectiveMotion::TargetReached,
+        );
+        assert_eq!(
+            super::promotion_requirement_for_pipeline_entry(&reached),
+            None
+        );
+        let reached_summary = super::format_rfc_summary(&[context(&reached)]);
+        assert!(reached_summary.contains("target 3 reached"));
+        assert!(!reached_summary.contains("Stage 3→3"));
+
+        let stable = entry(4, None, crate::project_flow::RfcObjectiveMotion::Associated);
+        assert_eq!(
+            super::promotion_requirement_for_pipeline_entry(&stable),
+            None
+        );
+        assert!(super::format_rfc_summary(&[context(&stable)]).contains("associated"));
+
+        let advancing = entry(
+            2,
+            Some(3),
+            crate::project_flow::RfcObjectiveMotion::Advancing,
+        );
+        assert!(super::promotion_requirement_for_pipeline_entry(&advancing).is_some());
+        assert!(super::format_rfc_summary(&[context(&advancing)]).contains("Stage 2→3"));
     }
 
     #[test]

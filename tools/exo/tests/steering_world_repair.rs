@@ -78,6 +78,7 @@ fn world_steering_includes_repair_actions_for_dirty_and_missing_snapshots() {
         tasks: vec![],
         goals: vec![],
         rfc_pipeline: HashMap::new(),
+        rfc_objective_diagnostics: vec![],
         unreviewed_epochs: vec![],
     };
 
@@ -200,6 +201,7 @@ fn make_world_state(
         tasks,
         goals,
         rfc_pipeline: HashMap::new(),
+        rfc_objective_diagnostics: vec![],
         unreviewed_epochs: vec![],
         session_boundary: exo::session_boundary::BoundaryDetection {
             boundary_type: exo::session_boundary::BoundaryType::Session,

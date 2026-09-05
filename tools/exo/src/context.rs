@@ -1884,8 +1884,41 @@ fn import_preflighted_sql_dumps_with_connection(
     conn.execute_batch("SAVEPOINT exo_projection_import")
         .context("Failed to start projection import transaction")?;
     let import_result = (|| -> ExoResult<()> {
+        let preserved_project_flow_observations = {
+            let mut statement = conn.prepare(
+                "SELECT artifact.provider, artifact.repository, artifact.number,
+                        observation.title, observation.lifecycle, observation.head_oid,
+                        observation.review_state, observation.checks_state,
+                        observation.last_success_at, observation.last_attempt_at,
+                        observation.last_error
+                 FROM project_flow_pull_request_observations_data observation
+                 JOIN project_flow_pull_requests_data artifact
+                   ON artifact.id = observation.artifact_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         conn.execute_batch(
-            "DELETE FROM rfc_relations;
+            "DELETE FROM project_flow_pull_request_observations_data;
+             DELETE FROM phase_pull_request_relations_data;
+             DELETE FROM campaign_rfc_objectives_data;
+             DELETE FROM project_flow_pull_requests_data;
+             DELETE FROM rfc_relations;
              DELETE FROM idea_task_refs;
              DELETE FROM idea_tags;
              DELETE FROM entity_aliases;
@@ -1908,6 +1941,45 @@ fn import_preflighted_sql_dumps_with_connection(
 
         exosuit_storage::import_tables(&conn, &dumps)
             .map_err(|error| anyhow::anyhow!("Failed to import SQL dumps: {error}"))?;
+        let revision_store = std::sync::Arc::new(exosuit_storage::RevisionStore::new(conn)?);
+        exosuit_storage::register_reactive_module(conn, "reactive", revision_store)?;
+        for (
+            provider,
+            repository,
+            number,
+            title,
+            lifecycle,
+            head_oid,
+            review_state,
+            checks_state,
+            last_success_at,
+            last_attempt_at,
+            last_error,
+        ) in preserved_project_flow_observations
+        {
+            conn.execute(
+                "INSERT INTO project_flow_pull_request_observations(
+                     artifact_id, title, lifecycle, head_oid, review_state, checks_state,
+                     last_success_at, last_attempt_at, last_error
+                 )
+                 SELECT id, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                 FROM project_flow_pull_requests_data
+                 WHERE provider = ?1 AND repository = ?2 AND number = ?3",
+                exosuit_storage::params![
+                    provider,
+                    repository,
+                    number,
+                    title,
+                    lifecycle,
+                    head_oid,
+                    review_state,
+                    checks_state,
+                    last_success_at,
+                    last_attempt_at,
+                    last_error,
+                ],
+            )?;
+        }
         Ok(())
     })();
 
@@ -2330,7 +2402,7 @@ status = "pending"
         std::fs::create_dir_all(&projection_dir).expect("create projection dir");
         std::fs::write(
             projection_dir.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write incompatible projection");
         let target = temp.path().join("new-state/.cache/exo.db");
@@ -2395,7 +2467,7 @@ status = "pending"
         std::fs::create_dir_all(&projection_dir).expect("create projection directory");
         std::fs::write(
             projection_dir.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write incompatible projection");
 
@@ -2434,7 +2506,7 @@ status = "pending"
         std::fs::create_dir_all(&projection_dir).expect("create projection directory");
         std::fs::write(
             projection_dir.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write incompatible projection");
 
@@ -2544,7 +2616,7 @@ status = "pending"
         let repaired = preflight_sql_dumps(&projection_dir)
             .expect("validate repaired projection")
             .expect("repaired projection remains available");
-        assert_eq!(repaired.generation, 0);
+        assert_eq!(repaired.generation, 1);
         assert!(
             repaired
                 .dumps
@@ -2571,7 +2643,7 @@ status = "pending"
         let dumps = vec![
             (
                 "epochs_data".to_string(),
-                "-- exo:minimum-writer-generation=1\n-- new epochs\n".to_string(),
+                "-- exo:minimum-writer-generation=2\n-- new epochs\n".to_string(),
             ),
             ("phases_data".to_string(), "-- new phases\n".to_string()),
         ];
@@ -2593,7 +2665,7 @@ status = "pending"
         assert!(
             std::fs::read_to_string(projection_dir.join("epochs.sql"))
                 .expect("read raised epochs projection")
-                .starts_with("-- exo:minimum-writer-generation=1\n"),
+                .starts_with("-- exo:minimum-writer-generation=2\n"),
             "the raised compatibility header must be durable before later tables"
         );
         assert_eq!(
@@ -2833,6 +2905,45 @@ status = "pending"
         writer
             .set_workspace_lane_focus("/tmp/exo-worktree", &lane_id)
             .expect("set workspace lane focus");
+        writer
+            .database()
+            .connection()
+            .execute_batch(&format!(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+                 VALUES('01projectionrfc', 10207, 'Project flow', 2, 'active',
+                        'project-flow', 'docs/rfcs/stage-2/10207-project-flow.md');
+                 INSERT INTO campaign_rfc_objectives(
+                     text_id, phase_id, rfc_ulid, rfc_number_snapshot, rfc_title_snapshot,
+                     observed_stage, target_stage, relation
+                 ) VALUES(
+                     '01projectionobjective',
+                     (SELECT id FROM phases_data WHERE text_id = '{phase_id}'),
+                     '01projectionrfc', 10207, 'Project flow', 2, 3, 'drives'
+                 );
+                 INSERT INTO project_flow_pull_requests(
+                     text_id, provider, repository, number, url
+                 ) VALUES(
+                     '01projectionpr', 'github', 'wycats/exo2', 76,
+                     'https://github.com/wycats/exo2/pull/76'
+                 );
+                 INSERT INTO phase_pull_request_relations(phase_id, artifact_id, role)
+                 VALUES(
+                     (SELECT id FROM phases_data WHERE text_id = '{phase_id}'),
+                     (SELECT id FROM project_flow_pull_requests_data
+                      WHERE text_id = '01projectionpr'),
+                     'implements'
+                 );
+                 INSERT INTO project_flow_pull_request_observations(
+                     artifact_id, title, lifecycle, head_oid, review_state, checks_state,
+                     last_success_at, last_attempt_at, last_error
+                 ) VALUES(
+                     (SELECT id FROM project_flow_pull_requests_data
+                      WHERE text_id = '01projectionpr'),
+                     'Observed locally', 'open', 'abc123', 'approved', 'passing',
+                     '2026-09-03T12:00:00Z', '2026-09-03T12:05:00Z', 'later refresh failed'
+                 );"
+            ))
+            .expect("add portable project-flow relationships");
         drop(writer);
 
         write_sql_dump_with_project_result(root, None).expect("write SQL projection");
@@ -2854,6 +2965,40 @@ status = "pending"
             .expect("load lane")
             .expect("lane should survive projection replacement");
         assert_eq!(lane.execution_phase_id, phase_id);
+        let relationship_counts: (i64, i64) = loader
+            .database()
+            .connection()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM campaign_rfc_objectives_data),
+                     (SELECT COUNT(*) FROM phase_pull_request_relations_data)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read restored project-flow relationships");
+        assert_eq!(relationship_counts, (1, 1));
+        let observation: (String, String, String) = loader
+            .database()
+            .connection()
+            .query_row(
+                "SELECT observation.title, observation.last_success_at, observation.last_error
+                 FROM project_flow_pull_request_observations_data observation
+                 JOIN project_flow_pull_requests_data artifact
+                   ON artifact.id = observation.artifact_id
+                 WHERE artifact.provider = 'github'
+                   AND artifact.repository = 'wycats/exo2' AND artifact.number = 76",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("machine-local observation survives portable replacement");
+        assert_eq!(
+            observation,
+            (
+                "Observed locally".to_string(),
+                "2026-09-03T12:00:00Z".to_string(),
+                "later refresh failed".to_string(),
+            )
+        );
         assert_eq!(
             loader
                 .load_workspace_lane_focus("/tmp/exo-worktree")

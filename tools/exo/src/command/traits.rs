@@ -38,6 +38,8 @@ pub struct CommandContext<'a> {
     pub format: OutputFormat,
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
+    /// Stable machine request identity used by recoverable external reads.
+    pub request_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
@@ -53,6 +55,8 @@ pub struct MutableCommandContext<'a> {
     pub format: OutputFormat,
     /// Agent session identity from request envelope (None = CLI/sidebar).
     pub agent_id: Option<String>,
+    /// Stable machine request identity used by recoverable external reads.
+    pub request_id: Option<String>,
     pub workflow_confirmation: Option<WorkflowConfirmationInput>,
     /// Optional content supplied by a machine transport for stdin-backed commands.
     pub input_content: Option<String>,
@@ -91,6 +95,8 @@ pub struct CommandOutput {
 pub struct CommandInvokeResult {
     /// The JSON result data.
     pub data: serde_json::Value,
+    /// Structured command output before transport rendering, for persistence decisions.
+    pub structured_data: serde_json::Value,
     /// Human-readable message from the command, if available.
     /// Used by the machine channel handler to generate display metadata.
     pub human_message: Option<String>,
@@ -174,6 +180,7 @@ impl CommandBox {
                     project: ctx.project,
                     format: ctx.format,
                     agent_id: ctx.agent_id.clone(),
+                    request_id: ctx.request_id.clone(),
                     workflow_confirmation: ctx.workflow_confirmation.clone(),
                     input_content: ctx.input_content.clone(),
                     runtime_services: ctx.runtime_services,
@@ -519,6 +526,7 @@ pub fn invoke_command_box_json(
         project: transport.project(),
         format: transport.output_format(),
         agent_id: transport.agent_id().map(String::from),
+        request_id: transport.request_id().map(String::from),
         workflow_confirmation: transport.workflow_confirmation().cloned(),
         input_content: transport.input_content().map(String::from),
         runtime_services: transport.runtime_services(),
@@ -597,9 +605,11 @@ pub fn invoke_command_box_json(
     };
 
     let human_message = output.human_message.clone();
+    let structured_data = output.data.clone();
     let data = transport_output_to_json(transport.format_output(output));
     Ok(CommandInvokeResult {
         data,
+        structured_data,
         human_message,
         effect,
         trace,
@@ -725,6 +735,7 @@ pub trait Command: Send + Sync {
             project: transport.project(),
             format: transport.output_format(),
             agent_id: transport.agent_id().map(String::from),
+            request_id: transport.request_id().map(String::from),
             workflow_confirmation: transport.workflow_confirmation().cloned(),
             input_content: transport.input_content().map(String::from),
             runtime_services: transport.runtime_services(),
@@ -796,6 +807,13 @@ pub fn recovery_class_for_command(
         return RecoveryClass::ReplayableRead;
     }
 
+    if matches!(
+        (namespace, operation),
+        ("project-flow", "pr.attach" | "refresh")
+    ) {
+        return RecoveryClass::PreparedExternalRead;
+    }
+
     let atomic_project_state = matches!(
         (namespace, operation),
         ("axiom", "add" | "remove")
@@ -822,6 +840,7 @@ pub fn recovery_class_for_command(
                 "add" | "focus" | "move" | "release" | "remove" | "reorder" | "start" | "update"
             )
             | ("plan", "move-goals" | "update-status")
+            | ("project-flow", "rfc.attach" | "rfc.detach" | "pr.detach")
             | (
                 "task",
                 "add" | "complete" | "log" | "remove" | "rename" | "reorder" | "start" | "update"
@@ -1024,6 +1043,7 @@ mod tests {
             project: Some(&project),
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
@@ -1082,5 +1102,46 @@ mod tests {
             error_msg.is_some_and(|m| m.contains("Failed to read TOML file")),
             "expected TOML read error, got: {err}"
         );
+    }
+
+    #[test]
+    fn invocation_preserves_refresh_persistence_intent_across_cli_formats() {
+        struct RefreshResult(bool);
+        impl Command for RefreshResult {
+            fn namespace(&self) -> &'static str {
+                "project-flow"
+            }
+
+            fn operation(&self) -> &'static str {
+                "refresh"
+            }
+
+            fn execute(&self, _ctx: &CommandContext) -> ExoResult<CommandOutput> {
+                Ok(CommandOutput {
+                    data: serde_json::json!({"portable_state_changed": self.0}),
+                    human_message: Some("Refreshed project motion".to_string()),
+                })
+            }
+        }
+
+        for format in [OutputFormat::Human, OutputFormat::Json] {
+            let transport = crate::command::transport::CliTransport::new(format);
+            for changed in [false, true] {
+                let command = CommandBox::pure(RefreshResult(changed));
+                let result = invoke_command_box_json(&command, &transport).unwrap();
+                assert_eq!(result.structured_data["portable_state_changed"], changed);
+                assert_ne!(result.data, result.structured_data);
+                assert_eq!(
+                    crate::post_write::should_persist_after_result(
+                        None,
+                        "project-flow",
+                        "refresh",
+                        Effect::Write,
+                        &result.structured_data,
+                    ),
+                    changed,
+                );
+            }
+        }
     }
 }

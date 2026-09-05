@@ -91,6 +91,7 @@ pub mod preload_guidance;
 #[doc(hidden)]
 pub mod process_spawn;
 pub mod project;
+pub mod project_flow;
 pub mod rfc;
 pub mod router;
 pub mod run;

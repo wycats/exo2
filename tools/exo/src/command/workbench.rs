@@ -365,6 +365,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,

@@ -53,6 +53,7 @@ fn make_world_state(
         tasks,
         goals,
         rfc_pipeline: HashMap::new(),
+        rfc_objective_diagnostics: vec![],
         unreviewed_epochs: vec![],
         session_boundary: exo::session_boundary::BoundaryDetection {
             boundary_type: exo::session_boundary::BoundaryType::Session,
@@ -119,10 +120,13 @@ fn nudge_rationale_includes_rfc_context_for_driving_rfc() {
         "001".to_string(),
         RfcPipelineEntry {
             id: "001".to_string(),
-            current_stage: 0,
+            current_stage: Some(0),
+            lifecycle: Some("active".to_string()),
+            superseded_by: None,
             target_stage: Some(1),
             title: "Test RFC".to_string(),
             is_driving: true,
+            motion: exo::project_flow::RfcObjectiveMotion::Advancing,
         },
     );
 
@@ -217,7 +221,7 @@ fn nudge_warns_when_goals_exist_without_rfc_linkage() {
     let rfc_nudge = steering
         .repair_actions
         .iter()
-        .find(|a| a.command.contains("--rfc"));
+        .find(|a| a.command.contains("exo project-flow rfc attach"));
 
     assert!(
         rfc_nudge.is_some(),
@@ -226,20 +230,34 @@ fn nudge_warns_when_goals_exist_without_rfc_linkage() {
     );
 
     let nudge = rfc_nudge.unwrap();
-    assert_eq!(nudge.label, "Link phase to RFC(s)");
-    assert!(nudge.rationale.contains("no RFC linkage"));
+    assert_eq!(nudge.label, "Attach an RFC objective to the campaign");
+    assert!(nudge.rationale.contains("no RFC objective"));
+    assert!(nudge.command.contains("--campaign phase-1"));
 }
 
 #[test]
-fn no_rfc_nudge_when_phase_has_rfc_linkage() {
-    // Active phase WITH RFC linkage
-    let world = make_world_state(
+fn no_legacy_linkage_nudge_when_typed_objective_exists() {
+    let mut rfc_pipeline = HashMap::new();
+    rfc_pipeline.insert(
+        "01typed".to_string(),
+        RfcPipelineEntry {
+            id: "00177".to_string(),
+            current_stage: Some(2),
+            lifecycle: Some("active".to_string()),
+            superseded_by: None,
+            target_stage: Some(3),
+            title: "Typed objective".to_string(),
+            is_driving: true,
+            motion: exo::project_flow::RfcObjectiveMotion::Advancing,
+        },
+    );
+    let world = make_world_state_with_pipeline(
         Some(ActivePhase {
             id: "phase-1".to_string(),
             title: "Test Phase".to_string(),
             epoch_id: "epoch-1".to_string(),
             epoch_title: "Epoch 1".to_string(),
-            rfcs: vec![PhaseRfc::related("0177")], // Has RFC linkage
+            rfcs: vec![],
             kind: PhaseKind::Regular,
         }),
         vec![(
@@ -248,6 +266,7 @@ fn no_rfc_nudge_when_phase_has_rfc_linkage() {
             "pending".to_string(),
         )],
         vec![],
+        rfc_pipeline,
     );
 
     let steering = derive_world_steering(&world, None);
@@ -256,12 +275,137 @@ fn no_rfc_nudge_when_phase_has_rfc_linkage() {
     let rfc_nudge = steering
         .repair_actions
         .iter()
-        .find(|a| a.command.contains("--rfc"));
+        .find(|a| a.command.contains("exo project-flow rfc attach"));
 
     assert!(
         rfc_nudge.is_none(),
-        "Should not suggest RFC linkage when already linked"
+        "typed objective authority should suppress the legacy linkage nudge"
     );
+}
+
+#[test]
+fn terminal_typed_objective_suppresses_goal_promotion_prompt() {
+    let mut rfc_pipeline = HashMap::new();
+    rfc_pipeline.insert(
+        "01typed".to_string(),
+        RfcPipelineEntry {
+            id: "00177".to_string(),
+            current_stage: Some(2),
+            lifecycle: Some("withdrawn".to_string()),
+            superseded_by: None,
+            target_stage: Some(3),
+            title: "Typed objective".to_string(),
+            is_driving: true,
+            motion: exo::project_flow::RfcObjectiveMotion::Terminal,
+        },
+    );
+    let goal = Goal {
+        id: "promote-rfc".to_string(),
+        label: "Promote RFC 00177".to_string(),
+        status: "pending".to_string(),
+        completion_log: None,
+        kind: None,
+        started_at: None,
+        description: None,
+        ulid: None,
+        slug: None,
+        aliases: Vec::new(),
+        rfc: Some("177".to_string()),
+        target_stage: Some(3),
+    };
+    let world = make_world_state_with_pipeline(
+        Some(ActivePhase {
+            id: "phase-1".to_string(),
+            title: "Test Phase".to_string(),
+            epoch_id: "epoch-1".to_string(),
+            epoch_title: "Epoch 1".to_string(),
+            rfcs: vec![],
+            kind: PhaseKind::Regular,
+        }),
+        Vec::new(),
+        vec![goal],
+        rfc_pipeline,
+    );
+
+    let steering = derive_world_steering(&world, None);
+    assert!(
+        steering
+            .next_actions
+            .iter()
+            .all(|action| !action.label.contains("promotion"))
+    );
+    assert_eq!(steering.rfc_context[0].lifecycle, "withdrawn");
+    assert_eq!(steering.rfc_context[0].promotion_requirement, None);
+}
+
+#[test]
+fn reached_and_stable_typed_objectives_suppress_goal_promotion_prompt() {
+    for (current_stage, target_stage, goal_target, motion) in [
+        (
+            3,
+            Some(3),
+            3,
+            exo::project_flow::RfcObjectiveMotion::TargetReached,
+        ),
+        (
+            4,
+            None,
+            4,
+            exo::project_flow::RfcObjectiveMotion::Associated,
+        ),
+    ] {
+        let mut rfc_pipeline = HashMap::new();
+        rfc_pipeline.insert(
+            "01typed".to_string(),
+            RfcPipelineEntry {
+                id: "00177".to_string(),
+                current_stage: Some(current_stage),
+                lifecycle: Some("active".to_string()),
+                superseded_by: None,
+                target_stage,
+                title: "Typed objective".to_string(),
+                is_driving: true,
+                motion,
+            },
+        );
+        let goal = Goal {
+            id: "promote-rfc".to_string(),
+            label: "Promote RFC 00177".to_string(),
+            status: "pending".to_string(),
+            completion_log: None,
+            kind: None,
+            started_at: None,
+            description: None,
+            ulid: None,
+            slug: None,
+            aliases: Vec::new(),
+            rfc: Some("177".to_string()),
+            target_stage: Some(goal_target),
+        };
+        let world = make_world_state_with_pipeline(
+            Some(ActivePhase {
+                id: "phase-1".to_string(),
+                title: "Test Phase".to_string(),
+                epoch_id: "epoch-1".to_string(),
+                epoch_title: "Epoch 1".to_string(),
+                rfcs: vec![],
+                kind: PhaseKind::Regular,
+            }),
+            Vec::new(),
+            vec![goal],
+            rfc_pipeline,
+        );
+
+        let steering = derive_world_steering(&world, None);
+        assert!(
+            steering
+                .next_actions
+                .iter()
+                .all(|action| !action.label.contains("promotion"))
+        );
+        assert_eq!(steering.rfc_context[0].motion, motion);
+        assert_eq!(steering.rfc_context[0].promotion_requirement, None);
+    }
 }
 
 #[test]
@@ -279,10 +423,9 @@ fn no_goal_nudges_when_no_active_phase() {
     );
 
     // Should NOT have any goal-related nudges
-    let goal_nudge = steering
-        .repair_actions
-        .iter()
-        .find(|a| a.command.contains("exo goal add") || a.command.contains("--rfc"));
+    let goal_nudge = steering.repair_actions.iter().find(|a| {
+        a.command.contains("exo goal add") || a.command.contains("exo project-flow rfc attach")
+    });
 
     assert!(
         goal_nudge.is_none(),

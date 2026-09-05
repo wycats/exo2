@@ -53,6 +53,7 @@ pub mod phase_cmd;
 
 // Namespace modules (Project identity)
 pub mod project;
+pub mod project_flow;
 pub mod sidecar;
 pub mod storage;
 

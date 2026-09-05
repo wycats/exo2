@@ -11,13 +11,15 @@ use super::traits::{
     Command, CommandBox, CommandContext, CommandOutput, MutableCommand, MutableCommandContext,
     OutputFormat,
 };
-use crate::api::protocol::Effect;
+use crate::api::protocol::{Effect, ErrorCode};
 use crate::context::{AgentContext, SqliteLoader, SqliteWriter};
+use crate::failure::ExoFailure;
 use crate::phase_owner::{self, PhaseOwnerView};
 use crate::steering::SuggestedAction;
 use crate::steering::WorkIntent;
 use anyhow::Result as ExoResult;
 use serde::Serialize;
+use serde_json::json;
 
 /// Default steering for epoch commands.
 fn default_epoch_steering() -> Vec<SuggestedAction> {
@@ -1085,6 +1087,75 @@ impl MutableCommand for EpochRemove {
             .find_epoch_by_id(&self.id)
             .map(|epoch| epoch.title.clone())
             .ok_or_else(|| anyhow::anyhow!("Epoch not found: {}", self.id))?;
+        let loader = SqliteLoader::open(ctx.db_path())?;
+        let conn = loader.database().connection();
+        let rfc_objectives = {
+            let mut statement = conn.prepare(
+                "SELECT phase.text_id, objective.rfc_ulid
+                 FROM campaign_rfc_objectives_data objective
+                 JOIN phases_data phase ON phase.id = objective.phase_id
+                 JOIN epochs_data epoch ON epoch.id = phase.epoch_id
+                 WHERE epoch.text_id = ?1
+                 ORDER BY phase.sort_key, phase.id, objective.rfc_ulid",
+            )?;
+            statement
+                .query_map([&self.id], |row| {
+                    Ok(json!({
+                        "phase_id": row.get::<_, String>(0)?,
+                        "rfc_ulid": row.get::<_, String>(1)?,
+                    }))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let pull_requests = {
+            let mut statement = conn.prepare(
+                "SELECT phase.text_id, artifact.url
+                 FROM phase_pull_request_relations_data relation
+                 JOIN phases_data phase ON phase.id = relation.phase_id
+                 JOIN epochs_data epoch ON epoch.id = phase.epoch_id
+                 JOIN project_flow_pull_requests_data artifact ON artifact.id = relation.artifact_id
+                 WHERE epoch.text_id = ?1
+                 ORDER BY phase.sort_key, phase.id,
+                          artifact.provider, artifact.repository, artifact.number",
+            )?;
+            statement
+                .query_map([&self.id], |row| {
+                    Ok(json!({
+                        "phase_id": row.get::<_, String>(0)?,
+                        "url": row.get::<_, String>(1)?,
+                    }))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !rfc_objectives.is_empty() || !pull_requests.is_empty() {
+            let first_campaign = rfc_objectives
+                .first()
+                .or_else(|| pull_requests.first())
+                .and_then(|relationship| relationship["phase_id"].as_str())
+                .unwrap_or_default();
+            return Err(ExoFailure::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "Epoch '{}' cannot be removed while its campaigns have attached project motion",
+                    self.id
+                ),
+                ExoFailure::orienting_steering(vec![SuggestedAction {
+                    label: "Inspect attached project motion".to_string(),
+                    command: format!("exo project-flow status --campaign {first_campaign}"),
+                    rationale: "Detach the RFC objectives and pull requests from every campaign in this epoch before removing it.".to_string(),
+                    intent: WorkIntent::Orient,
+                    confidence: Some(1.0),
+                }]),
+            )
+            .with_details(json!({
+                "kind": "epoch.has_project_flow_relationships",
+                "epoch_id": self.id,
+                "rfc_objectives": rfc_objectives,
+                "pull_requests": pull_requests,
+            }))
+            .into());
+        }
+        drop(loader);
         let writer = SqliteWriter::open(ctx.db_path())?;
         writer.remove_epoch(&self.id)?;
 

@@ -258,7 +258,11 @@ mod tests {
         let path = temp.path().join("exo.db");
         let connection = exosuit_storage::Connection::open(&path).expect("create database");
         connection
-            .pragma_update(None, "user_version", 1)
+            .pragma_update(
+                None,
+                "user_version",
+                exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+            )
             .expect("raise writer generation");
         drop(connection);
 

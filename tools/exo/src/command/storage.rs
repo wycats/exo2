@@ -370,6 +370,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
@@ -379,7 +380,7 @@ mod tests {
             .execute(&ctx)
             .expect("report compatibility");
         assert_eq!(output.data["kind"], "storage.compatibility");
-        assert_eq!(output.data["supported_writer_generation"], 0);
+        assert_eq!(output.data["supported_writer_generation"], 1);
         assert!(!temp.path().join(".cache").exists());
     }
 
@@ -399,6 +400,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
@@ -431,6 +433,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
@@ -470,6 +473,7 @@ mod tests {
             project: None,
             format: OutputFormat::Json,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,

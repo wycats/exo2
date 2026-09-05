@@ -149,6 +149,11 @@ fn make_display(
         crate::command::update::format_update_human_data(workspace_root, &invoke_result.data)
             .or_else(|| invoke_result.human_message.clone())
             .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
+    } else if namespace == "project-flow" {
+        invoke_result
+            .human_message
+            .clone()
+            .or_else(|| generate_body_from_data(namespace, operation, &invoke_result.data))
     } else {
         generate_body_from_data(namespace, operation, &invoke_result.data)
     };
@@ -1582,6 +1587,47 @@ pub fn handle_request_with_project_and_diagnostics_as_writer(
     request: RequestEnvelope,
     diagnostics: &DaemonDiagnostics,
 ) -> ResponseEnvelope {
+    if let Some(project) = project
+        && let Some(recovery) = crate::daemon_outcomes::request_declared_recovery(&request)
+        && recovery.recovery_class == crate::api::protocol::RecoveryClass::PreparedExternalRead
+    {
+        let db_path = project.db_path();
+        let (namespace, operation) =
+            crate::daemon_outcomes::request_command_path(&request).unwrap_or_default();
+        let outcome = crate::daemon_outcomes::execute_prepared_external_read_direct(
+            request,
+            recovery.effect,
+            &db_path,
+            |request, owner| {
+                crate::command::project_flow::prepare_external_read_request(
+                    &db_path,
+                    workspace_root,
+                    request,
+                    owner,
+                )
+            },
+            |request| {
+                handle_request_with_project_and_diagnostics_as_atomic_writer(
+                    workspace_root,
+                    Some(project),
+                    request,
+                    diagnostics,
+                )
+            },
+            |response| {
+                finalize_atomic_response_after_commit(
+                    workspace_root,
+                    Some(project),
+                    &namespace,
+                    &operation,
+                    recovery.effect,
+                    response,
+                    diagnostics,
+                )
+            },
+        );
+        return outcome.response;
+    }
     handle_request_with_project_and_diagnostics_in_runtime(
         workspace_root,
         project,
@@ -1837,9 +1883,12 @@ fn persist_after_success_with_diagnostics(
     namespace: &str,
     operation: &str,
     effect: Effect,
+    result: &JsonValue,
     diagnostics: &DaemonDiagnostics,
 ) -> anyhow::Result<Option<crate::post_write::PostWritePersistenceReport>> {
-    if !crate::post_write::should_persist_after_success(project, namespace, operation, effect) {
+    if !crate::post_write::should_persist_after_result(
+        project, namespace, operation, effect, result,
+    ) {
         return Ok(None);
     }
 
@@ -1849,12 +1898,13 @@ fn persist_after_success_with_diagnostics(
             "request.post_write_persistence_start",
             json!({ "namespace": namespace, "operation": operation }),
         );
-        let report = crate::post_write::persist_after_success(
+        let report = crate::post_write::persist_after_result(
             workspace_root,
             project,
             namespace,
             operation,
             effect,
+            result,
         );
         let report_json = match &report {
             Ok(report) => json!(report),
@@ -1891,6 +1941,7 @@ pub(crate) fn finalize_atomic_response_after_commit(
         namespace,
         operation,
         effect,
+        response.result.as_ref().unwrap_or(&JsonValue::Null),
         diagnostics,
     ) {
         Ok(report) => report,
@@ -2374,6 +2425,7 @@ fn handle_call_with_namespace_operation(
                             namespace,
                             operation,
                             effect,
+                            &invoke_result.structured_data,
                             diagnostics,
                         ) {
                             Ok(report) => report,
@@ -2628,6 +2680,7 @@ fn handle_list(
                 let namespace = invocation.path.namespace.as_str();
                 let operation = invocation.path.operation.as_str();
                 let invoke_result = CommandInvokeResult {
+                    structured_data: result.clone(),
                     data: normalize_list_result(result),
                     human_message: None,
                     effect: Effect::Pure,
@@ -3105,7 +3158,7 @@ fn steer_help_root() -> Steering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::protocol::{HelpParams, Op, RequestEnvelope};
+    use crate::api::protocol::{CallParams, HelpParams, Op, RequestEnvelope};
     use crate::command_reference::ExoCommandReference;
     use crate::steering::{SuggestedAction, WorkIntent};
 
@@ -3126,6 +3179,7 @@ mod tests {
     #[test]
     fn update_display_renders_detailed_human_report_from_machine_data() {
         let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
             data: json!({
                 "kind": "update",
                 "ok": true,
@@ -3162,6 +3216,7 @@ mod tests {
     #[test]
     fn workbench_launch_display_keeps_the_url_and_expiration() {
         let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
             data: json!({
                 "kind": "workbench.launch",
                 "ok": true,
@@ -3197,6 +3252,127 @@ mod tests {
                 .as_deref()
                 .is_some_and(|body| body.contains("http://127.0.0.1:49152/#ticket=secret"))
         );
+    }
+
+    #[test]
+    fn project_flow_status_display_keeps_the_human_motion_report() {
+        let invoke_result = CommandInvokeResult {
+            structured_data: JsonValue::Null,
+            data: json!({
+                "campaign_id": "campaign-one",
+                "rfc_objectives": [{"rfc_number": 10207}],
+                "pull_requests": [{"number": 75}],
+                "diagnostics": [],
+            }),
+            human_message: Some(
+                "Project motion for campaign campaign-one\n\nRFC objectives:\n  RFC 10207 Project flow [drives]: Stage 2 -> Stage 3\n\nPull-request delivery:\n  wycats/exo2#75 Deliver project flow [implements]: open; review approved; checks passing\n    observed 2m ago"
+                    .to_string(),
+            ),
+            effect: Effect::Pure,
+            trace: exosuit_storage::Trace::default(),
+        };
+
+        let display = make_display(
+            Path::new("/workspace"),
+            "project-flow",
+            "status",
+            &json!({}),
+            &invoke_result,
+        )
+        .expect("project-flow status display");
+
+        let body = display.body.expect("human status body");
+        assert!(body.contains("RFC 10207 Project flow"));
+        assert!(body.contains("wycats/exo2#75 Deliver project flow"));
+        assert_ne!(body, "done");
+    }
+
+    #[test]
+    fn project_flow_write_display_keeps_degraded_human_diagnostics() {
+        for operation in ["pr.attach", "refresh"] {
+            let invoke_result = CommandInvokeResult {
+                structured_data: JsonValue::Null,
+                data: json!({
+                    "campaign_id": "campaign-one",
+                    "rfc_objectives": [],
+                    "pull_requests": [],
+                    "diagnostics": [],
+                }),
+                human_message: Some(format!(
+                    "Attached pull request to campaign.\n\nProject motion for campaign campaign-one\n\nPull-request delivery:\n  wycats/exo2#75 [implements]: unobserved\n    refresh failed: permission: resource not accessible"
+                )),
+                effect: Effect::Write,
+                trace: exosuit_storage::Trace::default(),
+            };
+            let display = make_display(
+                Path::new("/workspace"),
+                "project-flow",
+                operation,
+                &json!({}),
+                &invoke_result,
+            )
+            .expect("project-flow write display");
+            let body = display.body.expect("human write body");
+            assert!(body.contains("permission: resource not accessible"));
+            assert_ne!(body, "done");
+        }
+    }
+
+    #[test]
+    fn machine_channel_project_flow_status_renders_the_stored_status() {
+        let temp = tempfile::tempdir().expect("project-flow transport fixture");
+        let db_path = crate::context::db_path(temp.path(), None);
+        let writer = crate::context::SqliteWriter::open(&db_path).unwrap();
+        let epoch = writer.add_epoch("Epoch", None, &[]).unwrap();
+        let campaign = writer
+            .add_phase(&epoch, "Campaign", "regular", Some("campaign"), &[])
+            .unwrap();
+        writer
+            .database()
+            .connection()
+            .execute(
+                "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+                 VALUES('01rfc000000000000000000001', 10207, 'Project flow', 2, 'active',
+                        'project-flow', 'docs/rfcs/stage-2/10207.md')",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        crate::project_flow::attach_rfc(
+            &db_path,
+            &campaign,
+            "01rfc000000000000000000001",
+            crate::project_flow::RfcRelation::Drives,
+            Some(3),
+        )
+        .unwrap();
+
+        let response = handle_request(
+            temp.path(),
+            RequestEnvelope {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                id: "project-flow-status-transport".to_string(),
+                op: Op::Call(CallParams {
+                    address: Address::Operation {
+                        path: vec!["project-flow".to_string(), "status".to_string()],
+                    },
+                    input: json!({"campaign": campaign}),
+                }),
+                workspace_root: Some(temp.path().to_path_buf()),
+                auth: None,
+                workflow_confirmation: None,
+                agent_id: None,
+            },
+        );
+
+        assert_eq!(response.status, Status::Ok, "{response:?}");
+        let body = response
+            .display
+            .and_then(|display| display.body)
+            .expect("machine display body");
+        assert!(body.contains("Project motion for campaign"));
+        assert!(body.contains("RFC 10207 Project flow [drives]: Stage 2 -> Stage 3"));
+        assert_ne!(body, "done");
     }
 
     #[test]
@@ -3303,7 +3479,7 @@ mod tests {
         std::fs::create_dir_all(&projection).expect("create projection directory");
         std::fs::write(
             projection.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write incompatible projection");
         let db_path = crate::context::db_path(temp.path(), None);

@@ -12,7 +12,7 @@ use crate::maintenance::AutoVacuumMode;
 use crate::migrations::{has_pending_migrations, run_migrations};
 use crate::DatabaseError;
 
-pub const SUPPORTED_WRITER_GENERATION: i32 = 0;
+pub const SUPPORTED_WRITER_GENERATION: i32 = 1;
 pub const MAX_WRITER_GENERATION: i32 = i32::MAX;
 pub const PROJECTION_GENERATION_PREFIX: &str = "-- exo:minimum-writer-generation=";
 
@@ -769,7 +769,8 @@ mod tests {
         let authority = acquire_exclusive_compatibility_authority(&path)
             .expect("acquire cross-process exclusive authority");
         let advancing = Connection::open(&path).expect("open database while authority is held");
-        set_database_generation(&advancing, 1).expect("advance writer generation");
+        set_database_generation(&advancing, SUPPORTED_WRITER_GENERATION + 1)
+            .expect("advance writer generation");
         drop(advancing);
         std::fs::write(&acquired, b"acquired").expect("write acquired marker");
         drop(authority);
@@ -803,7 +804,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("exo.db");
         let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.pragma_update(None, "user_version", SUPPORTED_WRITER_GENERATION + 1)
+            .unwrap();
         conn.execute_batch(
             "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
         )
@@ -815,8 +817,8 @@ mod tests {
         assert!(matches!(
             error,
             DatabaseError::WriterCompatibility(WriterCompatibilityError::Incompatible {
-                required_generation: 1,
-                supported_generation: 0,
+                required_generation: 2,
+                supported_generation: 1,
                 surface: StateSurface::Database,
             })
         ));
@@ -855,7 +857,8 @@ mod tests {
             "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.pragma_update(None, "user_version", SUPPORTED_WRITER_GENERATION + 1)
+            .unwrap();
         assert!(path.with_extension("db-wal").exists());
 
         let error = open_database_connection(&path).unwrap_err();
@@ -863,8 +866,8 @@ mod tests {
         assert!(matches!(
             error,
             DatabaseError::WriterCompatibility(WriterCompatibilityError::Incompatible {
-                required_generation: 1,
-                supported_generation: 0,
+                required_generation: 2,
+                supported_generation: 1,
                 surface: StateSurface::Database,
             })
         ));
@@ -878,7 +881,10 @@ mod tests {
                 .unwrap(),
             "same"
         );
-        assert_eq!(read_database_generation(&conn).unwrap(), 1);
+        assert_eq!(
+            read_database_generation(&conn).unwrap(),
+            SUPPORTED_WRITER_GENERATION + 1
+        );
         assert!(!path.with_extension("writer-compat.lock").exists());
     }
 
@@ -894,18 +900,19 @@ mod tests {
         conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
         conn.execute_batch("CREATE TABLE sentinel(value TEXT);")
             .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.pragma_update(None, "user_version", SUPPORTED_WRITER_GENERATION + 1)
+            .unwrap();
         assert!(wal_path.exists());
         assert!(shm_path.exists());
         std::fs::remove_file(&shm_path).unwrap();
 
-        let error = preflight_database(&path).expect_err("generation one must be rejected");
+        let error = preflight_database(&path).expect_err("newer generation must be rejected");
 
         assert!(matches!(
             error,
             DatabaseError::WriterCompatibility(WriterCompatibilityError::Incompatible {
-                required_generation: 1,
-                supported_generation: 0,
+                required_generation: 2,
+                supported_generation: 1,
                 surface: StateSurface::Database,
             })
         ));
@@ -986,7 +993,10 @@ mod tests {
         );
         assert!(acquired.exists());
         let advanced = Connection::open(&path).expect("reopen advanced database");
-        assert_eq!(read_database_generation(&advanced).unwrap(), 1);
+        assert_eq!(
+            read_database_generation(&advanced).unwrap(),
+            SUPPORTED_WRITER_GENERATION + 1
+        );
     }
 
     #[cfg(unix)]
@@ -1044,15 +1054,17 @@ mod tests {
 
         let error = open_database_connection_with_hook(&path, || {
             let advancing = Connection::open(&path).unwrap();
-            advancing.pragma_update(None, "user_version", 1).unwrap();
+            advancing
+                .pragma_update(None, "user_version", SUPPORTED_WRITER_GENERATION + 1)
+                .unwrap();
         })
         .unwrap_err();
 
         assert!(matches!(
             error,
             DatabaseError::WriterCompatibility(WriterCompatibilityError::Incompatible {
-                required_generation: 1,
-                supported_generation: 0,
+                required_generation: 2,
+                supported_generation: 1,
                 surface: StateSurface::Database,
             })
         ));
@@ -1064,7 +1076,10 @@ mod tests {
                 .unwrap(),
             "same"
         );
-        assert_eq!(read_database_generation(&unchanged).unwrap(), 1);
+        assert_eq!(
+            read_database_generation(&unchanged).unwrap(),
+            SUPPORTED_WRITER_GENERATION + 1
+        );
     }
 
     #[test]
@@ -1176,7 +1191,10 @@ mod tests {
             shm_path.exists(),
             "the WAL index should remain available to read-only probes"
         );
-        assert_eq!(preflight_database(&path).unwrap(), 0);
+        assert_eq!(
+            preflight_database(&path).unwrap(),
+            SUPPORTED_WRITER_GENERATION
+        );
     }
 
     #[test]

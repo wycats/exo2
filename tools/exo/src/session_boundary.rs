@@ -247,6 +247,7 @@ mod tests {
             tasks: vec![("task-1".into(), "Some task".into(), "planned".into())],
             goals: vec![],
             rfc_pipeline: HashMap::new(),
+            rfc_objective_diagnostics: Vec::new(),
             unreviewed_epochs: Vec::new(),
             // Placeholder — overwritten by detect_boundary itself
             session_boundary: BoundaryDetection {

@@ -2233,7 +2233,7 @@ mod tests {
         std::fs::create_dir_all(&projection).unwrap();
         std::fs::write(
             projection.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .unwrap();
         let resolver = resolver_with_test_home(&temp);
@@ -2271,7 +2271,13 @@ mod tests {
         let db_path = project_dir.join("cache/exo.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let connection = exosuit_storage::Connection::open(&db_path).unwrap();
-        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+            )
+            .unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('same');",
@@ -2313,7 +2319,7 @@ mod tests {
         std::fs::create_dir_all(&projection_dir).unwrap();
         std::fs::write(
             projection_dir.join("epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .unwrap();
         let config_path = resolver.local_projects_config_path().unwrap();
@@ -2444,7 +2450,13 @@ mod tests {
             false,
             || {
                 let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
-                advancing.pragma_update(None, "user_version", 1).unwrap();
+                advancing
+                    .pragma_update(
+                        None,
+                        "user_version",
+                        exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+                    )
+                    .unwrap();
             },
         )
         .unwrap_err();
@@ -2463,7 +2475,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 
@@ -2488,7 +2500,13 @@ mod tests {
             true,
             || {
                 let advancing = exosuit_storage::Connection::open(&db_path).unwrap();
-                advancing.pragma_update(None, "user_version", 1).unwrap();
+                advancing
+                    .pragma_update(
+                        None,
+                        "user_version",
+                        exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+                    )
+                    .unwrap();
             },
         )
         .unwrap_err();

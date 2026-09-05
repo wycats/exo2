@@ -1,6 +1,6 @@
 #![allow(clippy::disallowed_methods)]
 
-use exo::command::epoch::EpochStart;
+use exo::command::epoch::{EpochRemove, EpochStart};
 use exo::command::lane::{
     LaneCreate, LaneCurrent, LaneFocus, LaneList, LaneRemove, LaneShow, LaneStart,
 };
@@ -66,6 +66,7 @@ fn read_context<'a>(root: &'a Path, project: &'a Project) -> CommandContext<'a> 
         project: Some(project),
         format: OutputFormat::Json,
         agent_id: None,
+        request_id: None,
         workflow_confirmation: None,
         input_content: None,
         runtime_services: None,
@@ -78,6 +79,7 @@ fn write_context<'a>(root: &'a Path, project: &'a Project) -> MutableCommandCont
         project: Some(project),
         format: OutputFormat::Json,
         agent_id: None,
+        request_id: None,
         workflow_confirmation: None,
         input_content: None,
         runtime_services: None,
@@ -98,6 +100,7 @@ fn execute_human<C: Command>(command: &C, root: &Path, project: &Project) -> Com
             project: Some(project),
             format: OutputFormat::Human,
             agent_id: None,
+            request_id: None,
             workflow_confirmation: None,
             input_content: None,
             runtime_services: None,
@@ -511,7 +514,7 @@ fn phase_remove_reports_the_lanes_that_restrict_deletion() {
         .expect_err("phase with a lane cannot be removed");
     let failure = error
         .downcast_ref::<exo::failure::ExoFailure>()
-        .expect("structured failure");
+        .unwrap_or_else(|| panic!("structured failure: {error:#}"));
     assert_eq!(
         failure.error.code,
         exo::api::protocol::ErrorCode::PreconditionFailed
@@ -520,4 +523,160 @@ fn phase_remove_reports_the_lanes_that_restrict_deletion() {
     assert_eq!(details["kind"], "phase.has_workbench_lanes");
     assert_eq!(details["phase_id"], execution_phase);
     assert_eq!(details["lane_ids"], serde_json::json!([lane_id]));
+}
+
+#[test]
+fn phase_remove_reports_project_motion_that_restricts_deletion() {
+    let (temp, project, _bootstrap_phase, execution_phase) = fixture();
+    let root = temp.path();
+    let writer = SqliteWriter::open(project.db_path()).expect("open writer");
+    let conn = writer.database().connection();
+    conn.execute(
+        "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+         VALUES('01rfc000000000000000000001', 10207, 'Project flow', 2, 'active',
+                'project-flow', 'docs/rfcs/stage-2/10207.md')",
+        [],
+    )
+    .expect("add RFC fixture");
+    conn.execute(
+        "INSERT INTO campaign_rfc_objectives_data(
+             text_id, phase_id, rfc_ulid, rfc_number_snapshot, rfc_title_snapshot,
+             observed_stage, target_stage, relation
+         ) VALUES(
+             '01objective00000000000000001',
+             (SELECT id FROM phases_data WHERE text_id = ?1),
+             '01rfc000000000000000000001', 10207, 'Project flow', 2, 3, 'drives'
+         )",
+        [&execution_phase],
+    )
+    .expect("attach RFC objective");
+    conn.execute(
+        "INSERT INTO project_flow_pull_requests_data(
+             text_id, provider, repository, number, url
+         ) VALUES(
+             '01pullrequest000000000000001', 'github', 'wycats/exo2', 76,
+             'https://github.com/wycats/exo2/pull/76'
+         )",
+        [],
+    )
+    .expect("add pull request fixture");
+    conn.execute(
+        "INSERT INTO phase_pull_request_relations_data(phase_id, artifact_id, role)
+         VALUES(
+             (SELECT id FROM phases_data WHERE text_id = ?1),
+             (SELECT id FROM project_flow_pull_requests_data WHERE number = 76),
+             'implements'
+         )",
+        [&execution_phase],
+    )
+    .expect("attach pull request");
+    drop(writer);
+
+    let error = PhaseRemove::new(&execution_phase)
+        .execute_mut(&mut write_context(root, &project))
+        .expect_err("phase with project motion cannot be removed");
+    let failure = error
+        .downcast_ref::<exo::failure::ExoFailure>()
+        .unwrap_or_else(|| panic!("structured failure: {error:#}"));
+    assert_eq!(
+        failure.error.code,
+        exo::api::protocol::ErrorCode::PreconditionFailed
+    );
+    let details = failure.error.details.as_ref().expect("details");
+    assert_eq!(details["kind"], "phase.has_project_flow_relationships");
+    assert_eq!(details["phase_id"], execution_phase);
+    assert_eq!(
+        details["rfc_objectives"],
+        serde_json::json!(["01rfc000000000000000000001"])
+    );
+    assert_eq!(
+        details["pull_requests"],
+        serde_json::json!(["https://github.com/wycats/exo2/pull/76"])
+    );
+}
+
+#[test]
+fn epoch_remove_reports_project_motion_in_its_campaigns() {
+    let (temp, project, _bootstrap_phase, execution_phase) = fixture();
+    let root = temp.path();
+    let writer = SqliteWriter::open(project.db_path()).expect("open writer");
+    let conn = writer.database().connection();
+    let epoch_id = conn
+        .query_row(
+            "SELECT epoch.text_id
+             FROM epochs_data epoch
+             JOIN phases_data phase ON phase.epoch_id = epoch.id
+             WHERE phase.text_id = ?1",
+            [&execution_phase],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("load epoch ID");
+    conn.execute(
+        "INSERT INTO rfcs(text_id, rfc_number, title, stage, status, slug, file_path)
+         VALUES('01rfc000000000000000000001', 10207, 'Project flow', 2, 'active',
+                'project-flow', 'docs/rfcs/stage-2/10207.md')",
+        [],
+    )
+    .expect("add RFC fixture");
+    conn.execute(
+        "INSERT INTO campaign_rfc_objectives_data(
+             text_id, phase_id, rfc_ulid, rfc_number_snapshot, rfc_title_snapshot,
+             observed_stage, target_stage, relation
+         ) VALUES(
+             '01objective00000000000000001',
+             (SELECT id FROM phases_data WHERE text_id = ?1),
+             '01rfc000000000000000000001', 10207, 'Project flow', 2, 3, 'drives'
+         )",
+        [&execution_phase],
+    )
+    .expect("attach RFC objective");
+    conn.execute(
+        "INSERT INTO project_flow_pull_requests_data(
+             text_id, provider, repository, number, url
+         ) VALUES(
+             '01pullrequest000000000000001', 'github', 'wycats/exo2', 76,
+             'https://github.com/wycats/exo2/pull/76'
+         )",
+        [],
+    )
+    .expect("add pull request fixture");
+    conn.execute(
+        "INSERT INTO phase_pull_request_relations_data(phase_id, artifact_id, role)
+         VALUES(
+             (SELECT id FROM phases_data WHERE text_id = ?1),
+             (SELECT id FROM project_flow_pull_requests_data WHERE number = 76),
+             'implements'
+         )",
+        [&execution_phase],
+    )
+    .expect("attach pull request");
+    drop(writer);
+
+    let error = EpochRemove::new(&epoch_id)
+        .execute_mut(&mut write_context(root, &project))
+        .expect_err("epoch with project motion cannot be removed");
+    let failure = error
+        .downcast_ref::<exo::failure::ExoFailure>()
+        .unwrap_or_else(|| panic!("structured failure: {error:#}"));
+    assert_eq!(
+        failure.error.code,
+        exo::api::protocol::ErrorCode::PreconditionFailed
+    );
+    let details = failure.error.details.as_ref().expect("details");
+    assert_eq!(details["kind"], "epoch.has_project_flow_relationships");
+    assert_eq!(details["epoch_id"], epoch_id);
+    assert_eq!(
+        details["rfc_objectives"],
+        serde_json::json!([{
+            "phase_id": execution_phase,
+            "rfc_ulid": "01rfc000000000000000000001",
+        }])
+    );
+    assert_eq!(
+        details["pull_requests"],
+        serde_json::json!([{
+            "phase_id": execution_phase,
+            "url": "https://github.com/wycats/exo2/pull/76",
+        }])
+    );
 }

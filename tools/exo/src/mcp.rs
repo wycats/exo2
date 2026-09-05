@@ -2388,7 +2388,11 @@ mod tests {
         let connection = exosuit_storage::Connection::open(&db_path)
             .expect("create incompatible project database");
         connection
-            .pragma_update(None, "user_version", 1)
+            .pragma_update(
+                None,
+                "user_version",
+                exosuit_storage::SUPPORTED_WRITER_GENERATION + 1,
+            )
             .expect("raise writer generation");
         drop(connection);
 

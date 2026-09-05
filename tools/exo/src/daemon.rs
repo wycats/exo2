@@ -75,6 +75,8 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_FAILED_PROBE_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_HEALTH_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_HEALTH_PERSIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+const PROCESS_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_PROBE_KIND: &str = "daemon_probe";
 const DAEMON_PROBE_OK_KIND: &str = "daemon_probe_ok";
 const DAEMON_DIAGNOSTICS_INACTIVE: &str = "daemon.diagnostics_requested_but_inactive";
@@ -1292,7 +1294,7 @@ fn inspect_daemon_endpoint_once(
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_identity(pid: u32) -> io::Result<String> {
+pub(crate) fn process_start_identity(pid: u32) -> io::Result<String> {
     if pid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1311,7 +1313,7 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_start_identity(pid: u32) -> io::Result<String> {
+pub(crate) fn process_start_identity(pid: u32) -> io::Result<String> {
     if pid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1320,7 +1322,7 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
     }
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output_guarded()?;
+        .output_guarded_timeout(PROCESS_IDENTITY_PROBE_TIMEOUT)?;
     let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || start.is_empty() {
         return Err(io::Error::new(
@@ -1332,12 +1334,12 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn process_start_identity(pid: u32) -> io::Result<String> {
+pub(crate) fn process_start_identity(pid: u32) -> io::Result<String> {
     let script =
         format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks");
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output_guarded()?;
+        .output_guarded_timeout(PROCESS_IDENTITY_PROBE_TIMEOUT)?;
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1355,10 +1357,10 @@ fn process_start_identity(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn process_start_identity(pid: u32) -> io::Result<String> {
+pub(crate) fn process_start_identity(pid: u32) -> io::Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output_guarded()?;
+        .output_guarded_timeout(PROCESS_IDENTITY_PROBE_TIMEOUT)?;
     let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || start.is_empty() {
         return Err(io::Error::new(
@@ -1919,9 +1921,11 @@ fn execute_ledgered_daemon_request(
     outcome_ledger: &RequestOutcomeLedger,
     mut request: RequestEnvelope,
     effect: Effect,
+    recovery_class: RecoveryClass,
     instance_id: &str,
     diagnostics: &DaemonDiagnostics,
     runtime_services: Option<&DaemonRuntimeServices>,
+    prepared_write_tx: Option<&tokio::sync::broadcast::Sender<()>>,
 ) -> OutcomeExecution {
     let response_id = request.id.clone();
     if let Some(request_id) =
@@ -1932,7 +1936,7 @@ fn execute_ledgered_daemon_request(
     let handler_response_id = response_id.clone();
     let is_workbench_launch = is_workbench_launch_request(&request);
     let execute = |mut request: RequestEnvelope| {
-        request.id = handler_response_id;
+        request.id = handler_response_id.clone();
         let request_id = request.id.clone();
         let context = match daemon_request_context(startup_workspace, startup_project, &request) {
             Ok(context) => context,
@@ -1976,6 +1980,78 @@ fn execute_ledgered_daemon_request(
             |request_id, response| runtime_services.retain_launch_replay(request_id, response),
             |request_id| runtime_services.replay_launch_response(request_id),
             |request_id| runtime_services.discard_launch_replay(request_id),
+        )
+    } else if recovery_class == RecoveryClass::PreparedExternalRead {
+        let Some(runtime_services) = runtime_services else {
+            return OutcomeExecution {
+                response: daemon_handler_error_response(
+                    response_id,
+                    ErrorCode::PreconditionFailed,
+                    "prepared external read requires daemon runtime services".to_string(),
+                ),
+                replayed: false,
+            };
+        };
+        let context = match daemon_request_context(startup_workspace, startup_project, &request) {
+            Ok(context) => context,
+            Err(error) => {
+                return OutcomeExecution {
+                    response: daemon_workspace_error_response(response_id, &error),
+                    replayed: false,
+                };
+            }
+        };
+        let owner = runtime_services.prepared_read_owner();
+        let project_db_path = context.project.db_path();
+        let workspace_root = context.workspace_root;
+        let project = context.project;
+        let (namespace, operation) = request_command_path(&request).unwrap_or_default();
+        let atomic_response_id = handler_response_id.clone();
+        outcome_ledger.execute_prepared_external_read_with_finalization(
+            request,
+            effect,
+            &owner,
+            Duration::from_secs(30),
+            &project_db_path,
+            |request| {
+                crate::command::project_flow::prepare_external_read_request(
+                    &project_db_path,
+                    &workspace_root,
+                    request,
+                    &owner,
+                )
+            },
+            |mut request| {
+                request.id = atomic_response_id;
+                handle_request_with_project_and_diagnostics_as_atomic_writer(
+                    &workspace_root,
+                    Some(&project),
+                    request,
+                    diagnostics,
+                )
+            },
+            || {
+                runtime_services
+                    .project_state_guard()
+                    .map_err(|_| anyhow::anyhow!("project state gate is unavailable"))
+            },
+            |response| {
+                crate::api::handler::finalize_atomic_response_after_commit(
+                    &workspace_root,
+                    Some(&project),
+                    &namespace,
+                    &operation,
+                    effect,
+                    response,
+                    diagnostics,
+                )
+            },
+            || {
+                runtime_services.revision_after_write();
+                if let Some(write_tx) = prepared_write_tx {
+                    let _ = write_tx.send(());
+                }
+            },
         )
     } else {
         outcome_ledger.execute(
@@ -3172,11 +3248,14 @@ pub async fn run_daemon(
                                 &outcome_ledger,
                                 req,
                                 recovery.effect,
+                                recovery.recovery_class,
                                 &instance_id,
                                 &diagnostics,
                                 Some(&handler_runtime_services),
+                                Some(&write_tx),
                             );
                             let advances_revision = !workbench_launch
+                                && recovery.recovery_class != RecoveryClass::PreparedExternalRead
                                 && !outcome.replayed
                                 && response_committed_write(&outcome.response);
                             (outcome.response, advances_revision)
@@ -3776,8 +3855,8 @@ mod tests {
         let details = error.details.as_ref().expect("compatibility details");
         assert_eq!(details["kind"], "storage.writer_incompatible");
         assert_eq!(details["state_surface"], "projection");
-        assert_eq!(details["required_generation"], 1);
-        assert_eq!(details["supported_generation"], 0);
+        assert_eq!(details["required_generation"], 2);
+        assert_eq!(details["supported_generation"], 1);
         assert_eq!(details["request_outcome_checked"], false);
         assert_eq!(details["retry_with_same_request_id"], true);
         assert_eq!(details["retryable"], false);
@@ -4403,8 +4482,10 @@ mod tests {
             &ledger,
             first_request,
             Effect::Exec,
+            RecoveryClass::ExternalAtMostOnce,
             "instance-a",
             &diagnostics,
+            None,
             None,
         );
         let second = execute_ledgered_daemon_request(
@@ -4413,8 +4494,10 @@ mod tests {
             &ledger,
             second_request,
             Effect::Exec,
+            RecoveryClass::ExternalAtMostOnce,
             "instance-a",
             &diagnostics,
+            None,
             None,
         );
 
@@ -4592,8 +4675,10 @@ mod tests {
             &ledger,
             request,
             reserved.effect,
+            reserved.recovery_class,
             "replacement-instance",
             &DaemonDiagnostics::disabled(),
+            None,
             None,
         );
 
@@ -4669,7 +4754,7 @@ mod tests {
         let before = std::fs::read(&database_path).expect("snapshot database");
         std::fs::write(
             workspace.join("docs/agent-context/epochs.sql"),
-            "-- exo:minimum-writer-generation=1\n",
+            "-- exo:minimum-writer-generation=2\n",
         )
         .expect("write newer canonical projection");
 
@@ -4714,7 +4799,7 @@ mod tests {
         drop(exosuit_storage::open_database(&database_path).expect("create event database"));
         std::fs::write(
             &projection_path,
-            "-- exo:minimum-writer-generation=1\n-- newer canonical projection\n",
+            "-- exo:minimum-writer-generation=2\n-- newer canonical projection\n",
         )
         .expect("write newer canonical projection");
 
@@ -4764,7 +4849,7 @@ mod tests {
         drop(connection);
         std::fs::write(
             &projection_path,
-            "-- exo:minimum-writer-generation=1\n-- retained projection\n",
+            "-- exo:minimum-writer-generation=2\n-- retained projection\n",
         )
         .expect("write newer canonical projection");
         let database_before = std::fs::read(&database_path).expect("snapshot database");
@@ -4882,8 +4967,10 @@ mod tests {
             &ledger,
             request,
             Effect::Write,
+            RecoveryClass::ExternalAtMostOnce,
             "instance-a",
             &DaemonDiagnostics::disabled(),
+            None,
             None,
         );
 
@@ -4920,8 +5007,10 @@ mod tests {
             &ledger,
             conflicting_request,
             Effect::Write,
+            RecoveryClass::ExternalAtMostOnce,
             "instance-a",
             &DaemonDiagnostics::disabled(),
+            None,
             None,
         );
 
