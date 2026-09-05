@@ -14,8 +14,8 @@ use crate::project_flow::{
     DeliveryRole, GithubProvider, ProjectFlowStatus as ProjectFlowStatusData, PullRequestIdentity,
     RfcObjectiveMotion, RfcRelation, attach_pr_with_provider, attach_rfc, detach_pr, detach_rfc,
     finalize_pr_attachment, finalize_refresh_with_preflight, prepare_pr_attachment,
-    prepare_refresh, project_flow_precondition, refresh_with_provider_and_preflight,
-    status_with_effective_rfcs,
+    prepare_refresh, prepared_campaign_for_finalization, project_flow_precondition,
+    refresh_with_provider_and_preflight, status_with_effective_rfcs,
 };
 use anyhow::{Result as ExoResult, bail};
 
@@ -425,10 +425,11 @@ impl MutableCommand for ProjectFlowPrAttach {
     fn execute_mut(&self, ctx: &mut MutableCommandContext<'_>) -> ExoResult<CommandOutput> {
         let request_id = request_id(ctx);
         let status = if prepared_read_is_finalizing(ctx)? {
+            let campaign = prepared_campaign_for_finalization(&ctx.db_path(), &request_id)?;
             finalize_pr_attachment(
                 &ctx.db_path(),
                 &request_id,
-                &self.campaign,
+                &campaign,
                 self.identity.clone(),
                 self.role,
             )?
@@ -526,11 +527,15 @@ impl Command for ProjectFlowRefresh {
 
 impl MutableCommand for ProjectFlowRefresh {
     fn execute_mut(&self, ctx: &mut MutableCommandContext<'_>) -> ExoResult<CommandOutput> {
-        let campaign = self
-            .campaign
-            .clone()
-            .map_or_else(|| active_campaign_mut(ctx), Ok)?;
         let request_id = request_id(ctx);
+        let finalizing = prepared_read_is_finalizing(ctx)?;
+        let campaign = if finalizing {
+            prepared_campaign_for_finalization(&ctx.db_path(), &request_id)?
+        } else {
+            self.campaign
+                .clone()
+                .map_or_else(|| active_campaign_mut(ctx), Ok)?
+        };
         let preflight = || {
             crate::post_write::preflight_sidecar_post_write(
                 ctx.project,
@@ -539,7 +544,7 @@ impl MutableCommand for ProjectFlowRefresh {
                 Effect::Write,
             )
         };
-        let status = if prepared_read_is_finalizing(ctx)? {
+        let status = if finalizing {
             finalize_refresh_with_preflight(&ctx.db_path(), &request_id, &campaign, preflight)?
         } else {
             refresh_with_provider_and_preflight(
@@ -737,6 +742,188 @@ mod tests {
     use crate::api::protocol::{Address, CallParams, ErrorCode};
     use crate::failure::ExoFailure;
     use crate::project_flow::{PullRequestView, RfcObjectiveView};
+
+    #[test]
+    fn prepared_commands_keep_their_campaign_when_focus_or_alias_changes() {
+        struct UnavailableProvider;
+        impl crate::project_flow::PullRequestProvider for UnavailableProvider {
+            fn observe(
+                &self,
+                _: &PullRequestIdentity,
+            ) -> Result<
+                crate::project_flow::ProviderObservation,
+                crate::project_flow::ProviderFailure,
+            > {
+                Err(crate::project_flow::ProviderFailure {
+                    class: "provider_unavailable",
+                    message: "fixture unavailable".to_string(),
+                })
+            }
+        }
+        for scenario in [
+            "refresh-switch",
+            "refresh-clear",
+            "refresh-alias",
+            "attach-alias",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let path = crate::context::db_path(root, None);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let writer = crate::context::SqliteWriter::open(&path).unwrap();
+            let epoch = writer.add_epoch("Epoch", Some("epoch"), &[]).unwrap();
+            let first = writer
+                .add_phase(
+                    &epoch,
+                    "First",
+                    "regular",
+                    Some("first-campaign"),
+                    &["first-campaign".to_string()],
+                )
+                .unwrap();
+            let second = writer
+                .add_phase(&epoch, "Second", "regular", Some("second-campaign"), &[])
+                .unwrap();
+            writer.update_phase_status(&first, "in-progress").unwrap();
+            let identity = PullRequestIdentity::parse("wycats/exo2#76").unwrap();
+            let owner = crate::daemon_outcomes::direct_prepared_read_owner().unwrap();
+            let attaching = scenario == "attach-alias";
+            if attaching {
+                prepare_pr_attachment(
+                    &path,
+                    "pending",
+                    "first-campaign",
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &owner,
+                    &UnavailableProvider,
+                )
+                .unwrap();
+                for (campaign, changed_identity, role) in [
+                    (second.as_str(), identity.clone(), DeliveryRole::Implements),
+                    (
+                        first.as_str(),
+                        PullRequestIdentity::parse("wycats/exo2#77").unwrap(),
+                        DeliveryRole::Implements,
+                    ),
+                    (first.as_str(), identity.clone(), DeliveryRole::Validates),
+                ] {
+                    let error = prepare_pr_attachment(
+                        &path,
+                        "pending",
+                        campaign,
+                        changed_identity,
+                        role,
+                        &owner,
+                        &UnavailableProvider,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error
+                            .downcast_ref::<ExoFailure>()
+                            .unwrap()
+                            .error
+                            .details
+                            .as_ref()
+                            .unwrap()["kind"],
+                        "project_flow.request_id_conflict"
+                    );
+                }
+            } else {
+                attach_pr_with_provider(
+                    &path,
+                    "initial",
+                    &first,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &UnavailableProvider,
+                )
+                .unwrap();
+                prepare_refresh(
+                    &path,
+                    "pending",
+                    "first-campaign",
+                    &owner,
+                    &UnavailableProvider,
+                )
+                .unwrap();
+                let error =
+                    prepare_refresh(&path, "pending", &second, &owner, &UnavailableProvider)
+                        .unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<ExoFailure>()
+                        .unwrap()
+                        .error
+                        .details
+                        .as_ref()
+                        .unwrap()["kind"],
+                    "project_flow.request_id_conflict"
+                );
+            }
+            if scenario.ends_with("alias") {
+                writer.database().connection().execute(
+                    "UPDATE entity_aliases SET entity_id = (SELECT id FROM phases_data WHERE text_id = ?1)
+                     WHERE entity_type = 'phase' AND alias = 'first-campaign'", [&second],
+                ).unwrap();
+                assert_eq!(
+                    crate::project_flow::resolve_campaign(
+                        writer.database().connection(),
+                        "first-campaign"
+                    )
+                    .unwrap(),
+                    second
+                );
+            } else {
+                writer.update_phase_status(&first, "pending").unwrap();
+                if scenario == "refresh-switch" {
+                    writer.update_phase_status(&second, "in-progress").unwrap();
+                }
+            }
+            let transaction = exosuit_storage::RequestTransaction::begin(&path).unwrap();
+            let mut ctx = MutableCommandContext {
+                root,
+                project: None,
+                format: crate::command::traits::OutputFormat::Json,
+                agent_id: None,
+                request_id: Some("pending".to_string()),
+                workflow_confirmation: None,
+                input_content: None,
+                runtime_services: None,
+            };
+            let output = if attaching {
+                ProjectFlowPrAttach::new(
+                    identity,
+                    "first-campaign".to_string(),
+                    DeliveryRole::Implements,
+                )
+                .execute_mut(&mut ctx)
+            } else {
+                ProjectFlowRefresh::new(
+                    scenario
+                        .ends_with("alias")
+                        .then(|| "first-campaign".to_string()),
+                )
+                .execute_mut(&mut ctx)
+            }
+            .unwrap();
+            transaction.commit().unwrap();
+            assert_eq!(output.data["campaign_id"], first, "{scenario}");
+            assert_eq!(
+                crate::project_flow::status(&path, &first)
+                    .unwrap()
+                    .pull_requests
+                    .len(),
+                1
+            );
+            assert!(
+                crate::project_flow::status(&path, &second)
+                    .unwrap()
+                    .pull_requests
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn status_command_observes_the_workspace_rfc_document() {

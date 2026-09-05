@@ -98,6 +98,10 @@ pub struct PullRequestIdentity {
 }
 
 impl PullRequestIdentity {
+    fn natural_key(&self) -> (&str, &str, i64) {
+        (&self.provider, &self.repository, self.number)
+    }
+
     pub fn parse(selector: &str) -> Result<Self> {
         if selector.is_empty()
             || selector
@@ -540,6 +544,33 @@ pub fn resolve_campaign(conn: &Connection, selector: &str) -> Result<String> {
             ),
         )),
     }
+}
+
+/// Read the target already bound by preparation during the same request's finalization.
+pub(crate) fn prepared_campaign_for_finalization(
+    db_path: &Path,
+    request_id: &str,
+) -> Result<String> {
+    if exosuit_storage::active_request_database(db_path)?.is_none() {
+        return Err(project_flow_precondition(
+            "project_flow.prepared_finalization_required",
+            "prepared campaign lookup requires an active request finalization",
+        ));
+    }
+    let db = open_request_database(db_path)?;
+    db.connection()
+        .query_row(
+            "SELECT phase_text_id FROM project_flow_prepared_reads WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            project_flow_precondition(
+                "project_flow.prepared_read_missing",
+                "project-flow provider read was not prepared",
+            )
+        })
 }
 
 fn resolve_rfc(conn: &Connection, selector: &str) -> Result<RfcRecord> {
@@ -1372,6 +1403,37 @@ fn attachment_canonicalization_fingerprint(conn: &Connection, campaign: &str) ->
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&rows)?)))
 }
 
+fn validate_prepared_relationship(
+    conn: &Connection,
+    campaign: &str,
+    target: &PreparedTarget,
+    canonicalization_fingerprint: Option<&str>,
+) -> Result<()> {
+    let snapshot = target.attachment_snapshot.as_ref().filter(|snapshot| snapshot.schema_version == 1 && snapshot.canonicalization_fingerprint.is_some()).ok_or_else(|| {
+        project_flow_precondition(
+            "project_flow.prepared_identity_snapshot_missing",
+            "this older prepared read lacks a complete artifact and campaign relationship snapshot; retry with a new request",
+        )
+    })?;
+    if artifact_ulid(conn, &target.identity)? != snapshot.artifact_ulid
+        || attachment_relation_snapshot(conn, campaign, &target.identity)? != snapshot.relation
+    {
+        return Err(project_flow_precondition(
+            "project_flow.prepared_input_changed",
+            "the prepared pull-request artifact or campaign relationship changed; retry with a new request",
+        ));
+    }
+    if let Some(fingerprint) = canonicalization_fingerprint
+        && Some(fingerprint) != snapshot.canonicalization_fingerprint.as_deref()
+    {
+        return Err(project_flow_precondition(
+            "project_flow.prepared_input_changed",
+            "pull-request destination state changed during canonical resolution; retry with a new request",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<i64> {
     let existing = conn
         .query_row(
@@ -1637,34 +1699,15 @@ pub(crate) fn finalize_pr_attachment(
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
-    let snapshot = target.attachment_snapshot.filter(|snapshot| snapshot.schema_version == 1 && snapshot.canonicalization_fingerprint.is_some()).ok_or_else(|| {
-        project_flow_precondition(
-            "project_flow.prepared_identity_snapshot_missing",
-            "this older prepared attachment lacks a complete artifact and campaign relationship snapshot; retry with a new request",
-        )
-    })?;
-    if artifact_ulid(conn, &identity)? != snapshot.artifact_ulid
-        || attachment_relation_snapshot(conn, &campaign, &identity)? != snapshot.relation
-    {
-        return Err(project_flow_precondition(
-            "project_flow.prepared_input_changed",
-            "the prepared pull-request artifact or campaign relationship changed; retry with a new request",
-        ));
-    }
     let canonical_identity = observation
         .observation
         .as_ref()
         .map(|observation| &observation.identity)
         .unwrap_or(&identity);
-    if canonical_identity != &identity
-        && Some(attachment_canonicalization_fingerprint(conn, &campaign)?)
-            != snapshot.canonicalization_fingerprint
-    {
-        return Err(project_flow_precondition(
-            "project_flow.prepared_input_changed",
-            "pull-request destination state changed during canonical resolution; retry with a new request",
-        ));
-    }
+    let fingerprint = (canonical_identity != &identity)
+        .then(|| attachment_canonicalization_fingerprint(conn, &campaign))
+        .transpose()?;
+    validate_prepared_relationship(conn, &campaign, &target, fingerprint.as_deref())?;
     let requested_artifact_id = artifact_id(conn, &identity)?;
     let artifact_id = upsert_campaign_delivery_relation(
         conn,
@@ -1778,7 +1821,7 @@ pub(crate) fn prepare_refresh(
                  WHERE phase.text_id = ?1
                  ORDER BY artifact.provider, artifact.repository, artifact.number",
             )?;
-            Ok(stmt
+            let mut targets = stmt
                 .query_map([&campaign], |row| {
                     Ok(PreparedTarget {
                         attachment_snapshot: None,
@@ -1791,7 +1834,17 @@ pub(crate) fn prepare_refresh(
                         role: row.get(4)?,
                     })
                 })?
-                .collect::<Result<Vec<_>, _>>()?)
+                .collect::<Result<Vec<_>, _>>()?;
+            let fingerprint = attachment_canonicalization_fingerprint(conn, &campaign)?;
+            for target in &mut targets {
+                target.attachment_snapshot = Some(PreparedAttachmentSnapshot {
+                    schema_version: 1,
+                    artifact_ulid: artifact_ulid(conn, &target.identity)?,
+                    relation: attachment_relation_snapshot(conn, &campaign, &target.identity)?,
+                    canonicalization_fingerprint: Some(fingerprint.clone()),
+                });
+            }
+            Ok(targets)
         },
         provider,
     )?;
@@ -1864,6 +1917,22 @@ pub(crate) fn finalize_refresh_with_preflight(
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
+    let fingerprint = portable_state_changed
+        .then(|| attachment_canonicalization_fingerprint(conn, &campaign))
+        .transpose()?;
+    // Validate the whole batch before an earlier canonical merge can alter a later target.
+    let moving_sources = targets
+        .iter()
+        .zip(&observations)
+        .filter_map(|(target, observation)| {
+            observation
+                .observation
+                .as_ref()
+                .filter(|result| result.identity.natural_key() != target.identity.natural_key())
+                .map(|_| target.identity.natural_key())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut canonical_roles = std::collections::BTreeMap::new();
     for (target, observation) in targets.iter().zip(&observations) {
         if observation.identity != target.identity {
             return Err(project_flow_precondition(
@@ -1871,9 +1940,35 @@ pub(crate) fn finalize_refresh_with_preflight(
                 "prepared project-flow provider result changed identity",
             ));
         }
-        let (artifact_id, current_role): (i64, String) = conn
+        validate_prepared_relationship(conn, &campaign, target, fingerprint.as_deref())?;
+        let canonical = observation
+            .observation
+            .as_ref()
+            .map(|result| &result.identity)
+            .unwrap_or(&target.identity);
+        let key = canonical.natural_key();
+        if moving_sources.contains(&key) {
+            return Err(project_flow_precondition(
+                "project_flow.canonical_redirect_conflict",
+                "provider results contain chained or cyclic PR redirects; retry with a fresh request after canonical identities stabilize",
+            ));
+        }
+        if let Some(previous) = canonical_roles.insert(key, target.role.as_str())
+            && previous != target.role
+        {
+            return Err(project_flow_precondition(
+                "project_flow.canonical_role_conflict",
+                format!(
+                    "multiple relationships resolve to {}#{} with different delivery roles; reconcile their roles before refreshing",
+                    canonical.repository, canonical.number
+                ),
+            ));
+        }
+    }
+    for (target, observation) in targets.iter().zip(&observations) {
+        let artifact_id: i64 = conn
             .query_row(
-                "SELECT artifact.id, relation.role FROM project_flow_pull_requests_data artifact
+                "SELECT artifact.id FROM project_flow_pull_requests_data artifact
              JOIN phase_pull_request_relations_data relation ON relation.artifact_id = artifact.id
              JOIN phases_data phase ON phase.id = relation.phase_id
              WHERE phase.text_id = ?1 AND artifact.provider = ?2
@@ -1884,7 +1979,7 @@ pub(crate) fn finalize_refresh_with_preflight(
                     target.identity.repository,
                     target.identity.number
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()?
             .ok_or_else(|| {
@@ -1893,12 +1988,6 @@ pub(crate) fn finalize_refresh_with_preflight(
                     "prepared project-flow relationship no longer exists",
                 )
             })?;
-        if current_role != target.role {
-            return Err(project_flow_precondition(
-                "project_flow.prepared_input_changed",
-                "prepared project-flow relationship changed delivery role",
-            ));
-        }
         let canonical_identity = observation
             .observation
             .as_ref()
@@ -3014,6 +3103,238 @@ mod tests {
                 assert_eq!(result.unwrap().pull_requests.len(), 2);
             }
         }
+    }
+
+    #[test]
+    fn refresh_validates_all_canonical_destinations_before_mutating() {
+        for mutation in ["none", "detach", "role", "mixed-role"] {
+            let (_temp, path, campaign) = fixture();
+            let source = PullRequestIdentity::parse("a-owner/old-repo#75").unwrap();
+            let destination = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+            for (request, identity) in [("source", &source), ("destination", &destination)] {
+                let mut result = observation(request);
+                result.identity = identity.clone();
+                attach_pr_with_provider(
+                    &path,
+                    request,
+                    &campaign,
+                    identity.clone(),
+                    if mutation == "mixed-role" && request == "destination" {
+                        DeliveryRole::Validates
+                    } else {
+                        DeliveryRole::Implements
+                    },
+                    &FakeProvider {
+                        calls: Cell::new(0),
+                        result: Ok(result),
+                    },
+                )
+                .unwrap();
+            }
+            let provider = FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("Refreshed")),
+            };
+            prepare_refresh(
+                &path,
+                "pending-refresh",
+                &campaign,
+                &direct_process_owner().unwrap(),
+                &provider,
+            )
+            .unwrap();
+            match mutation {
+                "detach" => {
+                    detach_pr(&path, &campaign, &destination).unwrap();
+                }
+                "role" => {
+                    attach_pr_with_provider(
+                        &path,
+                        "concurrent-role",
+                        &campaign,
+                        destination.clone(),
+                        DeliveryRole::Validates,
+                        &provider,
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let before = serde_json::to_value(status(&path, &campaign).unwrap()).unwrap();
+            let result = finalize_refresh(&path, "pending-refresh", &campaign);
+            if mutation == "none" {
+                let result = result.unwrap();
+                assert_eq!(result.pull_requests.len(), 1);
+                assert_eq!(result.pull_requests[0].identity, destination);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<ExoFailure>()
+                        .unwrap()
+                        .error
+                        .details
+                        .as_ref()
+                        .unwrap()["kind"],
+                    if mutation == "mixed-role" {
+                        "project_flow.canonical_role_conflict"
+                    } else {
+                        "project_flow.prepared_input_changed"
+                    }
+                );
+                assert_eq!(
+                    serde_json::to_value(status(&path, &campaign).unwrap()).unwrap(),
+                    before,
+                    "rejected refresh must preserve relationships and observations"
+                );
+                if mutation == "mixed-role" {
+                    attach_pr_with_provider(
+                        &path,
+                        "reconcile-role",
+                        &campaign,
+                        destination,
+                        DeliveryRole::Implements,
+                        &provider,
+                    )
+                    .unwrap();
+                    let result =
+                        refresh_with_provider(&path, "reconciled-refresh", &campaign, &provider)
+                            .unwrap();
+                    assert_eq!(result.pull_requests.len(), 1);
+                    assert_eq!(result.pull_requests[0].role, "implements");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_rejects_chained_redirects_without_losing_a_destination() {
+        struct ChainProvider {
+            source: PullRequestIdentity,
+            middle: PullRequestIdentity,
+            destination: PullRequestIdentity,
+        }
+        impl PullRequestProvider for ChainProvider {
+            fn observe(
+                &self,
+                identity: &PullRequestIdentity,
+            ) -> Result<ProviderObservation, ProviderFailure> {
+                let mut result = observation("Redirected");
+                result.identity = if identity == &self.source {
+                    self.middle.clone()
+                } else {
+                    self.destination.clone()
+                };
+                Ok(result)
+            }
+        }
+        for mixed_roles in [false, true] {
+            let (_temp, path, campaign) = fixture();
+            let source = PullRequestIdentity::parse("a-owner/old-repo#75").unwrap();
+            let middle = PullRequestIdentity::parse("b-owner/middle-repo#75").unwrap();
+            for (request, identity) in [("source", &source), ("middle", &middle)] {
+                let mut result = observation(request);
+                result.identity = identity.clone();
+                attach_pr_with_provider(
+                    &path,
+                    request,
+                    &campaign,
+                    identity.clone(),
+                    if mixed_roles && request == "middle" {
+                        DeliveryRole::Validates
+                    } else {
+                        DeliveryRole::Implements
+                    },
+                    &FakeProvider {
+                        calls: Cell::new(0),
+                        result: Ok(result),
+                    },
+                )
+                .unwrap();
+            }
+            let provider = ChainProvider {
+                source,
+                middle,
+                destination: PullRequestIdentity::parse("c-owner/new-repo#75").unwrap(),
+            };
+            prepare_refresh(
+                &path,
+                "chain",
+                &campaign,
+                &direct_process_owner().unwrap(),
+                &provider,
+            )
+            .unwrap();
+            let before = serde_json::to_value(status(&path, &campaign).unwrap()).unwrap();
+            let error = finalize_refresh(&path, "chain", &campaign).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ExoFailure>()
+                    .unwrap()
+                    .error
+                    .details
+                    .as_ref()
+                    .unwrap()["kind"],
+                "project_flow.canonical_redirect_conflict"
+            );
+            assert_eq!(
+                serde_json::to_value(status(&path, &campaign).unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unfinished_refresh_requires_new_snapshots_but_completed_replay_survives() {
+        let (_temp, path, campaign) = fixture();
+        let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+        let provider = FakeProvider {
+            calls: Cell::new(0),
+            result: Ok(observation("PR")),
+        };
+        attach_pr_with_provider(
+            &path,
+            "attach",
+            &campaign,
+            identity,
+            DeliveryRole::Implements,
+            &provider,
+        )
+        .unwrap();
+        prepare_refresh(
+            &path,
+            "legacy-refresh",
+            &campaign,
+            &direct_process_owner().unwrap(),
+            &provider,
+        )
+        .unwrap();
+        let remove_snapshot = |request: &str| {
+            let writer = SqliteWriter::open(&path).unwrap();
+            writer.database().connection().execute(
+                "UPDATE project_flow_prepared_reads SET targets_json = json_remove(targets_json, '$[0].attachment_snapshot') WHERE request_id = ?1", [request],
+            ).unwrap();
+        };
+        remove_snapshot("legacy-refresh");
+        let error = finalize_refresh(&path, "legacy-refresh", &campaign).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ExoFailure>()
+                .unwrap()
+                .error
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "project_flow.prepared_identity_snapshot_missing"
+        );
+        let completed =
+            refresh_with_provider(&path, "fresh-refresh", &campaign, &provider).unwrap();
+        remove_snapshot("fresh-refresh");
+        assert_eq!(
+            serde_json::to_value(finalize_refresh(&path, "fresh-refresh", &campaign).unwrap())
+                .unwrap(),
+            serde_json::to_value(completed).unwrap()
+        );
     }
 
     #[test]
