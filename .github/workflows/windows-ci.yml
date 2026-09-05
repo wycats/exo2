@@ -112,6 +112,9 @@ jobs:
       - name: Test daemon connect-or-spawn
         run: cargo test --locked -p exo --test daemon_connect_or_spawn test_ensure_daemon_spawns_and_connects -- --test-threads=1
 
+      - name: Test bounded process output
+        run: cargo test --locked -p exo --test process_output_deadline -- --test-threads=1
+
       - name: Test sidecar daemon concurrency
         run: cargo test --locked -p exo --test run_task_daemon_safe -- --test-threads=1
 

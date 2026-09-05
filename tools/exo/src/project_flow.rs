@@ -776,7 +776,21 @@ struct PreparedTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PreparedAttachmentSnapshot {
+    #[serde(default)]
+    schema_version: u8,
     artifact_ulid: Option<String>,
+    #[serde(default)]
+    relation: Option<PreparedRelationSnapshot>,
+    #[serde(default)]
+    canonicalization_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PreparedRelationSnapshot {
+    id: i64,
+    role: String,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1307,6 +1321,57 @@ fn artifact_ulid(conn: &Connection, identity: &PullRequestIdentity) -> Result<Op
         .optional()?)
 }
 
+fn attachment_relation_snapshot(
+    conn: &Connection,
+    campaign: &str,
+    identity: &PullRequestIdentity,
+) -> Result<Option<PreparedRelationSnapshot>> {
+    Ok(conn
+        .query_row(
+            "SELECT relation.id, relation.role, relation.created_at, relation.updated_at
+         FROM phase_pull_request_relations_data relation
+         JOIN project_flow_pull_requests_data artifact ON artifact.id = relation.artifact_id
+         JOIN phases_data phase ON phase.id = relation.phase_id
+         WHERE phase.text_id = ?1 AND artifact.provider = ?2
+           AND artifact.repository = ?3 AND artifact.number = ?4",
+            params![
+                campaign,
+                identity.provider,
+                identity.repository,
+                identity.number
+            ],
+            |row| {
+                Ok(PreparedRelationSnapshot {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn attachment_canonicalization_fingerprint(conn: &Connection, campaign: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    // The provider may redirect to an identity unknown when the read was prepared.
+    // Fence that case against all potential destinations and this campaign's links.
+    let mut statement = conn.prepare(
+        "SELECT json_array(artifact.text_id, artifact.provider, artifact.repository,
+                    artifact.number, artifact.url, relation.id, relation.role,
+                    relation.created_at, relation.updated_at)
+         FROM project_flow_pull_requests_data artifact
+         LEFT JOIN phase_pull_request_relations_data relation
+           ON relation.artifact_id = artifact.id
+          AND relation.phase_id = (SELECT id FROM phases_data WHERE text_id = ?1)
+         ORDER BY artifact.text_id",
+    )?;
+    let rows = statement
+        .query_map([campaign], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&rows)?)))
+}
+
 fn ensure_artifact(conn: &Connection, identity: &PullRequestIdentity) -> Result<i64> {
     let existing = conn
         .query_row(
@@ -1489,7 +1554,12 @@ pub(crate) fn prepare_pr_attachment(
         |conn| {
             let mut target = target;
             target.attachment_snapshot = Some(PreparedAttachmentSnapshot {
+                schema_version: 1,
                 artifact_ulid: artifact_ulid(conn, &target.identity)?,
+                relation: attachment_relation_snapshot(conn, &campaign, &target.identity)?,
+                canonicalization_fingerprint: Some(attachment_canonicalization_fingerprint(
+                    conn, &campaign,
+                )?),
             });
             Ok(vec![target])
         },
@@ -1567,16 +1637,18 @@ pub(crate) fn finalize_pr_attachment(
     }
     let conn = db.connection();
     resolve_campaign(conn, &campaign)?;
-    let snapshot = target.attachment_snapshot.ok_or_else(|| {
+    let snapshot = target.attachment_snapshot.filter(|snapshot| snapshot.schema_version == 1 && snapshot.canonicalization_fingerprint.is_some()).ok_or_else(|| {
         project_flow_precondition(
             "project_flow.prepared_identity_snapshot_missing",
-            "this older prepared attachment lacks an artifact identity snapshot; retry with a new request",
+            "this older prepared attachment lacks a complete artifact and campaign relationship snapshot; retry with a new request",
         )
     })?;
-    if artifact_ulid(conn, &identity)? != snapshot.artifact_ulid {
+    if artifact_ulid(conn, &identity)? != snapshot.artifact_ulid
+        || attachment_relation_snapshot(conn, &campaign, &identity)? != snapshot.relation
+    {
         return Err(project_flow_precondition(
             "project_flow.prepared_input_changed",
-            "the prepared pull-request artifact identity changed; retry with a new request",
+            "the prepared pull-request artifact or campaign relationship changed; retry with a new request",
         ));
     }
     let canonical_identity = observation
@@ -1584,6 +1656,15 @@ pub(crate) fn finalize_pr_attachment(
         .as_ref()
         .map(|observation| &observation.identity)
         .unwrap_or(&identity);
+    if canonical_identity != &identity
+        && Some(attachment_canonicalization_fingerprint(conn, &campaign)?)
+            != snapshot.canonicalization_fingerprint
+    {
+        return Err(project_flow_precondition(
+            "project_flow.prepared_input_changed",
+            "pull-request destination state changed during canonical resolution; retry with a new request",
+        ));
+    }
     let requested_artifact_id = artifact_id(conn, &identity)?;
     let artifact_id = upsert_campaign_delivery_relation(
         conn,
@@ -2692,6 +2773,250 @@ mod tests {
     }
 
     #[test]
+    fn prepared_attachment_preserves_concurrent_campaign_detach_and_role_changes() {
+        for (detach, redirected) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (_temp, path, campaign_a) = fixture();
+            let writer = SqliteWriter::open(&path).unwrap();
+            let epoch = writer
+                .add_epoch("Second epoch", Some("second-epoch"), &[])
+                .unwrap();
+            let campaign_b = writer
+                .add_phase(
+                    &epoch,
+                    "Second campaign",
+                    "regular",
+                    Some("second-campaign"),
+                    &[],
+                )
+                .unwrap();
+            let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+            let provider = FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("Shared PR")),
+            };
+            for (request, campaign) in [("attach-a", &campaign_a), ("attach-b", &campaign_b)] {
+                attach_pr_with_provider(
+                    &path,
+                    request,
+                    campaign,
+                    identity.clone(),
+                    DeliveryRole::Implements,
+                    &provider,
+                )
+                .unwrap();
+            }
+            let requested = if redirected {
+                PullRequestIdentity::parse("previous-owner/previous-repo#75").unwrap()
+            } else {
+                identity.clone()
+            };
+            prepare_pr_attachment(
+                &path,
+                "pending-b",
+                &campaign_b,
+                requested.clone(),
+                DeliveryRole::Implements,
+                &direct_process_owner().unwrap(),
+                &provider,
+            )
+            .unwrap();
+            if detach {
+                detach_pr(&path, &campaign_b, &identity).unwrap();
+            } else {
+                attach_pr_with_provider(
+                    &path,
+                    "role-change-b",
+                    &campaign_b,
+                    identity.clone(),
+                    DeliveryRole::Validates,
+                    &provider,
+                )
+                .unwrap();
+            }
+            let error = finalize_pr_attachment(
+                &path,
+                "pending-b",
+                &campaign_b,
+                requested.clone(),
+                DeliveryRole::Implements,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ExoFailure>()
+                    .unwrap()
+                    .error
+                    .details
+                    .as_ref()
+                    .unwrap()["kind"],
+                "project_flow.prepared_input_changed"
+            );
+            let current = status(&path, &campaign_b).unwrap();
+            if detach {
+                assert!(current.pull_requests.is_empty());
+            } else {
+                assert_eq!(current.pull_requests[0].role, "validates");
+            }
+            assert_eq!(
+                status(&path, &campaign_a).unwrap().pull_requests[0].role,
+                "implements"
+            );
+            let fresh = attach_pr_with_provider(
+                &path,
+                "fresh-b",
+                &campaign_b,
+                requested,
+                DeliveryRole::Validates,
+                &provider,
+            )
+            .unwrap();
+            assert_eq!(fresh.pull_requests[0].role, "validates");
+            assert_eq!(fresh.pull_requests[0].identity, identity);
+        }
+    }
+
+    #[test]
+    fn redirected_attachment_fences_destination_creation_and_garbage_collection() {
+        for create in [false, true] {
+            let (_temp, path, campaign) = fixture();
+            let alias = PullRequestIdentity::parse("previous-owner/previous-repo#75").unwrap();
+            let canonical = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
+            let provider = FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("PR")),
+            };
+            if !create {
+                attach_pr_with_provider(
+                    &path,
+                    "initial",
+                    &campaign,
+                    canonical.clone(),
+                    DeliveryRole::Implements,
+                    &provider,
+                )
+                .unwrap();
+            }
+            prepare_pr_attachment(
+                &path,
+                "pending",
+                &campaign,
+                alias.clone(),
+                DeliveryRole::Implements,
+                &direct_process_owner().unwrap(),
+                &provider,
+            )
+            .unwrap();
+            if create {
+                attach_pr_with_provider(
+                    &path,
+                    "concurrent",
+                    &campaign,
+                    canonical.clone(),
+                    DeliveryRole::Validates,
+                    &provider,
+                )
+                .unwrap();
+            } else {
+                detach_pr(&path, &campaign, &canonical).unwrap();
+            }
+            let error = finalize_pr_attachment(
+                &path,
+                "pending",
+                &campaign,
+                alias,
+                DeliveryRole::Implements,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ExoFailure>()
+                    .unwrap()
+                    .error
+                    .details
+                    .as_ref()
+                    .unwrap()["kind"],
+                "project_flow.prepared_input_changed"
+            );
+            let current = status(&path, &campaign).unwrap();
+            if create {
+                assert_eq!(current.pull_requests[0].role, "validates");
+            } else {
+                assert!(current.pull_requests.is_empty());
+                let writer = SqliteWriter::open(&path).unwrap();
+                assert!(
+                    artifact_ulid(writer.database().connection(), &canonical)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_artifact_changes_only_conflict_with_redirected_attachments() {
+        for redirected in [false, true] {
+            let (_temp, path, campaign) = fixture();
+            let requested = PullRequestIdentity::parse(if redirected {
+                "previous-owner/previous-repo#75"
+            } else {
+                "wycats/exo2#75"
+            })
+            .unwrap();
+            let provider = FakeProvider {
+                calls: Cell::new(0),
+                result: Ok(observation("PR")),
+            };
+            prepare_pr_attachment(
+                &path,
+                "pending",
+                &campaign,
+                requested.clone(),
+                DeliveryRole::Implements,
+                &direct_process_owner().unwrap(),
+                &provider,
+            )
+            .unwrap();
+            let unrelated = PullRequestIdentity::parse("wycats/exo2#76").unwrap();
+            let mut unrelated_observation = observation("Another PR");
+            unrelated_observation.identity = unrelated.clone();
+            attach_pr_with_provider(
+                &path,
+                "unrelated",
+                &campaign,
+                unrelated,
+                DeliveryRole::Implements,
+                &FakeProvider {
+                    calls: Cell::new(0),
+                    result: Ok(unrelated_observation),
+                },
+            )
+            .unwrap();
+            let result = finalize_pr_attachment(
+                &path,
+                "pending",
+                &campaign,
+                requested,
+                DeliveryRole::Implements,
+            );
+            if redirected {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<ExoFailure>()
+                        .unwrap()
+                        .error
+                        .details
+                        .as_ref()
+                        .unwrap()["kind"],
+                    "project_flow.prepared_input_changed"
+                );
+            } else {
+                assert_eq!(result.unwrap().pull_requests.len(), 2);
+            }
+        }
+    }
+
+    #[test]
     fn older_uncompleted_attachment_requires_a_fresh_identity_snapshot() {
         let (_temp, path, campaign) = fixture();
         let identity = PullRequestIdentity::parse("wycats/exo2#75").unwrap();
@@ -2730,6 +3055,34 @@ mod tests {
         assert_eq!(
             retained_payload, legacy_payload,
             "adding the snapshot must preserve request hashes"
+        );
+        writer
+            .database()
+            .connection()
+            .execute(
+                "UPDATE project_flow_prepared_reads SET targets_json = json_remove(targets_json,
+                '$[0].attachment_snapshot.schema_version', '$[0].attachment_snapshot.relation')
+             WHERE request_id = 'legacy-prepared-attach'",
+                [],
+            )
+            .unwrap();
+        let error = finalize_pr_attachment(
+            &path,
+            "legacy-prepared-attach",
+            &campaign,
+            identity.clone(),
+            DeliveryRole::Implements,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ExoFailure>()
+                .unwrap()
+                .error
+                .details
+                .as_ref()
+                .unwrap()["kind"],
+            "project_flow.prepared_identity_snapshot_missing"
         );
         writer.database().connection().execute(
             "UPDATE project_flow_prepared_reads SET targets_json = json_remove(targets_json, '$[0].attachment_snapshot')

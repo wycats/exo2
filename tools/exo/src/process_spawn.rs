@@ -15,6 +15,7 @@ pub trait CommandSpawnExt {
     fn output_guarded(&mut self) -> io::Result<Output>;
 
     /// Run to completion, killing and reaping the child when the deadline expires.
+    /// The deadline also covers pipe EOF when descendants inherit captured output.
     fn output_guarded_timeout(&mut self, timeout: Duration) -> io::Result<Output>;
 
     /// Run to completion while preserving the caller's configured stdout and stderr.
@@ -48,40 +49,72 @@ impl CommandSpawnExt for Command {
     }
 
     fn output_guarded_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
-        self.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = self.spawn_guarded()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
-        let stdout = std::thread::spawn(move || drain_output(stdout));
-        let stderr = std::thread::spawn(move || drain_output(stderr));
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(Output {
-                    status,
-                    stdout: join_output(stdout, "stdout")?,
-                    stderr: join_output(stderr, "stderr")?,
-                });
-            }
-            if Instant::now() >= deadline {
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded process output is unavailable on this platform",
+        ));
+
+        #[cfg(any(unix, windows))]
+        {
+            self.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = self.spawn_guarded()?;
+            let result = (|| {
+                let mut stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+                let mut stderr = child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+                stdout.prepare()?;
+                stderr.prepare()?;
+                let mut stdout_bytes = Vec::new();
+                let mut stderr_bytes = Vec::new();
+                let mut stdout_eof = false;
+                let mut stderr_eof = false;
+                let mut status = None;
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("process exceeded {} ms timeout", timeout.as_millis()),
+                        ));
+                    }
+                    if status.is_none() {
+                        status = child.try_wait()?;
+                    }
+                    let stdout_progress =
+                        drain_available(&mut stdout, &mut stdout_bytes, &mut stdout_eof)?;
+                    let stderr_progress =
+                        drain_available(&mut stderr, &mut stderr_bytes, &mut stderr_eof)?;
+                    if stdout_eof
+                        && stderr_eof
+                        && let Some(status) = status
+                    {
+                        return Ok(Output {
+                            status,
+                            stdout: stdout_bytes,
+                            stderr: stderr_bytes,
+                        });
+                    }
+                    if !stdout_progress && !stderr_progress {
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                }
+            })();
+            if result.is_err() {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = join_output(stdout, "stdout");
-                let _ = join_output(stderr, "stderr");
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("process exceeded {} ms timeout", timeout.as_millis()),
-                ));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            result
         }
     }
 
@@ -103,19 +136,80 @@ impl CommandSpawnExt for Command {
     }
 }
 
-fn drain_output(mut output: impl Read) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    output.read_to_end(&mut bytes)?;
-    Ok(bytes)
+#[cfg(any(unix, windows))]
+trait TimeoutPipe: Read {
+    fn prepare(&mut self) -> io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>>;
 }
 
-fn join_output(
-    reader: std::thread::JoinHandle<io::Result<Vec<u8>>>,
-    stream: &str,
-) -> io::Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other(format!("{stream} reader panicked")))?
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd> TimeoutPipe for T {
+    fn prepare(&mut self) -> io::Result<()> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = OFlag::from_bits_truncate(fcntl(&*self, FcntlArg::F_GETFL)?);
+        fcntl(&*self, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        match self.read(buffer) {
+            Ok(count) => Ok(Some(count)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsHandle> TimeoutPipe for T {
+    fn prepare(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        use io_lifetimes::AsFilelike;
+        // Peek through a borrowed handle, but consume through ChildStdout/ChildStderr:
+        // std::fs::File::read does not support their overlapped Windows handles.
+        let available =
+            system_interface::io::IoExt::peek(&*self.as_filelike_view::<std::fs::File>(), buffer);
+        match available {
+            Ok(0) => Ok(None),
+            Ok(count) => self.read(&mut buffer[..count]).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(Some(0)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn drain_available(
+    pipe: &mut impl TimeoutPipe,
+    bytes: &mut Vec<u8>,
+    eof: &mut bool,
+) -> io::Result<bool> {
+    if *eof {
+        return Ok(false);
+    }
+    let mut buffer = [0; 8192];
+    match pipe.read_available(&mut buffer)? {
+        None => Ok(false),
+        Some(0) => {
+            *eof = true;
+            Ok(false)
+        }
+        Some(count) => {
+            bytes.extend_from_slice(&buffer[..count]);
+            Ok(true)
+        }
+    }
 }
 
 /// Guarded process creation for Tokio commands.

@@ -57,8 +57,12 @@ include_dir = { version = "0.7.4", optional = true }
 libc = "0.2"
 fs2 = "0.4.3"
 mime_guess = "2.0.5"
-nix = { version = "0.31.1", features = ["process", "signal"] }
+nix = { version = "0.31.1", features = ["fs", "process", "signal"] }
 tempfile = "3.10"
+
+[target.'cfg(windows)'.dependencies]
+io-lifetimes = "2.0.4"
+system-interface = "0.27.3"
 
 [target.'cfg(unix)'.dependencies]
 locald-core = { git = "https://github.com/wycats/locald.git", rev = "28b7cdf403dd0e933a28cf4d38eeb75cebf1d51c" }
